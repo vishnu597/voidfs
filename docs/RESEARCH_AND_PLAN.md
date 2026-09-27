@@ -41,7 +41,8 @@ protocol spec, benchmarks), the changelog, terms, press coverage, and the SDK re
   and off by default.
 - **Suggested stack:** Rust core (engine, S3 gateway, daemon, CLI) built on Apache OpenDAL
   (storage backends), `s3s` (S3 server and SigV4) and `fastcdc`.
-  - macOS first: a native FSKit module in a SwiftUI menu-bar app (decided).
+  - macOS first: a native FSKit module in a SwiftUI menu-bar app, with the Rust client core in a
+    per-user launchd agent (decided; see the [FSKit spike](spikes/fskit.md)).
   - Windows later: WinFsp or the Cloud Files API.
   - Postgres or SQLite for the control plane.
 - **The hardest parts** are not the S3 API. They are (1) POSIX and desktop-app semantics over a
@@ -426,30 +427,47 @@ enterprise or later.
 **Decision (2026-09-26): a native FSKit module, macOS first.** No macFUSE or FUSE-T dependency.
 File Provider stays in reserve for Finder-integration features (badges, "keep downloaded").
 
-What that implies:
+What that implies (updated 2026-09-27 from the [FSKit spike](spikes/fskit.md)):
 
-- **Minimum macOS 26.** FSKit mounts local volumes from 15.4, but network ("non-local") volumes
-  only from macOS 26.
+- **Minimum macOS 27 (recommended by the spike; to confirm).** FSKit mounts network
+  ("non-local") volumes from macOS 26, but a drive that other machines change needs
+  `FSVolume.setCacheState` to evict what the kernel cached, and that exists only from macOS 27. So do the `FSVolume.*Handler` protocols (the `*Operations` ones are
+  deprecated in 27), `FSClient.mountSingleVolume` and `openFileSystemExtensionsSettings`.
 - **Shape.** `voidfs.app` is a SwiftUI menu-bar app. It is the host FSKit requires. It contains:
-  - the FSKit module (a Swift app extension);
-  - the Rust client core (cache, write journal, upload queue, change-feed client), built as an
-    XCFramework with UniFFI bindings;
+  - the FSKit module (a thin Swift app extension);
+  - a per-user launchd agent that runs the Rust client core (cache, write journal, upload queue,
+    change-feed client), linked as an XCFramework with UniFFI bindings;
   - the `voidfs` CLI, installed on the user's `PATH`.
 
-  Users enable the extension once in System Settings (Login Items & Extensions → File System
-  Extensions).
-- **Where the Rust core runs** is the first thing to settle in the FSKit spike. Either it runs
-  in-process in the extension, with the cache in an App Group container, or in a launchd agent
-  the extension reaches over XPC. The agent approach survives extension restarts and is shared
-  by the CLI and several mounts, but adds a hop per call.
+  Users enable the extension once in System Settings (General → Login Items & Extensions → File
+  System Extensions). The app can open that pane and check the setting through `FSClient`.
+- **The Rust core runs in the agent, not the extension.** The spike found one extension process
+  per mounted volume, which exits on unmount and, if it crashes, takes the volume with it (a
+  forced unmount, no relaunch). The sandbox lets the extension reach an agent whose XPC service
+  name starts with the App Group (62 µs per round trip). The extension keeps a metadata memo and
+  reads cached chunks straight from files in the App Group container, so warm operations do not
+  pay the hop.
+- **Mount flow.** An `FSGenericURLResource` for `voidfs://host[:port]/drive`, mounted with
+  `mount -F -t voidfs <url> <folder>` as the logged-in user, the way Apple's own FTP module works.
+  Mounting in `/Volumes` through `FSClient.mountSingleVolume` needs the
+  `com.apple.developer.fskit.mount` entitlement, which the team's profile does not grant.
 - **Build requirements.**
   - Full Xcode, not just the Command Line Tools.
-  - An Apple Developer Program membership, for the FSKit module entitlement, Developer ID
-    signing and notarization.
-- **Risk.** FSKit is young. The early spike must prove: byte-range reads at video-scrubbing
-  rates, xattrs and resource forks, atomic-save renames, `flock`, mmap, and Finder behavior
-  (`.DS_Store`, AppleDouble files). This is why the spike runs alongside Phase 1 rather than
-  after it.
+  - An Apple Developer Program membership. `com.apple.developer.fskit.fsmodule` is a restricted
+    entitlement: without a provisioning profile that grants it, AMFI kills the extension at
+    launch. Contributors need their own team to run a build.
+  - Developer ID signing and notarization (a Developer ID profile with the FSKit Module
+    capability is still to be confirmed).
+- **Risk, as measured by the spike.** Over loopback, the read-only mount streamed a 1 GiB file at
+  2.3–2.5 GB/s and listed 1,000 files in 21–33 ms. What remains hard:
+  - Kernel caches can only be revoked, not updated. Phase 2 reads open files at the version
+    current when they were opened (snapshot-at-open).
+  - `RENAME_SWAP` loses data on Apple's FSKit FAT module (it reports success and overwrites).
+  - Locks never reach the module.
+  - Finder looks up an AppleDouble `._` file for every file.
+  - A hung connection blocks callers for the whole request timeout.
+
+  The spike write-up lists each finding with its evidence.
 
 ---
 
@@ -535,7 +553,7 @@ use per-shard presigned URLs.
 | Phase | Goal | Deliverables | Exit criteria |
 |---|---|---|---|
 | **0: Specs** | Lock the foundations | On-bucket format spec; wire protocol; conformance case format and cases; `LICENSE`, `NOTICE`, `DCO`, `TRADEMARKS.md`, `SECURITY.md`; `rfcs/` process | **Drafts done 2026-09-26** (35 cases, validator passing). Exit: specs reviewed, RFC 0001 accepted (done 2026-09-27) |
-| **1: Engine and S3 gateway** (+ FSKit spike in parallel) | "It's a better bucket" | E1–E8, E11; B1, B3; S1–S5, S8; CLI basics; conformance runner; `docker compose` with SQLite; S3, R2 and MinIO in CI. **Spike:** a minimal FSKit module serving a read-only drive | Stock AWS CLI, boto3 and rclone work; all conformance cases pass on S3, R2 and MinIO; benchmark harness runs. The spike answers §5.3's open questions. **Progress (2026-09-26):** engine, server, SigV4 (including `aws-chunked` and checksums), checkpoints, forks, change feed and conformance runner done. 35/35 conformance cases pass on memory and local disk, including across a restart; boto3 and the AWS CLI work. **2026-09-27:** Cloudflare R2 passes too (35/35 conformance, boto3, restart, exclusive conditional writes under 32-way races). Still to do: GC (E8), content-defined checkpoint segments, Amazon S3 and MinIO runs, rclone, benchmarks, the FSKit spike |
+| **1: Engine and S3 gateway** (+ FSKit spike in parallel) | "It's a better bucket" | E1–E8, E11; B1, B3; S1–S5, S8; CLI basics; conformance runner; `docker compose` with SQLite; S3, R2 and MinIO in CI. **Spike:** a minimal FSKit module serving a read-only drive | Stock AWS CLI, boto3 and rclone work; all conformance cases pass on S3, R2 and MinIO; benchmark harness runs. The spike answers §5.3's open questions. **Progress (2026-09-26):** engine, server, SigV4 (including `aws-chunked` and checksums), checkpoints, forks, change feed and conformance runner done. 35/35 conformance cases pass on memory and local disk, including across a restart; boto3 and the AWS CLI work. **2026-09-27:** Cloudflare R2 passes too (35/35 conformance, boto3, restart, exclusive conditional writes under 32-way races). **2026-09-27:** FSKit spike done ([write-up](spikes/fskit.md)): a read-only native mount works, and §5.3's questions are answered. Still to do: GC (E8), content-defined checkpoint segments, Amazon S3 and MinIO runs, rclone, benchmarks |
 | **2: macOS drive** | "It's a drive on my Mac" | D1, D3, D5, D6, D9, D11 (SwiftUI menu-bar host app); change feed; journal and uploads; notarized build | Edit a 50 GB video project and a code repo from two Macs; changes visible within 5 s; app-compat matrix (Finder, Premiere, Resolve, Final Cut, Blender, Office) green |
 | **3: Control plane and web** | Multi-user | C1–C4, C5, C6, C8; B4, B5; S6, S9; access keys and scoped storage credentials | A team of 3 on one BYO R2 bucket with scoped keys, share links and an audit trail |
 | **4: Agents and search** | "AI-native" | A1 (all four), A2, A3 (MCP), A4, A5; E10; B6 adopt and B7 export | Agent forks, edits and restores through MCP; search across drives |
@@ -586,15 +604,16 @@ voidfs/
 | License | **Apache-2.0** for code, SDKs and specs | Explicit patent grant; compatible with OpenDAL, s3s, SlateDB and Tantivy. Does not stop anyone from reselling voidfs as a service, which is accepted |
 | Hosted offering | **None for now** | Billing, abuse handling, a managed control plane and multi-tenant hardening are out of scope. Design for one organization per deployment, and keep workspaces so a team can still split drives |
 | Contribution sign-off | **DCO** | `git commit -s` on every commit; no CLA. Relicensing later would need every contributor's consent, which is accepted |
-| macOS mount | **Native FSKit module** | Minimum macOS 26; needs full Xcode and an Apple Developer Program membership; see §5.3 |
+| macOS mount | **Native FSKit module** | Minimum macOS 26 for now; the [FSKit spike](spikes/fskit.md) recommends 27 (open item 2 below). Needs full Xcode and a provisioning profile with the FSKit Module capability; see §5.3 |
+| macOS client core | **A per-user launchd agent, reached over XPC** (2026-09-27, from the [FSKit spike](spikes/fskit.md)) | The FSKit extension stays thin: a metadata memo, cached reads from App Group files, everything else through the agent. The agent serves an App-Group-prefixed XPC service and owns the cache, journal, uploads and change feed |
 | Metadata engine | **Follow Space's architecture for now** ([RFC 0001](../rfcs/0001-metadata-in-the-bucket.md), accepted 2026-09-27) | Metadata as a commit log plus checkpoints in the user's bucket, in the same shape as Space's documented design, with fewer writes per version. Revisit when benchmarks exist |
 | Platform order | **macOS → (control plane, agents) → Windows and Linux mounts** | Linux servers and agents use S3 and the SDKs until the Linux mount lands. The desktop host app is SwiftUI on macOS; a cross-platform shell (such as Tauri) is revisited when Windows starts |
 
 ### Still open
 
-1. **Where the Rust client core runs on macOS**: in the FSKit extension, or in a launchd agent
-   over XPC. The Phase 1 spike settles it.
-2. **Space compatibility shim.** Whether and when to also accept `x-s3sdk-*` (see §12.8).
+1. **Space compatibility shim.** Whether and when to also accept `x-s3sdk-*` (see §12.8).
+2. **Minimum macOS for the drive: 26 or 27.** The FSKit spike recommends 27: only macOS 27 lets a
+   module evict kernel caches when another machine changes a file (§5.3).
 
 ---
 
