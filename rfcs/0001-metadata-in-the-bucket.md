@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed |
+| Status | Accepted (2026-09-27), to be revisited once benchmarks exist |
 | Author(s) | voidfs maintainers |
 | Created | 2026-09-26 |
 | Affects | format (and the cost model of the protocol) |
@@ -48,6 +48,27 @@ In short (the normative text is [`spec/format.md`](../spec/format.md)):
 - **Cost.** A mutation costs its new shards plus its share of one commit object. Space's
   documented design costs four objects per version (shard, transaction, version locator and
   record head). Checkpoints add an amortized cost.
+
+## Relation to Space's design
+
+The decision was to follow Space's architecture for now. As far as Space documents it
+(docs.spacefs.com, "Architecture" and "Performance guide"), this RFC already does, point for
+point:
+
+| Space (documented) | This RFC |
+|---|---|
+| Drive metadata lives in the drive's bucket, next to the content | Same |
+| Content is immutable, content-addressed shards: FastCDC, about 2 MiB (256 KiB to 16 MiB), SHA-256 names | Same parameters |
+| A version is a manifest, a list of shards; edits, renames and rollbacks write only what changed | Same |
+| One authority per drive orders commits and checks preconditions | Same |
+| Commits are fenced with the bucket's conditional writes | Same (`If-None-Match: *` on the log) |
+| Forks start from the parent's manifests and copy no bytes | Same, plus the fork gets its own checkpoint |
+
+Space does not publish its on-bucket object layout, so that part cannot be copied. The one
+difference it does describe is cost: Space writes four objects per version (the shard, a
+transaction, a version locator, and the record head). This RFC writes the shard and one commit
+object, and folds locators and heads into periodic checkpoints. That is a cheaper encoding of
+the same design, not a different design, so it stands.
 
 ## Compatibility
 

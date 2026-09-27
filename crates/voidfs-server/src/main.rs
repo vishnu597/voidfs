@@ -26,10 +26,15 @@ struct Args {
     /// Address to listen on.
     #[arg(long, env = "VOIDFS_LISTEN", default_value = "127.0.0.1:9000")]
     listen: SocketAddr,
-    /// Endpoint of an S3-compatible service (for R2, MinIO and others). AWS credentials come
-    /// from the usual AWS environment variables.
+    /// Endpoint of an S3-compatible service, for R2, MinIO and others.
     #[arg(long, env = "VOIDFS_S3_ENDPOINT")]
     s3_endpoint: Option<String>,
+    /// Access key id for the bucket. Without it, the usual AWS credential sources are used.
+    #[arg(long, env = "VOIDFS_S3_ACCESS_KEY_ID")]
+    s3_access_key_id: Option<String>,
+    /// Secret for the bucket's access key.
+    #[arg(long, env = "VOIDFS_S3_SECRET_ACCESS_KEY", hide_env_values = true)]
+    s3_secret_access_key: Option<String>,
     /// Region of the bucket (`auto` for R2).
     #[arg(long, env = "VOIDFS_S3_REGION", default_value = "us-east-1")]
     s3_region: String,
@@ -62,7 +67,12 @@ fn open_store(args: &Args) -> anyhow::Result<Store> {
     }
     if let Some(rest) = spec.strip_prefix("s3:") {
         let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-        return Store::s3(bucket, &format!("/{prefix}"), args.s3_endpoint.as_deref(), &args.s3_region);
+        let credentials = match (&args.s3_access_key_id, &args.s3_secret_access_key) {
+            (Some(id), Some(secret)) => Some((id.as_str(), secret.as_str())),
+            (None, None) => None,
+            _ => bail!("give both --s3-access-key-id and --s3-secret-access-key, or neither"),
+        };
+        return Store::s3(bucket, &format!("/{prefix}"), args.s3_endpoint.as_deref(), &args.s3_region, credentials);
     }
     bail!("--store must be memory, fs:<directory> or s3:<bucket>[/<prefix>]")
 }

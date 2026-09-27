@@ -534,8 +534,8 @@ use per-shard presigned URLs.
 
 | Phase | Goal | Deliverables | Exit criteria |
 |---|---|---|---|
-| **0: Specs** | Lock the foundations | On-bucket format spec; wire protocol; conformance case format and cases; `LICENSE`, `NOTICE`, `DCO`, `TRADEMARKS.md`, `SECURITY.md`; `rfcs/` process | **Drafts done 2026-09-26** (35 cases, validator passing). Exit: specs reviewed, RFC 0001 accepted |
-| **1: Engine and S3 gateway** (+ FSKit spike in parallel) | "It's a better bucket" | E1–E8, E11; B1, B3; S1–S5, S8; CLI basics; conformance runner; `docker compose` with SQLite; S3, R2 and MinIO in CI. **Spike:** a minimal FSKit module serving a read-only drive | Stock AWS CLI, boto3 and rclone work; all conformance cases pass on S3, R2 and MinIO; benchmark harness runs. The spike answers §5.3's open questions. **Progress (2026-09-26):** engine, server, SigV4 (including `aws-chunked` and checksums), checkpoints, forks, change feed and conformance runner done. 35/35 conformance cases pass on memory and local disk, including across a restart; boto3 and the AWS CLI work. Still to do: GC (E8), content-defined checkpoint segments, runs on real S3/R2/MinIO, rclone, benchmarks, the FSKit spike |
+| **0: Specs** | Lock the foundations | On-bucket format spec; wire protocol; conformance case format and cases; `LICENSE`, `NOTICE`, `DCO`, `TRADEMARKS.md`, `SECURITY.md`; `rfcs/` process | **Drafts done 2026-09-26** (35 cases, validator passing). Exit: specs reviewed, RFC 0001 accepted (done 2026-09-27) |
+| **1: Engine and S3 gateway** (+ FSKit spike in parallel) | "It's a better bucket" | E1–E8, E11; B1, B3; S1–S5, S8; CLI basics; conformance runner; `docker compose` with SQLite; S3, R2 and MinIO in CI. **Spike:** a minimal FSKit module serving a read-only drive | Stock AWS CLI, boto3 and rclone work; all conformance cases pass on S3, R2 and MinIO; benchmark harness runs. The spike answers §5.3's open questions. **Progress (2026-09-26):** engine, server, SigV4 (including `aws-chunked` and checksums), checkpoints, forks, change feed and conformance runner done. 35/35 conformance cases pass on memory and local disk, including across a restart; boto3 and the AWS CLI work. **2026-09-27:** Cloudflare R2 passes too (35/35 conformance, boto3, restart, exclusive conditional writes under 32-way races). Still to do: GC (E8), content-defined checkpoint segments, Amazon S3 and MinIO runs, rclone, benchmarks, the FSKit spike |
 | **2: macOS drive** | "It's a drive on my Mac" | D1, D3, D5, D6, D9, D11 (SwiftUI menu-bar host app); change feed; journal and uploads; notarized build | Edit a 50 GB video project and a code repo from two Macs; changes visible within 5 s; app-compat matrix (Finder, Premiere, Resolve, Final Cut, Blender, Office) green |
 | **3: Control plane and web** | Multi-user | C1–C4, C5, C6, C8; B4, B5; S6, S9; access keys and scoped storage credentials | A team of 3 on one BYO R2 bucket with scoped keys, share links and an audit trail |
 | **4: Agents and search** | "AI-native" | A1 (all four), A2, A3 (MCP), A4, A5; E10; B6 adopt and B7 export | Agent forks, edits and restores through MCP; search across drives |
@@ -587,16 +587,14 @@ voidfs/
 | Hosted offering | **None for now** | Billing, abuse handling, a managed control plane and multi-tenant hardening are out of scope. Design for one organization per deployment, and keep workspaces so a team can still split drives |
 | Contribution sign-off | **DCO** | `git commit -s` on every commit; no CLA. Relicensing later would need every contributor's consent, which is accepted |
 | macOS mount | **Native FSKit module** | Minimum macOS 26; needs full Xcode and an Apple Developer Program membership; see §5.3 |
+| Metadata engine | **Follow Space's architecture for now** ([RFC 0001](../rfcs/0001-metadata-in-the-bucket.md), accepted 2026-09-27) | Metadata as a commit log plus checkpoints in the user's bucket, in the same shape as Space's documented design, with fewer writes per version. Revisit when benchmarks exist |
 | Platform order | **macOS → (control plane, agents) → Windows and Linux mounts** | Linux servers and agents use S3 and the SDKs until the Linux mount lands. The desktop host app is SwiftUI on macOS; a cross-platform shell (such as Tauri) is revisited when Windows starts |
 
 ### Still open
 
-1. **Metadata engine.** Proposed in [RFC 0001](../rfcs/0001-metadata-in-the-bucket.md): a
-   custom commit log plus checkpoints in the bucket, with SlateDB considered only as a server
-   cache. The format draft is written on that basis. It needs your acceptance.
-2. **Where the Rust client core runs on macOS**: in the FSKit extension, or in a launchd agent
+1. **Where the Rust client core runs on macOS**: in the FSKit extension, or in a launchd agent
    over XPC. The Phase 1 spike settles it.
-3. **Space compatibility shim.** Whether and when to also accept `x-s3sdk-*` (see §12.8).
+2. **Space compatibility shim.** Whether and when to also accept `x-s3sdk-*` (see §12.8).
 
 ---
 

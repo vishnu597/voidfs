@@ -29,10 +29,15 @@ impl Store {
         Ok(Store::Local(root))
     }
 
-    pub fn s3(bucket: &str, root: &str, endpoint: Option<&str>, region: &str) -> anyhow::Result<Store> {
+    /// Opens an S3-compatible bucket. With `credentials`, only those are used; without, the
+    /// usual AWS sources (environment, `~/.aws`, instance metadata) are.
+    pub fn s3(bucket: &str, root: &str, endpoint: Option<&str>, region: &str, credentials: Option<(&str, &str)>) -> anyhow::Result<Store> {
         let mut b = opendal::services::S3::default().bucket(bucket).root(root).region(region);
         if let Some(e) = endpoint {
             b = b.endpoint(e);
+        }
+        if let Some((id, secret)) = credentials {
+            b = b.access_key_id(id).secret_access_key(secret).disable_config_load().disable_ec2_metadata();
         }
         Ok(Store::Dal(Operator::new(b)?.finish()))
     }
@@ -224,6 +229,44 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("voidfs-store-{}", uuid::Uuid::new_v4()));
         exercise(Store::local(&dir).unwrap()).await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A bucket named by the `VOIDFS_S3_*` variables, under a fresh prefix. Run with
+    /// `cargo test -p voidfs-server -- --ignored` after loading `.env`.
+    fn s3_from_env() -> Store {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"));
+        let root = format!("/voidfs-test-{}/store/", chrono::Utc::now().format("%Y%m%dT%H%M%S"));
+        let id = var("VOIDFS_S3_ACCESS_KEY_ID");
+        let secret = var("VOIDFS_S3_SECRET_ACCESS_KEY");
+        let region = std::env::var("VOIDFS_S3_REGION").unwrap_or_else(|_| "auto".into());
+        Store::s3(&var("VOIDFS_S3_BUCKET"), &root, Some(&var("VOIDFS_S3_ENDPOINT")), &region, Some((&id, &secret))).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real bucket"]
+    async fn s3_store() {
+        exercise(s3_from_env()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real bucket"]
+    async fn s3_put_new_is_exclusive_under_races() {
+        races(s3_from_env()).await;
+    }
+
+    async fn races(s: Store) {
+        let tasks: Vec<_> = (0..32)
+            .map(|i| {
+                let s = s.clone();
+                tokio::spawn(async move { s.put_new("log/1.json", Bytes::from(format!("{i}"))).await.unwrap() })
+            })
+            .collect();
+        let mut wins = 0;
+        for t in tasks {
+            wins += t.await.unwrap() as usize;
+        }
+        assert_eq!(wins, 1, "exactly one racing writer may create the object");
+        s.delete("log/1.json").await.unwrap();
     }
 
     #[tokio::test]

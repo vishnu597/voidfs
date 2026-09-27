@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, anyhow, bail};
+use futures::StreamExt;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use voidfs_core::chunk::{Params, Shard};
@@ -24,6 +25,10 @@ const CHECKPOINT_EVERY: u64 = 1000;
 const SEGMENT_ROWS: usize = 4096;
 /// Change-feed batches kept in memory per drive.
 const FEED_KEEP: usize = 10_000;
+/// Log entries fetched at once when replaying (each is a round trip to the bucket).
+const LOG_FETCH_PARALLELISM: usize = 32;
+/// Drives loaded at once when a pool opens.
+const DRIVE_LOAD_PARALLELISM: usize = 8;
 
 fn log_path(id: &DriveId, seq: u64) -> String {
     format!("drives/{id}/log/{seq:020}.json")
@@ -268,13 +273,22 @@ impl Pool {
             deleted: RwLock::new(HashMap::new()),
             authority: format!("a-{}", uuid::Uuid::new_v4()),
         });
-        for dir in pool.store.list_dirs("drives/").await? {
-            let Ok(id) = dir.parse::<DriveId>() else { continue };
-            match pool.load_drive(&id).await {
-                Ok(Some(d)) => {
-                    let deleted = pool.store.exists(&format!("drives/{id}/deleted.json")).await?;
-                    pool.register(d, deleted);
+        let ids: Vec<DriveId> = pool.store.list_dirs("drives/").await?.iter().filter_map(|d| d.parse().ok()).collect();
+        let loads = futures::stream::iter(ids)
+            .map(|id| {
+                let pool = &pool;
+                async move {
+                    let loaded = pool.load_drive(&id).await;
+                    let deleted = pool.store.exists(&format!("drives/{id}/deleted.json")).await;
+                    (id, loaded, deleted)
                 }
+            })
+            .buffer_unordered(DRIVE_LOAD_PARALLELISM)
+            .collect::<Vec<_>>()
+            .await;
+        for (id, loaded, deleted) in loads {
+            match loaded {
+                Ok(Some(d)) => pool.register(d, deleted?),
                 Ok(None) => {}
                 Err(e) => tracing::error!("drive {id} could not be loaded: {e:#}"),
             }
@@ -321,13 +335,37 @@ impl Pool {
     }
 
     /// Applies every commit after `state.seq()` and returns their feed batches.
+    /// The drive's commits after `seq`, in order. Fetched concurrently, since each is a
+    /// round trip to the bucket; stops at the first gap (format §8.4).
+    async fn commits_after(&self, id: &DriveId, seq: u64) -> anyhow::Result<Vec<Commit>> {
+        let dir = format!("drives/{id}/log/");
+        let names = self.store.list_files(&dir, Some(&format!("{seq:020}.json"))).await?;
+        let mut stream = futures::stream::iter(names)
+            .map(|name| {
+                let path = format!("{dir}{name}");
+                async move {
+                    let bytes = self.store.get(&path).await?.ok_or_else(|| anyhow!("log entry {path} vanished"))?;
+                    serde_json::from_slice::<Commit>(&bytes).with_context(|| format!("parsing {path}"))
+                }
+            })
+            .buffered(LOG_FETCH_PARALLELISM);
+        let mut out = Vec::new();
+        let mut expect = seq + 1;
+        while let Some(c) = stream.next().await {
+            let c = c?;
+            if c.seq != expect {
+                break;
+            }
+            expect += 1;
+            out.push(c);
+        }
+        Ok(out)
+    }
+
     async fn replay(&self, id: &DriveId, state: &mut DriveState) -> anyhow::Result<Vec<FeedBatch>> {
         let mut out = Vec::new();
-        let dir = format!("drives/{id}/log/");
-        let after = format!("{:020}.json", state.seq());
-        for name in self.store.list_files(&dir, Some(&after)).await? {
-            let bytes = self.store.get(&format!("{dir}{name}")).await?.ok_or_else(|| anyhow!("log entry {name} vanished"))?;
-            let commit: Commit = serde_json::from_slice(&bytes).with_context(|| format!("parsing {name}"))?;
+        for commit in self.commits_after(id, state.seq()).await? {
+            let name = log_path(id, commit.seq);
             if commit.seq != state.seq() + 1 {
                 break; // a gap: stop at it (format §8.4)
             }
@@ -627,12 +665,8 @@ impl Pool {
                 bail!("that instant is before this fork was made");
             }
         }
-        let dir = format!("drives/{}/log/", d.id);
-        let after = format!("{:020}.json", state.seq());
-        for name in self.store.list_files(&dir, Some(&after)).await? {
-            let bytes = self.store.get(&format!("{dir}{name}")).await?.ok_or_else(|| anyhow!("log entry vanished"))?;
-            let commit: Commit = serde_json::from_slice(&bytes)?;
-            if commit.time > t || commit.seq != state.seq() + 1 {
+        for commit in self.commits_after(&d.id, state.seq()).await? {
+            if commit.time > t {
                 break;
             }
             state = state.apply(&commit)?;

@@ -40,5 +40,5 @@ First drafts.
     `removed`.
   - Self-contained forks.
   - Retention, multipart staging, and two-phase garbage collection.
-  ([RFC 0001](../rfcs/0001-metadata-in-the-bucket.md), Proposed.)
+  ([RFC 0001](../rfcs/0001-metadata-in-the-bucket.md), accepted 2026-09-27.)
 - **Conformance:** 35 cases and the case file format, with `validate.py`.
