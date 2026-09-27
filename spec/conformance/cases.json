@@ -1,0 +1,621 @@
+{
+  "format": 1,
+  "protocol": 1,
+  "cases": [
+    {
+      "id": "drive-lifecycle",
+      "title": "Create, see, soft-delete and undelete a drive",
+      "spec": ["protocol §3", "protocol §5.1", "protocol §5.3", "protocol §8"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" },
+          "expect": { "status": 200, "headers": { "x-voidfs-drive-id": { "matches": "d-[0-9a-f-]{36}" }, "x-voidfs-protocol": { "equals": "1" } } } },
+        { "request": { "method": "HEAD", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/" },
+          "expect": { "status": 200, "body": { "xml": [ { "path": "ListAllMyBucketsResult/Buckets/Bucket/Name", "contains": "${drive}" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}" },
+          "expect": { "status": 409, "body": { "s3_error": "BucketAlreadyOwnedByYou" } } },
+        { "request": { "method": "DELETE", "path": "/${drive}" }, "expect": { "status": 204 } },
+        { "request": { "method": "HEAD", "path": "/${drive}" }, "expect": { "status": 404 } },
+        { "request": { "method": "POST", "path": "/${drive}", "query": { "x-voidfs-undelete": "" } }, "expect": { "status": 200 } },
+        { "request": { "method": "HEAD", "path": "/${drive}" }, "expect": { "status": 200 } }
+      ]
+    },
+    {
+      "id": "versioning-always-enabled",
+      "title": "Versioning reports Enabled and cannot be changed",
+      "spec": ["protocol §1.1", "protocol §3"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "versioning": "" } },
+          "expect": { "status": 200, "body": { "xml": [ { "path": "VersioningConfiguration/Status", "equals": ["Enabled"] } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}", "query": { "versioning": "" },
+                       "body": { "text": "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>" } },
+          "expect": { "status": 501, "body": { "s3_error": "NotImplemented" } } }
+      ]
+    },
+    {
+      "id": "put-get-roundtrip",
+      "title": "A put object reads back whole, with its version, size and kind",
+      "spec": ["protocol §3", "protocol §4.0"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/hello.txt", "headers": { "Content-Type": "text/plain" }, "body": { "text": "hello world" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v1" }, "ETag": { "capture": "e1" }, "x-voidfs-size": { "equals": "11" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/hello.txt" },
+          "expect": { "status": 200, "body": { "text": "hello world" } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/hello.txt" },
+          "expect": { "status": 200, "headers": { "Content-Length": { "equals": "11" }, "ETag": { "equals": "${e1}" },
+                                                   "Content-Type": { "equals": "text/plain" }, "x-voidfs-kind": { "equals": "file" },
+                                                   "x-voidfs-object-id": { "matches": "o-[0-9A-HJKMNP-TV-Z]{26}" } } } }
+      ]
+    },
+    {
+      "id": "get-range",
+      "title": "A single byte range reads only those bytes",
+      "spec": ["protocol §3"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/r.txt", "body": { "text": "hello world" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/r.txt", "headers": { "Range": "bytes=6-10" } },
+          "expect": { "status": 206, "headers": { "Content-Range": { "equals": "bytes 6-10/11" } }, "body": { "text": "world" } } }
+      ]
+    },
+    {
+      "id": "conditional-put",
+      "title": "If-None-Match: * and If-Match guard whole-object writes",
+      "spec": ["protocol §3", "protocol §4.0"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/c.txt", "headers": { "If-None-Match": "*" }, "body": { "text": "first" } },
+          "expect": { "status": 200, "headers": { "ETag": { "capture": "e1" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/c.txt", "headers": { "If-None-Match": "*" }, "body": { "text": "second" } },
+          "expect": { "status": 412, "body": { "s3_error": "PreconditionFailed" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/c.txt", "headers": { "If-Match": "\"not-the-etag\"" }, "body": { "text": "second" } },
+          "expect": { "status": 412 } },
+        { "request": { "method": "PUT", "path": "/${drive}/c.txt", "headers": { "If-Match": "${e1}" }, "body": { "text": "second" } },
+          "expect": { "status": 200, "headers": { "ETag": { "not_equals": "${e1}" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/c.txt" }, "expect": { "status": 200, "body": { "text": "second" } } }
+      ]
+    },
+    {
+      "id": "write-at-offset",
+      "title": "An offset write overwrites bytes in the middle as one version",
+      "spec": ["protocol §4.1"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/w.txt", "body": { "text": "hello world" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v1" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/w.txt", "query": { "x-voidfs-write": "" }, "headers": { "x-voidfs-offset": "6" }, "body": { "text": "WORLD" } },
+          "expect": { "status": 200, "headers": { "x-voidfs-size": { "equals": "11" }, "x-amz-version-id": { "not_equals": "${v1}" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/w.txt" }, "expect": { "status": 200, "body": { "text": "hello WORLD" } } },
+        { "request": { "method": "GET", "path": "/${drive}/w.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions.length", "equals": 2 }, { "path": "$.versions[1].operation", "equals": "write" } ] } } }
+      ]
+    },
+    {
+      "id": "write-at-extends-with-zeros",
+      "title": "Writing past the end fills the gap with zeros, and writing to a missing key creates it",
+      "spec": ["protocol §4.1"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/z.bin", "body": { "text": "ab" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/z.bin", "query": { "x-voidfs-write": "" }, "headers": { "x-voidfs-offset": "4" }, "body": { "text": "cd" } },
+          "expect": { "status": 200, "headers": { "x-voidfs-size": { "equals": "6" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/z.bin" }, "expect": { "status": 200, "body": { "base64": "YWIAAGNk" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/new.bin", "query": { "x-voidfs-write": "" }, "headers": { "x-voidfs-offset": "3" }, "body": { "text": "x" } },
+          "expect": { "status": 200, "headers": { "x-voidfs-size": { "equals": "4" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/new.bin" }, "expect": { "status": 200, "body": { "base64": "AAAAeA==" } } }
+      ]
+    },
+    {
+      "id": "write-at-preconditions",
+      "title": "A guarded write based on a stale version fails with 412 naming the current version",
+      "spec": ["protocol §1.5", "protocol §4.0", "protocol §4.1"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/p.txt", "body": { "text": "v1" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v1" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/p.txt", "query": { "x-voidfs-write": "" }, "headers": { "x-voidfs-offset": "0", "x-voidfs-if-version": "${v1}" }, "body": { "text": "V" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v2" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/p.txt", "query": { "x-voidfs-write": "" }, "headers": { "x-voidfs-offset": "1", "x-voidfs-if-version": "${v1}" }, "body": { "text": "X" } },
+          "expect": { "status": 412, "headers": { "x-amz-version-id": { "equals": "${v2}" } }, "body": { "s3_error": "PreconditionFailed" } } },
+        { "request": { "method": "GET", "path": "/${drive}/p.txt" }, "expect": { "status": 200, "body": { "text": "V1" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/missing.txt", "query": { "x-voidfs-write": "" }, "headers": { "x-voidfs-offset": "0", "x-voidfs-if-version": "${v1}" }, "body": { "text": "X" } },
+          "expect": { "status": 412 } }
+      ]
+    },
+    {
+      "id": "truncate-and-extend",
+      "title": "An empty offset write with a size truncates or extends",
+      "spec": ["protocol §4.1"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/t.txt", "body": { "text": "hello world" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/t.txt", "query": { "x-voidfs-write": "" }, "headers": { "x-voidfs-offset": "0", "x-voidfs-size": "5" } },
+          "expect": { "status": 200, "headers": { "x-voidfs-size": { "equals": "5" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/t.txt" }, "expect": { "status": 200, "body": { "text": "hello" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/t.txt", "query": { "x-voidfs-write": "" }, "headers": { "x-voidfs-offset": "0", "x-voidfs-size": "7" } },
+          "expect": { "status": 200, "headers": { "x-voidfs-size": { "equals": "7" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/t.txt" }, "expect": { "status": 200, "body": { "base64": "aGVsbG8AAA==" } } }
+      ]
+    },
+    {
+      "id": "batched-patch",
+      "title": "A patch applies many edits as exactly one version",
+      "spec": ["protocol §4.2"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/b.txt", "body": { "text": "hello world" } }, "expect": { "status": 200 } },
+        { "request": { "method": "POST", "path": "/${drive}/b.txt", "query": { "x-voidfs-patch": "" }, "headers": { "Content-Type": "application/vnd.voidfs.patch" },
+                       "body": { "patch": [[0, "H"], [6, "W"], [11, "!"]] } },
+          "expect": { "status": 200, "headers": { "x-voidfs-size": { "equals": "12" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/b.txt" }, "expect": { "status": 200, "body": { "text": "Hello World!" } } },
+        { "request": { "method": "GET", "path": "/${drive}/b.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions.length", "equals": 2 } ] } } },
+        { "request": { "method": "POST", "path": "/${drive}/b.txt", "query": { "x-voidfs-patch": "" }, "headers": { "Content-Type": "application/vnd.voidfs.patch" },
+                       "body": { "patch": [[0, "aaaa"], [2, "ZZ"]] } },
+          "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/b.txt" }, "expect": { "status": 200, "body": { "text": "aaZZo World!" } } }
+      ]
+    },
+    {
+      "id": "malformed-patch-rejected",
+      "title": "Malformed patch bodies are refused and change nothing",
+      "spec": ["protocol §4.2", "protocol §6"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/m.txt", "body": { "text": "unchanged" } }, "expect": { "status": 200 } },
+        { "request": { "method": "POST", "path": "/${drive}/m.txt", "query": { "x-voidfs-patch": "" }, "headers": { "Content-Type": "application/vnd.voidfs.patch" }, "body": { "text": "not a patch" } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidPatch" } } },
+        { "request": { "method": "POST", "path": "/${drive}/m.txt", "query": { "x-voidfs-patch": "" }, "headers": { "Content-Type": "application/vnd.voidfs.patch" }, "body": { "base64": "VkZTUAEAAAAAAAAA" } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidPatch" } } },
+        { "request": { "method": "POST", "path": "/${drive}/m.txt", "query": { "x-voidfs-patch": "" }, "headers": { "Content-Type": "application/vnd.voidfs.patch" }, "body": { "base64": "VkZTUAEAAAAAAAABAAAAAAAAAAAAAAAAAAAACmFi" } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidPatch" } } },
+        { "request": { "method": "GET", "path": "/${drive}/m.txt" }, "expect": { "status": 200, "body": { "text": "unchanged" } } },
+        { "request": { "method": "GET", "path": "/${drive}/m.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions.length", "equals": 1 } ] } } }
+      ]
+    },
+    {
+      "id": "splice-insert-remove",
+      "title": "Splices insert and remove bytes, and invalid splices are refused",
+      "spec": ["protocol §4.3"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/s.txt", "body": { "text": "hello world" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/s.txt", "query": { "x-voidfs-splice": "" }, "headers": { "x-voidfs-offset": "5" }, "body": { "text": "," } },
+          "expect": { "status": 200, "headers": { "x-voidfs-size": { "equals": "12" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/s.txt" }, "expect": { "status": 200, "body": { "text": "hello, world" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/s.txt", "query": { "x-voidfs-splice": "" }, "headers": { "x-voidfs-offset": "0", "x-voidfs-remove": "7" } },
+          "expect": { "status": 200, "headers": { "x-voidfs-size": { "equals": "5" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/s.txt" }, "expect": { "status": 200, "body": { "text": "world" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/s.txt", "query": { "x-voidfs-splice": "" }, "headers": { "x-voidfs-offset": "0", "x-voidfs-remove": "0" } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/s.txt", "query": { "x-voidfs-splice": "" }, "headers": { "x-voidfs-offset": "3", "x-voidfs-remove": "10" } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/nope.txt", "query": { "x-voidfs-splice": "" }, "headers": { "x-voidfs-offset": "0" }, "body": { "text": "x" } },
+          "expect": { "status": 404, "body": { "s3_error": "NoSuchKey" } } }
+      ]
+    },
+    {
+      "id": "version-history-and-restore",
+      "title": "History lists every version oldest first, and a rollback adds a new version",
+      "spec": ["protocol §1.1", "protocol §4.4", "protocol §4.6"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/h.txt", "body": { "text": "one" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v1" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/h.txt", "body": { "text": "two" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v2" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/h.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.key", "equals": "h.txt" },
+            { "path": "$.versions.length", "equals": 2 },
+            { "path": "$.versions[0].versionId", "equals": "${v1}" },
+            { "path": "$.versions[0].isLatest", "equals": false },
+            { "path": "$.versions[0].operation", "equals": "put" },
+            { "path": "$.versions[1].versionId", "equals": "${v2}" },
+            { "path": "$.versions[1].isLatest", "equals": true } ] } } },
+        { "request": { "method": "POST", "path": "/${drive}/h.txt", "query": { "x-voidfs-restore": "", "versionId": "${v1}" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v3" }, "x-voidfs-restored-from": { "equals": "${v1}" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/h.txt" }, "expect": { "status": 200, "body": { "text": "one" } } },
+        { "request": { "method": "GET", "path": "/${drive}/h.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.versions.length", "equals": 3 },
+            { "path": "$.versions[2].versionId", "equals": "${v3}" },
+            { "path": "$.versions[2].operation", "equals": "restore" },
+            { "path": "$.versions[2].restoredFrom", "equals": "${v1}" } ] } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "versions": "", "prefix": "h.txt" } },
+          "expect": { "status": 200, "body": { "xml": [ { "path": "ListVersionsResult/Version/VersionId", "count": 3 } ] } } },
+        { "request": { "method": "POST", "path": "/${drive}/h.txt", "query": { "x-voidfs-restore": "", "versionId": "999999999.0" } },
+          "expect": { "status": 404, "body": { "s3_error": "NoSuchVersion" } } }
+      ]
+    },
+    {
+      "id": "read-by-version-id",
+      "title": "Any past version reads back by id",
+      "spec": ["protocol §4.5"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/o.txt", "body": { "text": "one" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v1" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/o.txt", "body": { "text": "two" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/o.txt", "query": { "versionId": "${v1}" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "equals": "${v1}" } }, "body": { "text": "one" } } },
+        { "request": { "method": "GET", "path": "/${drive}/o.txt", "query": { "versionId": "999999999.0" } },
+          "expect": { "status": 404, "body": { "s3_error": "NoSuchVersion" } } }
+      ]
+    },
+    {
+      "id": "read-as-of",
+      "title": "Reading as of an instant returns the version current then",
+      "spec": ["protocol §4.4", "protocol §4.5"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/a.txt", "body": { "text": "one" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v1" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/a.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions[0].lastModified", "capture": "t1" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/a.txt", "body": { "text": "two" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/a.txt", "headers": { "x-voidfs-as-of": "${t1}" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "equals": "${v1}" } }, "body": { "text": "one" } } },
+        { "request": { "method": "GET", "path": "/${drive}/a.txt", "headers": { "x-voidfs-as-of": "2000-01-01T00:00:00Z" } },
+          "expect": { "status": 404, "body": { "s3_error": "NoSuchVersion" } } },
+        { "request": { "method": "GET", "path": "/${drive}/a.txt", "query": { "versionId": "${v1}" }, "headers": { "x-voidfs-as-of": "${t1}" } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } }
+      ]
+    },
+    {
+      "id": "history-is-immutable",
+      "title": "Deleting a specific version is refused",
+      "spec": ["protocol §3"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/i.txt", "body": { "text": "keep" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v1" } } } },
+        { "request": { "method": "DELETE", "path": "/${drive}/i.txt", "query": { "versionId": "${v1}" } },
+          "expect": { "status": 501, "body": { "s3_error": "NotImplemented" } } },
+        { "request": { "method": "GET", "path": "/${drive}/i.txt" }, "expect": { "status": 200, "body": { "text": "keep" } } }
+      ]
+    },
+    {
+      "id": "folders-and-path-conflicts",
+      "title": "Writes create real parent folders, and a file and a folder cannot share a path",
+      "spec": ["protocol §1.2"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/a/b/c.txt", "body": { "text": "x" } }, "expect": { "status": 200 } },
+        { "request": { "method": "HEAD", "path": "/${drive}/a/" }, "expect": { "status": 200, "headers": { "x-voidfs-kind": { "equals": "folder" } } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/a/b/" }, "expect": { "status": 200, "headers": { "x-voidfs-kind": { "equals": "folder" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/a", "body": { "text": "file where a folder is" } },
+          "expect": { "status": 409, "body": { "s3_error": "PathConflict" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/a/b/c.txt/d", "body": { "text": "under a file" } },
+          "expect": { "status": 409, "body": { "s3_error": "PathConflict" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/empty/" }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "list-type": "2" } },
+          "expect": { "status": 200, "body": { "xml": [ { "path": "ListBucketResult/Contents/Key", "equals": ["a/b/c.txt", "empty/"] } ] } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "list-type": "2", "delimiter": "/" } },
+          "expect": { "status": 200, "body": { "xml": [ { "path": "ListBucketResult/CommonPrefixes/Prefix", "equals": ["a/", "empty/"] },
+                                                          { "path": "ListBucketResult/Contents/Key", "count": 0 } ] } } }
+      ]
+    },
+    {
+      "id": "delete-and-folders",
+      "title": "Deleting a file keeps its folder, and deleting a non-empty folder does nothing",
+      "spec": ["protocol §1.2", "protocol §3"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/x.txt", "body": { "text": "x" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/e/y.txt", "body": { "text": "y" } }, "expect": { "status": 200 } },
+        { "request": { "method": "DELETE", "path": "/${drive}/d/x.txt" }, "expect": { "status": 204 } },
+        { "request": { "method": "HEAD", "path": "/${drive}/d/x.txt" }, "expect": { "status": 404 } },
+        { "request": { "method": "HEAD", "path": "/${drive}/d/" }, "expect": { "status": 200 } },
+        { "request": { "method": "DELETE", "path": "/${drive}/d/" }, "expect": { "status": 204 } },
+        { "request": { "method": "HEAD", "path": "/${drive}/d/" }, "expect": { "status": 404 } },
+        { "request": { "method": "DELETE", "path": "/${drive}/e/" }, "expect": { "status": 204 } },
+        { "request": { "method": "HEAD", "path": "/${drive}/e/y.txt" }, "expect": { "status": 200 } }
+      ]
+    },
+    {
+      "id": "listing-pagination",
+      "title": "ListObjectsV2 paginates in key order",
+      "spec": ["protocol §3"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/k1", "body": { "text": "1" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/k3", "body": { "text": "3" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/k2", "body": { "text": "2" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "list-type": "2", "max-keys": "2" } },
+          "expect": { "status": 200, "body": { "xml": [
+            { "path": "ListBucketResult/Contents/Key", "equals": ["k1", "k2"] },
+            { "path": "ListBucketResult/IsTruncated", "equals": ["true"] },
+            { "path": "ListBucketResult/NextContinuationToken", "capture": "token" } ] } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "list-type": "2", "max-keys": "2", "continuation-token": "${token}" } },
+          "expect": { "status": 200, "body": { "xml": [
+            { "path": "ListBucketResult/Contents/Key", "equals": ["k3"] },
+            { "path": "ListBucketResult/IsTruncated", "equals": ["false"] } ] } } }
+      ]
+    },
+    {
+      "id": "special-character-keys",
+      "title": "Keys with spaces, reserved characters and non-ASCII round-trip exactly",
+      "spec": ["protocol §1"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/sp%20ace%2Bplus%25/%C3%A9t%C3%A9%20%E2%9C%93.txt", "body": { "text": "unicode" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/sp%20ace%2Bplus%25/%C3%A9t%C3%A9%20%E2%9C%93.txt" }, "expect": { "status": 200, "body": { "text": "unicode" } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "list-type": "2", "prefix": "sp ace+plus%/" } },
+          "expect": { "status": 200, "body": { "xml": [ { "path": "ListBucketResult/Contents/Key", "equals": ["sp ace+plus%/été ✓.txt"] } ] } } }
+      ]
+    },
+    {
+      "id": "rename-file",
+      "title": "A rename is one metadata-only version; content, ETag and history follow the file",
+      "spec": ["protocol §4.4", "protocol §4.7"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/a.txt", "body": { "text": "content" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v1" }, "ETag": { "capture": "e1" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/b/c.txt", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": "a.txt" } },
+          "expect": { "status": 200, "headers": { "ETag": { "equals": "${e1}" }, "x-voidfs-size": { "equals": "7" } } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/a.txt" }, "expect": { "status": 404 } },
+        { "request": { "method": "GET", "path": "/${drive}/b/c.txt" }, "expect": { "status": 200, "body": { "text": "content" } } },
+        { "request": { "method": "GET", "path": "/${drive}/b/c.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions.length", "equals": 1 }, { "path": "$.versions[0].versionId", "equals": "${v1}" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/other.txt", "body": { "text": "other" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/other.txt", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": "b/c.txt" } },
+          "expect": { "status": 409, "body": { "s3_error": "PathConflict" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/gone.txt", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": "does-not-exist.txt" } },
+          "expect": { "status": 404, "body": { "s3_error": "NoSuchKey" } } }
+      ]
+    },
+    {
+      "id": "rename-replace-atomic-save",
+      "title": "Renaming a temporary file over an existing one replaces it in one version",
+      "spec": ["protocol §4.7"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/doc.txt", "body": { "text": "old" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/.doc.txt.tmp", "body": { "text": "new" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/doc.txt", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": ".doc.txt.tmp", "x-voidfs-replace": "true" } },
+          "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/doc.txt" }, "expect": { "status": 200, "body": { "text": "new" } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/.doc.txt.tmp" }, "expect": { "status": 404 } }
+      ]
+    },
+    {
+      "id": "rename-folder-subtree",
+      "title": "A folder moves with its whole subtree as one version",
+      "spec": ["protocol §4.7"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/src/1.txt", "body": { "text": "1" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/src/sub/2.txt", "body": { "text": "2" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/dst/", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": "src/" } },
+          "expect": { "status": 200, "headers": { "x-voidfs-size": { "equals": "0" } } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "list-type": "2", "prefix": "dst/" } },
+          "expect": { "status": 200, "body": { "xml": [ { "path": "ListBucketResult/Contents/Key", "equals": ["dst/1.txt", "dst/sub/2.txt"] } ] } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/src/" }, "expect": { "status": 404 } },
+        { "request": { "method": "PUT", "path": "/${drive}/dst/inner/", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": "dst/" } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/file.txt", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": "dst/" } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } }
+      ]
+    },
+    {
+      "id": "copy-by-reference",
+      "title": "CopyObject within a drive produces an identical object recorded as a copy",
+      "spec": ["protocol §3", "protocol §4.4"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/orig.txt", "body": { "text": "copy me" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/copy.txt", "headers": { "x-amz-copy-source": "/${drive}/orig.txt" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/copy.txt" }, "expect": { "status": 200, "body": { "text": "copy me" } } },
+        { "request": { "method": "GET", "path": "/${drive}/copy.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions[0].operation", "equals": "copy" } ] } } }
+      ]
+    },
+    {
+      "id": "fork-copy-on-write",
+      "title": "A fork starts as the source's state and diverges independently; the source can then be deleted",
+      "spec": ["protocol §5.2", "protocol §5.3", "protocol §5.4"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200, "headers": { "x-voidfs-drive-id": { "capture": "src" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/f.txt", "body": { "text": "base" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v0" } } } },
+        { "request": { "method": "PUT", "path": "/${drive2}", "headers": { "x-voidfs-fork-source": "${drive}" } },
+          "expect": { "status": 200, "headers": { "x-voidfs-drive-id": { "capture": "fork" }, "x-voidfs-fork-source-id": { "equals": "${src}" }, "x-voidfs-fork-point": { "present": true } } } },
+        { "request": { "method": "GET", "path": "/${drive2}/f.txt" }, "expect": { "status": 200, "body": { "text": "base" } } },
+        { "request": { "method": "PUT", "path": "/${drive2}/f.txt", "body": { "text": "fork" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/f.txt" }, "expect": { "status": 200, "body": { "text": "base" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/only-source.txt", "body": { "text": "s" } }, "expect": { "status": 200 } },
+        { "request": { "method": "HEAD", "path": "/${drive2}/only-source.txt" }, "expect": { "status": 404 } },
+        { "request": { "method": "GET", "path": "/${drive2}/f.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions.length", "equals": 2 }, { "path": "$.versions[0].versionId", "equals": "${v0}" } ] } } },
+        { "request": { "method": "GET", "path": "/${drive2}", "query": { "x-voidfs-drive": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.driveId", "equals": "${fork}" }, { "path": "$.forkOf.driveId", "equals": "${src}" } ] } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-drive": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.forks", "contains": "${fork}" } ] } } },
+        { "request": { "method": "DELETE", "path": "/${drive}", "headers": { "x-voidfs-hard-delete": "true" } }, "expect": { "status": 204 } },
+        { "request": { "method": "GET", "path": "/${drive2}/f.txt" }, "expect": { "status": 200, "body": { "text": "fork" } } },
+        { "request": { "method": "GET", "path": "/${drive2}/f.txt", "query": { "versionId": "${v0}" } }, "expect": { "status": 200, "body": { "text": "base" } } }
+      ]
+    },
+    {
+      "id": "fork-missing-source",
+      "title": "Forking a drive that does not exist fails and creates nothing",
+      "spec": ["protocol §5.2"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive2}", "headers": { "x-voidfs-fork-source": "${drive3}" } },
+          "expect": { "status": 404, "body": { "s3_error": "NoSuchBucket" } } },
+        { "request": { "method": "HEAD", "path": "/${drive2}" }, "expect": { "status": 404 } }
+      ]
+    },
+    {
+      "id": "multipart-one-version",
+      "title": "A completed multipart upload is exactly one version",
+      "spec": ["protocol §3"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "POST", "path": "/${drive}/big.bin", "query": { "uploads": "" } },
+          "expect": { "status": 200, "body": { "xml": [ { "path": "InitiateMultipartUploadResult/UploadId", "capture": "upload" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/big.bin", "query": { "partNumber": "1", "uploadId": "${upload}" }, "body": { "bytes": { "seed": 1, "size": 5242880 } } },
+          "expect": { "status": 200, "headers": { "ETag": { "capture": "p1" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/big.bin", "query": { "partNumber": "2", "uploadId": "${upload}" }, "body": { "text": "tail" } },
+          "expect": { "status": 200, "headers": { "ETag": { "capture": "p2" } } } },
+        { "request": { "method": "POST", "path": "/${drive}/big.bin", "query": { "uploadId": "${upload}" },
+                       "body": { "text": "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${p1}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${p2}</ETag></Part></CompleteMultipartUpload>" } },
+          "expect": { "status": 200 } },
+        { "request": { "method": "HEAD", "path": "/${drive}/big.bin" }, "expect": { "status": 200, "headers": { "Content-Length": { "equals": "5242884" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/big.bin", "headers": { "Range": "bytes=5242880-5242883" } },
+          "expect": { "status": 206, "body": { "text": "tail" } } },
+        { "request": { "method": "GET", "path": "/${drive}/big.bin", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions.length", "equals": 1 }, { "path": "$.versions[0].operation", "equals": "put" } ] } } }
+      ]
+    },
+    {
+      "id": "unsupported-operation",
+      "title": "Operations outside the subset answer 501 NotImplemented",
+      "spec": ["protocol §3", "protocol §6"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "policy": "" } },
+          "expect": { "status": 501, "body": { "s3_error": "NotImplemented" } } }
+      ]
+    },
+    {
+      "id": "unsigned-extension-header-rejected",
+      "title": "An x-voidfs-* header left out of the signature is refused",
+      "spec": ["protocol §2"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/u.txt", "body": { "text": "hello" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/u.txt", "query": { "x-voidfs-write": "" }, "headers": { "x-voidfs-offset": "0" },
+                       "unsigned_headers": ["x-voidfs-offset"], "body": { "text": "J" } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
+        { "request": { "method": "GET", "path": "/${drive}/u.txt" }, "expect": { "status": 200, "body": { "text": "hello" } } }
+      ]
+    },
+    {
+      "id": "read-key-scope",
+      "title": "A read-scoped key can read but not write or create drives",
+      "spec": ["protocol §2"],
+      "requires": ["key:read"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/r.txt", "body": { "text": "readable" } }, "expect": { "status": 200 } },
+        { "key": "read", "request": { "method": "GET", "path": "/${drive}/r.txt" }, "expect": { "status": 200, "body": { "text": "readable" } } },
+        { "key": "read", "request": { "method": "PUT", "path": "/${drive}/r.txt", "body": { "text": "nope" } },
+          "expect": { "status": 403, "body": { "s3_error": "AccessDenied" } } },
+        { "key": "read", "request": { "method": "PUT", "path": "/${drive2}" }, "expect": { "status": 403, "body": { "s3_error": "AccessDenied" } } },
+        { "request": { "method": "GET", "path": "/${drive}/r.txt" }, "expect": { "status": 200, "body": { "text": "readable" } } }
+      ]
+    },
+    {
+      "id": "attributes",
+      "title": "Mode, mtime and extended attributes are stored without changing content or ETag",
+      "spec": ["protocol §4.0", "protocol §4.8"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/a.txt", "headers": { "x-voidfs-mode": "0600", "x-voidfs-mtime": "2026-01-02T03:04:05Z" }, "body": { "text": "attrs" } },
+          "expect": { "status": 200, "headers": { "ETag": { "capture": "e1" } } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/a.txt" },
+          "expect": { "status": 200, "headers": { "x-voidfs-mode": { "equals": "0600" }, "x-voidfs-mtime": { "matches": "2026-01-02T03:04:05(\\.0+)?Z" } } } },
+        { "request": { "method": "POST", "path": "/${drive}/a.txt", "query": { "x-voidfs-attrs": "" },
+                       "body": { "json": { "mode": "0644", "xattrs": { "set": { "user.tag": "aGk=" } } } } },
+          "expect": { "status": 200, "headers": { "ETag": { "equals": "${e1}" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/a.txt", "query": { "x-voidfs-attrs": "" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.kind", "equals": "file" },
+            { "path": "$.mode", "equals": "0644" },
+            { "path": "$.xattrs['user.tag']", "equals": "aGk=" } ] } } },
+        { "request": { "method": "GET", "path": "/${drive}/a.txt" }, "expect": { "status": 200, "body": { "text": "attrs" } } },
+        { "request": { "method": "GET", "path": "/${drive}/a.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions.length", "equals": 1 } ] } } },
+        { "request": { "method": "GET", "path": "/${drive}/a.txt", "query": { "x-voidfs-versions": "", "x-voidfs-all": "true" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions.length", "equals": 2 }, { "path": "$.versions[1].operation", "equals": "attrs" } ] } } }
+      ]
+    },
+    {
+      "id": "listing-with-attributes",
+      "title": "One request lists a folder's children with kinds and attributes, in key order",
+      "spec": ["protocol §4.9"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/dir/sub/b.txt", "body": { "text": "b" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/dir/a.txt", "body": { "text": "aa" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-list": "", "prefix": "dir/" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.seq", "present": true },
+            { "path": "$.entries.length", "equals": 2 },
+            { "path": "$.entries[0].name", "equals": "a.txt" },
+            { "path": "$.entries[0].kind", "equals": "file" },
+            { "path": "$.entries[0].size", "equals": 2 },
+            { "path": "$.entries[1].name", "equals": "sub/" },
+            { "path": "$.entries[1].kind", "equals": "folder" } ] } } }
+      ]
+    },
+    {
+      "id": "recently-deleted",
+      "title": "A deleted file is listed as recently deleted and can be restored",
+      "spec": ["protocol §4.6", "protocol §4.10"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/gone.txt", "body": { "text": "bye" } }, "expect": { "status": 200 } },
+        { "request": { "method": "DELETE", "path": "/${drive}/gone.txt" }, "expect": { "status": 204 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-deleted": "" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.deleted.length", "equals": 1 },
+            { "path": "$.deleted[0].key", "equals": "gone.txt" },
+            { "path": "$.deleted[0].lastVersionId", "capture": "last" } ] } } },
+        { "request": { "method": "POST", "path": "/${drive}/gone.txt", "query": { "x-voidfs-restore": "", "versionId": "${last}" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/gone.txt" }, "expect": { "status": 200, "body": { "text": "bye" } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-deleted": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.deleted.length", "equals": 0 } ] } } }
+      ]
+    },
+    {
+      "id": "subtree-restore-as-of",
+      "title": "A folder restored as of an instant returns to exactly its state then",
+      "spec": ["protocol §4.6"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/p/a.txt", "body": { "text": "1" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/p/b.txt", "body": { "text": "keep" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/p/b.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions[0].lastModified", "capture": "t1" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/p/a.txt", "body": { "text": "2" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/p/new.txt", "body": { "text": "n" } }, "expect": { "status": 200 } },
+        { "request": { "method": "DELETE", "path": "/${drive}/p/b.txt" }, "expect": { "status": 204 } },
+        { "request": { "method": "POST", "path": "/${drive}/p/", "query": { "x-voidfs-restore": "" }, "headers": { "x-voidfs-as-of": "${t1}" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/p/a.txt" }, "expect": { "status": 200, "body": { "text": "1" } } },
+        { "request": { "method": "GET", "path": "/${drive}/p/b.txt" }, "expect": { "status": 200, "body": { "text": "keep" } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/p/new.txt" }, "expect": { "status": 404 } }
+      ]
+    },
+    {
+      "id": "change-feed",
+      "title": "The change feed reports writes after a listing's position, and a folder rename as one change",
+      "spec": ["protocol §4.9", "protocol §5.6"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/f/1.txt", "body": { "text": "1" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/f/2.txt", "body": { "text": "2" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-list": "", "prefix": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.seq", "capture": "s0" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/a.txt", "body": { "text": "a" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "va" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/g/", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": "f/" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-changes": "", "since": "${s0}" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.changes.length", "equals": 2 },
+            { "path": "$.changes[0].op", "equals": "put" },
+            { "path": "$.changes[0].key", "equals": "a.txt" },
+            { "path": "$.changes[0].versionId", "equals": "${va}" },
+            { "path": "$.changes[1].op", "equals": "rename" },
+            { "path": "$.changes[1].key", "equals": "g/" },
+            { "path": "$.changes[1].fromKey", "equals": "f/" } ] } } }
+      ]
+    }
+  ]
+}
