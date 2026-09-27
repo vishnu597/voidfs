@@ -9,7 +9,8 @@ the user's own bucket.*
 - **No hosted offering**: voidfs is self-hosted only.
 - **macOS first, on native FSKit**, then Windows.
 
-See §11 for the full list. Protocol approach: §12. Phase 0 specs: [`spec/`](../spec/).
+See §11 for the full list. Protocol approach: §12. Phase 0 specs: [`spec/`](../spec/). Where voidfs
+stands against SpaceFS today, and the step-by-step plan to parity: [PARITY.md](PARITY.md).
 
 *Researched 2026-09-26 from spacefs.com, docs.spacefs.com (including their full `llms-full.txt`,
 protocol spec, benchmarks), the changelog, terms, press coverage, and the SDK registry listings.*
@@ -215,8 +216,10 @@ This section is taken from their Architecture, Protocol and Benchmarks pages. It
 8. **Mount path:** the client can bypass the API and read shards directly from the bucket with
    scoped short-lived credentials (the `?x-s3sdk-mount` exchange). That keeps bulk bytes off the
    service.
-9. **macOS implementation:** not disclosed. It could be macFUSE, FSKit or File Provider. Linux
-   uses FUSE 3.
+9. **macOS implementation:** not in their docs, but visible in their app (0.2.300, checked
+   2026-09-27). It is a native FSKit module with its core in a separate Rust daemon, a privileged
+   mount helper and a Finder Sync extension, signed with Developer ID ([PARITY.md
+   §5](PARITY.md#5-what-spacefss-mac-app-is-made-of)). Linux uses FUSE 3.
 
 **Weak spots they admit to:** small-object writes, multipart, first read of a small object far
 from the bucket, no South America or Africa authorities, and no offline mode.
@@ -303,6 +306,7 @@ enterprise or later.
 | D9 | CLI parity: login, whoami, workspace list/use, drives, drive create/delete, mount/unmount/mounts, status, daemon install/start/stop/restart/info, upload/uploads --watch, history/show/restore, keys create/list/revoke (`--format env`), fork, update --check (JSON output everywhere) | P0 |
 | D10 | Self-update: checksum-verified, atomic swap, rollback; package repos (deb, rpm, Homebrew, winget) | P1 |
 | D11 | Desktop app (tray or menu bar): onboarding, drives, transfers, settings, updates, notifications | P1 |
+| D12 | Finder integration: a Finder Sync extension for status badges and context menus (SpaceFS ships one) | P1 |
 
 ### 3.6 SDKs, agents and search
 
@@ -429,9 +433,10 @@ File Provider stays in reserve for Finder-integration features (badges, "keep do
 
 What that implies (updated 2026-09-27 from the [FSKit spike](spikes/fskit.md)):
 
-- **Minimum macOS 27 (recommended by the spike; to confirm).** FSKit mounts network
+- **Minimum macOS 27** (decided 2026-09-27, on the spike's evidence). FSKit mounts network
   ("non-local") volumes from macOS 26, but a drive that other machines change needs
-  `FSVolume.setCacheState` to evict what the kernel cached, and that exists only from macOS 27. So do the `FSVolume.*Handler` protocols (the `*Operations` ones are
+  `FSVolume.setCacheState` to evict what the kernel cached, and that exists only from macOS 27.
+  SpaceFS supports macOS 26.4 and later, so voidfs gives up macOS 26 users. So do the `FSVolume.*Handler` protocols (the `*Operations` ones are
   deprecated in 27), `FSClient.mountSingleVolume` and `openFileSystemExtensionsSettings`.
 - **Shape.** `voidfs.app` is a SwiftUI menu-bar app. It is the host FSKit requires. It contains:
   - the FSKit module (a thin Swift app extension);
@@ -451,13 +456,15 @@ What that implies (updated 2026-09-27 from the [FSKit spike](spikes/fskit.md)):
   `mount -F -t voidfs <url> <folder>` as the logged-in user, the way Apple's own FTP module works.
   Mounting in `/Volumes` through `FSClient.mountSingleVolume` needs the
   `com.apple.developer.fskit.mount` entitlement, which the team's profile does not grant.
+  SpaceFS mounts in `/Volumes` through a privileged LaunchDaemon helper instead, and voidfs will do
+  the same.
 - **Build requirements.**
   - Full Xcode, not just the Command Line Tools.
   - An Apple Developer Program membership. `com.apple.developer.fskit.fsmodule` is a restricted
     entitlement: without a provisioning profile that grants it, AMFI kills the extension at
     launch. Contributors need their own team to run a build.
-  - Developer ID signing and notarization (a Developer ID profile with the FSKit Module
-    capability is still to be confirmed).
+  - Developer ID signing and notarization. A Developer ID provisioning profile can carry the
+    FSKit Module entitlement: SpaceFS ships one, notarized.
 - **Risk, as measured by the spike.** Over loopback, the read-only mount streamed a 1 GiB file at
   2.3–2.5 GB/s and listed 1,000 files in 21–33 ms. What remains hard:
   - Kernel caches can only be revoked, not updated. Phase 2 reads open files at the version
@@ -550,6 +557,9 @@ use per-shard presigned URLs.
 
 ## 9. Phased roadmap
 
+The current stocktake against SpaceFS and the step-by-step plan to parity are in
+[PARITY.md](PARITY.md). It orders the work more finely than this table, and it is newer.
+
 | Phase | Goal | Deliverables | Exit criteria |
 |---|---|---|---|
 | **0: Specs** | Lock the foundations | On-bucket format spec; wire protocol; conformance case format and cases; `LICENSE`, `NOTICE`, `DCO`, `TRADEMARKS.md`, `SECURITY.md`; `rfcs/` process | **Drafts done 2026-09-26** (35 cases, validator passing). Exit: specs reviewed, RFC 0001 accepted (done 2026-09-27) |
@@ -604,16 +614,14 @@ voidfs/
 | License | **Apache-2.0** for code, SDKs and specs | Explicit patent grant; compatible with OpenDAL, s3s, SlateDB and Tantivy. Does not stop anyone from reselling voidfs as a service, which is accepted |
 | Hosted offering | **None for now** | Billing, abuse handling, a managed control plane and multi-tenant hardening are out of scope. Design for one organization per deployment, and keep workspaces so a team can still split drives |
 | Contribution sign-off | **DCO** | `git commit -s` on every commit; no CLA. Relicensing later would need every contributor's consent, which is accepted |
-| macOS mount | **Native FSKit module** | Minimum macOS 26 for now; the [FSKit spike](spikes/fskit.md) recommends 27 (open item 2 below). Needs full Xcode and a provisioning profile with the FSKit Module capability; see §5.3 |
+| macOS mount | **Native FSKit module**, **minimum macOS 27** (2026-09-27) | 27 rather than 26 because only 27 lets a module evict kernel caches when another machine changes a file ([FSKit spike](spikes/fskit.md)). SpaceFS supports 26.4. Needs full Xcode and a provisioning profile with the FSKit Module capability; see §5.3 |
 | macOS client core | **A per-user launchd agent, reached over XPC** (2026-09-27, from the [FSKit spike](spikes/fskit.md)) | The FSKit extension stays thin: a metadata memo, cached reads from App Group files, everything else through the agent. The agent serves an App-Group-prefixed XPC service and owns the cache, journal, uploads and change feed |
 | Metadata engine | **Follow Space's architecture for now** ([RFC 0001](../rfcs/0001-metadata-in-the-bucket.md), accepted 2026-09-27) | Metadata as a commit log plus checkpoints in the user's bucket, in the same shape as Space's documented design, with fewer writes per version. Revisit when benchmarks exist |
-| Platform order | **macOS → (control plane, agents) → Windows and Linux mounts** | Linux servers and agents use S3 and the SDKs until the Linux mount lands. The desktop host app is SwiftUI on macOS; a cross-platform shell (such as Tauri) is revisited when Windows starts |
+| Platform order | **macOS → (control plane, agents) → Windows and Linux mounts**; full Mac parity before the Linux mount (2026-09-27, [PARITY.md](PARITY.md)) | Linux servers and agents use S3 and the SDKs until the Linux mount lands. The desktop host app is SwiftUI on macOS; a cross-platform shell (such as Tauri) is revisited when Windows starts |
 
 ### Still open
 
 1. **Space compatibility shim.** Whether and when to also accept `x-s3sdk-*` (see §12.8).
-2. **Minimum macOS for the drive: 26 or 27.** The FSKit spike recommends 27: only macOS 27 lets a
-   module evict kernel caches when another machine changes a file (§5.3).
 
 ---
 

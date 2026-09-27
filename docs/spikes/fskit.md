@@ -21,9 +21,9 @@ Everything below was measured or observed on the machine above unless it says ot
   one extension process per mounted volume, it exits on unmount, and when it crashes the volume is
   force-unmounted and not relaunched. The sandbox allows XPC to an agent whose service name starts
   with the App Group (62 µs round trip).
-- **Target macOS 27, not 26** (a recommendation; the plan still says 26 until this is confirmed).
-  A network drive needs `FSVolume.setCacheState` to show other machines' changes, and that API,
-  like the new handler protocols, is macOS 27 only.
+- **Target macOS 27, not 26** (decided the same day; SpaceFS supports 26.4). A network drive needs
+  `FSVolume.setCacheState` to show other machines' changes, and that API, like the new handler
+  protocols, is macOS 27 only.
 - **Signing needs a provisioning profile.** `com.apple.developer.fskit.fsmodule` is a restricted
   entitlement; without a profile, AMFI kills the extension at launch. Xcode's automatic signing
   issued a team profile that grants it. `com.apple.developer.fskit.mount`, needed for
@@ -258,10 +258,11 @@ Shape for Phase 2:
   reports `isEnabled`, so the app can guide the user.
 - **Discovery.** FSKit found the module wherever the app was registered with LaunchServices
   (even in a build folder); no copy to `/Applications` was needed.
-- **Distribution (not yet tested):** Developer ID signing needs a Developer ID provisioning
-  profile that carries the FSKit Module capability, plus notarization. Confirm in the developer
-  portal that the capability is offered for Developer ID, and ask Apple about
-  `com.apple.developer.fskit.mount` if volumes should appear in `/Volumes` and the Finder sidebar.
+- **Distribution:** Developer ID signing needs a Developer ID provisioning profile that carries
+  the FSKit Module capability, plus notarization. Not tried with voidfs's team yet, but SpaceFS
+  ships exactly that, notarized ([PARITY.md §5](../PARITY.md#5-what-spacefss-mac-app-is-made-of)).
+  SpaceFS also shows that `/Volumes` needs no `fskit.mount` entitlement: a privileged
+  LaunchDaemon helper mounts there.
 - **Contributors** cannot build a runnable module without their own team, because the
   entitlement is profile-gated. Document this in `CONTRIBUTING.md` in Phase 2.
 
@@ -364,9 +365,9 @@ Consequences for Phase 2:
 
 ## 7. Risks
 
-1. **Profile-gated entitlements.** Developer ID with FSKit Module is unverified, and
-   `fskit.mount` is not available to the team. Without it, volumes mount in a user folder rather
-   than `/Volumes`; whether Finder shows them in the sidebar there was not tested.
+1. **Profile-gated entitlements.** Developer ID with FSKit Module works for SpaceFS but is untried
+   for voidfs's team. `fskit.mount` is not available to the team; a privileged mount helper, as
+   SpaceFS uses, gets volumes into `/Volumes` without it.
 2. **FSKit bugs and churn.** Two surprises in one day: the `RENAME_SWAP` data loss and the SDK
    selector skew. Expect more, and keep an app-compat rig (§8.1 of the plan) running on every
    macOS seed.
@@ -399,8 +400,9 @@ Consequences for Phase 2:
    xattrs. Once files carry `com.apple.provenance`, every `getxattr` would cost one `?x-voidfs-attrs`
    request per file. By [CONTRIBUTING](../../CONTRIBUTING.md#3-changes-to-the-specs) this needs an
    RFC, spec text and a conformance case.
-7. **Signing:** confirm a Developer ID profile with FSKit Module in the portal; ask Apple about
-   `fskit.mount`; document the contributor path.
+7. **Signing:** create a Developer ID provisioning profile with FSKit Module (SpaceFS ships one);
+   mount into `/Volumes` through a privileged helper rather than waiting for `fskit.mount`;
+   document the contributor path.
 
 ### How the Rust core would reach Swift (UniFFI)
 
