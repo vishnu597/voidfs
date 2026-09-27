@@ -20,8 +20,10 @@ billing or plans), this page says so.
   - 35 conformance cases passing on local disk and Cloudflare R2.
 - **Almost everything a person touches is missing:** a writable mount, a CLI, accounts and a web
   app, SDKs, search and share links.
-- **Performance parity is unmeasured.** SpaceFS publishes 49 benchmark scenarios; voidfs has never
-  run them. Step 1 of the plan fixes that.
+- **Performance parity is measurable, not yet measured for real.** SpaceFS publishes 49
+  benchmark scenarios; [`bench/`](../bench/README.md) now runs all of them against voidfs and the
+  bare bucket underneath it. Local runs (§6) find one cause behind most of the gap: a drive
+  commits one mutation per bucket round trip.
 - **SpaceFS's Mac app is now understood** (§5). It is a native FSKit module with its core in Rust,
   running in a separate daemon, which is the architecture the FSKit spike chose for voidfs. It
   also shows that the FSKit entitlement can ship with Developer ID.
@@ -48,8 +50,8 @@ scored against the code:
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
 | Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount (the spike). No agent, journal, CLI, Finder integration, Linux or Windows |
 | SDKs, agents, search (A1–A7) | 0 | 0 | 7 | Stock S3 SDKs and the AWS CLI work; nothing voidfs-specific |
-| Operations (O1–O6) | 0 | 1 | 5 | One binary. No compose file, metrics or benchmark harness |
-| **Total** | **8** | **12** | **51** | Of the 28 P0 items: 8 done, 10 partly, 10 missing |
+| Operations (O1–O6) | 0 | 2 | 4 | One binary. A benchmark harness, not yet run in the cloud. No compose file or metrics |
+| **Total** | **8** | **13** | **50** | Of the 28 P0 items: 8 done, 10 partly, 10 missing |
 
 "Partly" means:
 - E1 has no compression, and E11 lacks content-defined segments.
@@ -58,7 +60,7 @@ scored against the code:
   S8 has no operations catalogue.
 - C3 keys can't be minted or revoked.
 - D3 is read-only, D6 relies on the kernel's read-ahead only, and D11 is the spike's shell.
-- O1 has no compose file.
+- O1 has no compose file. O5 has run locally and against R2, not yet in SpaceFS's setup.
 
 ## 4. Product by product
 
@@ -137,13 +139,41 @@ SpaceFS publishes no numbers for its mount.
 
 ### Where voidfs stands
 
-- Not measured on this workload.
-- The only numbers so far are the FSKit spike's, over loopback: 2.3–2.5 GB/s sequential,
-  1,000 files listed in 21–33 ms, random 4 KiB reads at 1.5–1.9 ms p50.
-- Two predictions follow from the architecture, to be checked by step 1:
-  - The metadata-only rows (rename, move, listing, edits in large files) should come close
-    without tuning.
-  - The small-write rows are where voidfs can beat SpaceFS (step 3).
+*First measurements, 27 September 2026: [bench/README.md](../bench/README.md#results-so-far).*
+All 49 scenarios ran on one Mac, against a local S3 server (versitygw), once over loopback and
+once with the bucket 12 ms away; 23 of them also ran against Cloudflare R2. **These are not comparable with SpaceFS's cloud figures**; the
+real run in their setup is still to do (§8).
+
+| Scenarios | Rows | Loopback | Bucket 12 ms away | SpaceFS |
+|---|--:|---|---|---|
+| Small, ranged and cached reads, `head`, fan-out gets | 7 | 1.1× slower to 4.6× faster | 1.1× slower to 48× faster | 2.6–34× faster |
+| Large gets and streams | 4 | 1.1–1.7× slower | 1.1–3.0× faster | 12–17× faster |
+| Edits inside 32 and 64 MiB files | 16 | parity to 24× faster | 1.1× slower to 3.3× faster | 1.4–15× faster |
+| Rename and folder move | 2 | 44–138× faster | 1.5–4.8× faster | 7.9–18× faster |
+| Listing | 1 | 31× faster | 34× faster | 9.1× faster |
+| Edits inside 1 MiB files | 8 | 1.6–4.7× slower | 3.4–3.6× slower | 2.1× slower to parity |
+| Whole-object puts and overwrites, fan-out puts | 9 | 1.7–4.5× slower | 2.1–70× slower | 1.1–3.1× slower |
+| Multipart uploads | 2 | parity to 1.2× faster | 1.6–1.9× slower | 1.8–2.4× slower |
+
+What the runs show:
+- **The prediction held for metadata:** listing, `head` and small warm reads are far ahead of
+  the bare bucket at any distance, and further ahead than SpaceFS.
+- **Against Cloudflare R2** (23 small-object scenarios, voidfs-server beside the harness on the
+  Mac, the bucket about 200 ms per PUT away): reads and metadata ran 15–324× faster than the
+  bare bucket, and every write ran at its concurrency times one PUT, up to 13 s.
+- **Everything that writes is held back by one thing:** a drive commits one mutation per bucket
+  round trip, because the commit lock is held across the log's conditional PUT. At 8 operations
+  at once, every write costs 8 round trips; at 64, 64. That is why renames and large-file edits
+  lose most of their lead once the bucket is far away, and why fan-out puts are up to 70× slower.
+  Group commit (step 3) is the fix.
+- **The shard cache stops admitting new shards** once shards read often earlier fill it (moka's
+  TinyLFU admission), so warm reads silently go to the bucket. Switching it to LRU fixed the
+  affected rows in a trial build.
+- Also found: patch re-chunks once per edit, multipart completion is a chain of round trips, and
+  a write takes at least two round trips where SpaceFS takes one. Details and code references are
+  in [bench/README.md](../bench/README.md#findings-where-voidfs-is-far-from-parity-and-why).
+- The FSKit spike's mount numbers (loopback: 2.3–2.5 GB/s sequential, 1,000 files listed in
+  21–33 ms, random 4 KiB reads at 1.5–1.9 ms p50) are still the only ones for the mount.
 
 ## 7. Step-by-step plan
 
@@ -168,10 +198,17 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - Runs on AWS S3 and MinIO, and rclone.
    - Virtual-host addressing.
    - A `docker compose` file, and health checks and metrics.
-3. **Win the rows SpaceFS loses.**
-   - A small-file path: tiny files stored inside their metadata.
-   - Fewer bucket writes per commit, and batched commits.
-   - A disk tier for the shard cache, and parallel shard fetch for large reads.
+3. **Win the rows SpaceFS loses.** The work items, with the step 1 evidence and a row-by-row
+   baseline, are in [step-3-performance.md](step-3-performance.md). In order of impact:
+   - Group commit: one log write per batch of mutations, not per mutation (37 rows).
+   - A shard cache that admits new shards (LRU instead of TinyLFU), then a disk tier.
+   - Fewer sequential round trips per write: a small-file path with tiny files stored inside
+     their metadata (a format change, so an RFC first), pipelined ingest, and checkpoints off
+     the commit path.
+   - Patch that rewrites each touched shard once, and a multipart completion without a chain
+     of round trips.
+   - Parallel and coalesced shard fetch for cold and large reads, once the harness can measure
+     cold reads.
    - **Done when:** every one of the 49 rows is at least as fast as SpaceFS's.
 4. **Client core, CLI and Rust SDK.**
    - `crates/client`: cache, journal, upload queue, change-feed client.
@@ -219,6 +256,8 @@ plain objects, file locking, offline pinning.
 ## 8. Open items
 
 - **Cloud accounts for step 1:** an AWS bucket in us-east-1 and a GCP VM in us-east4, billed to
-  the maintainer.
+  the maintainer. The commands and scripts are in
+  [bench/README.md](../bench/README.md#the-real-run). SpaceFS ran their layer on the client VM,
+  so that topology is the like-for-like one; the plan's server in us-east-1 is a second run.
 - **Test data in the SpaceFS trial:** uploading the benchmark data into a trial drive needs the
   account owner's go-ahead each time.
