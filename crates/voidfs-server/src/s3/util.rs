@@ -147,12 +147,13 @@ impl Query {
         self.0.get(k).map(String::as_str)
     }
 
-    /// Names that are not in `known`, ignoring presigned-URL parameters and response overrides.
+    /// Names that are not in `known`, ignoring presigned-URL parameters, response overrides, and
+    /// the `x-id=<Operation>` that AWS SDKs add to many requests (S3 ignores it too).
     pub fn unknown(&self, known: &[&str]) -> Option<&str> {
         self.0
             .keys()
             .map(String::as_str)
-            .find(|k| !known.contains(k) && !k.starts_with("X-Amz-") && !k.starts_with("x-amz-") && !k.starts_with("response-"))
+            .find(|k| !known.contains(k) && *k != "x-id" && !k.starts_with("X-Amz-") && !k.starts_with("x-amz-") && !k.starts_with("response-"))
     }
 }
 
@@ -366,6 +367,7 @@ mod tests {
         assert_eq!(q.get("prefix"), Some("sp ace+"));
         assert_eq!(q.unknown(&["x-voidfs-write", "versionId", "prefix"]), None);
         assert_eq!(Query::parse("policy").unknown(&["versions"]), Some("policy"));
+        assert_eq!(Query::parse("x-id=PutObject").unknown(&[]), None, "added by AWS SDKs");
     }
 
     #[test]
