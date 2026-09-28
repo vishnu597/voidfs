@@ -32,6 +32,9 @@ pub const REFRESH_EVERY: Duration = Duration::from_secs(60);
 pub const VIEW_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 /// Re-reads further apart than this forget every check. The format allows an hour (§12.4).
 pub const RENEW_WITHIN: Duration = Duration::from_secs(50 * 60);
+/// A write commits within this long of the check it relies on: half the minimum grace period
+/// (§12.4).
+pub const COMMIT_WITHIN: Duration = Duration::from_secs(12 * 3600);
 /// How long a write waits for a run that is deleting objects it needs.
 const DELETING_WAIT: Duration = Duration::from_secs(120);
 const DELETING_POLL: Duration = Duration::from_millis(250);
@@ -181,7 +184,7 @@ impl Guard {
 
     /// Makes every object in `items` safe for a commit to reference (§12.4): uploads those
     /// not already checked, rewrites and rescues candidates of a waiting run, and waits out a
-    /// run that is deleting any of them. The caller must commit within 12 hours.
+    /// run that is deleting any of them. The caller must commit within [`COMMIT_WITHIN`].
     pub async fn admit(&self, store: &Store, clock: &Clock, kind: Kind, items: &[(ShardHash, Bytes)]) -> anyhow::Result<()> {
         let started = clock.mono();
         let mut waits = 0u32;

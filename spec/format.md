@@ -364,6 +364,15 @@ rows did not change. An authority SHOULD keep segment boundaries stable between 
 example by cutting segments where a row's key hash has 12 low zero bits, bounded to 256–8,192
 rows) so that a checkpoint rewrites only the segments that changed.
 
+*(informative)* voidfs hashes each row's key, encoded as in §8.2, with SHA-256, and counts the
+low zero bits of the digest read as a big-endian number. Once a segment has 256 rows, it ends
+after the first row with 12 such bits. A segment that reaches 8,192 rows first ends instead after
+the last of its rows (from the 256th) with 10, or at 8,192 rows if none has them. Every cut then
+depends only on the rows near it and on where its segment began, so a row inserted or removed
+rewrites the segment it falls in, and rarely any other. Cutting at exactly 8,192 rows instead
+would shift every later boundary until the next cut by key, and about one segment in seven
+reaches that bound. Readers do not depend on how segments are cut.
+
 ### 8.4 Finding the latest state
 
 1. Read `_last_checkpoint` (a small JSON object `{ "seq": n }`). It is a hint and MAY be stale

@@ -163,9 +163,13 @@ Two more costs sit on the same path:
   request body while each batch of four shards uploads (line 325). With chunking and hashing on
   the server, 32 and 64 MiB puts run 2× slower than the bare bucket even on loopback. Which of
   these dominates has not been measured.
-- Every 1,000th commit writes a full checkpoint *while holding the commit lock*
-  (pool.rs:650). Every writer of that drive waits several round trips behind it. This has not
-  been measured separately; it shows in p99, not p50.
+- The commit that makes a checkpoint due (1,000 commits or 16 MiB of log since the last one)
+  writes it *while holding the commit lock* (`Pool::checkpoint`). Every writer of that drive
+  waits several round trips behind it. Since content-defined segments (E11), a checkpoint stores
+  only the segments that changed, but it still encodes and hashes every row: for 600,000 rows,
+  about 600 ms of CPU in a release build, of which 280–420 ms is copying the state out
+  (`DriveState::rows`) and about 50 ms is hashing keys to cut segments. Its effect on commit
+  latency has not been measured separately; it shows in p99, not p50.
 
 **Rows it moves:** puts, overwrites and fan-out puts (9), multipart uploads (2), and every
 edit's shard wave (24).
@@ -185,7 +189,11 @@ edit's shard wave (24).
    whether CPU (FastCDC and SHA-256) or waiting dominates.
 3. **Checkpoints off the commit path:** write them from the installed `Arc<DriveState>` in a
    background task after releasing the lock. The format does not tie a checkpoint to the commit
-   that triggered it ([format §8](../spec/format.md#8-checkpoints)).
+   that triggered it ([format §8](../spec/format.md#8-checkpoints)). The commit lock also guards
+   the drive's `Cadence`: the count towards the next checkpoint, and the last checkpoint's pages,
+   which the next one lists without storing them again. A background writer needs those pages,
+   and the rule that comes with them: the new index is written within 12 hours of the old one
+   being seen (format §12.4, option 1).
 
 **Expected effect.** With item 1, tiny puts at about 1–2 round trips (SpaceFS: 2× the bare
 bucket); large puts within 1.1–1.2× of the bare bucket, as SpaceFS's are.
