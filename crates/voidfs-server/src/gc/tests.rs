@@ -90,17 +90,17 @@ fn offline() -> Options {
     Options { grace: Duration::ZERO, offline: true, ..Options::default() }
 }
 
-async fn put(pool: &Pool, d: &Drive, key: &str, data: &[u8]) -> anyhow::Result<()> {
+async fn put(pool: &Arc<Pool>, d: &Arc<Drive>, key: &str, data: &[u8]) -> anyhow::Result<()> {
     let e = voidfs_core::content::from_bytes(&Bytes::copy_from_slice(data), pool.params);
     pool.write_shards(&e.new_shards).await?;
     let desc = pool.describe(e.extents).await?;
     let key = key.to_owned();
-    pool.commit(d, |s| Ok(ops::put(s, &key, desc, Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?)).await.map_err(|e| anyhow!("{e:?}"))?;
+    pool.commit(d, move |s| Ok(ops::put(s, &key, desc.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?)).await.map_err(|e| anyhow!("{e:?}"))?;
     Ok(())
 }
 
 /// A drive with a file whose only reference goes away when the drive is hard-deleted.
-async fn garbage(pool: &Pool, data: &[u8]) {
+async fn garbage(pool: &Arc<Pool>, data: &[u8]) {
     let d = pool.create_drive("doomed", None).await.unwrap();
     put(pool, &d, "file", data).await.unwrap();
     assert!(pool.hard_delete("doomed").await.unwrap());
@@ -341,7 +341,7 @@ async fn manifest_trees_are_followed() {
     }
     let desc = pool.describe(extents).await.unwrap();
     assert!(matches!(desc, voidfs_core::model::ContentDescriptor::Tree { .. }));
-    pool.commit(&a, |s| Ok(ops::put(s, "big", desc, Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?)).await.unwrap();
+    pool.commit(&a, move |s| Ok(ops::put(s, "big", desc.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?)).await.unwrap();
     sim.clock.advance(SECOND);
     assert_eq!(step(&pool, &offline()).await.unwrap().outcome, Outcome::NothingToCollect);
     assert!(pool.hard_delete("a").await.unwrap());
@@ -462,7 +462,7 @@ impl World {
 }
 
 /// Upload-staging records the simulation writes, as `object.rs` does (format §11).
-async fn start_upload(w: &Pool, d: &Drive, data: &[u8], now: Timestamp) -> anyhow::Result<()> {
+async fn start_upload(w: &Arc<Pool>, d: &Arc<Drive>, data: &[u8], now: Timestamp) -> anyhow::Result<()> {
     let e = voidfs_core::content::from_bytes(&Bytes::copy_from_slice(data), w.params);
     w.write_shards(&e.new_shards).await?;
     let dir = format!("drives/{}/uploads/{}/", d.id, uuid::Uuid::new_v4());
@@ -473,7 +473,7 @@ async fn start_upload(w: &Pool, d: &Drive, data: &[u8], now: Timestamp) -> anyho
     Ok(())
 }
 
-async fn finish_upload(w: &Pool, d: &Drive, complete: bool) -> anyhow::Result<()> {
+async fn finish_upload(w: &Arc<Pool>, d: &Arc<Drive>, complete: bool) -> anyhow::Result<()> {
     let uploads = format!("drives/{}/uploads/", d.id);
     let Some(up) = w.store.list_dirs(&uploads).await?.into_iter().next() else { return Ok(()) };
     let dir = format!("{uploads}{up}/");
@@ -481,13 +481,13 @@ async fn finish_upload(w: &Pool, d: &Drive, complete: bool) -> anyhow::Result<()
         let Some(b) = w.store.get(&format!("{dir}00001.json")).await? else { return Ok(()) };
         let part: Part = serde_json::from_slice(&b)?;
         let desc = w.describe(part.extents).await?;
-        w.commit(d, |s| Ok(ops::put(s, "upload", desc, Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?)).await.map_err(|e| anyhow!("{e:?}"))?;
+        w.commit(d, move |s| Ok(ops::put(s, "upload", desc.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?)).await.map_err(|e| anyhow!("{e:?}"))?;
     }
     w.store.delete_prefix(&dir).await
 }
 
 /// One random operation by a writer. Failures are expected: requests fail at random.
-async fn operate(w: &Pool, world: &World, clock: &Clock) -> anyhow::Result<()> {
+async fn operate(w: &Arc<Pool>, world: &World, clock: &Clock) -> anyhow::Result<()> {
     let live = w.list_drives();
     if live.is_empty() {
         let name = format!("d{}", world.drives_made.fetch_add(1, Ordering::SeqCst));
@@ -500,7 +500,7 @@ async fn operate(w: &Pool, world: &World, clock: &Clock) -> anyhow::Result<()> {
     match world.pick(100) {
         0..40 => put(w, &d, key, &block).await?,
         40..48 => {
-            w.commit(&d, |s| match ops::delete(s, key, &Precondition::default(), &Actor::system())? {
+            w.commit(&d, move |s| match ops::delete(s, key, &Precondition::default(), &Actor::system())? {
                 Some(t) => Ok(t),
                 None => Err(crate::pool::CommitError::Op(voidfs_core::ops::OpError::NoSuchKey)),
             })
@@ -513,7 +513,7 @@ async fn operate(w: &Pool, world: &World, clock: &Clock) -> anyhow::Result<()> {
             let Some(r) = Key::parse(key).ok().and_then(|k| src.lookup(&k)).and_then(|o| src.record(&o).cloned()) else { return Ok(()) };
             let Some(content) = r.content else { return Ok(()) };
             let dst = KEYS[world.pick(KEYS.len())];
-            w.commit(&d, |s| Ok(ops::put(s, dst, content, Attrs::default(), Op::Copy, &Precondition::default(), &Actor::system())?)).await.map_err(|e| anyhow!("{e:?}"))?;
+            w.commit(&d, move |s| Ok(ops::put(s, dst, content.clone(), Attrs::default(), Op::Copy, &Precondition::default(), &Actor::system())?)).await.map_err(|e| anyhow!("{e:?}"))?;
         }
         58..63 if world.drives_made.load(Ordering::SeqCst) < 8 => {
             let name = format!("d{}", world.drives_made.fetch_add(1, Ordering::SeqCst));
@@ -700,8 +700,10 @@ async fn simulate(seed: u64, rounds: usize) -> Result<(), String> {
 }
 
 /// `VOIDFS_GC_SIM_SEEDS` sets how many seeds to run, and `VOIDFS_GC_SIM_SEED` runs one seed. The
-/// default of 256 catches each rule of RFC 0002 when it is removed: the unchecked cache at seed
-/// 6, the recheck after a rescue at seed 70, and the `deleting` mark at seed 185.
+/// default of 256 catches each rule of RFC 0002 when it is removed. Ids are random, so which seed
+/// does varies from run to run: with group commit, the unchecked cache within the first three
+/// seeds, the recheck after a rescue at seed 32 or 186 in four runs of four, and the `deleting`
+/// mark at seed 186.
 #[tokio::test]
 async fn simulation() {
     let one: Option<u64> = std::env::var("VOIDFS_GC_SIM_SEED").ok().and_then(|s| s.parse().ok());

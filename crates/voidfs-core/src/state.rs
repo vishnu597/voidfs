@@ -122,6 +122,26 @@ impl DriveState {
         Ok(next)
     }
 
+    /// Returns the state after `txn` as transaction `idx` of commit `seq` made at `time`, or an
+    /// error and no change. Applying a commit's transactions this way one after another, from
+    /// the state before it, gives what [`DriveState::apply`] gives; a writer that builds a commit
+    /// of several transactions plans each against the state the ones before it leave (format
+    /// §7.1). The result's position is the commit's from its first transaction on.
+    pub fn apply_txn_of(&self, seq: u64, idx: u32, time: Timestamp, txn: &Txn) -> Result<DriveState, StateError> {
+        let expected = if idx == 0 { self.seq + 1 } else { self.seq };
+        if seq != expected {
+            return Err(StateError::BadSeq { expected, got: seq });
+        }
+        if self.time.is_some_and(|t| time < t) || (idx > 0 && self.time != Some(time)) {
+            return Err(StateError::TimeWentBackwards);
+        }
+        let mut next = self.clone();
+        next.apply_txn(txn, VersionId::new(seq, idx), time)?;
+        next.seq = seq;
+        next.time = Some(time);
+        Ok(next)
+    }
+
     /// Checks that `txn` would apply cleanly to this state, without keeping the result.
     pub fn check_txn(&self, txn: &Txn) -> Result<(), StateError> {
         let mut scratch = self.clone();
@@ -683,6 +703,29 @@ mod tests {
         assert_eq!(s.lookup(&Key::parse("a/new.txt").unwrap()), None);
         assert_eq!(s.seq(), 1);
         assert!(matches!(s.apply(&commit(3, vec![])), Err(StateError::BadSeq { expected: 2, got: 3 })));
+    }
+
+    #[test]
+    fn a_commit_applies_a_transaction_at_a_time() {
+        let (s, [a, b, ..]) = sample();
+        let root = ObjectId::root();
+        let t = s.time().unwrap();
+        let moved = txn(&b, Op::Rename, vec![Change::Move(MoveChange { oid: b.clone(), parent: root, name: "b.txt".into() })]);
+        let written = txn(&b, Op::Write, vec![set_content(&b, 7)]);
+        let whole = s.apply(&Commit { time: t, ..commit(2, vec![moved.clone(), written.clone()]) }).unwrap();
+        let first = s.apply_txn_of(2, 0, t, &moved).unwrap();
+        assert_eq!((first.seq(), first.key_of(&b).as_deref(), first.record(&b).unwrap().size), (2, Some("b.txt"), 3));
+        let second = first.apply_txn_of(2, 1, t, &written).unwrap();
+        assert_eq!(second.rows(), whole.rows());
+        assert_eq!(second.record(&b).unwrap().head, VersionId::new(2, 1));
+        // Each step must follow the one before it, in the same commit.
+        assert_eq!(s.apply_txn_of(2, 1, t, &written).unwrap_err(), StateError::BadSeq { expected: 1, got: 2 });
+        assert_eq!(first.apply_txn_of(3, 1, t, &written).unwrap_err(), StateError::BadSeq { expected: 2, got: 3 });
+        let later = Timestamp::from_datetime(t.datetime() + chrono::Duration::seconds(1));
+        assert_eq!(first.apply_txn_of(2, 1, later, &written).unwrap_err(), StateError::TimeWentBackwards);
+        let bad = txn(&a, Op::Put, vec![create(&a, &ObjectId::root(), "fresh", Kind::Folder)]);
+        assert!(matches!(first.apply_txn_of(2, 1, t, &bad), Err(StateError::AlreadyLinked(_))));
+        assert_eq!(first.record(&b).unwrap().size, 3, "a failed step changes nothing");
     }
 
     #[test]

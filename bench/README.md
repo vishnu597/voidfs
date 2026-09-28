@@ -208,10 +208,10 @@ at once.
 The biggest first. The file references point at the code at `c434fcb`. The step-3 plan that
 turns these into work items is [docs/step-3-performance.md](../docs/step-3-performance.md).
 
-1. **A drive commits one mutation per bucket round trip.** `Pool::commit`
-   ([`pool.rs`](../crates/voidfs-server/src/pool.rs)) holds the drive's commit lock while it
-   writes the log entry with a conditional PUT. Operations on one drive therefore queue, and the
-   p50 of any write row is its concurrency times one conditional PUT.
+1. **A drive committed one mutation per bucket round trip.** `Pool::commit`
+   ([`pool.rs`](../crates/voidfs-server/src/pool.rs)) held the drive's commit lock while it
+   wrote the log entry with a conditional PUT. Operations on one drive therefore queued, and the
+   p50 of any write row was its concurrency times one conditional PUT.
    - With the bucket 12 ms away, renaming a 64 MiB file took 12.8, 24.5, 48.4 and 99.2 ms at 1,
      2, 4 and 8 at once ([probes](results/probes/)). Fan-out puts took 412 ms at 32 at once and 859 ms at 64 (SpaceFS: 60 and
      67 ms). On loopback the ceiling is about 2,500 commits a second. Against R2, with about
@@ -219,9 +219,12 @@ turns these into work items is [docs/step-3-performance.md](../docs/step-3-perfo
    - It sets the floor of 37 rows: every edit, put, overwrite, multipart upload, rename and move.
      With S3's conditional PUTs taking tens of milliseconds, the real run will show hundreds of
      milliseconds at 8 at once, and seconds at 32 and 64.
-   - Direction (step 3, "batched commits"): group commit. The format already allows several
-     transactions in one log entry (`Commit.txns`), so every transaction waiting on the lock can
-     share one PUT. The next batch can be planned while the current one is written.
+   - **Fixed by group commit** (28 September 2026,
+     [results](results/group-commit/README.md)): the mutations that wait while a log entry is
+     written share the next one (`Commit.txns`). At 12 ms, renames at 1, 2, 4 and 8 at once now
+     take 13.9, 20.7, 26.1 and 26.3 ms, and fan-out puts 37 and 38 ms at 32 and 64 at once. A
+     small write's p50 is now two or three round trips at any concurrency, and finding 2 is what
+     is left.
 2. **Every write takes two or more bucket round trips, one after another.** A 4 KiB put at
    concurrency 1 took 27.3 ms where a rename took 12.8: shards first, then the log entry. The
    format requires that order (a commit may only reference stored shards, format §7.4), where
@@ -266,9 +269,11 @@ turns these into work items is [docs/step-3-performance.md](../docs/step-3-perfo
 
 What the runs confirm from [PARITY.md §6](../docs/PARITY.md#where-voidfs-stands): metadata-only
 work (listing, `head`, small warm reads) is well ahead of the bare bucket at any distance, and
-further ahead than SpaceFS. Renames, moves and edits in large files are ahead on loopback, but
-behind SpaceFS's ratios once the bucket is far away, because of finding 1. The small-write rows
-are, for now, where voidfs is furthest behind.
+further ahead than SpaceFS. Renames, moves and edits in large files were ahead on loopback, but
+behind SpaceFS's ratios once the bucket was far away, because of finding 1. With group commit,
+the folder move is at SpaceFS's ratio at 12 ms and 9 or 10 of the 24 edits are ahead of it.
+Overwrite 4 KiB is ahead too, and the other small puts and fan-out puts are within 2–28% of it,
+held back by finding 2.
 
 Two problems outside performance turned up on the way:
 - voidfs-server answered `501 NotImplemented` to the `x-id=PutObject` query parameter that

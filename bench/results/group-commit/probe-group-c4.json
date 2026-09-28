@@ -1,0 +1,127 @@
+{
+  "harness": "voidfs-bench 0.0.0",
+  "run_id": "20260928T191402Z",
+  "started": "2026-09-28T19:14:02Z",
+  "finished": "2026-09-28T19:14:05Z",
+  "settings": {
+    "rounds": 2,
+    "warmups": 3,
+    "concurrency": 4,
+    "connections": 64,
+    "ops_scale": 0.5,
+    "checksums": "SdkDefault",
+    "like_spacefs": false
+  },
+  "environment": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpus": 15,
+    "labels": {
+      "bucket": "versitygw 1.8.0 on local disk, 127.0.0.1:7070",
+      "commit": "ae3a466 (with uncommitted changes)",
+      "distance to the bucket": "emulated with `voidfs-bench delay --one-way-ms 4` between the bucket and both voidfs-server and the harness's bare target (timer granularity adds about 2 ms each way; the bare head row shows the real round trip). The harness reaches voidfs-server over loopback, as SpaceFS's reached its layer on the client host",
+      "setup": "one machine over loopback: harness, voidfs-server and the S3 server (15 CPUs, Darwin arm64)",
+      "voidfs server": "voidfs-server release build, s3: store in that bucket, 512 MiB shard cache"
+    }
+  },
+  "targets": {
+    "voidfs": "http://127.0.0.1:9000 (drives vfbench-*)"
+  },
+  "spacefs": {
+    "source": "https://docs.spacefs.com/benchmarks/",
+    "run": "20260920T055107Z (build s3sdk@fff9779)"
+  },
+  "scenarios": [
+    {
+      "id": "rename-64m",
+      "name": "rename 64 MiB",
+      "family": "metadata",
+      "concurrency": 4,
+      "ops": 16,
+      "spacefs": {
+        "layer": 108.0,
+        "bare": 858.0
+      },
+      "results": {
+        "voidfs": {
+          "p50_ms": 26.065520999999997,
+          "rounds": [
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 25.3297085,
+              "p90_ms": 26.059063,
+              "p99_ms": 26.1335662,
+              "mean_ms": 23.834429625,
+              "min_ms": 13.245334,
+              "max_ms": 26.134666,
+              "wall_ms": 102.114541
+            },
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 26.8013335,
+              "p90_ms": 27.1173125,
+              "p99_ms": 27.367193850000003,
+              "mean_ms": 22.03045325,
+              "min_ms": 13.819875,
+              "max_ms": 27.369750000000003,
+              "wall_ms": 94.87929100000001
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 45,
+          "bytes_up": 268435456,
+          "bytes_down": 0
+        }
+      }
+    },
+    {
+      "id": "put-4k",
+      "name": "put 4 KiB",
+      "family": "writes",
+      "concurrency": 4,
+      "ops": 100,
+      "spacefs": {
+        "layer": 60.6,
+        "bare": 30.1
+      },
+      "results": {
+        "voidfs": {
+          "p50_ms": 28.07049975,
+          "rounds": [
+            {
+              "ops": 100,
+              "errors": 0,
+              "p50_ms": 27.653333,
+              "p90_ms": 40.147696100000005,
+              "p99_ms": 43.15452717000001,
+              "mean_ms": 29.939959570000006,
+              "min_ms": 24.237709,
+              "max_ms": 44.374125,
+              "wall_ms": 758.8187079999999,
+              "mib_per_s": 0.5147804025938697
+            },
+            {
+              "ops": 100,
+              "errors": 0,
+              "p50_ms": 28.4876665,
+              "p90_ms": 41.8417378,
+              "p99_ms": 44.02061592,
+              "mean_ms": 31.177712510000013,
+              "min_ms": 25.241417,
+              "max_ms": 44.098125,
+              "wall_ms": 783.2472499999999,
+              "mib_per_s": 0.4987250194622453
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 205,
+          "bytes_up": 831488,
+          "bytes_down": 0
+        }
+      }
+    }
+  ]
+}
