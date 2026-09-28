@@ -19,6 +19,9 @@ use voidfs_core::model::{
 use voidfs_core::ops::OpError;
 use voidfs_core::state::{DriveState, Rows};
 
+use crate::clock::Clock;
+use crate::gc::guard::{self, Guard};
+
 /// Commits between checkpoints (format §8.4).
 const CHECKPOINT_EVERY: u64 = 1000;
 /// Rows per checkpoint segment.
@@ -29,6 +32,8 @@ const FEED_KEEP: usize = 10_000;
 const LOG_FETCH_PARALLELISM: usize = 32;
 /// Drives loaded at once when a pool opens.
 const DRIVE_LOAD_PARALLELISM: usize = 8;
+/// Shards and pages remembered as safe to reference without uploading (format §12.4).
+const REUSE_CAPACITY: usize = 1 << 20;
 
 fn log_path(id: &DriveId, seq: u64) -> String {
     format!("drives/{id}/log/{seq:020}.json")
@@ -230,31 +235,43 @@ pub struct Pool {
     pub store: crate::store::Store,
     pub desc: PoolDescriptor,
     pub params: Params,
+    pub clock: Clock,
+    /// Which shards and pages a commit may reference without uploading them (format §12.4).
+    pub guard: Guard,
     shards: moka::sync::Cache<ShardHash, Bytes>,
     pages: moka::sync::Cache<ShardHash, Bytes>,
     drives: RwLock<HashMap<DriveId, Arc<Drive>>>,
     aliases: RwLock<HashMap<String, DriveId>>,
     deleted: RwLock<HashMap<String, DriveId>>,
+    /// Serializes changes to `drives`, `aliases` and `deleted`. Never held across an await, and
+    /// no other of their locks is held while taking it.
+    registry: std::sync::Mutex<()>,
     authority: String,
 }
 
 impl Pool {
     /// Opens the pool in `store`, creating it if the store is empty.
     pub async fn open(store: crate::store::Store, cache_bytes: u64) -> anyhow::Result<Arc<Pool>> {
+        Pool::open_with(store, cache_bytes, Clock::System).await
+    }
+
+    /// [`Pool::open`] with a given clock. A system clock also starts a task that re-reads
+    /// `gc/pending.json` every minute.
+    pub async fn open_with(store: crate::store::Store, cache_bytes: u64, clock: Clock) -> anyhow::Result<Arc<Pool>> {
         let desc = match store.get("voidfs.json").await? {
             Some(b) => serde_json::from_slice::<PoolDescriptor>(&b).context("reading voidfs.json")?,
             None => {
                 let d = PoolDescriptor {
                     format: voidfs_core::FORMAT_VERSION,
                     pool_id: format!("p-{}", uuid::Uuid::new_v4()),
-                    created: Timestamp::now(),
+                    created: clock.now(),
                     features: Features { compatible: vec![], incompatible: vec![] },
                     chunking: Chunking::default(),
                     hash: "sha256".into(),
                     commit_guard: CommitGuard::CreateIfAbsent,
                 };
                 if !store.put_new("voidfs.json", Bytes::from(serde_json::to_vec_pretty(&d)?)).await? {
-                    return Box::pin(Pool::open(store, cache_bytes)).await;
+                    return Box::pin(Pool::open_with(store, cache_bytes, clock)).await;
                 }
                 d
             }
@@ -266,10 +283,13 @@ impl Pool {
             store,
             desc,
             params,
+            clock,
+            guard: Guard::new(REUSE_CAPACITY),
             shards: moka::sync::Cache::builder().weigher(weigh).max_capacity(cache_bytes).build(),
             pages: moka::sync::Cache::builder().weigher(weigh).max_capacity(cache_bytes / 8 + 1).build(),
             drives: RwLock::new(HashMap::new()),
             aliases: RwLock::new(HashMap::new()),
+            registry: std::sync::Mutex::new(()),
             deleted: RwLock::new(HashMap::new()),
             authority: format!("a-{}", uuid::Uuid::new_v4()),
         });
@@ -288,7 +308,9 @@ impl Pool {
             .await;
         for (id, loaded, deleted) in loads {
             match loaded {
-                Ok(Some(d)) => pool.register(d, deleted?),
+                Ok(Some(d)) => {
+                    pool.register(d, deleted?);
+                }
                 Ok(None) => {}
                 Err(e) => tracing::error!("drive {id} could not be loaded: {e:#}"),
             }
@@ -305,17 +327,34 @@ impl Pool {
                 p.forks.write().unwrap().push(child);
             }
         }
+        if let Err(e) = pool.guard.refresh(&pool.store, &pool.clock).await {
+            tracing::warn!("{e:#}; writes will fail until it can be read");
+        }
+        if !pool.clock.is_manual() {
+            let weak = Arc::downgrade(&pool);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(guard::REFRESH_EVERY).await;
+                    let Some(pool) = weak.upgrade() else { break };
+                    if let Err(e) = pool.guard.refresh(&pool.store, &pool.clock).await {
+                        tracing::warn!("re-reading {}: {e:#}", crate::gc::PENDING);
+                    }
+                }
+            });
+        }
         Ok(pool)
     }
 
-    fn register(&self, d: Drive, deleted: bool) {
+    fn register(&self, d: Drive, deleted: bool) -> Arc<Drive> {
         let d = Arc::new(d);
+        let _r = self.registry.lock().unwrap();
         if deleted {
             self.deleted.write().unwrap().insert(d.alias.clone(), d.id.clone());
         } else {
             self.aliases.write().unwrap().insert(d.alias.clone(), d.id.clone());
         }
-        self.drives.write().unwrap().insert(d.id.clone(), d);
+        self.drives.write().unwrap().insert(d.id.clone(), d.clone());
+        d
     }
 
     async fn load_drive(&self, id: &DriveId) -> anyhow::Result<Option<Drive>> {
@@ -437,10 +476,12 @@ impl Pool {
         if let Some(b) = self.shards.get(h) {
             return Ok(b);
         }
-        let b = self.store.get(&format!("shards/{}", h.object_path())).await?.ok_or_else(|| anyhow!("shard {h} is missing"))?;
+        let generation = self.guard.generation();
+        let b = self.store.get(&guard::Kind::Shard.path(h)).await?.ok_or_else(|| anyhow!("shard {h} is missing"))?;
         if ShardHash::of(&b) != *h {
             bail!("shard {h} is corrupt");
         }
+        self.guard.confirmed(*h, generation);
         self.shards.insert(*h, b.clone());
         Ok(b)
     }
@@ -449,33 +490,38 @@ impl Pool {
         if let Some(b) = self.pages.get(h) {
             return Ok(b);
         }
-        let b = self.store.get(&format!("pages/{}", h.object_path())).await?.ok_or_else(|| anyhow!("page {h} is missing"))?;
+        let generation = self.guard.generation();
+        let b = self.store.get(&guard::Kind::Page.path(h)).await?.ok_or_else(|| anyhow!("page {h} is missing"))?;
+        self.guard.confirmed(*h, generation);
         self.pages.insert(*h, b.clone());
         Ok(b)
     }
 
+    /// Stores shards so that a commit may reference them (format §7.4, §12.4). Shards already
+    /// checked are not uploaded again; holding a shard's bytes in the cache is not a check.
     pub async fn write_shards(&self, shards: &[Shard]) -> anyhow::Result<()> {
-        let tasks = shards.iter().filter(|s| !self.shards.contains_key(&s.hash)).map(|s| async move {
-            self.store.put(&format!("shards/{}", s.hash.object_path()), s.bytes.clone()).await?;
+        let items: Vec<(ShardHash, Bytes)> = shards.iter().map(|s| (s.hash, s.bytes.clone())).collect();
+        self.guard.admit(&self.store, &self.clock, guard::Kind::Shard, &items).await?;
+        for s in shards {
             self.shards.insert(s.hash, s.bytes.clone());
-            anyhow::Ok(())
-        });
-        for r in futures::future::join_all(tasks).await {
-            r?;
         }
         Ok(())
     }
 
+    /// [`Pool::write_shards`] for manifest pages and checkpoint segments.
     pub async fn write_pages(&self, pages: &[Page]) -> anyhow::Result<()> {
-        let tasks = pages.iter().filter(|p| !self.pages.contains_key(&p.hash)).map(|p| async move {
-            self.store.put(&format!("pages/{}", p.hash.object_path()), p.bytes.clone()).await?;
+        let items: Vec<(ShardHash, Bytes)> = pages.iter().map(|p| (p.hash, p.bytes.clone())).collect();
+        self.guard.admit(&self.store, &self.clock, guard::Kind::Page, &items).await?;
+        for p in pages {
             self.pages.insert(p.hash, p.bytes.clone());
-            anyhow::Ok(())
-        });
-        for r in futures::future::join_all(tasks).await {
-            r?;
         }
         Ok(())
+    }
+
+    /// Drops a deleted shard or page from the caches.
+    pub fn forget(&self, h: &ShardHash) {
+        self.shards.invalidate(h);
+        self.pages.invalidate(h);
     }
 
     /// The full extent list of a content descriptor.
@@ -549,13 +595,18 @@ impl Pool {
             Some(src) => {
                 // Hold the source's commit lock so the fork includes every acknowledged write.
                 let _g = src.commit_lock.lock().await;
+                // The fork references content through the source's state, so the source must
+                // still be a drive (format §12.4): a hard delete forgets it before deleting it.
+                if self.drive_by_id(&src.id).is_none() {
+                    return Err(CreateError::NotFound);
+                }
                 let s = src.snapshot().fork();
                 self.write_checkpoint(&id, &s).await?;
                 let seq = s.seq();
                 (s, Some(ForkOf { drive_id: src.id.clone(), seq }))
             }
         };
-        let desc = DriveDescriptor { format: 1, drive_id: id.clone(), created: Timestamp::now(), alias: alias.to_owned(), fork_of };
+        let desc = DriveDescriptor { format: 1, drive_id: id.clone(), created: self.clock.now(), alias: alias.to_owned(), fork_of };
         if !self.store.put_new(&format!("drives/{id}/drive.json"), Bytes::from(serde_json::to_vec_pretty(&desc).map_err(anyhow::Error::from)?)).await? {
             return Err(CreateError::Other(anyhow!("drive id collision")));
         }
@@ -566,14 +617,21 @@ impl Pool {
         if let Some(src) = source {
             src.forks.write().unwrap().push(id.clone());
         }
-        self.register(Drive::new(desc, state), false);
-        Ok(self.drive_by_id(&id).unwrap())
+        Ok(self.register(Drive::new(desc, state), false))
     }
 
     pub async fn soft_delete(&self, d: &Drive) -> anyhow::Result<()> {
-        let marker = serde_json::json!({ "time": Timestamp::now(), "actor": { "kind": "system", "id": "voidfs" } });
+        let marker = serde_json::json!({ "time": self.clock.now(), "actor": { "kind": "system", "id": "voidfs" } });
         self.store.put(&format!("drives/{}/deleted.json", d.id), Bytes::from(marker.to_string())).await?;
-        self.aliases.write().unwrap().remove(&d.alias);
+        let _r = self.registry.lock().unwrap();
+        if !self.drives.read().unwrap().contains_key(&d.id) {
+            return Ok(());
+        }
+        let mut aliases = self.aliases.write().unwrap();
+        if aliases.get(&d.alias) == Some(&d.id) {
+            aliases.remove(&d.alias);
+        }
+        drop(aliases);
         self.deleted.write().unwrap().insert(d.alias.clone(), d.id.clone());
         Ok(())
     }
@@ -583,10 +641,21 @@ impl Pool {
         if self.alias_taken(alias) {
             return Err(CreateError::Exists);
         }
+        // Garbage collection may have hard-deleted it since this server loaded it (format §10).
+        if !self.store.exists(&format!("drives/{id}/drive.json")).await? {
+            self.forget_drive(&id);
+            return Err(CreateError::NotFound);
+        }
         self.store.delete(&format!("drives/{id}/deleted.json")).await?;
+        let _r = self.registry.lock().unwrap();
+        // A hard delete may have removed it meanwhile, or another drive taken the alias.
+        let d = self.drive_by_id(&id).ok_or(CreateError::NotFound)?;
+        if self.alias_taken(alias) {
+            return Err(CreateError::Exists);
+        }
         self.deleted.write().unwrap().remove(alias);
-        self.aliases.write().unwrap().insert(alias.to_owned(), id.clone());
-        Ok(self.drive_by_id(&id).unwrap())
+        self.aliases.write().unwrap().insert(alias.to_owned(), id);
+        Ok(d)
     }
 
     /// Permanently deletes a drive, live or soft-deleted. Its forks keep working: each has its
@@ -599,15 +668,46 @@ impl Pool {
                 None => return Ok(false),
             },
         };
-        let d = self.drive_by_id(&id).unwrap();
-        self.store.delete_prefix(&format!("drives/{id}/")).await?;
-        self.aliases.write().unwrap().remove(&d.alias);
-        self.deleted.write().unwrap().remove(&d.alias);
-        self.drives.write().unwrap().remove(&id);
-        for other in self.drives.read().unwrap().values() {
-            other.forks.write().unwrap().retain(|f| *f != id);
-        }
+        self.hard_delete_id(&id).await?;
         Ok(true)
+    }
+
+    /// Permanently deletes a drive by id, whether or not this server has loaded it.
+    ///
+    /// The drive is forgotten first, so that no new request can reference content through it,
+    /// and commits and forks already running finish before `drive.json` goes, which is when the
+    /// drive stops being a garbage-collection root. If the deletion fails part way, the server
+    /// no longer serves the drive, and what is left in the bucket is loaded again on restart
+    /// only if `drive.json` survived.
+    pub async fn hard_delete_id(&self, id: &DriveId) -> anyhow::Result<()> {
+        let d = self.drive_by_id(id);
+        self.forget_drive(id);
+        let _g = match &d {
+            Some(d) => Some(d.commit_lock.lock().await),
+            None => None,
+        };
+        self.store.delete(&format!("drives/{id}/drive.json")).await?;
+        self.store.delete_prefix(&format!("drives/{id}/")).await?;
+        Ok(())
+    }
+
+    fn forget_drive(&self, id: &DriveId) {
+        let _r = self.registry.lock().unwrap();
+        let removed = self.drives.write().unwrap().remove(id);
+        if let Some(d) = removed {
+            let mut aliases = self.aliases.write().unwrap();
+            if aliases.get(&d.alias) == Some(id) {
+                aliases.remove(&d.alias);
+            }
+            drop(aliases);
+            let mut deleted = self.deleted.write().unwrap();
+            if deleted.get(&d.alias) == Some(id) {
+                deleted.remove(&d.alias);
+            }
+        }
+        for other in self.drives.read().unwrap().values() {
+            other.forks.write().unwrap().retain(|f| f != id);
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -624,7 +724,7 @@ impl Pool {
         let _g = d.commit_lock.lock().await;
         let cur = d.snapshot();
         let txn = plan(&cur)?;
-        let now = Timestamp::now();
+        let now = self.clock.now();
         let time = cur.time().map_or(now, |t| t.max(now));
         let commit = Commit { format: 1, seq: cur.seq() + 1, time, authority: self.authority.clone(), txns: vec![txn] };
         let next = cur.apply(&commit).map_err(|e| CommitError::Other(anyhow!("planned transaction does not apply: {e}")))?;
