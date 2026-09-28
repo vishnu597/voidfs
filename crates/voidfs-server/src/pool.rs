@@ -21,6 +21,7 @@ use voidfs_core::state::{DriveState, Rows};
 
 use crate::clock::Clock;
 use crate::gc::guard::{self, Guard};
+use crate::probe;
 
 /// A checkpoint is due this many commits after the last one (format §8.4)...
 const CHECKPOINT_EVERY: u64 = 1000;
@@ -357,15 +358,25 @@ pub struct Pool {
 
 impl Pool {
     /// Opens the pool in `store`, creating it if the store is empty.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn open(store: crate::store::Store, cache_bytes: u64) -> anyhow::Result<Arc<Pool>> {
         Pool::open_with(store, cache_bytes, Clock::System).await
     }
 
     /// [`Pool::open`] with a given clock. A system clock also starts a task that re-reads
     /// `gc/pending.json` every minute.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn open_with(store: crate::store::Store, cache_bytes: u64, clock: Clock) -> anyhow::Result<Arc<Pool>> {
-        let desc = match store.get("voidfs.json").await? {
-            Some(b) => serde_json::from_slice::<PoolDescriptor>(&b).context("reading voidfs.json")?,
+        Pool::open_as(store, cache_bytes, clock, CommitGuard::CreateIfAbsent).await
+    }
+
+    /// [`Pool::open_with`] for a server started with `--commit-guard guard`. A new pool is
+    /// created with that guard, and an existing one must have it. With create-if-absent, the
+    /// store must first be seen to honour it (format §7.2): a pool it has just created in a store
+    /// that does not is removed again.
+    pub async fn open_as(store: crate::store::Store, cache_bytes: u64, clock: Clock, guard: CommitGuard) -> anyhow::Result<Arc<Pool>> {
+        let (desc, bytes, created) = match store.get(probe::DESCRIPTOR).await? {
+            Some(b) => (serde_json::from_slice::<PoolDescriptor>(&b).context("reading voidfs.json")?, b, false),
             None => {
                 let d = PoolDescriptor {
                     format: voidfs_core::FORMAT_VERSION,
@@ -374,15 +385,38 @@ impl Pool {
                     features: Features { compatible: vec![], incompatible: vec![] },
                     chunking: Chunking::default(),
                     hash: "sha256".into(),
-                    commit_guard: CommitGuard::CreateIfAbsent,
+                    commit_guard: guard,
                 };
-                if !store.put_new("voidfs.json", Bytes::from(serde_json::to_vec_pretty(&d)?)).await? {
-                    return Box::pin(Pool::open_with(store, cache_bytes, clock)).await;
+                let b = Bytes::from(serde_json::to_vec_pretty(&d)?);
+                let created = match guard {
+                    CommitGuard::CreateIfAbsent => store.put_new(probe::DESCRIPTOR, b.clone()).await.context("creating voidfs.json with a create-if-absent write (If-None-Match: *)")?,
+                    // Only this server writes the pool (§7.3), and it has just seen no descriptor.
+                    CommitGuard::External => {
+                        store.put(probe::DESCRIPTOR, b.clone()).await?;
+                        true
+                    }
+                };
+                if !created {
+                    return Box::pin(Pool::open_as(store, cache_bytes, clock, guard)).await;
                 }
-                d
+                (d, b, true)
             }
         };
         desc.check_readable().map_err(|e| anyhow!(e))?;
+        if let Some(why) = probe::guard_mismatch(desc.commit_guard, guard) {
+            bail!("{why}");
+        }
+        if guard == CommitGuard::CreateIfAbsent {
+            let checked = probe::create_if_absent(&store, probe::DESCRIPTOR, bytes).await;
+            if let Some(why) = checked.refusal() {
+                if created && checked == probe::Conditional::Ignored {
+                    // Nothing can have been written to it: any other server would refuse too.
+                    let _ = store.delete(probe::DESCRIPTOR).await;
+                    bail!("{why}. The pool this server had just created was removed. If this is the only server that will ever write the pool, start it with --commit-guard external (format §7.3)");
+                }
+                bail!("{why}. This pool relies on them, so this server will not write it");
+            }
+        }
         let params = Params::from_pool(&desc.chunking)?;
         let weigh = |_: &ShardHash, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX);
         let pool = Arc::new(Pool {
@@ -449,6 +483,23 @@ impl Pool {
             });
         }
         Ok(pool)
+    }
+
+    /// Creates an object only if it does not exist yet, as the pool's commit guard does it, and
+    /// returns `false` if it did (format §7.2, §7.3).
+    pub async fn create(&self, path: &str, bytes: Bytes) -> anyhow::Result<bool> {
+        match self.desc.commit_guard {
+            CommitGuard::CreateIfAbsent => self.store.put_new(path, bytes).await,
+            // Only this server writes the pool, so nothing can create the object between the
+            // check and the write. The check alone would not be enough otherwise.
+            CommitGuard::External => {
+                if self.store.exists(path).await? {
+                    return Ok(false);
+                }
+                self.store.put(path, bytes).await?;
+                Ok(true)
+            }
+        }
     }
 
     fn register(&self, d: Drive, deleted: bool) -> Arc<Drive> {
@@ -766,7 +817,7 @@ impl Pool {
             let _ = self.store.delete_prefix(&format!("drives/{id}/")).await;
             return Err(CreateError::Other(anyhow!("creating the fork took too long; try again")));
         }
-        if !self.store.put_new(&format!("drives/{id}/drive.json"), Bytes::from(serde_json::to_vec_pretty(&desc).map_err(anyhow::Error::from)?)).await? {
+        if !self.create(&format!("drives/{id}/drive.json"), Bytes::from(serde_json::to_vec_pretty(&desc).map_err(anyhow::Error::from)?)).await? {
             return Err(CreateError::Other(anyhow!("drive id collision")));
         }
         // The fork's checkpoint is a garbage-collection root from now on (format §12).
@@ -893,7 +944,7 @@ impl Pool {
         let next = cur.apply(&commit).map_err(|e| CommitError::Other(anyhow!("planned transaction does not apply: {e}")))?;
         let bytes = Bytes::from(serde_json::to_vec(&commit).map_err(anyhow::Error::from)?);
         let len = bytes.len();
-        if !self.store.put_new(&log_path(&d.id, commit.seq), bytes).await? {
+        if !self.create(&log_path(&d.id, commit.seq), bytes).await? {
             // Another authority wrote this sequence number: catch up and ask for a new plan.
             let mut s = (*cur).clone();
             let batches = self.replay(&d.id, &mut s, &mut cadence).await?;
@@ -1057,6 +1108,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, VersionId::new(2, 0));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Commit guards (format §7.2, §7.3)
+
+    /// Makes every create-if-absent write to `mem` behave as `fault` says.
+    fn on_put_new(mem: &MemStore, fault: Fault) {
+        mem.set_hook(Some(Arc::new(move |op, _| futures::future::ready(if op == MemOp::PutNew { fault } else { Fault::None }).boxed())));
+    }
+
+    #[tokio::test]
+    async fn a_pool_does_not_open_where_create_if_absent_is_not_honoured() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let store = Store::Mem(mem.clone());
+        let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        put(&pool, &pool.create_drive("d", None).await.unwrap(), "x", b"x").await;
+        let before = mem.peek("voidfs.json").unwrap();
+        on_put_new(&mem, Fault::Unconditional);
+        let e = Pool::open(store.clone(), 1 << 20).await.err().unwrap();
+        assert!(format!("{e:#}").contains("ignores create-if-absent"), "{e:#}");
+        assert_eq!(mem.peek("voidfs.json").unwrap(), before, "the check rewrote the same bytes");
+        // A check that fails tells nothing, so it refuses too.
+        on_put_new(&mem, Fault::Fail);
+        let e = Pool::open(store.clone(), 1 << 20).await.err().unwrap();
+        assert!(format!("{e:#}").contains("could not confirm"), "{e:#}");
+        assert_eq!(mem.peek("voidfs.json").unwrap(), before);
+        mem.set_hook(None);
+        let pool = Pool::open(store, 1 << 20).await.unwrap();
+        assert!(pool.drive("d").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_pool_just_created_where_create_if_absent_is_ignored_is_removed() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        on_put_new(&mem, Fault::Unconditional);
+        let e = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.err().unwrap();
+        assert!(format!("{e:#}").contains("--commit-guard external"), "{e:#}");
+        assert!(mem.peek("voidfs.json").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_external_guard_checks_before_each_write() {
+        // The store rejects conditional writes outright; the external guard sends none.
+        let mem = Arc::new(MemStore::new(Clock::System));
+        on_put_new(&mem, Fault::Fail);
+        let store = Store::Mem(mem.clone());
+        let p1 = Pool::open_as(store.clone(), 1 << 20, Clock::System, CommitGuard::External).await.unwrap();
+        let desc: PoolDescriptor = serde_json::from_slice(&mem.peek("voidfs.json").unwrap()).unwrap();
+        assert_eq!(desc.commit_guard, CommitGuard::External);
+        let d1 = p1.create_drive("shared", None).await.unwrap();
+        // Two servers on one external pool break its rule, but show that the check before each
+        // write finds a commit already there.
+        let p2 = Pool::open_as(store.clone(), 1 << 20, Clock::System, CommitGuard::External).await.unwrap();
+        let d2 = p2.drive("shared").unwrap();
+        put(&p1, &d1, "x", b"from one").await;
+        let e = voidfs_core::content::from_bytes(&Bytes::from_static(b"from two"), p2.params);
+        p2.write_shards(&e.new_shards).await.unwrap();
+        let desc = p2.describe(e.extents).await.unwrap();
+        let plan = |s: &DriveState| Ok(ops::put(s, "y", desc.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?);
+        assert!(matches!(p2.commit(&d2, plan).await, Err(CommitError::Retry)));
+        assert_eq!(p2.commit(&d2, plan).await.unwrap().0, VersionId::new(2, 0));
+        // A pool keeps its guard, whichever it has.
+        let e = Pool::open(store, 1 << 20).await.err().unwrap();
+        assert!(format!("{e:#}").contains("start it with --commit-guard external"), "{e:#}");
+        let other = Store::memory().unwrap();
+        Pool::open(other.clone(), 1 << 20).await.unwrap();
+        let e = Pool::open_as(other, 1 << 20, Clock::System, CommitGuard::External).await.err().unwrap();
+        assert!(format!("{e:#}").contains("without --commit-guard external"), "{e:#}");
     }
 
     // -----------------------------------------------------------------------------------------

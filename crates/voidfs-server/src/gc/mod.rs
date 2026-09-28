@@ -250,7 +250,7 @@ async fn phase1(pool: &Pool, opts: &Options, report: &mut Report) -> anyhow::Res
     let run = uuid::Uuid::new_v4().to_string();
     let started = pool.clock.mono();
     let mut rec = PendingRecord { format: 1, run: run.clone(), phase: Phase::Marking, t1: None, grace: opts.grace.as_secs(), candidates: Vec::new() };
-    if !store.put_new(PENDING, rec.bytes()?).await? {
+    if !pool.create(PENDING, rec.bytes()?).await? {
         report.outcome = Outcome::Busy;
         return Ok(());
     }

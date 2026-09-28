@@ -152,8 +152,8 @@ impl Store {
             },
             Store::Mem(m) => {
                 let now = m.clock.now();
-                m.run(MemOp::PutNew, path, |o| {
-                    if o.contains_key(path) {
+                m.run_faulted(MemOp::PutNew, path, |o, fault| {
+                    if o.contains_key(path) && fault != Fault::Unconditional {
                         return Ok(false);
                     }
                     o.insert(path.to_owned(), (data, now));
@@ -368,6 +368,9 @@ pub enum Fault {
     Fail,
     /// Do it, then report a failure: the reply was lost.
     FailAfter,
+    /// A create-if-absent write overwrites like a plain one, as on a backend that ignores
+    /// `If-None-Match`. Other requests are unaffected.
+    Unconditional,
 }
 
 /// Runs before every request to a [`MemStore`]: it can delay the request (to reorder requests
@@ -398,6 +401,11 @@ impl MemStore {
     }
 
     async fn run<T>(&self, op: MemOp, path: &str, f: impl FnOnce(&mut BTreeMap<String, (Bytes, Timestamp)>) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.run_faulted(op, path, |o, _| f(o)).await
+    }
+
+    /// [`MemStore::run`], telling `f` the fault the hook chose.
+    async fn run_faulted<T>(&self, op: MemOp, path: &str, f: impl FnOnce(&mut BTreeMap<String, (Bytes, Timestamp)>, Fault) -> anyhow::Result<T>) -> anyhow::Result<T> {
         let hook = self.hook.lock().unwrap().clone();
         let fault = match hook {
             Some(h) => h(op, path).await,
@@ -406,7 +414,7 @@ impl MemStore {
         if fault == Fault::Fail {
             return Err(anyhow!("injected failure: {op:?} {path}"));
         }
-        let out = f(&mut self.objects.lock().unwrap())?;
+        let out = f(&mut self.objects.lock().unwrap(), fault)?;
         if fault == Fault::FailAfter {
             return Err(anyhow!("injected failure after {op:?} {path}"));
         }

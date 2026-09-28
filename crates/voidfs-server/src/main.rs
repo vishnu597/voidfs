@@ -4,6 +4,7 @@
 mod clock;
 mod gc;
 mod pool;
+mod probe;
 mod s3;
 mod sigv4;
 mod store;
@@ -15,6 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use rand::RngExt;
+use voidfs_core::model::CommitGuard;
 
 use crate::sigv4::{KeyInfo, Keys, Scope};
 use crate::store::Store;
@@ -43,6 +45,13 @@ struct Args {
     /// Region of the bucket (`auto` for R2).
     #[arg(long, env = "VOIDFS_S3_REGION", default_value = "us-east-1", global = true)]
     s3_region: String,
+    /// How the pool stops two servers from writing the same commit (format §7). With
+    /// `create-if-absent`, the bucket must honour conditional writes, which is checked at start.
+    /// `external` is for buckets that don't: then at most one server, and at most one garbage
+    /// collector, may write the pool at a time. A new pool keeps the guard it is created with,
+    /// and an existing pool opens only with its own.
+    #[arg(long, env = "VOIDFS_COMMIT_GUARD", value_enum, default_value = "create-if-absent", global = true)]
+    commit_guard: Guard,
     /// Admin access key id clients sign with. Generated and printed if not given.
     #[arg(long, env = "VOIDFS_ACCESS_KEY_ID")]
     access_key_id: Option<String>,
@@ -69,6 +78,28 @@ enum Command {
     /// at least the grace period later, deletes those still unreferenced. Drives soft-deleted
     /// longer than their window are hard-deleted, and stale multipart uploads aborted, first.
     Gc(GcArgs),
+    /// Check what the bucket supports, and report whether a server could write the pool there.
+    ///
+    /// Checks create-if-absent writes, lifecycle rules, versioning, object lock, CORS, presigned
+    /// URLs, modification times and the bucket's clock. It stores nothing: the one write, which
+    /// creates voidfs.json again, must be refused by the bucket. Exits with status 1 if a server
+    /// started with the same options would refuse to open the pool.
+    Probe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Guard {
+    CreateIfAbsent,
+    External,
+}
+
+impl From<Guard> for CommitGuard {
+    fn from(g: Guard) -> CommitGuard {
+        match g {
+            Guard::CreateIfAbsent => CommitGuard::CreateIfAbsent,
+            Guard::External => CommitGuard::External,
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -106,13 +137,14 @@ fn random(alphabet: &[u8], n: usize) -> String {
     (0..n).map(|_| alphabet[rng.random_range(0..alphabet.len())] as char).collect()
 }
 
-fn open_store(args: &Args) -> anyhow::Result<Store> {
+/// The store `--store` names, and for a bucket, requests for its configuration.
+fn open_store(args: &Args) -> anyhow::Result<(Store, Option<probe::Bucket>)> {
     let spec = args.store.as_str();
     if spec == "memory" {
-        return Store::memory();
+        return Ok((Store::memory()?, None));
     }
     if let Some(dir) = spec.strip_prefix("fs:") {
-        return Store::local(dir);
+        return Ok((Store::local(dir)?, None));
     }
     if let Some(rest) = spec.strip_prefix("s3:") {
         let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
@@ -121,21 +153,42 @@ fn open_store(args: &Args) -> anyhow::Result<Store> {
             (None, None) => None,
             _ => bail!("give both --s3-access-key-id and --s3-secret-access-key, or neither"),
         };
-        return Store::s3(bucket, &format!("/{prefix}"), args.s3_endpoint.as_deref(), &args.s3_region, credentials);
+        let store = Store::s3(bucket, &format!("/{prefix}"), args.s3_endpoint.as_deref(), &args.s3_region, credentials)?;
+        let api = probe::Bucket::new(bucket, prefix, args.s3_endpoint.as_deref(), &args.s3_region, credentials)?;
+        return Ok((store, Some(api)));
     }
     bail!("--store must be memory, fs:<directory> or s3:<bucket>[/<prefix>]")
+}
+
+/// Opens the pool for writing, after checking that the bucket won't lose its objects and
+/// honours the commit guard.
+async fn open_pool(args: &Args) -> anyhow::Result<Arc<pool::Pool>> {
+    let (store, bucket) = open_store(args)?;
+    if let Some(b) = &bucket {
+        probe::check_bucket(b).await.context("checking the bucket")?;
+    }
+    pool::Pool::open_as(store, args.cache_mib * 1024 * 1024, clock::Clock::System, args.commit_guard.into()).await.context("opening the pool")
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     let args = Args::parse();
-    if let Some(Command::Gc(g)) = &args.command {
-        let opts = gc::Options { grace: g.grace, offline: g.offline, dry_run: g.dry_run, expire_deleted_drives: g.expire_deleted_drives.0, abort_uploads: g.abort_uploads.0 };
-        let pool = pool::Pool::open(open_store(&args)?, args.cache_mib * 1024 * 1024).await.context("opening the pool")?;
-        let report = gc::step(&pool, &opts).await?;
-        println!("{report}");
-        return Ok(());
+    match &args.command {
+        Some(Command::Gc(g)) => {
+            let opts = gc::Options { grace: g.grace, offline: g.offline, dry_run: g.dry_run, expire_deleted_drives: g.expire_deleted_drives.0, abort_uploads: g.abort_uploads.0 };
+            let pool = open_pool(&args).await?;
+            let report = gc::step(&pool, &opts).await?;
+            println!("{report}");
+            return Ok(());
+        }
+        Some(Command::Probe) => {
+            let (store, bucket) = open_store(&args)?;
+            let report = probe::report(&store, bucket.as_ref(), args.commit_guard.into()).await?;
+            println!("{report}");
+            std::process::exit(if report.refusals.is_empty() { 0 } else { 1 });
+        }
+        None => {}
     }
 
     let mut keys = Keys::default();
@@ -158,9 +211,8 @@ async fn main() -> anyhow::Result<()> {
         keys.insert(KeyInfo { id: id.into(), secret: secret.into(), scope: scope.parse().map_err(anyhow::Error::msg)?, drives: None });
     }
 
-    let store = open_store(&args)?;
-    let pool = pool::Pool::open(store, args.cache_mib * 1024 * 1024).await.context("opening the pool")?;
-    tracing::info!("pool {} open with {} drives", pool.desc.pool_id, pool.list_drives().len());
+    let pool = open_pool(&args).await?;
+    tracing::info!("pool {} open with {} drives, commit guard {}", pool.desc.pool_id, pool.list_drives().len(), probe::guard_name(pool.desc.commit_guard));
     if let Some(every) = args.gc_interval {
         tracing::info!("collecting garbage every {}s", every.as_secs());
         tokio::spawn(gc::run_periodically(pool.clone(), gc::Options::default(), every));
@@ -204,5 +256,19 @@ mod tests {
         let a = Args::try_parse_from(["voidfs-server", "--gc-interval", "1h"]).unwrap();
         assert!(a.command.is_none());
         assert_eq!(a.gc_interval, Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn the_commit_guard_and_probe_parse() {
+        let a = Args::try_parse_from(["voidfs-server"]).unwrap();
+        assert_eq!(a.commit_guard, Guard::CreateIfAbsent);
+        let a = Args::try_parse_from(["voidfs-server", "--commit-guard", "external"]).unwrap();
+        assert_eq!(CommitGuard::from(a.commit_guard), CommitGuard::External);
+        let a = Args::try_parse_from(["voidfs-server", "probe", "--store", "s3:b/pool", "--commit-guard", "external"]).unwrap();
+        assert!(matches!(a.command, Some(Command::Probe)));
+        assert_eq!(a.commit_guard, Guard::External);
+        assert!(Args::try_parse_from(["voidfs-server", "--commit-guard", "none"]).is_err());
+        let a = Args::try_parse_from(["voidfs-server", "gc", "--commit-guard", "external"]).unwrap();
+        assert_eq!(a.commit_guard, Guard::External);
     }
 }

@@ -13,7 +13,7 @@ use futures::FutureExt;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use voidfs_core::ids::{ShardHash, Timestamp};
-use voidfs_core::model::{Actor, Attrs, Extent, Op};
+use voidfs_core::model::{Actor, Attrs, CommitGuard, Extent, Op};
 use voidfs_core::names::Key;
 use voidfs_core::ops::{self, Precondition};
 
@@ -71,6 +71,19 @@ impl Sim {
         }
         Some(out)
     }
+}
+
+#[tokio::test]
+async fn an_external_pool_is_collected_without_conditional_writes() {
+    let sim = Sim::new();
+    // The bucket rejects conditional writes; with the external guard, none is sent (format §7.3).
+    sim.mem.set_hook(Some(Arc::new(|op, _| futures::future::ready(if op == MemOp::PutNew { Fault::Fail } else { Fault::None }).boxed())));
+    let pool = Pool::open_as(sim.store.clone(), 64 << 20, sim.clock.clone(), CommitGuard::External).await.unwrap();
+    garbage(&pool, b"external").await;
+    sim.clock.advance(SECOND);
+    assert_eq!(step(&pool, &offline()).await.unwrap().outcome, Outcome::Deleted { objects: 1, bytes: 8 });
+    assert!(!sim.has(b"external").await);
+    assert!(sim.store.get(PENDING).await.unwrap().is_none());
 }
 
 fn offline() -> Options {
