@@ -48,6 +48,18 @@ const LOG_FETCH_PARALLELISM: usize = 32;
 const DRIVE_LOAD_PARALLELISM: usize = 8;
 /// Shards and pages remembered as safe to reference without uploading (format §12.4).
 const REUSE_CAPACITY: usize = 1 << 20;
+/// Transactions in one commit, at most (format §7.1)...
+const BATCH_TXNS: usize = 256;
+/// ...and their size as encoded, unless the first alone is larger, so that log entries stay
+/// quick to replay.
+const BATCH_BYTES: usize = 1 << 20;
+/// How many times a batch is planned again after another authority wrote the sequence number it
+/// was for (format §7.2), before its transactions are handed back to be retried.
+const BATCH_ATTEMPTS: u32 = 8;
+/// The longest a transaction waits for the log. What it references was checked for garbage
+/// collection before it was queued, and must be committed within 12 hours of that check (format
+/// §12.4), of which a request body may take 6.
+const QUEUE_MAX: Duration = Duration::from_secs(3600);
 
 fn log_path(id: &DriveId, seq: u64) -> String {
     format!("drives/{id}/log/{seq:020}.json")
@@ -75,28 +87,43 @@ pub struct FeedBatch {
     pub changes: Vec<FeedChange>,
 }
 
-fn feed_for(commit: &Commit, before: &DriveState, after: &DriveState) -> FeedBatch {
-    let mut changes = Vec::new();
-    for (i, txn) in commit.txns.iter().enumerate() {
-        let v = VersionId::new(commit.seq, i as u32);
-        for c in &txn.changes {
-            if let voidfs_core::model::Change::Create(c) = c
-                && c.oid != txn.target && c.kind == Kind::Folder && before.record(&c.oid).is_none()
-                    && let Some(key) = after.key_of(&c.oid) {
-                        changes.push(FeedChange { op: "create", key, from_key: None, object_id: c.oid.clone(), version_id: v, kind: Kind::Folder });
-                    }
-        }
-        let kind = after.kind(&txn.target).unwrap_or(Kind::File);
-        let (key, from_key) = match txn.op {
-            Op::Delete => (before.key_of(&txn.target), None),
-            Op::Rename => (after.key_of(&txn.target), before.key_of(&txn.target)),
-            _ => (after.key_of(&txn.target), None),
-        };
-        if let Some(key) = key {
-            changes.push(FeedChange { op: txn.op.as_str(), key, from_key, object_id: txn.target.clone(), version_id: v, kind });
-        }
+/// Adds the feed changes of `txn`, version `v`, given the drive's state just before and just
+/// after it.
+fn feed_of(txn: &Txn, v: VersionId, before: &DriveState, after: &DriveState, changes: &mut Vec<FeedChange>) {
+    for c in &txn.changes {
+        if let voidfs_core::model::Change::Create(c) = c
+            && c.oid != txn.target && c.kind == Kind::Folder && before.record(&c.oid).is_none()
+                && let Some(key) = after.key_of(&c.oid) {
+                    changes.push(FeedChange { op: "create", key, from_key: None, object_id: c.oid.clone(), version_id: v, kind: Kind::Folder });
+                }
     }
-    FeedBatch { seq: commit.seq, time: commit.time, changes }
+    let kind = after.kind(&txn.target).unwrap_or(Kind::File);
+    let (key, from_key) = match txn.op {
+        Op::Delete => (before.key_of(&txn.target), None),
+        Op::Rename => (after.key_of(&txn.target), before.key_of(&txn.target)),
+        _ => (after.key_of(&txn.target), None),
+    };
+    if let Some(key) = key {
+        changes.push(FeedChange { op: txn.op.as_str(), key, from_key, object_id: txn.target.clone(), version_id: v, kind });
+    }
+}
+
+/// Applies `commit` a transaction at a time, so that each one's feed changes name keys as they
+/// were just before and after it, not after the whole commit.
+fn apply_logged(state: &DriveState, commit: &Commit) -> Result<(DriveState, FeedBatch), voidfs_core::state::StateError> {
+    let mut changes = Vec::new();
+    let mut next: Option<DriveState> = None;
+    for (i, txn) in commit.txns.iter().enumerate() {
+        let before = next.as_ref().unwrap_or(state);
+        let after = before.apply_txn_of(commit.seq, i as u32, commit.time, txn)?;
+        feed_of(txn, VersionId::new(commit.seq, i as u32), before, &after, &mut changes);
+        next = Some(after);
+    }
+    let next = match next {
+        Some(n) => n,
+        None => state.apply(commit)?,
+    };
+    Ok((next, FeedBatch { seq: commit.seq, time: commit.time, changes }))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -249,12 +276,30 @@ async fn rows_of<T: for<'de> Deserialize<'de>>(pages: &mut (impl futures::Stream
 // ---------------------------------------------------------------------------------------------
 // Drives
 
+/// A transaction's plan: it checks the transaction's preconditions against the state it is given
+/// and returns the transaction.
+type Plan = Box<dyn FnMut(&DriveState) -> Result<Txn, CommitError> + Send>;
+
+/// What a commit answers: the transaction's version, and the drive's state just after it.
+pub type Committed = Result<(VersionId, Arc<DriveState>), CommitError>;
+
+/// A mutation waiting for its drive's log.
+struct Waiting {
+    plan: Plan,
+    reply: tokio::sync::oneshot::Sender<Committed>,
+    /// When it was queued, on the monotonic clock.
+    since: Duration,
+}
+
 pub struct Drive {
     pub id: DriveId,
     pub alias: String,
     pub desc: DriveDescriptor,
     state: RwLock<Arc<DriveState>>,
+    /// Held while a batch is committed, and by anything that must see every acknowledged write.
     commit_lock: tokio::sync::Mutex<Cadence>,
+    /// Mutations waiting for the next commit, in the order they arrived.
+    queue: std::sync::Mutex<VecDeque<Waiting>>,
     feed: RwLock<VecDeque<FeedBatch>>,
     /// The oldest seq the feed can still report changes after.
     feed_floor: RwLock<u64>,
@@ -267,7 +312,8 @@ pub struct Drive {
 pub enum CommitError {
     /// The request is invalid against the current state.
     Op(OpError),
-    /// Another writer changed what this commit was based on; plan again.
+    /// Not committed, and worth trying again: what the plan was based on has changed, another
+    /// authority kept winning the log, or the log was too busy for too long.
     Retry,
     Other(anyhow::Error),
 }
@@ -294,6 +340,7 @@ impl Drive {
             desc,
             state: RwLock::new(Arc::new(state)),
             commit_lock: tokio::sync::Mutex::new(cadence),
+            queue: std::sync::Mutex::new(VecDeque::new()),
             feed: RwLock::new(VecDeque::new()),
             feed_floor: RwLock::new(floor),
             notify,
@@ -327,9 +374,9 @@ impl Drive {
         }
     }
 
-    fn install(&self, state: DriveState, batch: FeedBatch) {
+    fn install(&self, state: Arc<DriveState>, batch: FeedBatch) {
         let seq = state.seq();
-        *self.state.write().unwrap() = Arc::new(state);
+        *self.state.write().unwrap() = state;
         self.push_feed(batch);
         let _ = self.notify.send(seq);
     }
@@ -572,8 +619,8 @@ impl Pool {
             if commit.seq != state.seq() + 1 {
                 break; // a gap: stop at it (format §8.4)
             }
-            let next = state.apply(&commit).with_context(|| format!("applying {name}"))?;
-            out.push(feed_for(&commit, state, &next));
+            let (next, batch) = apply_logged(state, &commit).with_context(|| format!("applying {name}"))?;
+            out.push(batch);
             *state = next;
             cadence.add(len);
         }
@@ -927,46 +974,180 @@ impl Pool {
     // -----------------------------------------------------------------------------------------
     // Commits
 
-    /// Plans a transaction against the drive's current state and commits it (format §7).
-    /// `plan` runs under the drive's commit lock, so preconditions it checks are sound.
-    /// Shards and pages the transaction references must already be stored.
-    pub async fn commit(
-        &self,
-        d: &Drive,
-        plan: impl FnOnce(&DriveState) -> Result<Txn, CommitError>,
-    ) -> Result<(VersionId, Arc<DriveState>), CommitError> {
-        let mut cadence = d.commit_lock.lock().await;
-        let cur = d.snapshot();
-        let txn = plan(&cur)?;
-        let now = self.clock.now();
-        let time = cur.time().map_or(now, |t| t.max(now));
-        let commit = Commit { format: 1, seq: cur.seq() + 1, time, authority: self.authority.clone(), txns: vec![txn] };
-        let next = cur.apply(&commit).map_err(|e| CommitError::Other(anyhow!("planned transaction does not apply: {e}")))?;
-        let bytes = Bytes::from(serde_json::to_vec(&commit).map_err(anyhow::Error::from)?);
-        let len = bytes.len();
-        if !self.create(&log_path(&d.id, commit.seq), bytes).await? {
-            // Another authority wrote this sequence number: catch up and ask for a new plan.
-            let mut s = (*cur).clone();
-            let batches = self.replay(&d.id, &mut s, &mut cadence).await?;
-            let mut last = None;
-            for b in batches {
-                last = Some(b.clone());
-                d.push_feed(b);
+    /// Commits a transaction to the drive's log (format §7), in one log entry with whatever else
+    /// is waiting: the transactions that queue up while an entry is being written go into the next
+    /// one together.
+    ///
+    /// `plan` checks the transaction's preconditions against the state it is given, the drive's
+    /// state plus the transactions before it in the same commit, and returns the transaction. It
+    /// may run more than once, and only its last run counts: again after another authority wrote
+    /// the sequence number the commit was for (format §7.2), and in the next commit if this one is
+    /// full. Shards and pages the transaction references must already be stored.
+    ///
+    /// Answers the transaction's version and the drive's state just after it, which has the
+    /// commit's earlier transactions in it and not its later ones.
+    pub async fn commit(self: &Arc<Self>, d: &Arc<Drive>, plan: impl FnMut(&DriveState) -> Result<Txn, CommitError> + Send + 'static) -> Committed {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        d.queue.lock().unwrap().push_back(Waiting { plan: Box::new(plan), reply, since: self.clock.mono() });
+        // A task of its own, so that a request that goes away cannot stop a commit that others
+        // are waiting on.
+        tokio::spawn(self.clone().drain(d.clone()));
+        answer.await.unwrap_or_else(|_| Err(CommitError::Other(anyhow!("the commit was abandoned"))))
+    }
+
+    /// Commits what is waiting on `d`, a batch at a time, until nothing is. Every mutation starts
+    /// one of these, and whichever holds the commit lock takes everything waiting, so a batch is
+    /// what queued up while the one before it was being written.
+    async fn drain(self: Arc<Self>, d: Arc<Drive>) {
+        loop {
+            // Taken for each batch, so that forks and deletions of the drive get their turn.
+            let mut cadence = d.commit_lock.lock().await;
+            let batch: Vec<Waiting> = {
+                let mut q = d.queue.lock().unwrap();
+                let n = q.len().min(BATCH_TXNS);
+                q.drain(..n).collect()
+            };
+            if batch.is_empty() {
+                return;
             }
-            *d.state.write().unwrap() = Arc::new(s);
-            if let Some(b) = last {
-                let _ = d.notify.send(b.seq);
+            let rest = self.commit_batch(&d, &mut cadence, batch).await;
+            let mut q = d.queue.lock().unwrap();
+            for w in rest.into_iter().rev() {
+                q.push_front(w);
             }
-            return Err(CommitError::Retry);
         }
-        let batch = feed_for(&commit, &cur, &next);
-        let next = Arc::new(next);
-        d.install((*next).clone(), batch);
-        cadence.add(len);
-        if cadence.due() {
-            self.checkpoint(&d.id, &next, &mut cadence).await;
+    }
+
+    /// Plans `batch` in order, each transaction against the state the ones before it leave,
+    /// writes those that plan as one commit, and answers each mutation. Returns the mutations that
+    /// did not fit, to wait for the next commit.
+    ///
+    /// A mutation is answered only once the commit is written, unless its plan failed against
+    /// the drive's state as installed, before any transaction of the batch: a failure may rest
+    /// on an earlier transaction that is never written.
+    async fn commit_batch(&self, d: &Drive, cadence: &mut Cadence, batch: Vec<Waiting>) -> Vec<Waiting> {
+        let now = self.clock.mono();
+        let (mut batch, late): (Vec<Waiting>, Vec<Waiting>) = batch.into_iter().partition(|w| now.saturating_sub(w.since) <= QUEUE_MAX);
+        for w in late {
+            let _ = w.reply.send(Err(CommitError::Retry));
         }
-        Ok((VersionId::new(commit.seq, 0), next))
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let cur = d.snapshot();
+            let now = self.clock.now();
+            let (seq, time) = (cur.seq() + 1, cur.time().map_or(now, |t| t.max(now)));
+            let mut state = cur.clone();
+            let (mut txns, mut bytes, mut changes) = (Vec::new(), 0, Vec::new());
+            let mut held: Vec<(Waiting, Committed)> = Vec::new();
+            let mut rest = Vec::new();
+            let mut waiting = batch.into_iter();
+            while let Some(mut w) = waiting.next() {
+                let planned = (w.plan)(&state).and_then(|txn| {
+                    let len = serde_json::to_vec(&txn).map_err(anyhow::Error::from)?.len();
+                    Ok((txn, len))
+                });
+                let (txn, len) = match planned {
+                    Ok(t) => t,
+                    Err(e) if txns.is_empty() => {
+                        let _ = w.reply.send(Err(e));
+                        continue;
+                    }
+                    Err(e) => {
+                        held.push((w, Err(e)));
+                        continue;
+                    }
+                };
+                if !txns.is_empty() && bytes + len > BATCH_BYTES {
+                    rest.push(w);
+                    rest.extend(waiting);
+                    break;
+                }
+                let v = VersionId::new(seq, txns.len() as u32);
+                match state.apply_txn_of(seq, v.idx, time, &txn) {
+                    Ok(next) => {
+                        let next = Arc::new(next);
+                        feed_of(&txn, v, &state, &next, &mut changes);
+                        held.push((w, Ok((v, next.clone()))));
+                        state = next;
+                        bytes += len;
+                        txns.push(txn);
+                    }
+                    Err(e) => {
+                        let e = CommitError::Other(anyhow!("planned transaction does not apply: {e}"));
+                        if txns.is_empty() {
+                            let _ = w.reply.send(Err(e));
+                        } else {
+                            held.push((w, Err(e)));
+                        }
+                    }
+                }
+            }
+            if txns.is_empty() {
+                return rest;
+            }
+            let commit = Commit { format: 1, seq, time, authority: self.authority.clone(), txns };
+            let written = match serde_json::to_vec(&commit) {
+                Ok(bytes) => {
+                    let len = bytes.len();
+                    self.create(&log_path(&d.id, seq), Bytes::from(bytes)).await.map(|created| created.then_some(len))
+                }
+                Err(e) => Err(e.into()),
+            };
+            match written {
+                Ok(Some(len)) => {
+                    d.install(state.clone(), FeedBatch { seq, time, changes });
+                    cadence.add(len);
+                    if cadence.due() {
+                        self.checkpoint(&d.id, &state, cadence).await;
+                    }
+                    for (w, answer) in held {
+                        let _ = w.reply.send(answer);
+                    }
+                    return rest;
+                }
+                // Another authority wrote this sequence number: catch up, and plan everything
+                // again against what it wrote (format §7.2).
+                Ok(None) => {
+                    let failed = match self.catch_up(d, &cur, cadence).await {
+                        Err(e) => Some(format!("catching up with the log: {e:#}")),
+                        Ok(()) if attempts >= BATCH_ATTEMPTS => None,
+                        Ok(()) => {
+                            batch = held.into_iter().map(|(w, _)| w).chain(rest).collect();
+                            continue;
+                        }
+                    };
+                    for (w, _) in held {
+                        let _ = w.reply.send(Err(failed.as_ref().map_or(CommitError::Retry, |e| CommitError::Other(anyhow!("{e}")))));
+                    }
+                    return rest;
+                }
+                // Whether it was written is not known, so none of it may be reported as done.
+                Err(e) => {
+                    for (w, _) in held {
+                        let _ = w.reply.send(Err(CommitError::Other(anyhow!("writing log entry {seq}: {e:#}"))));
+                    }
+                    return rest;
+                }
+            }
+        }
+    }
+
+    /// Applies the commits another authority wrote after `cur`, the drive's state, and installs
+    /// the result.
+    async fn catch_up(&self, d: &Drive, cur: &DriveState, cadence: &mut Cadence) -> anyhow::Result<()> {
+        let mut s = cur.clone();
+        let batches = self.replay(&d.id, &mut s, cadence).await?;
+        let mut last = None;
+        for b in batches {
+            last = Some(b.seq);
+            d.push_feed(b);
+        }
+        *d.state.write().unwrap() = Arc::new(s);
+        if let Some(seq) = last {
+            let _ = d.notify.send(seq);
+        }
+        Ok(())
     }
 
     /// The drive's state at instant `t`, rebuilt from its checkpoints and log.
@@ -1007,22 +1188,81 @@ mod tests {
     use futures::FutureExt;
     use voidfs_core::model::{Actor, Attrs, Change, CreateChange, RemoveChange, SetChange};
     use voidfs_core::names::Key;
-    use voidfs_core::ops::{self, Precondition};
+    use voidfs_core::ops::{self, AttrsPatch, OpError, Precondition};
 
     use super::*;
     use crate::store::{Fault, MemOp, MemStore, Store};
 
     const HOUR: Duration = Duration::from_secs(3600);
 
-    async fn put(pool: &Pool, d: &Drive, key: &str, data: &'static [u8]) -> VersionId {
+    async fn put(pool: &Arc<Pool>, d: &Arc<Drive>, key: &str, data: &'static [u8]) -> VersionId {
+        let desc = content(pool, data).await;
+        pool.commit(d, put_plan(key, &desc, Precondition::default(), &Arc::default())).await.unwrap().0
+    }
+
+    /// Stores `data` and describes it.
+    async fn content(pool: &Pool, data: &'static [u8]) -> ContentDescriptor {
         let e = voidfs_core::content::from_bytes(&Bytes::from_static(data), pool.params);
         pool.write_shards(&e.new_shards).await.unwrap();
-        let desc = pool.describe(e.extents).await.unwrap();
+        pool.describe(e.extents).await.unwrap()
+    }
+
+    type TestPlan = Box<dyn FnMut(&DriveState) -> Result<Txn, CommitError> + Send>;
+
+    /// Puts `desc` at `key` under `pre`, counting its runs in `runs`.
+    fn put_plan(key: &str, desc: &ContentDescriptor, pre: Precondition, runs: &Arc<AtomicUsize>) -> TestPlan {
+        let (key, desc, runs) = (key.to_owned(), desc.clone(), runs.clone());
+        Box::new(move |s| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(ops::put(s, &key, desc.clone(), Attrs::default(), Op::Put, &pre, &Actor::system())?)
+        })
+    }
+
+    fn rename_plan(src: &str, dst: &str) -> TestPlan {
+        let (src, dst) = (src.to_owned(), dst.to_owned());
+        Box::new(move |s| Ok(ops::rename(s, &src, &dst, false, &AttrsPatch::default(), &Precondition::default(), &Actor::system())?))
+    }
+
+    fn delete_plan(key: &str) -> TestPlan {
         let key = key.to_owned();
-        pool.commit(d, |s| Ok(ops::put(s, &key, desc, Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?))
-            .await
-            .unwrap()
-            .0
+        Box::new(move |s| ops::delete(s, &key, &Precondition::default(), &Actor::system())?.ok_or(CommitError::Op(OpError::NoSuchKey)))
+    }
+
+    fn absent() -> Precondition {
+        Precondition { if_none_match_any: true, ..Default::default() }
+    }
+
+    /// Commits `plans` together: they queue up while the log is busy, then go into as few
+    /// commits as the caps allow. Answers in their order.
+    async fn batch(pool: &Arc<Pool>, d: &Arc<Drive>, plans: Vec<TestPlan>) -> Vec<Committed> {
+        let busy = d.commit_lock.lock().await;
+        let n = plans.len();
+        let tasks: Vec<_> = plans
+            .into_iter()
+            .map(|p| {
+                let (pool, d) = (pool.clone(), d.clone());
+                tokio::spawn(async move { pool.commit(&d, p).await })
+            })
+            .collect();
+        while d.queue.lock().unwrap().len() < n {
+            tokio::task::yield_now().await;
+        }
+        drop(busy);
+        futures::future::join_all(tasks).await.into_iter().map(Result::unwrap).collect()
+    }
+
+    fn version(a: &Committed) -> VersionId {
+        a.as_ref().map(|(v, _)| *v).unwrap_or_else(|e| panic!("{e:?}"))
+    }
+
+    /// The drive's log, as stored.
+    async fn log(store: &Store, d: &Drive) -> Vec<Commit> {
+        let dir = format!("drives/{}/log/", d.id);
+        let mut out = Vec::new();
+        for name in store.list_files(&dir, None).await.unwrap() {
+            out.push(serde_json::from_slice(&store.get(&format!("{dir}{name}")).await.unwrap().unwrap()).unwrap());
+        }
+        out
     }
 
     async fn read(pool: &Pool, d: &Drive, key: &str) -> Option<Vec<u8>> {
@@ -1086,28 +1326,232 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `p2` has not seen `p1`'s commit, so its batch claims seq 1 and loses the race. Nothing it
+    /// planned is reported: it catches up and plans the batch again against `p1`'s commit, where
+    /// a precondition that held before no longer does (format §7.2).
+    async fn lose_a_race(p1: &Arc<Pool>, p2: &Arc<Pool>) {
+        let (d1, d2) = (p1.drive("shared").unwrap(), p2.drive("shared").unwrap());
+        put(p1, &d1, "x", b"from one").await;
+        let two = content(p2, b"from two").await;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let answers = batch(p2, &d2, vec![
+            put_plan("y", &two, absent(), &runs),
+            put_plan("x", &two, absent(), &runs),
+            put_plan("z", &two, Precondition::default(), &runs),
+        ])
+        .await;
+        assert_eq!(runs.load(Ordering::SeqCst), 6, "every plan ran again after catching up");
+        assert_eq!(version(&answers[0]), VersionId::new(2, 0));
+        assert!(matches!(answers[1], Err(CommitError::Op(OpError::PreconditionFailed { current: Some(v) })) if v == VersionId::new(1, 0)));
+        assert_eq!(version(&answers[2]), VersionId::new(2, 1));
+        assert_eq!(d2.snapshot().seq(), 2);
+        let log = log(&p2.store, &d2).await;
+        assert_eq!(log.iter().map(|c| (c.seq, c.authority.as_str(), c.txns.len())).collect::<Vec<_>>(), [(1, p1.authority.as_str(), 1), (2, p2.authority.as_str(), 2)]);
+        let fresh = Pool::open_as(p2.store.clone(), 1 << 20, Clock::System, p2.desc.commit_guard).await.unwrap();
+        let d = fresh.drive("shared").unwrap();
+        for (key, data) in [("x", &b"from one"[..]), ("y", b"from two"), ("z", b"from two")] {
+            assert_eq!(read(&fresh, &d, key).await.as_deref(), Some(data), "{key}");
+        }
+    }
+
     #[tokio::test]
     async fn a_second_authority_cannot_fork_history() {
         let store = Store::memory().unwrap();
         let p1 = Pool::open(store.clone(), 1 << 20).await.unwrap();
-        let d1 = p1.create_drive("shared", None).await.unwrap();
+        p1.create_drive("shared", None).await.unwrap();
         let p2 = Pool::open(store.clone(), 1 << 20).await.unwrap();
-        let d2 = p2.drive("shared").unwrap();
-        put(&p1, &d1, "x", b"from one").await;
-        // p2 has not seen p1's commit: its first attempt must be refused, then it catches up.
-        let e = voidfs_core::content::from_bytes(&Bytes::from_static(b"from two"), p2.params);
-        p2.write_shards(&e.new_shards).await.unwrap();
-        let desc = p2.describe(e.extents).await.unwrap();
-        let first = p2
-            .commit(&d2, |s| Ok(ops::put(s, "y", desc.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?))
-            .await;
-        assert!(matches!(first, Err(CommitError::Retry)));
-        assert_eq!(d2.snapshot().seq(), 1, "caught up with the other authority's commit");
-        let (v, _) = p2
-            .commit(&d2, |s| Ok(ops::put(s, "y", desc, Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?))
-            .await
-            .unwrap();
-        assert_eq!(v, VersionId::new(2, 0));
+        lose_a_race(&p1, &p2).await;
+    }
+
+    /// A batch that keeps losing is handed back to be retried, and nothing it planned is in the
+    /// log.
+    #[tokio::test]
+    async fn a_batch_that_keeps_losing_is_handed_back() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let store = Store::Mem(mem.clone());
+        let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = content(&pool, b"one").await;
+        // Another authority writes each sequence number just before this one tries to.
+        let rival = store.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            let won = (op == MemOp::PutNew && path.contains("/log/")).then(|| {
+                let seq: u64 = path.rsplit('/').next().and_then(|n| n.strip_suffix(".json")).unwrap().parse().unwrap();
+                (path.to_owned(), Bytes::from(serde_json::to_vec(&commit(seq, vec![file(seq as usize)])).unwrap()))
+            });
+            let rival = rival.clone();
+            async move {
+                if let Some((path, bytes)) = won {
+                    rival.put(&path, bytes).await.unwrap();
+                }
+                Fault::None
+            }
+            .boxed()
+        })));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let answers = batch(&pool, &d, vec![put_plan("a", &one, Precondition::default(), &runs), put_plan("b", &one, Precondition::default(), &runs)]).await;
+        mem.set_hook(None);
+        assert!(answers.iter().all(|a| matches!(a, Err(CommitError::Retry))));
+        assert_eq!(runs.load(Ordering::SeqCst), 2 * BATCH_ATTEMPTS as usize);
+        assert_eq!(d.snapshot().seq(), BATCH_ATTEMPTS as u64, "caught up with each of the rival's commits");
+        assert!(log(&store, &d).await.iter().all(|c| c.authority == "test"));
+        assert_eq!(version(&pool.commit(&d, put_plan("a", &one, Precondition::default(), &runs)).await), VersionId::new(BATCH_ATTEMPTS as u64 + 1, 0));
+    }
+
+    /// Mutations that wait together go into one commit, each planned against the state the ones
+    /// before it leave, and each answered with the drive's state just after it (format §7.1).
+    #[tokio::test]
+    async fn a_batch_plans_each_transaction_after_the_ones_before_it() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let (one, two) = (content(&pool, b"one").await, content(&pool, b"two").await);
+        let entries = count(&mem, |op, path| op == MemOp::PutNew && path.contains("/log/"));
+        let runs = Arc::new(AtomicUsize::new(0));
+        // Against the drive as it is, only the first would succeed.
+        let answers = batch(&pool, &d, vec![
+            put_plan("a", &one, absent(), &runs),
+            put_plan("a", &two, Precondition { if_match: Some(one.etag()), ..Default::default() }, &runs),
+            rename_plan("a", "b"),
+        ])
+        .await;
+        assert_eq!(answers.iter().map(version).collect::<Vec<_>>(), [VersionId::new(1, 0), VersionId::new(1, 1), VersionId::new(1, 2)]);
+        assert_eq!(entries.load(Ordering::SeqCst), 1, "one log entry");
+        let etag = |a: &Committed, key: &str| {
+            let s = &a.as_ref().unwrap().1;
+            s.lookup(&Key::parse(key).unwrap()).and_then(|o| s.record(&o)).map(|r| r.etag.clone())
+        };
+        assert_eq!(etag(&answers[0], "a"), Some(one.etag()));
+        assert_eq!(etag(&answers[1], "a"), Some(two.etag()));
+        assert_eq!((etag(&answers[2], "a"), etag(&answers[2], "b")), (None, Some(two.etag())));
+        assert_eq!(d.snapshot().rows(), answers[2].as_ref().unwrap().1.rows());
+        mem.set_hook(None);
+        let again = Pool::open(pool.store.clone(), 1 << 20).await.unwrap();
+        assert_eq!(again.drive("d").unwrap().snapshot().rows(), d.snapshot().rows(), "the log entry replays to the same state");
+    }
+
+    /// A transaction that fails gets its own error, and the rest of its batch commits without
+    /// it. A failure that rests on an earlier transaction of the batch is reported only once that
+    /// transaction is written.
+    #[tokio::test]
+    async fn a_failed_transaction_leaves_the_rest_of_its_batch() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = content(&pool, b"one").await;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let plans = || {
+            vec![
+                delete_plan("missing"),
+                put_plan("a", &one, absent(), &runs),
+                put_plan("a", &one, absent(), &runs),
+                put_plan("b", &one, Precondition::default(), &runs),
+            ]
+        };
+        // While the log cannot be written, only the failure planned against the drive as it is
+        // is reported as such.
+        on_put_new(&mem, Fault::Fail);
+        let answers = batch(&pool, &d, plans()).await;
+        assert!(matches!(answers[0], Err(CommitError::Op(OpError::NoSuchKey))));
+        assert!(answers[1..].iter().all(|a| matches!(a, Err(CommitError::Other(_)))));
+        assert_eq!(d.snapshot().seq(), 0);
+        mem.set_hook(None);
+        let answers = batch(&pool, &d, plans()).await;
+        assert!(matches!(answers[0], Err(CommitError::Op(OpError::NoSuchKey))));
+        assert_eq!(version(&answers[1]), VersionId::new(1, 0));
+        assert!(matches!(answers[2], Err(CommitError::Op(OpError::PreconditionFailed { current: Some(v) })) if v == VersionId::new(1, 0)));
+        assert_eq!(version(&answers[3]), VersionId::new(1, 1));
+        let s = d.snapshot();
+        let a = s.lookup(&Key::parse("a").unwrap()).unwrap();
+        assert_eq!(s.history(&a).unwrap().iter().map(|r| r.version).collect::<Vec<_>>(), [VersionId::new(1, 0)]);
+    }
+
+    /// A batched commit's feed has each transaction's changes in order, with keys as they were
+    /// just before and after that transaction, and each transaction is a version in its object's
+    /// history. A server that replays the log reports the same.
+    #[tokio::test]
+    async fn a_batched_commit_feeds_and_records_each_transaction() {
+        let pool = Pool::open(Store::memory().unwrap(), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = content(&pool, b"one").await;
+        let answers = batch(&pool, &d, vec![put_plan("f/a", &one, Precondition::default(), &Arc::default()), rename_plan("f/a", "g/b"), delete_plan("g/b")]).await;
+        let v = |i| VersionId::new(1, i);
+        assert_eq!(answers.iter().map(version).collect::<Vec<_>>(), [v(0), v(1), v(2)]);
+        let feed = |batches: Vec<FeedBatch>| {
+            batches.iter().flat_map(|b| b.changes.iter().map(|c| (b.seq, c.op, c.key.clone(), c.from_key.clone(), c.version_id))).collect::<Vec<_>>()
+        };
+        let s = |k: &str| k.to_owned();
+        let expected = vec![
+            (1, "create", s("f/"), None, v(0)),
+            (1, "put", s("f/a"), None, v(0)),
+            (1, "create", s("g/"), None, v(1)),
+            (1, "rename", s("g/b"), Some(s("f/a")), v(1)),
+            (1, "delete", s("g/b"), None, v(2)),
+        ];
+        assert_eq!(feed(d.changes_since(0).unwrap()), expected);
+        let oid = answers[0].as_ref().unwrap().1.lookup(&Key::parse("f/a").unwrap()).unwrap();
+        let history = d.snapshot().history(&oid).unwrap().iter().map(|r| (r.version, r.op)).collect::<Vec<_>>();
+        assert_eq!(history, [(v(0), Op::Put), (v(1), Op::Rename), (v(2), Op::Delete)]);
+        let replayed = pool.replay(&d.id, &mut DriveState::empty(), &mut Cadence::default()).await.unwrap();
+        assert_eq!(feed(replayed), expected, "replayed from the log");
+    }
+
+    /// A commit holds at most [`BATCH_TXNS`] transactions and, unless its first alone is larger,
+    /// [`BATCH_BYTES`] of them. The rest wait for the next.
+    #[tokio::test]
+    async fn batches_are_capped() {
+        let store = Store::memory().unwrap();
+        let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = content(&pool, b"x").await;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let plans = (0..BATCH_TXNS + 10).map(|i| put_plan(&format!("k{i}"), &one, Precondition::default(), &runs)).collect();
+        let versions: Vec<VersionId> = batch(&pool, &d, plans).await.iter().map(version).collect();
+        let expected: Vec<VersionId> = (0..BATCH_TXNS as u32).map(|i| VersionId::new(1, i)).chain((0..10).map(|i| VersionId::new(2, i))).collect();
+        assert_eq!(versions, expected);
+        // Transactions of about 80 KB: a file of 1,000 extents, all of one shard.
+        let e = voidfs_core::content::from_bytes(&Bytes::from_static(b"x"), pool.params);
+        let big = pool.describe(vec![e.extents[0]; 1000]).await.unwrap();
+        let plans = (0..30).map(|i| put_plan(&format!("big{i}"), &big, Precondition::default(), &runs)).collect();
+        let answers = batch(&pool, &d, plans).await;
+        let seqs: HashSet<u64> = answers.iter().map(|a| version(a).seq).collect();
+        let commits: Vec<Commit> = log(&store, &d).await.into_iter().filter(|c| seqs.contains(&c.seq)).collect();
+        assert!(commits.len() >= 3, "{} commits", commits.len());
+        assert_eq!(commits.iter().map(|c| c.txns.len()).sum::<usize>(), 30);
+        for c in &commits {
+            let size: usize = c.txns.iter().map(|t| serde_json::to_vec(t).unwrap().len()).sum();
+            assert!(c.txns.len() > 1 && size <= BATCH_BYTES, "seq {}: {} transactions, {size} bytes", c.seq, c.txns.len());
+        }
+        // A transaction larger than the cap commits, alone.
+        let huge = ContentDescriptor::Inline { extents: vec![e.extents[0]; 20_000] };
+        let answers = batch(&pool, &d, vec![put_plan("huge", &huge, Precondition::default(), &runs), put_plan("small", &one, Precondition::default(), &runs)]).await;
+        let first = version(&answers[0]);
+        assert_eq!(version(&answers[1]), VersionId::new(first.seq + 1, 0));
+        assert!(store.get(&log_path(&d.id, first.seq)).await.unwrap().unwrap().len() > BATCH_BYTES);
+    }
+
+    /// A mutation that waited longer than [`QUEUE_MAX`] for the log is handed back, not committed
+    /// so long after the garbage-collection checks it relied on (format §12.4).
+    #[tokio::test]
+    async fn a_mutation_that_waited_too_long_is_handed_back() {
+        let clock = Clock::manual("2026-09-28T00:00:00Z".parse().unwrap());
+        let pool = Pool::open_with(Store::memory().unwrap(), 1 << 20, clock.clone()).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = content(&pool, b"one").await;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let busy = d.commit_lock.lock().await;
+        let late = tokio::spawn({
+            let (pool, d, plan) = (pool.clone(), d.clone(), put_plan("a", &one, Precondition::default(), &runs));
+            async move { pool.commit(&d, plan).await.map(|(v, _)| v) }
+        });
+        while d.queue.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(QUEUE_MAX + Duration::from_secs(1));
+        drop(busy);
+        assert!(matches!(late.await.unwrap(), Err(CommitError::Retry)));
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "never planned");
+        assert_eq!(version(&pool.commit(&d, put_plan("a", &one, Precondition::default(), &runs)).await), VersionId::new(1, 0));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1157,18 +1601,11 @@ mod tests {
         let p1 = Pool::open_as(store.clone(), 1 << 20, Clock::System, CommitGuard::External).await.unwrap();
         let desc: PoolDescriptor = serde_json::from_slice(&mem.peek("voidfs.json").unwrap()).unwrap();
         assert_eq!(desc.commit_guard, CommitGuard::External);
-        let d1 = p1.create_drive("shared", None).await.unwrap();
+        p1.create_drive("shared", None).await.unwrap();
         // Two servers on one external pool break its rule, but show that the check before each
         // write finds a commit already there.
         let p2 = Pool::open_as(store.clone(), 1 << 20, Clock::System, CommitGuard::External).await.unwrap();
-        let d2 = p2.drive("shared").unwrap();
-        put(&p1, &d1, "x", b"from one").await;
-        let e = voidfs_core::content::from_bytes(&Bytes::from_static(b"from two"), p2.params);
-        p2.write_shards(&e.new_shards).await.unwrap();
-        let desc = p2.describe(e.extents).await.unwrap();
-        let plan = |s: &DriveState| Ok(ops::put(s, "y", desc.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?);
-        assert!(matches!(p2.commit(&d2, plan).await, Err(CommitError::Retry)));
-        assert_eq!(p2.commit(&d2, plan).await.unwrap().0, VersionId::new(2, 0));
+        lose_a_race(&p1, &p2).await;
         // A pool keeps its guard, whichever it has.
         let e = Pool::open(store, 1 << 20).await.err().unwrap();
         assert!(format!("{e:#}").contains("start it with --commit-guard external"), "{e:#}");
@@ -1332,10 +1769,7 @@ mod tests {
         let big = pool.describe(vec![e.extents[0]; 1000]).await.unwrap();
         let (mut logged, mut last) = (0, 0);
         while checkpoints(&store, &d).await.is_empty() {
-            let (v, _) = pool
-                .commit(&d, |s| Ok(ops::put(s, "big", big.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?))
-                .await
-                .unwrap();
+            let v = version(&pool.commit(&d, put_plan("big", &big, Precondition::default(), &Arc::default())).await);
             last = store.get(&log_path(&d.id, v.seq)).await.unwrap().unwrap().len() as u64;
             logged += last;
             assert!(v.seq < CHECKPOINT_EVERY, "no checkpoint after {logged} bytes of log");

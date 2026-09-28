@@ -349,11 +349,11 @@ fn mutation_response(v: VersionId, s: &DriveState, key: &str) -> http::response:
     b
 }
 
-async fn commit(app: &App, d: &Drive, plan: impl FnOnce(&DriveState) -> Result<voidfs_core::model::Txn, CommitError>) -> Result<(VersionId, Arc<DriveState>), S3Error> {
+async fn commit(app: &App, d: &Arc<Drive>, plan: impl FnMut(&DriveState) -> Result<voidfs_core::model::Txn, CommitError> + Send + 'static) -> Result<(VersionId, Arc<DriveState>), S3Error> {
     Ok(app.pool.commit(d, plan).await?)
 }
 
-async fn put(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Response, S3Error> {
+async fn put(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
     let key = ctx.key().to_owned();
     let attrs = ctx.attrs_for_put()?;
     let pre = ctx.precondition();
@@ -361,11 +361,11 @@ async fn put(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Respons
     let extents = ingest(&app.pool, reader).await?;
     let desc = app.pool.describe(extents).await?;
     let actor = ctx.actor();
-    let (v, s) = commit(app, d, |st| Ok(ops::put(st, &key, desc, attrs, Op::Put, &pre, &actor)?)).await?;
-    Ok(mutation_response(v, &s, &key).body(Body::empty()).unwrap())
+    let (v, s) = commit(app, d, move |st| Ok(ops::put(st, &key, desc.clone(), attrs.clone(), Op::Put, &pre, &actor)?)).await?;
+    Ok(mutation_response(v, &s, ctx.key()).body(Body::empty()).unwrap())
 }
 
-async fn copy(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> {
+async fn copy(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>) -> Result<Response, S3Error> {
     let raw = ctx.header("x-amz-copy-source").unwrap_or_default();
     let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy().into_owned();
     let (path, src_version) = match decoded.split_once("?versionId=") {
@@ -402,8 +402,8 @@ async fn copy(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error>
     let pre = ctx.precondition();
     let actor = ctx.actor();
     let desc = content.unwrap_or_else(ContentDescriptor::empty);
-    let (v, s) = commit(app, d, |st| Ok(ops::put(st, &key, desc, attrs, Op::Copy, &pre, &actor)?)).await?;
-    let r = s.lookup(&parse_key(&key)?).and_then(|o| s.record(&o).cloned()).ok_or_else(S3Error::no_key)?;
+    let (v, s) = commit(app, d, move |st| Ok(ops::put(st, &key, desc.clone(), attrs.clone(), Op::Copy, &pre, &actor)?)).await?;
+    let r = s.lookup(&parse_key(ctx.key())?).and_then(|o| s.record(&o).cloned()).ok_or_else(S3Error::no_key)?;
     let body = format!(
         "<CopyObjectResult xmlns=\"{S3_NS}\"><LastModified>{}</LastModified><ETag>{}</ETag></CopyObjectResult>",
         iso(r.time),
@@ -416,13 +416,13 @@ async fn copy(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error>
     Ok(resp)
 }
 
-async fn delete(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> {
+async fn delete(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>) -> Result<Response, S3Error> {
     let key = ctx.key().to_owned();
     let pre = ctx.precondition();
     let actor = ctx.actor();
     let r = app
         .pool
-        .commit(d, |st| match ops::delete(st, &key, &pre, &actor)? {
+        .commit(d, move |st| match ops::delete(st, &key, &pre, &actor)? {
             Some(t) => Ok(t),
             None => Err(CommitError::Op(ops::OpError::NoSuchKey)),
         })
@@ -478,10 +478,10 @@ pub async fn delete_objects(app: &Arc<App>, ctx: &Ctx, body: Body) -> Result<Res
             ));
             continue;
         }
-        let pre = Default::default();
+        let (k, pre, actor) = (key.clone(), Default::default(), actor.clone());
         let r = app
             .pool
-            .commit(&d, |st| match ops::delete(st, &key, &pre, &actor)? {
+            .commit(&d, move |st| match ops::delete(st, &k, &pre, &actor)? {
                 Some(t) => Ok(t),
                 None => Err(CommitError::Op(ops::OpError::NoSuchKey)),
             })
@@ -556,7 +556,7 @@ fn edit_range(edit: &Edit, size: u64) -> Vec<(u64, u64)> {
     }
 }
 
-async fn run_edit(app: &Arc<App>, ctx: &Ctx, d: &Drive, edit: Edit, size: Option<u64>) -> Result<Response, S3Error> {
+async fn run_edit(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, edit: Edit, size: Option<u64>) -> Result<Response, S3Error> {
     let key = ctx.key().to_owned();
     let pre = ctx.precondition();
     let patch = ctx.attrs_patch()?;
@@ -596,18 +596,19 @@ async fn run_edit(app: &Arc<App>, ctx: &Ctx, d: &Drive, edit: Edit, size: Option
         };
         app.pool.write_shards(&edited.new_shards).await?;
         let desc = app.pool.describe(edited.extents).await?;
+        let (key, patch, pre, actor) = (key.clone(), patch.clone(), pre.clone(), actor.clone());
         let r = app
             .pool
-            .commit(d, |st| {
+            .commit(d, move |st| {
                 let head = Key::parse(&key).ok().and_then(|k| st.lookup(&k)).and_then(|o| st.record(&o)).map(|r| r.head);
                 if head != base_head {
                     return Err(CommitError::Retry);
                 }
-                Ok(ops::write(st, &key, desc, &patch, &pre, &actor)?)
+                Ok(ops::write(st, &key, desc.clone(), &patch, &pre, &actor)?)
             })
             .await;
         match r {
-            Ok((v, s)) => return Ok(mutation_response(v, &s, &key).body(Body::empty()).unwrap()),
+            Ok((v, s)) => return Ok(mutation_response(v, &s, ctx.key()).body(Body::empty()).unwrap()),
             Err(CommitError::Retry) => continue,
             Err(e) => return Err(e.into()),
         }
@@ -615,14 +616,14 @@ async fn run_edit(app: &Arc<App>, ctx: &Ctx, d: &Drive, edit: Edit, size: Option
     Err(CommitError::Retry.into())
 }
 
-async fn write(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Response, S3Error> {
+async fn write(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
     let offset = header_u64(ctx, "x-voidfs-offset")?.ok_or_else(|| S3Error::invalid("x-voidfs-offset is required"))?;
     let size = header_u64(ctx, "x-voidfs-size")?;
     let data = BodyReader::new(body, ctx, MAX_EXTENSION_BODY)?.read_all().await?;
     run_edit(app, ctx, d, Edit::Write { offset, data }, size).await
 }
 
-async fn splice(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Response, S3Error> {
+async fn splice(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
     let offset = header_u64(ctx, "x-voidfs-offset")?.ok_or_else(|| S3Error::invalid("x-voidfs-offset is required"))?;
     let remove = header_u64(ctx, "x-voidfs-remove")?.unwrap_or(0);
     let data = BodyReader::new(body, ctx, MAX_EXTENSION_BODY)?.read_all().await?;
@@ -632,7 +633,7 @@ async fn splice(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Resp
     run_edit(app, ctx, d, Edit::Splice { offset, remove, data }, None).await
 }
 
-async fn patch(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Response, S3Error> {
+async fn patch(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
     let size = header_u64(ctx, "x-voidfs-size")?;
     let body = BodyReader::new(body, ctx, MAX_EXTENSION_BODY)?.read_all().await?;
     voidfs_core::patch::decode(&body).map_err(|e| S3Error::new(400, "InvalidPatch", e.to_string()))?;
@@ -642,7 +643,7 @@ async fn patch(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Respo
 // ---------------------------------------------------------------------------------------------
 // Rename, restore, attributes, history
 
-async fn rename(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> {
+async fn rename(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>) -> Result<Response, S3Error> {
     let raw = ctx.header("x-voidfs-source").ok_or_else(|| S3Error::invalid("x-voidfs-source is required"))?;
     let src = percent_encoding::percent_decode_str(raw).decode_utf8().map_err(|_| S3Error::invalid("x-voidfs-source is not UTF-8"))?.into_owned();
     let replace = ctx.header("x-voidfs-replace").is_some_and(|v| v.eq_ignore_ascii_case("true"));
@@ -650,11 +651,11 @@ async fn rename(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Erro
     let pre = ctx.precondition();
     let patch = ctx.attrs_patch()?;
     let actor = ctx.actor();
-    let (v, s) = commit(app, d, |st| Ok(ops::rename(st, &src, &dst, replace, &patch, &pre, &actor)?)).await?;
-    Ok(mutation_response(v, &s, &dst).body(Body::empty()).unwrap())
+    let (v, s) = commit(app, d, move |st| Ok(ops::rename(st, &src, &dst, replace, &patch, &pre, &actor)?)).await?;
+    Ok(mutation_response(v, &s, ctx.key()).body(Body::empty()).unwrap())
 }
 
-async fn restore(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> {
+async fn restore(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>) -> Result<Response, S3Error> {
     let key = ctx.key().to_owned();
     let pre = ctx.precondition();
     let actor = ctx.actor();
@@ -665,21 +666,21 @@ async fn restore(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Err
         (None, None) => Err(S3Error::invalid("versionId or x-voidfs-as-of is required")),
         (Some(v), None) => {
             let v: VersionId = v.parse().map_err(|_| S3Error::new(404, "NoSuchVersion", "no such version"))?;
-            let (nv, s) = commit(app, d, |st| Ok(ops::restore(st, &key, v, &pre, &actor)?)).await?;
-            Ok(mutation_response(nv, &s, &key).header("x-voidfs-restored-from", v.to_string()).body(Body::empty()).unwrap())
+            let (nv, s) = commit(app, d, move |st| Ok(ops::restore(st, &key, v, &pre, &actor)?)).await?;
+            Ok(mutation_response(nv, &s, ctx.key()).header("x-voidfs-restored-from", v.to_string()).body(Body::empty()).unwrap())
         }
         (None, Some(t)) => {
             let t: Timestamp = t.parse().map_err(|_| S3Error::invalid("x-voidfs-as-of is not an RFC 3339 timestamp"))?;
             if key.ends_with('/') {
                 let then = app.pool.state_at(d, t).await.map_err(|e| S3Error::invalid(format!("{e:#}")))?;
-                let (nv, s) = commit(app, d, |st| Ok(ops::restore_subtree(st, &then, &key, &actor)?)).await?;
-                Ok(mutation_response(nv, &s, &key).body(Body::empty()).unwrap())
+                let (nv, s) = commit(app, d, move |st| Ok(ops::restore_subtree(st, &then, &key, &actor)?)).await?;
+                Ok(mutation_response(nv, &s, ctx.key()).body(Body::empty()).unwrap())
             } else {
                 let snap = d.snapshot();
                 let oid = snap.lookup(&parse_key(&key)?).ok_or_else(S3Error::no_key)?;
                 let v = snap.as_of(&oid, t).map(|r| r.version).ok_or_else(|| S3Error::new(404, "NoSuchVersion", "the object did not exist then"))?;
-                let (nv, s) = commit(app, d, |st| Ok(ops::restore(st, &key, v, &pre, &actor)?)).await?;
-                Ok(mutation_response(nv, &s, &key).header("x-voidfs-restored-from", v.to_string()).body(Body::empty()).unwrap())
+                let (nv, s) = commit(app, d, move |st| Ok(ops::restore(st, &key, v, &pre, &actor)?)).await?;
+                Ok(mutation_response(nv, &s, ctx.key()).header("x-voidfs-restored-from", v.to_string()).body(Body::empty()).unwrap())
             }
         }
     }
@@ -724,7 +725,7 @@ struct AttrsBody {
     content_type: Option<String>,
 }
 
-async fn post_attrs(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Response, S3Error> {
+async fn post_attrs(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
     let body = BodyReader::new(body, ctx, MAX_SMALL_BODY)?.read_all().await?;
     let b: AttrsBody = serde_json::from_slice(&body).map_err(|e| S3Error::invalid(format!("attributes body: {e}")))?;
     let x = b.xattrs.unwrap_or_default();
@@ -739,8 +740,8 @@ async fn post_attrs(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<
     let key = ctx.key().to_owned();
     let pre = ctx.precondition();
     let actor = ctx.actor();
-    let (v, s) = commit(app, d, |st| Ok(ops::set_attrs(st, &key, &patch, &pre, &actor)?)).await?;
-    Ok(mutation_response(v, &s, &key).body(Body::empty()).unwrap())
+    let (v, s) = commit(app, d, move |st| Ok(ops::set_attrs(st, &key, &patch, &pre, &actor)?)).await?;
+    Ok(mutation_response(v, &s, ctx.key()).body(Body::empty()).unwrap())
 }
 
 /// `?x-voidfs-versions` (protocol §4.4).
@@ -875,7 +876,7 @@ async fn parts_of(app: &App, dir: &str) -> Result<Vec<PartRecord>, S3Error> {
     Ok(out)
 }
 
-async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Response, S3Error> {
+async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
     let key = ctx.key().to_owned();
     let (dir, rec) = load_upload(app, d, ctx.query.get("uploadId").unwrap_or_default(), &key).await?;
     let body = BodyReader::new(body, ctx, MAX_SMALL_BODY)?.read_all().await?;
@@ -908,17 +909,19 @@ async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Re
     let desc = app.pool.describe(content::normalize(extents)).await?;
     let pre = ctx.precondition();
     let actor = ctx.actor();
-    let (v, s) = commit(app, d, |st| Ok(ops::put(st, &key, desc, rec.attrs, Op::Put, &pre, &actor)?)).await?;
+    let attrs = rec.attrs;
+    let (v, s) = commit(app, d, move |st| Ok(ops::put(st, &key, desc.clone(), attrs.clone(), Op::Put, &pre, &actor)?)).await?;
     let _ = app.pool.store.delete_prefix(&dir).await;
-    let etag = s.lookup(&parse_key(&key)?).and_then(|o| s.record(&o).map(|r| r.etag.clone())).unwrap_or_default();
+    let key = ctx.key();
+    let etag = s.lookup(&parse_key(key)?).and_then(|o| s.record(&o).map(|r| r.etag.clone())).unwrap_or_default();
     let mut resp = xml(
         200,
         format!(
             "<CompleteMultipartUploadResult xmlns=\"{S3_NS}\"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
             xml_escape(ctx.bucket()),
-            xml_escape(&key),
+            xml_escape(key),
             xml_escape(ctx.bucket()),
-            xml_escape(&key),
+            xml_escape(key),
             xml_escape(&etag)
         ),
     );

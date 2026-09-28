@@ -33,6 +33,58 @@ how to check it. Expected effects are estimates, not measurements.
 
 ### Item 1. Group commit: one log write per batch, not per mutation
 
+**Status (28 September 2026): done.** Measured in
+[bench/results/group-commit](../bench/results/group-commit/README.md):
+- The probe's p50 stays flat from 1 to 8 at once: rename 13.9 / 20.7 / 26.1 / 26.3 ms, put 4 KiB
+  28.7 / 28.1 / 28.1 / 29.7 ms.
+- Over the 49 rows at 12 ms, p50 is half of `main`'s (geometric mean of the ratios 0.504; writes
+  0.325, edits 0.464). Fan-out puts went from 425 and 851 ms to 37 and 38 ms, renames and folder
+  moves from about 100 ms to 25–26.
+- Rows at or ahead of SpaceFS's ratio went from 6–7 to 17 in both runs.
+- The four small-write rows that garbage collection had made 3.5–7% slower now take 30–38 ms,
+  from 106–851; what is left of that difference can't be told apart from round trips (see the
+  README).
+- On loopback, p50 is 10% lower over the 49 rows (20% relative to the bare bucket in the same
+  run), so the committer's own costs don't show.
+- Multipart uploads at 8 at once have a 4–9% higher p50 and a 10% lower p90, with the same
+  throughput: their completions now land in one log entry, and the next uploads start together
+  and compete for connections. One at a time, they take the same as before.
+
+What was built, in `Pool::commit` ([pool.rs](../crates/voidfs-server/src/pool.rs)):
+- **Queue and committer.** A mutation queues its plan on the drive and starts a committer task.
+  Whichever holds the commit lock takes everything waiting (up to 256 transactions and 1 MiB
+  encoded, unless the first alone is larger) and plans it in order, each transaction against
+  the state the ones before it leave. The task is spawned, so a request that goes away cannot
+  stop a commit others wait on. The lock is taken per entry, so forks and hard deletes still get
+  their turn.
+- **Losing the race.** Plans may run again: after another authority wrote the sequence number
+  (format §7.2), the committer catches up and plans the whole batch again, up to eight times,
+  before handing `Retry` back. The alternative, handing `Retry` to every request, would turn one
+  lost race into a 503 for the whole batch. Planning again against the caught-up state is what a
+  client's retry would do, and a precondition that no longer holds fails then as it would have.
+  `run_edit` still gets `Retry` from its own head check, because only the request can compute the
+  edit's content again.
+- **Answers.** A request is answered once the entry holding it is written (§7.4), with the
+  drive's state just after its own transaction. A plan that fails against the drive as installed
+  is answered at once. One that fails after an earlier transaction of the batch waits for the
+  entry, because its failure may rest on a transaction that is never written; if the entry isn't
+  written, it gets the write's error.
+- **Garbage collection.** A mutation that has waited more than an hour for the log is handed back
+  with `Retry` rather than committed, so every commit stays well within 12 hours of the checks
+  it relies on (§12.4), of which a body may take 6.
+- **Change feed.** Each transaction's feed changes now come from the state just before and after
+  it, on commit and on replay. `feed_for` used the state after the whole commit, which named the
+  wrong keys once a commit held a put and then a rename of the same file.
+- **Unchanged:** the checkpoint cadence counts log entries and their bytes (§8.4), and a
+  checkpoint is still written under the lock after the entry that makes it due.
+
+What was left for later:
+- Rename at 8 at once takes two round trips: after an entry lands, the first new request starts
+  the next alone. A short hold before an entry, while the previous one had company, might bring
+  it to one; not tried.
+- Planning the next batch while an entry is in flight saves only CPU, a small part of a round
+  trip here, so it was not done.
+
 **Problem.** A drive commits one mutation per bucket round trip. `Pool::commit`
 ([pool.rs:619](../crates/voidfs-server/src/pool.rs#L619)) takes the drive's `commit_lock`
 (line 624) and holds it while it writes the log entry with a conditional PUT (line 632).
