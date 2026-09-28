@@ -199,7 +199,9 @@ every voidfs write row sits at its concurrency times that: 1.6 s at 8 at once, 6
 13 s at 64. Everything that only reads metadata or warm shards is two orders of magnitude
 ahead. The run took 28 minutes and sent about 10,000 requests to the bucket directly and 7,600
 to voidfs-server. Afterwards the voidfs pool held 5,992 objects, which were deleted
-(`voidfs-bench purge`).
+(`voidfs-bench purge`). A run's drives are hard-deleted at the end, so now garbage collection
+reclaims what they held: with the server stopped, `voidfs-server gc --offline --grace 0` does it
+at once.
 
 ## Findings: where voidfs is far from parity, and why
 
@@ -361,7 +363,7 @@ Copy them back with `gcloud compute scp` and commit them.
 ### Clean up
 
 ```bash
-aws s3 rm "s3://$BUCKET" --recursive     # the pool keeps every shard: voidfs has no GC yet
+aws s3 rm "s3://$BUCKET" --recursive     # everything: the pool and the bare target's objects
 aws s3api delete-bucket --bucket "$BUCKET"
 aws iam delete-access-key --user-name voidfs-bench --access-key-id <id>
 aws iam delete-user-policy --user-name voidfs-bench --policy-name voidfs-bench-bucket

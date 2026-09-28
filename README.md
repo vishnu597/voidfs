@@ -10,8 +10,9 @@ Cloudflare R2, MinIO, and others. There is no hosted voidfs; you run it.
 
 > **Status: Phase 1 (engine and S3 server), pre-alpha.** The server passes the whole
 > [conformance suite](spec/conformance/) and works with stock boto3 and the AWS CLI. There is
-> no Mac drive yet, and no garbage collection, so deleted data is not reclaimed. The protocol
-> and on-bucket format are drafts and will change. See the
+> no Mac drive yet. Garbage collection reclaims deleted drives and abandoned uploads, but every
+> version of a file in a live drive is kept, because there are no retention policies yet. The
+> protocol and on-bucket format are drafts and will change. See the
 > [roadmap](docs/RESEARCH_AND_PLAN.md#9-phased-roadmap).
 
 ## Why
@@ -51,6 +52,22 @@ suite against a server:
 VOIDFS_ENDPOINT=http://127.0.0.1:9000 VOIDFS_ACCESS_KEY_ID=<id> VOIDFS_SECRET_ACCESS_KEY=<secret> \
   cargo run -p voidfs-conformance
 ```
+
+### Garbage collection
+
+Content that nothing references any more, such as the content of hard-deleted drives, is
+deleted in two phases at least a day apart ([format §12](spec/format.md#12-garbage-collection)).
+Each run of `gc` does whichever phase is due; `--dry-run` only reports:
+
+```bash
+cargo run --release -p voidfs-server -- gc --store fs:./voidfs-data --dry-run
+cargo run --release -p voidfs-server -- gc --store fs:./voidfs-data
+```
+
+Or let the server collect on its own with `--gc-interval 1h`. A run also hard-deletes drives
+soft-deleted more than 30 days ago (`--expire-deleted-drives`) and aborts multipart uploads open
+more than 7 days (`--abort-uploads`). Only when no server is using the pool, `--offline --grace 0`
+collects everything unreferenced in one run.
 
 ## Repository
 

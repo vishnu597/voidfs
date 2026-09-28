@@ -97,6 +97,10 @@ concurrency × 1. At 12 ms: renames and edits from about 95 ms to 25–40 ms, fa
   - a failed transaction inside a batch;
   - a batch that loses the race (extend `a_second_authority_cannot_fork_history`);
   - the change feed and history of a batched commit.
+- Garbage collection left four small-write rows 3.5–7% slower at 12 ms, for a reason not yet
+  found (overwrite 4 KiB and the three fan-out puts;
+  [bench/results/gc](../bench/results/gc/README.md)). Compare them with `main-*` there once
+  commits are batched.
 
 ### Item 2. Shard cache admission
 
@@ -133,6 +137,14 @@ Shards are immutable and content-addressed, so recency is the right signal. Cons
 for the `pages` cache (line 270). If scan resistance matters later, the alternative is a
 recency window in front of the frequency filter, not TinyLFU alone. The disk tier (checklist
 S5) comes after this.
+
+*Added with garbage collection (28 September 2026):* moka's sync cache does its housekeeping
+inside inserts, on whichever async worker calls it. A second moka cache on the write path (the
+first version of the garbage-collection reuse set) made small-write rows 2–4% slower at 12 ms,
+and replacing it with a plain set removed that part
+([bench/results/gc](../bench/results/gc/README.md)). Whether the shard cache's own inserts cost
+the same way is worth measuring when this item changes it, for example with an async cache or
+with inserts moved off the request path.
 
 **Check.** Re-run the sequence in the probes (its `--scenario` list is in the probe's JSON),
 and the full 12 ms run: the fan-out gets should be under 1 ms, and get 32 MiB near get 64 MiB's
