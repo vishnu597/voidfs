@@ -158,6 +158,62 @@ concurrency × 1. At 12 ms: renames and edits from about 95 ms to 25–40 ms, fa
 
 ### Item 2. Shard cache admission
 
+**Status (28 September 2026): done.** Measured in
+[bench/results/shard-cache](../bench/results/shard-cache/README.md):
+- The probe sequence below: get 32 MiB 26.0–27.3 ms (`main` 54–79), the fan-out get 0.47–0.57 ms
+  (`main` 13.1–13.7).
+- Over the 49 rows at 12 ms, p50 is 0.77 of `main`'s (geometric mean of the ratios; reads 0.38,
+  edits 0.88). The three fan-out gets take 0.5–1.1 ms instead of 12.4–15.1, get 32 MiB 25 ms
+  instead of 56–88, and get 1 MiB's p90 is 1.6 ms instead of 15–16.
+- 12 of the 16 edits inside 32 and 64 MiB files are 11–57% faster: an edit reads the shard it
+  rewrites, which `main` had turned away since the file was written. The appends and the inserts
+  at the start moved within the spread between runs.
+- Rows at or ahead of SpaceFS's ratio: 21 and 22, against 16 and 19 for `main` in the same
+  session. The geometric mean speed-up over the bare bucket went from 2.0× to 2.6×.
+- Writes: with the cache full, fan-out put 1,000 × 4 KiB at 64 at once is 1–3% slower in p50
+  and 1.6–2.6% in round time; one at a time and at 8 at once, nothing shows. Inserting from a
+  blocking thread did not help.
+
+What was built, in `Pool::open_as` and the shard and page functions
+([pool.rs](../crates/voidfs-server/src/pool.rs)):
+- **Least recently used first**, for shards and pages (`EvictionPolicy::lru()`). Shards and pages
+  never change, so what was written or read last is what the next read wants: the file just
+  written, the one being edited. moka's TinyLFU admits a new entry only if it has been used more
+  often than all the entries it would evict put together, so a shard just written (used no times)
+  never got in once the cache was full, and a 2 MiB shard, which displaces many small ones,
+  hardly ever.
+- **Not a recency window in front of TinyLFU.** moka has none (Caffeine's W-TinyLFU does); it
+  would take a second cache and moving entries between the two, and moka's comparison against
+  the sum of the victims would still keep large shards out of the main part. What LRU gives up is
+  scan resistance: a read of more than the cache evicts everything before it. The harness has no
+  such scenario, so this is not measured. Where it matters, the disk tier (S5) is the place for a
+  scan-resistant policy, such as a probation segment for entries read once.
+- **Pages the same way.** The page cache (an eighth of the bytes) holds manifest pages and
+  checkpoint segments, just as immutable. Only files of more than 1,024 extents (about 2 GiB)
+  have manifest pages, and none of the benchmark's do, so this is decided by the argument and
+  the tests, not measured.
+- **The caches keep their own copy** of each shard and page (`cached`). A shard cut from an
+  upload is a slice of the chunker's buffer, and kept that buffer (about 33 MB) alive while the
+  cache counted the shard alone. After 48 puts of 16 MiB of fresh data, 1.1–1.2 GB was allocated
+  for the 512 MiB cache (`main` included); with the copies, 0.63 GB. For 96 versions of one
+  16 MiB file, which share all but one shard, allocation grew by a buffer a put, to 3.0 GB; with
+  the copies, 0.25 GB. The copy is one memcpy of what the cache takes in, less than the hashing
+  the write already does.
+- **`Pool::extents`** flattens a manifest tree from the pages it fetched, not from the cache. If
+  moka's upkeep ran between the fetch and the flatten, a page the cache had evicted or turned
+  away (with `--cache-mib 0` the page cache holds one byte) failed the read with "manifest page …
+  is missing".
+- Unchanged: holding a shard is not a garbage-collection check (the reuse set in `gc/guard.rs`
+  decides what a commit may reference), `Pool::forget` drops deleted shards and pages from both
+  caches, a miss checks the shard's hash, and the caches stay within `--cache-mib`.
+
+What was left for later:
+- Scan resistance, with the disk tier (above).
+- Inserts stay on the request path: the one row where they showed did not get faster with them
+  on a blocking thread, and moka 0.12's async cache does its upkeep in the calling task too.
+- The process's footprint also counts freed memory the allocator keeps: 0.84 GB after 48 puts of
+  16 MiB with the cache off and nothing allocated. Not the cache, and not changed.
+
 **Problem.** The shard cache is a moka cache with moka's default TinyLFU admission
 ([pool.rs:269](../crates/voidfs-server/src/pool.rs#L269)). TinyLFU lets a new entry in only if
 it looks more popular than the entry it would evict. Shards that were read many times earlier
@@ -212,11 +268,17 @@ trip, took 12.8 ms. SpaceFS says it commits in "one wave". The format forbids si
 may only reference shards that are already durable
 ([format §7.4](../spec/format.md#74-durability-order)).
 
-Two more costs sit on the same path:
+Three more costs sit on the same path:
 - `ingest` ([object.rs:310](../crates/voidfs-server/src/s3/object.rs#L310)) stops reading the
   request body while each batch of four shards uploads (line 325). With chunking and hashing on
   the server, 32 and 64 MiB puts run 2× slower than the bare bucket even on loopback. Which of
   these dominates has not been measured.
+- `StreamChunker::push` ([chunk.rs](../crates/voidfs-core/src/chunk.rs)) cuts each shard off its
+  buffer with `split_to`, so the next `extend_from_slice` finds the buffer shared and moves the
+  rest of it, up to 16 MiB, to a new allocation. In a large upload that is a copy of up to 16 MiB
+  for each shard of about 2 MiB; not timed. Found with item 2, where the shards kept those
+  buffers alive in the cache. Cutting each shard out as a copy and advancing the buffer would
+  copy each byte once.
 - The commit that makes a checkpoint due (1,000 commits or 16 MiB of log since the last one)
   writes it *while holding the commit lock* (`Pool::checkpoint`). Every writer of that drive
   waits several round trips behind it. Since content-defined segments (E11), a checkpoint stores

@@ -231,12 +231,13 @@ turns these into work items is [docs/step-3-performance.md](../docs/step-3-perfo
    SpaceFS commits in "one wave" (their words). Files of more than 1,024 extents (about 2 GiB)
    add a round trip for manifest pages; none of the benchmark's files are that large. `ingest`
    ([`object.rs`](../crates/voidfs-server/src/s3/object.rs)) also stops reading the body while
-   each batch of four shards uploads, on top of chunking and hashing it on the server. 32 and
+   each batch of four shards uploads, on top of chunking and hashing it on the server, and the
+   chunker copies up to 16 MiB for each shard it cuts (found with finding 3; not timed). 32 and
    64 MiB puts run 2× slower than the bare bucket even on loopback; which of these costs
    dominates is not yet measured. Direction (step 3): the small-file path (E9, a format change)
    for tiny objects, and shard uploads overlapped with receiving the body.
-3. **The shard cache stops admitting new shards.** It is a moka cache with moka's default
-   TinyLFU admission, which lets a new entry in only if it looks more popular than the entry it
+3. **The shard cache stopped admitting new shards.** It was a moka cache with moka's default
+   TinyLFU admission, which lets a new entry in only if it looks more popular than the entries it
    would evict. Shards that earlier scenarios read dozens of times (their drives long deleted)
    kept winning, so new objects were never cached.
    - In the 12 ms run, the second round of the 1,000 × 4 KiB fan-out read took 12.3 ms at p50,
@@ -245,7 +246,12 @@ turns these into work items is [docs/step-3-performance.md](../docs/step-3-perfo
      a throwaway build and not committed): get 32 MiB 75 → 27 ms, fan-out get 12.8 → 0.54 ms
      ([probes](results/probes/)).
    - On loopback a miss costs about a millisecond, so only the emulated distance shows this.
-     Direction (step 3): LRU, or a recency window in front of TinyLFU; then the disk tier (S5).
+   - **Fixed** (28 September 2026, [results](results/shard-cache/README.md)): both caches keep
+     what was used last, and keep their own copy of each shard, since a shard cut from an upload
+     otherwise holds the chunker's whole buffer. At 12 ms the three fan-out gets take 0.5–1.1 ms
+     instead of 12–15, get 32 MiB 25 ms instead of 56–88, and 12 of the 16 edits inside 32 and
+     64 MiB files, which read the shard they rewrite, are 11–57% faster. Rows at or ahead of SpaceFS's
+     ratio went from 16–19 to 21–22. The disk tier (S5) comes later.
 4. **Patch applies its edits one at a time.** `content::apply_edits`
    ([`content.rs`](../crates/voidfs-core/src/content.rs)) runs each edit as a full `write_at`,
    which re-chunks and re-hashes the shard every time. Sixteen edits in a 1 MiB file took 20–27 ms
@@ -273,7 +279,8 @@ further ahead than SpaceFS. Renames, moves and edits in large files were ahead o
 behind SpaceFS's ratios once the bucket was far away, because of finding 1. With group commit,
 the folder move is at SpaceFS's ratio at 12 ms and 9 or 10 of the 24 edits are ahead of it.
 Overwrite 4 KiB is ahead too, and the other small puts and fan-out puts are within 2–28% of it,
-held back by finding 2.
+held back by finding 2. With finding 3 fixed, the fan-out gets are ahead as well, and 9 to 12 of
+the edits.
 
 Two problems outside performance turned up on the way:
 - voidfs-server answered `501 NotImplemented` to the `x-id=PutObject` query parameter that

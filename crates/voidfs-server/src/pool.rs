@@ -403,6 +403,12 @@ pub struct Pool {
     authority: String,
 }
 
+/// What a cache keeps of `b`: a copy holding only these bytes. A slice keeps its whole buffer
+/// alive, and a shard cut by the chunker is a slice of a buffer of up to about 32 MiB.
+fn cached(b: &Bytes) -> Bytes {
+    Bytes::copy_from_slice(b)
+}
+
 impl Pool {
     /// Opens the pool in `store`, creating it if the store is empty.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -465,15 +471,18 @@ impl Pool {
             }
         }
         let params = Params::from_pool(&desc.chunking)?;
-        let weigh = |_: &ShardHash, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX);
+        // Least recently used first: shards and pages never change, so the ones used last are the
+        // ones to keep. moka's default (TinyLFU) admits an entry only if it was used more often
+        // than everything it would evict, so a full cache turned every new shard away.
+        let cache = |bytes| moka::sync::Cache::builder().weigher(|_: &ShardHash, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX)).max_capacity(bytes).eviction_policy(moka::policy::EvictionPolicy::lru()).build();
         let pool = Arc::new(Pool {
             store,
             desc,
             params,
             clock,
             guard: Guard::new(REUSE_CAPACITY),
-            shards: moka::sync::Cache::builder().weigher(weigh).max_capacity(cache_bytes).build(),
-            pages: moka::sync::Cache::builder().weigher(weigh).max_capacity(cache_bytes / 8 + 1).build(),
+            shards: cache(cache_bytes),
+            pages: cache(cache_bytes / 8 + 1),
             drives: RwLock::new(HashMap::new()),
             aliases: RwLock::new(HashMap::new()),
             registry: std::sync::Mutex::new(()),
@@ -733,7 +742,7 @@ impl Pool {
             bail!("shard {h} is corrupt");
         }
         self.guard.confirmed(*h, generation);
-        self.shards.insert(*h, b.clone());
+        self.shards.insert(*h, cached(&b));
         Ok(b)
     }
 
@@ -744,7 +753,7 @@ impl Pool {
         let generation = self.guard.generation();
         let b = self.store.get(&guard::Kind::Page.path(h)).await?.ok_or_else(|| anyhow!("page {h} is missing"))?;
         self.guard.confirmed(*h, generation);
-        self.pages.insert(*h, b.clone());
+        self.pages.insert(*h, cached(&b));
         Ok(b)
     }
 
@@ -754,7 +763,7 @@ impl Pool {
         let items: Vec<(ShardHash, Bytes)> = shards.iter().map(|s| (s.hash, s.bytes.clone())).collect();
         self.guard.admit(&self.store, &self.clock, guard::Kind::Shard, &items).await?;
         for s in shards {
-            self.shards.insert(s.hash, s.bytes.clone());
+            self.shards.insert(s.hash, cached(&s.bytes));
         }
         Ok(())
     }
@@ -764,7 +773,7 @@ impl Pool {
         let items: Vec<(ShardHash, Bytes)> = pages.iter().map(|p| (p.hash, p.bytes.clone())).collect();
         self.guard.admit(&self.store, &self.clock, guard::Kind::Page, &items).await?;
         for p in pages {
-            self.pages.insert(p.hash, p.bytes.clone());
+            self.pages.insert(p.hash, cached(&p.bytes));
         }
         Ok(())
     }
@@ -777,20 +786,20 @@ impl Pool {
 
     /// The full extent list of a content descriptor.
     pub async fn extents(&self, desc: &ContentDescriptor) -> anyhow::Result<Vec<Extent>> {
-        if let ContentDescriptor::Tree { .. } = desc {
-            // Prefetch the tree's pages; flatten then works from the cache.
-            let mut pending = vec![match desc {
-                ContentDescriptor::Tree { root, .. } => *root,
-                _ => unreachable!(),
-            }];
+        // Fetch the tree's pages, then flatten from what was fetched: the cache may already have
+        // evicted some of them.
+        let mut pages = HashMap::new();
+        if let ContentDescriptor::Tree { root, .. } = desc {
+            let mut pending = vec![*root];
             while let Some(h) = pending.pop() {
                 let bytes = self.page(&h).await?;
                 if let Ok(voidfs_core::model::ManifestPage::Node { children }) = serde_json::from_slice(&bytes) {
                     pending.extend(children.iter().map(|c| c.page));
                 }
+                pages.insert(h, bytes);
             }
         }
-        Ok(manifest::flatten(desc, &mut |h| self.pages.get(h))?)
+        Ok(manifest::flatten(desc, &mut |h| pages.get(h).cloned())?)
     }
 
     /// Fetches the given shards for an edit.
@@ -1914,5 +1923,96 @@ mod tests {
         let mut gone = Some(stale);
         pool.renew(&mut gone).await;
         assert!(gone.is_none());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Caches
+
+    /// `n` different objects of `size` bytes, with their hashes.
+    fn blobs(tag: &str, n: usize, size: usize) -> Vec<(ShardHash, Bytes)> {
+        (0..n)
+            .map(|i| {
+                let mut b = format!("{tag} {i} ").into_bytes();
+                b.resize(size, b'.');
+                (ShardHash::of(&b), Bytes::from(b))
+            })
+            .collect()
+    }
+
+    async fn write_as(pool: &Pool, kind: guard::Kind, items: &[(ShardHash, Bytes)]) {
+        match kind {
+            guard::Kind::Shard => pool.write_shards(&items.iter().map(|(hash, bytes)| Shard { hash: *hash, bytes: bytes.clone() }).collect::<Vec<_>>()).await,
+            guard::Kind::Page => pool.write_pages(&items.iter().map(|(hash, bytes)| Page { hash: *hash, bytes: bytes.clone() }).collect::<Vec<_>>()).await,
+        }
+        .unwrap();
+    }
+
+    async fn read_as(pool: &Pool, kind: guard::Kind, h: &ShardHash) -> Bytes {
+        match kind {
+            guard::Kind::Shard => pool.shard(h).await,
+            guard::Kind::Page => pool.page(h).await,
+        }
+        .unwrap()
+    }
+
+    /// A cache full of objects read many times still takes in new ones, written or read, and
+    /// serves them from then on. Under moka's default policy, it turned them away.
+    #[tokio::test]
+    async fn a_full_cache_keeps_new_shards_and_pages() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.unwrap();
+        // Sixteen objects fill each cache; the page cache holds an eighth of the shard cache.
+        for (kind, cache, size) in [(guard::Kind::Shard, &pool.shards, 64 << 10), (guard::Kind::Page, &pool.pages, 8 << 10)] {
+            let old = blobs(&format!("{kind:?} old"), 16, size);
+            write_as(&pool, kind, &old).await;
+            cache.run_pending_tasks();
+            for _ in 0..20 {
+                for (h, _) in &old {
+                    read_as(&pool, kind, h).await;
+                }
+            }
+            cache.run_pending_tasks();
+            let gets = count(&mem, |op, path| op == MemOp::Get && (path.starts_with("shards/") || path.starts_with("pages/")));
+            let [written, read] = &blobs(&format!("{kind:?} new"), 2, size)[..] else { unreachable!() };
+            write_as(&pool, kind, std::slice::from_ref(written)).await;
+            cache.run_pending_tasks();
+            assert_eq!(read_as(&pool, kind, &written.0).await, written.1);
+            assert_eq!(gets.load(Ordering::SeqCst), 0, "{kind:?}: one written is kept");
+            assert_ne!(cache.get(&written.0).unwrap().as_ptr(), written.1.as_ptr(), "{kind:?}: a copy, not a slice of the writer's buffer");
+            pool.store.put(&kind.path(&read.0), read.1.clone()).await.unwrap();
+            for _ in 0..3 {
+                assert_eq!(read_as(&pool, kind, &read.0).await, read.1);
+                cache.run_pending_tasks();
+            }
+            assert_eq!(read_as(&pool, kind, &written.0).await, written.1);
+            assert_eq!(gets.load(Ordering::SeqCst), 1, "{kind:?}: one read is fetched once, then kept");
+            assert!(cache.weighted_size() <= cache.policy().max_capacity().unwrap(), "{kind:?}: the cache stays within its bytes");
+            // A deleted object is dropped.
+            pool.forget(&written.0);
+            assert_eq!(read_as(&pool, kind, &written.0).await, written.1);
+            assert_eq!(gets.load(Ordering::SeqCst), 2, "{kind:?}: one forgotten is fetched again");
+        }
+    }
+
+    /// Reading a manifest tree doesn't rely on the page cache keeping the pages it fetched.
+    #[tokio::test]
+    async fn a_tree_reads_whatever_the_page_cache_keeps() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        // The page cache holds one byte, so each page goes at the next housekeeping.
+        let pool = Pool::open(Store::Mem(mem.clone()), 0).await.unwrap();
+        let extents: Vec<Extent> = (0..3_000u32).map(|i| Extent::Shard { s: ShardHash::of(&i.to_be_bytes()), n: 1 }).collect();
+        let desc = pool.describe(extents.clone()).await.unwrap();
+        assert!(matches!(desc, ContentDescriptor::Tree { .. }));
+        pool.pages.invalidate_all();
+        let weak = Arc::downgrade(&pool);
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if op == MemOp::Get && path.starts_with("pages/")
+                && let Some(pool) = weak.upgrade()
+            {
+                pool.pages.run_pending_tasks();
+            }
+            futures::future::ready(Fault::None).boxed()
+        })));
+        assert_eq!(pool.extents(&desc).await.unwrap(), extents);
     }
 }
