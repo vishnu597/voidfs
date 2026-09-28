@@ -95,7 +95,8 @@ bucket contents with the state a reader must derive from them) will be added in 
    not document conditional PUT. The draft requires an external guard for them
    (`commit_guard: "external"`). Is single-node-only acceptable for those backends in v1?
 2. **GC safety.** The draft's two-phase GC with a pending-deletion set needs a model check
-   (TLA+ or a deterministic simulation) before the format is marked stable.
+   (TLA+ or a deterministic simulation) before the format is marked stable. *The model check
+   found a race in the draft; [RFC 0002](0002-gc-safe-against-writers.md) closes it.*
 3. **Checkpoint cadence.** Every 1,000 commits or 16 MiB of log, whichever comes first, is a
    guess to be tuned with the benchmark harness.
 4. **Encoding.** JSON keeps the format readable. If manifests and segments turn out to be too
