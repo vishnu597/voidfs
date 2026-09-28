@@ -1,9 +1,13 @@
 # voidfs and SpaceFS: parity status and plan
 
-*Stocktake of 2026-09-27. Sources: the voidfs code at commit `76c8b9a`, the parity checklist in
-[§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build), SpaceFS's
-benchmark pages (runs of 20 and 23 September 2026) and changelog, and the SpaceFS macOS app
-0.2.300 installed on the same Mac.*
+*Stocktake of 2026-09-28; the first was taken on 2026-09-27.*
+
+Sources:
+- the voidfs code at commit `f0a769d`, with garbage collection merged;
+- the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
+- the benchmark results in [`bench/results/`](../bench/results/);
+- SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog;
+- the SpaceFS macOS app 0.2.300, installed on the same Mac.
 
 The goal is feature, functionality and performance parity with SpaceFS, as open source that people
 host themselves on their own bucket. Where voidfs differs on purpose (no hosted offering, so no
@@ -17,16 +21,26 @@ billing or plans), this page says so.
   - in-place edits and O(1) renames;
   - forks, point-in-time reads and restore;
   - a change feed;
+  - garbage collection, whose protocol is model-checked
+    ([RFC 0002](../rfcs/0002-gc-safe-against-writers.md));
   - 35 conformance cases passing on local disk and Cloudflare R2.
 - **Almost everything a person touches is missing:** a writable mount, a CLI, accounts and a web
   app, SDKs, search and share links.
-- **Performance parity is measurable, not yet measured for real.** SpaceFS publishes 49
-  benchmark scenarios; [`bench/`](../bench/README.md) now runs all of them against voidfs and the
-  bare bucket underneath it. Local runs (§6) find one cause behind most of the gap: a drive
-  commits one mutation per bucket round trip.
+- **Performance is measured locally, not yet in SpaceFS's setup.** SpaceFS publishes 49
+  benchmark scenarios; [`bench/`](../bench/README.md) runs all of them against voidfs and the bare
+  bucket underneath it.
+  - In the closest local emulation (the bucket 12 ms away), voidfs is at least as far ahead of
+    the bare bucket as SpaceFS on 7 of the 49 rows (§6).
+  - 35 of the other 42 are held back by one cause: a drive commits one mutation per bucket round
+    trip.
 - **SpaceFS's Mac app is now understood** (§5). It is a native FSKit module with its core in Rust,
   running in a separate daemon, which is the architecture the FSKit spike chose for voidfs. It
   also shows that the FSKit entitlement can ship with Developer ID.
+- **The plan (§7):**
+  - Step 1 has its harness and local results. Still to do: CI, the run in SpaceFS's setup (which
+    waits on cloud accounts, §8), and the Mac comparison.
+  - Step 2 has one of its six items done: garbage collection.
+  - Steps 3–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -39,13 +53,13 @@ billing or plans), this page says so.
 
 ## 3. Scorecard
 
-Every item of the plan's checklist (§3, 71 items with the Finder integration item added today),
-scored against the code:
+Every item of the plan's checklist (§3, 71 items, including the Finder integration item added on
+2026-09-27), scored against the code:
 
 | Area | Done | Partly | Missing | State |
 |---|---|---|---|---|
 | Engine (E1–E13) | 7 | 2 | 4 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints and garbage collection work. Missing: the small-file path, direct uploads, encryption, retention policies |
-| Storage backends (B1–B8) | 0 | 1 | 7 | Local disk and R2 work. Not yet run on AWS S3 or MinIO. No capability probe, no short-lived storage credentials, no adopt or export |
+| Storage backends (B1–B8) | 0 | 1 | 7 | Local disk, R2 and versitygw (the local S3 server the benchmarks use) work. Not yet run on AWS S3 or MinIO. No capability probe, no short-lived storage credentials, no adopt or export |
 | Server (S1–S9) | 2 | 4 | 3 | Full S3 subset, extensions and change feed, on one node. Missing: virtual-host addressing, a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
 | Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount (the spike). No agent, journal, CLI, Finder integration, Linux or Windows |
@@ -61,6 +75,14 @@ scored against the code:
 - C3 keys can't be minted or revoked.
 - D3 is read-only, D6 relies on the kernel's read-ahead only, and D11 is the spike's shell.
 - O1 has no compose file. O5 has run locally and against R2, not yet in SpaceFS's setup.
+
+The 28 P0 items, which a credible v1 needs:
+
+| Status | Items |
+|---|---|
+| Done (9) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, S2 S3 subset, S4 per-drive authority and change feed |
+| Partly (10) | E1 chunking, E11 checkpoints, B1 backends, S1 S3 server, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount, O1 single binary and compose |
+| Missing (9) | B3 capability probe, B5 stored bucket credentials, C1 sign-in, C2 workspaces, C4 bucket connections, D1 client daemon, D5 desktop semantics, D9 CLI, A1 Rust and TypeScript SDKs |
 
 ## 4. Product by product
 
@@ -175,6 +197,38 @@ What the runs show:
 - The FSKit spike's mount numbers (loopback: 2.3–2.5 GB/s sequential, 1,000 files listed in
   21–33 ms, random 4 KiB reads at 1.5–1.9 ms p50) are still the only ones for the mount.
 
+### Against SpaceFS's ratios
+
+Step 3 is done when every row is at least as fast, relative to the bare bucket, as SpaceFS's.
+Scored on the local runs, which are not SpaceFS's setup:
+
+| Run | Rows at or ahead of SpaceFS | Edits (24) | Writes (11) | Reads (10) | Metadata (4) |
+|---|--:|--:|--:|--:|--:|
+| Bucket 12 ms away, 28 September, with garbage collection | 7 | 0 | 2 | 3 | 2 |
+| Bucket 12 ms away, 27 September | 6 | 0 | 1 | 3 | 2 |
+| Loopback, 27 September | 20 | 13 | 4 | 0 | 3 |
+
+At 12 ms, voidfs beats the bare bucket on 26 rows; SpaceFS does on 31.
+
+What holds back the 42 rows voidfs does not yet win at 12 ms:
+- **One commit per bucket round trip (35 rows):** every edit, 9 of the 11 writes, the rename and
+  the folder move.
+  - Fan-out puts suffer most: 1,000 × 4 KiB at 64 at once runs at 0.01× the bare bucket, where
+    SpaceFS runs at 0.41×.
+  - Group commit (step 3, item 1) is the fix.
+- **The shard cache stops admitting new shards (the 3 fan-out gets, and get 32 MiB):** get
+  32 MiB runs at 0.90× the bare bucket, where SpaceFS runs at 11.8×. Switching it to LRU (step 3,
+  item 2) is the fix.
+- **Large reads can't be judged locally (get 64 MiB, and streams of 64 and 256 MiB):** the
+  emulated bucket adds latency but no bandwidth limit. The bare bucket's 64 MiB get takes 121 ms
+  here, against S3's 779 ms in SpaceFS's run. Edits inside 32 and 64 MiB files are understated
+  the same way. Only the real run can judge these rows.
+
+Garbage collection left speed unchanged overall: the geometric mean of the p50 ratios over the
+49 rows is 1.007. But four small-write rows became 3.5–7% slower, for a reason not yet found.
+They are to be measured again after group commit
+([bench/results/gc](../bench/results/gc/README.md)).
+
 ## 7. Step-by-step plan
 
 Each step lists what it delivers and when it counts as done. Later steps depend on earlier ones.
@@ -191,6 +245,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      region.
    - **Done when:** a table in the same format as theirs is published for both the S3 layer and
      the mount.
+   - **Status (2026-09-28):** the scenarios are ported and have run locally and against R2 (§6).
+     CI against MinIO, the run in SpaceFS's setup, and the Mac comparison are still to do.
 2. **Finish the engine** (the Phase 1 exit criteria).
    - Garbage collection first. **Done** (E8): two phases per format §12 as amended by
      [RFC 0002](../rfcs/0002-gc-safe-against-writers.md), which closes a race in draft 1 that
@@ -202,6 +258,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - Runs on AWS S3 and MinIO, and rclone.
    - Virtual-host addressing.
    - A `docker compose` file, and health checks and metrics.
+   - **Status (2026-09-28):** 1 of 6 done.
 3. **Win the rows SpaceFS loses.** The work items, with the step 1 evidence and a row-by-row
    baseline, are in [step-3-performance.md](step-3-performance.md). In order of impact:
    - Group commit: one log write per batch of mutations, not per mutation (37 rows).
@@ -265,3 +322,13 @@ plain objects, file locking, offline pinning.
   so that topology is the like-for-like one; the plan's server in us-east-1 is a second run.
 - **Test data in the SpaceFS trial:** uploading the benchmark data into a trial drive needs the
   account owner's go-ahead each time.
+- **CI:** the repository has no CI yet. Step 1's MinIO runs need a GitHub Actions workflow, which
+  needs the maintainer's go-ahead.
+- **Tools for step 2's backend runs:** rclone and the AWS CLI are not installed on the
+  development Mac, and installing them needs the maintainer's go-ahead. MinIO does not run on
+  this Mac (it crashes at startup), so its runs belong in CI.
+- **Order of the next steps (proposed):** do content-defined checkpoint segments and the
+  capability probe, then group commit (step 3, item 1), then the rest of step 2.
+  - Segments change the checkpoint writer, which group commit's work (step 3, item 3) moves off
+    the commit path.
+  - Group commit moves more rows than anything else (§6).

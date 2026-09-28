@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| Status | Proposed |
+| Status | Implemented (accepted and merged 2026-09-28) |
 | Author(s) | voidfs maintainers |
 | Created | 2026-09-27 |
 | Affects | format |
-| Implemented by | [`spec/format.md`](../spec/format.md) §7.4, §10, §12 (draft 1, revision 2) |
+| Implemented by | [`spec/format.md`](../spec/format.md) §7.4, §10, §12 (draft 1, revision 2), and voidfs-server's garbage collection ([#3](https://github.com/vishnu597/voidfs/pull/3)) |
 
 ## Summary
 
