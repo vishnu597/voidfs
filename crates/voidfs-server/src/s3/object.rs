@@ -306,8 +306,13 @@ async fn get(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> 
 // ---------------------------------------------------------------------------------------------
 // Whole-object writes
 
+/// The longest a streamed body may take. What it references must be committed within 12 hours
+/// of the garbage-collection check its first shards relied on (format §12.4).
+const MAX_INGEST: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 /// Streams a body into shards; returns the content's extents.
 async fn ingest(pool: &Pool, mut reader: BodyReader) -> Result<Vec<Extent>, S3Error> {
+    let started = pool.clock.mono();
     let mut chunker = StreamChunker::new(pool.params);
     let mut shards: Vec<Shard> = Vec::new();
     let mut extents = Vec::new();
@@ -330,6 +335,9 @@ async fn ingest(pool: &Pool, mut reader: BodyReader) -> Result<Vec<Extent>, S3Er
     store(&mut shards, &mut extents).await?;
     // Nothing is committed until the whole body matched its signature.
     reader.finish()?;
+    if pool.clock.mono().saturating_sub(started) > MAX_INGEST {
+        return Err(S3Error::new(400, "RequestTimeout", "the upload took longer than 6 hours"));
+    }
     Ok(content::normalize(extents))
 }
 
@@ -813,7 +821,7 @@ async fn create_upload(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response,
         return Err(S3Error::invalid("multipart uploads create files, not folders"));
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let rec = UploadRecord { key: key.clone(), created: Timestamp::now(), actor: ctx.actor(), attrs: ctx.attrs_for_put()? };
+    let rec = UploadRecord { key: key.clone(), created: app.pool.clock.now(), actor: ctx.actor(), attrs: ctx.attrs_for_put()? };
     let dir = upload_dir(d, &id)?;
     app.pool.store.put(&format!("{dir}upload.json"), Bytes::from(serde_json::to_vec(&rec).map_err(anyhow::Error::from)?)).await?;
     Ok(xml(

@@ -367,7 +367,7 @@ list in content order, covering exactly `size` bytes.
 - Preconditions (`x-voidfs-if-version`, `If-Match`, `If-None-Match: *`) apply as for PutObject.
 - `x-voidfs-content-type` carries the content type.
 - The server MUST confirm that every shard it did not already reference is present with the
-  right length before committing ([format §12.3](format.md#123-what-writers-must-do)).
+  right length before committing ([format §12.4](format.md#124-what-writers-must-do)).
 
 → `200` with the common headers. Errors: `400 InvalidArgument` (malformed body, wrong or expired
 token, missing shard), `409 PathConflict`, `412 PreconditionFailed`.

@@ -44,14 +44,14 @@ scored against the code:
 
 | Area | Done | Partly | Missing | State |
 |---|---|---|---|---|
-| Engine (E1–E13) | 6 | 2 | 5 | Chunking, versions, point-in-time reads, restore, in-place edits, forks and checkpoints work. Missing: garbage collection, the small-file path, direct uploads, encryption, retention policies |
+| Engine (E1–E13) | 7 | 2 | 4 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints and garbage collection work. Missing: the small-file path, direct uploads, encryption, retention policies |
 | Storage backends (B1–B8) | 0 | 1 | 7 | Local disk and R2 work. Not yet run on AWS S3 or MinIO. No capability probe, no short-lived storage credentials, no adopt or export |
 | Server (S1–S9) | 2 | 4 | 3 | Full S3 subset, extensions and change feed, on one node. Missing: virtual-host addressing, a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
 | Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount (the spike). No agent, journal, CLI, Finder integration, Linux or Windows |
 | SDKs, agents, search (A1–A7) | 0 | 0 | 7 | Stock S3 SDKs and the AWS CLI work; nothing voidfs-specific |
 | Operations (O1–O6) | 0 | 2 | 4 | One binary. A benchmark harness, not yet run in the cloud. No compose file or metrics |
-| **Total** | **8** | **13** | **50** | Of the 28 P0 items: 8 done, 10 partly, 10 missing |
+| **Total** | **9** | **13** | **49** | Of the 28 P0 items: 9 done, 10 partly, 9 missing |
 
 "Partly" means:
 - E1 has no compression, and E11 lacks content-defined segments.
@@ -192,7 +192,11 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - **Done when:** a table in the same format as theirs is published for both the S3 layer and
      the mount.
 2. **Finish the engine** (the Phase 1 exit criteria).
-   - Garbage collection first. Without it, deleted and overwritten data is never reclaimed.
+   - Garbage collection first. **Done** (E8): two phases per format §12 as amended by
+     [RFC 0002](../rfcs/0002-gc-safe-against-writers.md), which closes a race in draft 1 that
+     could delete a shard a new commit referenced. The protocol is model-checked and the
+     implementation simulated (`crates/voidfs-server/src/gc/`). It reclaims deleted drives and
+     abandoned uploads; old versions in live drives wait for retention policies (E13).
    - Content-defined checkpoint segments.
    - The bucket capability probe.
    - Runs on AWS S3 and MinIO, and rclone.

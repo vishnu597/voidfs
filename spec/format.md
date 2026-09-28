@@ -257,8 +257,9 @@ sufficient.
 ### 7.4 Durability order
 
 Before writing a commit, the authority MUST have confirmed that every shard and page the commit
-references is durably stored. It confirms either by having written them or by the checks in
-§12.3. A commit MUST NOT reference an object that is not yet stored.
+references is durably stored, by the checks in §12.4. Those checks apply to objects it has just
+written too: writing an object is not enough on its own while garbage collection runs. A commit
+MUST NOT reference an object that is not yet stored.
 
 A successful write of the commit object is the moment the transactions become durable. A server
 MUST NOT acknowledge a mutation before that.
@@ -424,10 +425,15 @@ A fork of drive `P` at sequence `s` is a new drive `F` whose state at `s` equals
   it, and those versions stop being GC roots. The head version of every live object is always
   retained.
 - **Soft delete of a drive** writes `deleted.json` (`{ "time": …, "actor": … }`). The drive is
-  no longer served, but its state stays intact and remains a GC root for the retention window
-  (default 30 days). Removing the marker restores the drive.
-- **Hard delete** removes everything under `drives/<drive-id>/`. Shards and pages that are no
-  longer referenced are then reclaimed by GC.
+  no longer served, but its state stays intact and remains a GC root until it is hard-deleted.
+  Removing the marker restores the drive. After the retention window (default 30 days, counted
+  from `time`), the authority or the garbage collector MAY hard-delete it.
+- **Hard delete** removes everything under `drives/<drive-id>/`, starting with `drive.json`: the
+  drive stops existing, and so stops being a GC root, when that object goes. Before deleting it,
+  the authority MUST stop starting operations on the drive and let those in progress finish,
+  because an operation that references content through the drive relies on the drive being a
+  root (§12.4, option 1). Shards and pages that are no longer referenced are then reclaimed by
+  GC.
 
 ---
 
@@ -451,47 +457,100 @@ GC roots.
 
 ## 12. Garbage collection
 
-A shard or page is **referenced** if any of these reaches it:
-- any retained version in any drive of the pool (including soft-deleted drives within their
-  window), through its content descriptor and manifest tree;
-- any checkpoint index still readable under §8.5;
-- any open multipart staging record.
+A shard or page is **referenced** if any of these reaches it (the **roots**):
+- any retained version in any drive of the pool, through its content descriptor and manifest
+  tree, including soft-deleted drives until they are hard-deleted (§10);
+- any checkpoint index still readable under §8.5, through its segments and their rows;
+- any open multipart staging record (§11).
 
 GC deletes shards and pages that are not referenced. Because content is shared across drives
-and uploads race with collection, it MUST follow this protocol.
+and uploads race with collection, it MUST follow this protocol. The design and the argument for
+it are in [RFC 0002](../rfcs/0002-gc-safe-against-writers.md).
 
-### 12.1 Mark and propose (phase 1)
+### 12.1 The run record: `gc/pending.json`
 
-1. Record `t1`, the current time.
+```json
+{
+  "format": 1,
+  "run": "3a1f0c7e-9b2d-4c61-8e5f-0d7a2b9c4e18",
+  "phase": "waiting",
+  "t1": "2026-09-27T21:00:00Z",
+  "grace": 86400,
+  "candidates": ["<sha256>", "…"]
+}
+```
+
+| Member | Meaning |
+|---|---|
+| `run` | A UUID that identifies the run |
+| `phase` | `marking`, `waiting` or `deleting` |
+| `t1` | The Last-Modified time of this object when the run created it, truncated to whole seconds. Absent in `marking` |
+| `grace` | The run's grace period in seconds |
+| `candidates` | Hashes proposed for deletion. A hash stands for both the shard and the page of that name. Absent in `marking` |
+
+- `grace` MUST be at least 86,400 (24 hours). A collector MAY use a shorter grace, including
+  zero, only while no writer is active in the pool (for example, every authority is stopped).
+- At most one collector works on a pool at a time. The create-if-absent write in §12.2 stops two
+  runs from starting together. The deployment MUST ensure that no two collectors continue the
+  same run.
+- A run in `waiting` or `deleting` whose collector stopped MAY be continued by the next
+  collector. A run left in `marking` MAY be deleted once it is more than `grace` old.
+
+### 12.2 Mark and propose (phase 1)
+
+1. Create `gc/pending.json` as `{ "format": 1, "run": "<uuid>", "phase": "marking", "grace": g }`
+   with a create-if-absent write. If it already exists, do not start a run. Read the object's
+   Last-Modified time, truncated to whole seconds: that is `t1`, on the bucket's clock.
 2. Compute the referenced set across every drive in the pool.
 3. List `shards/` and `pages/`. Every object that is not referenced *and* was last modified
-   before `t1 - grace` becomes a candidate. The default grace is 24 hours.
-4. Write `gc/pending.json`:
-   `{ "run": "<uuid>", "t1": "…", "candidates": ["<sha256>", …] }`. Large sets MAY be split into
-   pages referenced from it.
+   before `t1 - grace` is a candidate.
+4. If there are no candidates, delete `gc/pending.json`: the run is over.
+5. If more than `grace / 2` has passed since `t1` on the collector's clock, delete
+   `gc/pending.json`: the run is abandoned.
+6. Otherwise overwrite `gc/pending.json` with `phase: "waiting"`, `t1` and the candidates.
 
-### 12.2 Confirm and delete (phase 2)
+### 12.3 Confirm and delete (phase 2)
 
-1. Wait at least `grace` after `t1`.
-2. Recompute the referenced set.
-3. Delete each candidate that is still unreferenced **and** still last modified before `t1`.
-   GC SHOULD use a conditional delete (on last-modified time or ETag) where the backend supports
-   one.
+1. Once `t1 + grace` has passed on the collector's clock, overwrite `gc/pending.json` with
+   `phase: "deleting"`. Read its Last-Modified time. If that is earlier than `t1 + grace`, write
+   `phase: "waiting"` back and try again later.
+2. Recompute the referenced set. The recompute MUST start after step 1 completed.
+3. Observe each candidate's Last-Modified time after step 1 completed (by listing, or with a
+   HEAD). Delete each candidate that is still unreferenced **and** was last modified before
+   `t1`.
 4. Delete `gc/pending.json`.
 
-### 12.3 What writers must do
+*(informative)* A conditional delete cannot replace the `deleting` mark. A rewritten shard has
+the same bytes, so the same ETag, and few backends offer a condition on the last-modified time.
 
-A writer that wants to reference an existing shard or page instead of uploading it (dedup) MUST
-do one of the following before committing:
-- find it referenced by the state it is committing against; or
-- confirm it exists **and** is not listed in `gc/pending.json`; or
-- rewrite it with its (identical) bytes, which refreshes its modification time past `t1` and
-  saves it from phase 2.
+### 12.4 What writers must do
 
-A writer MUST NOT commit more than `grace / 2` after the check it relied on.
+Before committing, a writer MUST have done one of the following for **every** shard and page
+the commit references, whether or not it uploaded the object itself:
 
-*(informative)* This protocol has not yet been model-checked. RFC 0001 lists that as a
-prerequisite for marking the format Stable.
+1. **Referenced.** It saw the object referenced by a root (a drive's state, a readable
+   checkpoint, or an open staging record) as that root stood at time `r`.
+2. **Not a candidate, then present.** It read `gc/pending.json` at time `r` and found no run, or
+   a run that does not list the object. Then it confirmed the object exists with a request that
+   started after `r`: an upload (PUT), a GET or a HEAD.
+3. **Rescued.** It read `gc/pending.json` at time `r` and found the object listed by a run in
+   phase `waiting`. After `r`, it rewrote the object with its (identical) bytes. It then read
+   `gc/pending.json` again and found the same run, still not `deleting`.
+   - If that second read finds the run `deleting`, the writer MUST NOT commit. It waits until
+     the run has ended and then uses option 2.
+   - If it finds another run, or none, the writer starts again.
+
+A writer MUST NOT commit more than 12 hours (half the minimum grace) after the `r` it relies on.
+
+A writer MAY cache `gc/pending.json` if it re-reads it at least once an hour. Then:
+- A check under option 2 stays valid while every re-read omits the object, with `r` taken as the
+  latest re-read. It lapses as soon as a re-read lists the object, or when an hour passes
+  without a successful re-read.
+- An object rescued under option 3 stays rescued for as long as the same run is in
+  `gc/pending.json`.
+
+*(informative)* An upload of bytes identical to a candidate *is* a rewrite, whether or not the
+writer knew. That is why these checks apply to uploads too.
 
 ---
 

@@ -207,7 +207,7 @@ impl Target {
     }
 
     /// Removes everything a scenario made. On voidfs the drive is hard-deleted; its shards stay
-    /// in the pool, because voidfs has no garbage collection yet.
+    /// in the pool until garbage collection reclaims them (`voidfs-server gc`).
     pub async fn destroy(&self, p: &Place) -> anyhow::Result<()> {
         match &self.ext {
             Some(ext) => {

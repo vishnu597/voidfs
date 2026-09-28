@@ -42,8 +42,8 @@ enum Command {
         #[command(flatten)]
         filter: Filter,
     },
-    /// List, and with --yes delete, every object under a prefix of the bucket: what a run
-    /// leaves behind in the voidfs pool, which has no garbage collection yet.
+    /// List, and with --yes delete, every object under a prefix of the bucket, such as a whole
+    /// voidfs pool. To reclaim only what the pool no longer references, use `voidfs-server gc`.
     Purge {
         #[command(flatten)]
         bucket: Bucket,

@@ -24,3 +24,4 @@ RFCs are never deleted. A later RFC that replaces one says so, and the old one i
 | RFC | Title | Status |
 |---|---|---|
 | [0001](0001-metadata-in-the-bucket.md) | Drive metadata as a commit log and checkpoints in the bucket | Accepted |
+| [0002](0002-gc-safe-against-writers.md) | Garbage collection that is safe against writers | Proposed |
