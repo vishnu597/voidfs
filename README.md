@@ -53,6 +53,22 @@ VOIDFS_ENDPOINT=http://127.0.0.1:9000 VOIDFS_ACCESS_KEY_ID=<id> VOIDFS_SECRET_AC
   cargo run -p voidfs-conformance
 ```
 
+### Checking the bucket
+
+Commits rely on the bucket refusing to create an object that already exists (`If-None-Match: *`,
+[format §7.2](spec/format.md#72-claiming-a-sequence-number-create-if-absent)). A server checks
+that before it writes the pool, and refuses a bucket that ignores it. It also refuses lifecycle
+rules that would delete or archive the pool's objects. `probe` reports these and the rest of
+what the bucket supports, and stores nothing:
+
+```bash
+cargo run --release -p voidfs-server -- probe --store s3:<bucket>/<prefix> --s3-endpoint <url>
+```
+
+For a bucket without conditional writes, create the pool with `--commit-guard external`. At most
+one server, and one garbage collector, may then write it
+([§7.3](spec/format.md#73-external-guard)).
+
 ### Garbage collection
 
 Content that nothing references any more, such as the content of hard-deleted drives, is

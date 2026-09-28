@@ -481,21 +481,24 @@ What that implies (updated 2026-09-27 from the [FSKit spike](spikes/fskit.md)):
 ## 6. Storage-provider compatibility (bring your own bucket)
 
 What the design needs from a bucket, and where each provider stands. Entries marked "verify"
-still need confirming in the capability probe and conformance CI.
+still need confirming with the capability probe (`voidfs-server probe`) and conformance CI.
 
 | Provider | Conditional PUT (fencing) | Temp scoped creds for direct I/O | Egress | Notes |
 |---|---|---|---|---|
 | AWS S3 | Yes (`If-None-Match` since 2024-08, `If-Match` since 2024-11) | STS AssumeRole plus session policy | ~$0.09/GB | Every version costs several PUTs: watch request costs |
-| Cloudflare R2 | Yes (`If-Match`, `If-None-Match`, wildcard) | R2 temporary access credentials | **$0** | Best default for media-heavy users; Space itself appears to default to R2 |
+| Cloudflare R2 | Yes (`If-Match`, `If-None-Match`, wildcard); the probe confirmed a second create-if-absent PUT is refused (2026-09-28) | R2 temporary access credentials (minted with a Cloudflare API token); presigned URLs work | **$0** | Best default for media-heavy users; Space itself appears to default to R2. An S3 token scoped to objects gets AccessDenied reading lifecycle rules, versioning, object lock and CORS, so a server can't check them |
 | MinIO / Ceph RGW / Garage | Mostly (verify per version) | MinIO STS; others vary | Self-hosted | On-prem story |
+| versitygw 1.8.0 (the local S3 server the benchmarks use) | Yes: a second create-if-absent PUT is refused with 412 (probe, 2026-09-28) | Presigned URLs work | Self-hosted | Lifecycle rules not supported; versioning only with `--versioning-dir` |
 | GCS | Generation preconditions (native API; verify in S3-interop mode) | Downscoped tokens (native API) | Paid | Likely needs the native API through OpenDAL |
 | Azure Blob | ETag `If-Match` (native) | User-delegation SAS | Paid | Not S3-compatible; OpenDAL covers it |
 | Backblaze B2 | Not documented for S3 PUT (verify) | Presigned URLs | Low or free with a CDN | May need single-node mode or an external lock |
 | Wasabi, DO Spaces, Tigris, Hetzner, Storj | Verify each | Presigned URLs at minimum | Varies | Run the capability probe and the conformance suite in CI |
 
 Fallback rule: without conditional PUT, the authority must be the only writer, either with a
-single-node deployment or with a lease held in Postgres or etcd. Without temporary credentials,
-use per-shard presigned URLs.
+single-node deployment or with a lease held in Postgres or etcd. A pool created with
+`--commit-guard external` says so (format §7.3), and a server won't write a pool that relies on
+create-if-absent in a bucket that fails the probe. Without temporary credentials, use per-shard
+presigned URLs.
 
 ---
 
