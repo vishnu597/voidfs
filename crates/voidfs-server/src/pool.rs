@@ -2,8 +2,9 @@
 //! A pool (format §2–§3) and its drives: loading them from the bucket, committing to their
 //! logs, checkpoints, forks, deletion, and the change feed (protocol §5.6).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use futures::StreamExt;
@@ -13,8 +14,7 @@ use voidfs_core::chunk::{Params, Shard};
 use voidfs_core::ids::{DriveId, ObjectId, ShardHash, Timestamp, VersionId};
 use voidfs_core::manifest::{self, Page};
 use voidfs_core::model::{
-    Chunking, Commit, CommitGuard, ContentDescriptor, DriveDescriptor, EntryRow, Extent, Features, ForkOf, HistoryRow, Kind, ObjectRecord,
-    Op, PoolDescriptor, RemovedRow, Txn,
+    Chunking, Commit, CommitGuard, ContentDescriptor, DriveDescriptor, Extent, Features, ForkOf, Kind, Op, PoolDescriptor, Txn,
 };
 use voidfs_core::ops::OpError;
 use voidfs_core::state::{DriveState, Rows};
@@ -22,10 +22,23 @@ use voidfs_core::state::{DriveState, Rows};
 use crate::clock::Clock;
 use crate::gc::guard::{self, Guard};
 
-/// Commits between checkpoints (format §8.4).
+/// A checkpoint is due this many commits after the last one (format §8.4)...
 const CHECKPOINT_EVERY: u64 = 1000;
-/// Rows per checkpoint segment.
-const SEGMENT_ROWS: usize = 4096;
+/// ...or after this many bytes of log, whichever comes first.
+const CHECKPOINT_LOG_BYTES: u64 = 16 << 20;
+/// Rows in a checkpoint segment, except that a table's last may have fewer (format §8.3).
+const SEGMENT_MIN_ROWS: usize = 256;
+const SEGMENT_MAX_ROWS: usize = 8192;
+/// Between those bounds, a segment ends at a row whose key hash has this many low zero bits...
+const SEGMENT_CUT_BITS: u32 = 12;
+/// ...or, if it reaches the maximum first, at the last of its rows whose key hash has this many.
+const SEGMENT_FALLBACK_BITS: u32 = 10;
+/// Checkpoint segments fetched at once when loading (each is a round trip to the bucket).
+const PAGE_FETCH_PARALLELISM: usize = 32;
+/// A checkpoint lists the previous one's pages without storing them again only if that one's
+/// index was seen this recently; otherwise it reads the index again first (format §12.4,
+/// option 1).
+const REUSE_WITHOUT_REREAD: Duration = Duration::from_secs(6 * 3600);
 /// Change-feed batches kept in memory per drive.
 const FEED_KEEP: usize = 10_000;
 /// Log entries fetched at once when replaying (each is a round trip to the bucket).
@@ -105,6 +118,13 @@ struct CheckpointTables {
     removed: Vec<SegmentRef>,
 }
 
+impl CheckpointTables {
+    /// Every page the index lists.
+    fn pages(&self) -> HashSet<ShardHash> {
+        self.entries.iter().chain(&self.objects).chain(&self.history).chain(&self.removed).map(|s| s.page).collect()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct CheckpointIndex {
     format: u32,
@@ -127,9 +147,53 @@ struct SegmentOut<'a, T> {
     rows: &'a [T],
 }
 
+/// How many low zero bits the SHA-256 of a row's key has (format §8.3), up to 16. The key is
+/// encoded as in §8.2, and the digest read as a big-endian number.
+fn key_zeros(key: &str) -> u32 {
+    let h = ShardHash::of(key.as_bytes()).0;
+    u16::from_be_bytes([h[30], h[31]]).trailing_zeros()
+}
+
+/// Where a table's segments end (format §8.3). Once a segment has [`SEGMENT_MIN_ROWS`], it ends
+/// after the first row with [`SEGMENT_CUT_BITS`] [`key_zeros`]. If it reaches
+/// [`SEGMENT_MAX_ROWS`] first, it ends after the last of its rows with
+/// [`SEGMENT_FALLBACK_BITS`], or at the maximum if none has them.
+///
+/// A cut depends only on the rows near it and on where its segment began, so a row inserted or
+/// removed rewrites the segment it falls in, and rarely any other. Cutting at the maximum would
+/// not: every later segment would shift until the next cut by key. About one segment in seven
+/// reaches the maximum; the fallback leaves about one in 2,300 to end there.
+/// Returns the end (exclusive) of each segment.
+fn segment_ends<T>(rows: &[T], key: impl Fn(&T) -> String) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let (mut start, mut i, mut fallback) = (0, 0, None);
+    while i < rows.len() {
+        let n = i + 1 - start;
+        let zeros = if n >= SEGMENT_MIN_ROWS { key_zeros(&key(&rows[i])) } else { 0 };
+        if zeros >= SEGMENT_FALLBACK_BITS {
+            fallback = Some(i + 1);
+        }
+        if zeros >= SEGMENT_CUT_BITS || n == SEGMENT_MAX_ROWS {
+            let end = fallback.unwrap_or(i + 1);
+            ends.push(end);
+            (start, i, fallback) = (end, end, None);
+        } else {
+            i += 1;
+        }
+    }
+    if start < rows.len() {
+        ends.push(rows.len());
+    }
+    ends
+}
+
 fn segments<T: Serialize>(table: &str, rows: &[T], key: impl Fn(&T) -> String, pages: &mut Vec<Page>) -> Vec<SegmentRef> {
-    rows.chunks(SEGMENT_ROWS)
-        .map(|chunk| {
+    let mut start = 0;
+    segment_ends(rows, &key)
+        .into_iter()
+        .map(|end| {
+            let chunk = &rows[start..end];
+            start = end;
             let seg = SegmentOut { kind: "segment", table, rows: chunk };
             let bytes = Bytes::from(serde_json::to_vec(&seg).expect("rows serialize"));
             let page = ShardHash::of(&bytes);
@@ -137,6 +201,48 @@ fn segments<T: Serialize>(table: &str, rows: &[T], key: impl Fn(&T) -> String, p
             SegmentRef { page, first: key(&chunk[0]), last: key(chunk.last().unwrap()), count: chunk.len() }
         })
         .collect()
+}
+
+/// A checkpoint index this server wrote or read. The drive's next checkpoint lists the same page
+/// for every segment that has not changed (format §8.3), and need not store it again: this index
+/// referenced it when it was seen, which is the first of the checks in format §12.4.
+struct Checkpointed {
+    index: String,
+    pages: HashSet<ShardHash>,
+    /// When the index was last seen in the bucket, on the monotonic clock: the check's `r`.
+    seen: Duration,
+}
+
+/// What a drive's commit lock guards besides its log: when the next checkpoint is due (format
+/// §8.4), and what the last one listed.
+#[derive(Default)]
+struct Cadence {
+    /// Commits since the last checkpoint, or since an attempt at one failed.
+    commits: u64,
+    /// Their size as stored.
+    bytes: u64,
+    last: Option<Checkpointed>,
+}
+
+impl Cadence {
+    fn add(&mut self, bytes: usize) {
+        self.commits += 1;
+        self.bytes += bytes as u64;
+    }
+
+    fn due(&self) -> bool {
+        self.commits >= CHECKPOINT_EVERY || self.bytes >= CHECKPOINT_LOG_BYTES
+    }
+}
+
+/// The rows of the next `n` segments that `pages` yields.
+async fn rows_of<T: for<'de> Deserialize<'de>>(pages: &mut (impl futures::Stream<Item = anyhow::Result<Bytes>> + Unpin), n: usize) -> anyhow::Result<Vec<T>> {
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let bytes = pages.next().await.ok_or_else(|| anyhow!("a checkpoint segment went missing"))??;
+        out.extend(serde_json::from_slice::<Segment<T>>(&bytes)?.rows);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -147,7 +253,7 @@ pub struct Drive {
     pub alias: String,
     pub desc: DriveDescriptor,
     state: RwLock<Arc<DriveState>>,
-    commit_lock: tokio::sync::Mutex<()>,
+    commit_lock: tokio::sync::Mutex<Cadence>,
     feed: RwLock<VecDeque<FeedBatch>>,
     /// The oldest seq the feed can still report changes after.
     feed_floor: RwLock<u64>,
@@ -178,7 +284,7 @@ impl From<OpError> for CommitError {
 }
 
 impl Drive {
-    fn new(desc: DriveDescriptor, state: DriveState) -> Drive {
+    fn new(desc: DriveDescriptor, state: DriveState, cadence: Cadence) -> Drive {
         let (notify, _) = tokio::sync::watch::channel(state.seq());
         let floor = state.seq();
         Drive {
@@ -186,7 +292,7 @@ impl Drive {
             alias: desc.alias.clone(),
             desc,
             state: RwLock::new(Arc::new(state)),
-            commit_lock: tokio::sync::Mutex::new(()),
+            commit_lock: tokio::sync::Mutex::new(cadence),
             feed: RwLock::new(VecDeque::new()),
             feed_floor: RwLock::new(floor),
             notify,
@@ -360,23 +466,27 @@ impl Pool {
     async fn load_drive(&self, id: &DriveId) -> anyhow::Result<Option<Drive>> {
         let Some(b) = self.store.get(&format!("drives/{id}/drive.json")).await? else { return Ok(None) };
         let desc: DriveDescriptor = serde_json::from_slice(&b).context("reading drive.json")?;
+        let mut cadence = Cadence::default();
         let mut state = match self.latest_checkpoint(id).await? {
-            Some(s) => s,
+            Some((s, c)) => {
+                cadence.last = Some(c);
+                s
+            }
             None if desc.fork_of.is_some() => bail!("fork {id} has no checkpoint"),
             None => DriveState::empty(),
         };
-        let drive_feed = self.replay(id, &mut state).await?;
-        let d = Drive::new(desc, state);
+        let drive_feed = self.replay(id, &mut state, &mut cadence).await?;
+        let d = Drive::new(desc, state, cadence);
         for b in drive_feed {
             d.push_feed(b);
         }
         Ok(Some(d))
     }
 
-    /// Applies every commit after `state.seq()` and returns their feed batches.
-    /// The drive's commits after `seq`, in order. Fetched concurrently, since each is a
-    /// round trip to the bucket; stops at the first gap (format §8.4).
-    async fn commits_after(&self, id: &DriveId, seq: u64) -> anyhow::Result<Vec<Commit>> {
+    /// The drive's commits after `seq`, in order, each with its size as stored. Fetched
+    /// concurrently, since each is a round trip to the bucket; stops at the first gap (format
+    /// §8.4).
+    async fn commits_after(&self, id: &DriveId, seq: u64) -> anyhow::Result<Vec<(Commit, usize)>> {
         let dir = format!("drives/{id}/log/");
         let names = self.store.list_files(&dir, Some(&format!("{seq:020}.json"))).await?;
         let mut stream = futures::stream::iter(names)
@@ -384,26 +494,29 @@ impl Pool {
                 let path = format!("{dir}{name}");
                 async move {
                     let bytes = self.store.get(&path).await?.ok_or_else(|| anyhow!("log entry {path} vanished"))?;
-                    serde_json::from_slice::<Commit>(&bytes).with_context(|| format!("parsing {path}"))
+                    let c = serde_json::from_slice::<Commit>(&bytes).with_context(|| format!("parsing {path}"))?;
+                    anyhow::Ok((c, bytes.len()))
                 }
             })
             .buffered(LOG_FETCH_PARALLELISM);
         let mut out = Vec::new();
         let mut expect = seq + 1;
         while let Some(c) = stream.next().await {
-            let c = c?;
+            let (c, len) = c?;
             if c.seq != expect {
                 break;
             }
             expect += 1;
-            out.push(c);
+            out.push((c, len));
         }
         Ok(out)
     }
 
-    async fn replay(&self, id: &DriveId, state: &mut DriveState) -> anyhow::Result<Vec<FeedBatch>> {
+    /// Applies every commit after `state.seq()`, counts them towards the next checkpoint, and
+    /// returns their feed batches.
+    async fn replay(&self, id: &DriveId, state: &mut DriveState, cadence: &mut Cadence) -> anyhow::Result<Vec<FeedBatch>> {
         let mut out = Vec::new();
-        for commit in self.commits_after(id, state.seq()).await? {
+        for (commit, len) in self.commits_after(id, state.seq()).await? {
             let name = log_path(id, commit.seq);
             if commit.seq != state.seq() + 1 {
                 break; // a gap: stop at it (format §8.4)
@@ -411,11 +524,12 @@ impl Pool {
             let next = state.apply(&commit).with_context(|| format!("applying {name}"))?;
             out.push(feed_for(&commit, state, &next));
             *state = next;
+            cadence.add(len);
         }
         Ok(out)
     }
 
-    async fn latest_checkpoint(&self, id: &DriveId) -> anyhow::Result<Option<DriveState>> {
+    async fn latest_checkpoint(&self, id: &DriveId) -> anyhow::Result<Option<(DriveState, Checkpointed)>> {
         let dir = format!("drives/{id}/checkpoints/");
         let Some(name) = self.store.list_files(&dir, None).await?.into_iter().rfind(|n| n.ends_with(".json")) else {
             return Ok(None);
@@ -424,29 +538,27 @@ impl Pool {
     }
 
     /// Reads a checkpoint index and its segments into a state (format §8).
-    async fn load_checkpoint(&self, path: &str) -> anyhow::Result<DriveState> {
+    async fn load_checkpoint(&self, path: &str) -> anyhow::Result<(DriveState, Checkpointed)> {
+        let seen = self.clock.mono();
         let bytes = self.store.get(path).await?.ok_or_else(|| anyhow!("checkpoint {path} is missing"))?;
         let idx: CheckpointIndex = serde_json::from_slice(&bytes).with_context(|| format!("parsing {path}"))?;
+        let t = &idx.tables;
+        // Each segment is a round trip to the bucket: fetch them concurrently, and in order.
+        let hashes: Vec<ShardHash> = t.entries.iter().chain(&t.objects).chain(&t.history).chain(&t.removed).map(|r| r.page).collect();
+        let mut pages = std::pin::pin!(futures::stream::iter(hashes).map(|h| async move { self.page(&h).await }).buffered(PAGE_FETCH_PARALLELISM));
         let rows = Rows {
-            entries: self.read_segments::<EntryRow>(&idx.tables.entries).await?,
-            objects: self.read_segments::<ObjectRecord>(&idx.tables.objects).await?,
-            history: self.read_segments::<HistoryRow>(&idx.tables.history).await?,
-            removed: self.read_segments::<RemovedRow>(&idx.tables.removed).await?,
+            entries: rows_of(&mut pages, t.entries.len()).await?,
+            objects: rows_of(&mut pages, t.objects.len()).await?,
+            history: rows_of(&mut pages, t.history.len()).await?,
+            removed: rows_of(&mut pages, t.removed.len()).await?,
         };
-        Ok(DriveState::from_rows(idx.seq, idx.time, rows)?)
+        let state = DriveState::from_rows(idx.seq, idx.time, rows)?;
+        Ok((state, Checkpointed { index: path.to_owned(), pages: t.pages(), seen }))
     }
 
-    async fn read_segments<T: for<'de> Deserialize<'de>>(&self, refs: &[SegmentRef]) -> anyhow::Result<Vec<T>> {
-        let mut out = Vec::new();
-        for r in refs {
-            let bytes = self.page(&r.page).await?;
-            let seg: Segment<T> = serde_json::from_slice(&bytes)?;
-            out.extend(seg.rows);
-        }
-        Ok(out)
-    }
-
-    async fn write_checkpoint(&self, id: &DriveId, state: &DriveState) -> anyhow::Result<()> {
+    /// Writes a checkpoint of `state` (format §8) and returns it. Pages that `reuse` lists are
+    /// not stored again; the others go through the garbage-collection guard like any page.
+    async fn write_checkpoint(&self, id: &DriveId, state: &DriveState, reuse: Option<&Checkpointed>) -> anyhow::Result<Checkpointed> {
         let rows = state.rows();
         let mut pages = Vec::new();
         let tables = CheckpointTables {
@@ -455,7 +567,15 @@ impl Pool {
             history: segments("history", &rows.history, |h| format!("{}@{:020}.{}", h.oid, h.version.seq, h.version.idx), &mut pages),
             removed: segments("removed", &rows.removed, |r| format!("{}@{}", r.key, r.oid), &mut pages),
         };
-        self.write_pages(&pages).await?;
+        let listed = tables.pages();
+        let (reused, new): (Vec<Page>, Vec<Page>) = pages.into_iter().partition(|p| reuse.is_some_and(|r| r.pages.contains(&p.hash)));
+        self.write_pages(&new).await?;
+        if let Some(r) = reuse
+            && !reused.is_empty()
+            && self.clock.mono().saturating_sub(r.seen) > guard::COMMIT_WITHIN
+        {
+            bail!("the previous checkpoint was seen too long ago to vouch for its pages");
+        }
         let idx = CheckpointIndex {
             format: 1,
             seq: state.seq(),
@@ -465,8 +585,37 @@ impl Pool {
         };
         let name = format!("drives/{id}/checkpoints/{:020}.json", state.seq());
         self.store.put(&name, Bytes::from(serde_json::to_vec(&idx)?)).await?;
+        let seen = self.clock.mono();
         self.store.put(&format!("drives/{id}/_last_checkpoint"), Bytes::from(format!("{{\"seq\":{}}}", state.seq()))).await?;
-        Ok(())
+        Ok(Checkpointed { index: name, pages: listed, seen })
+    }
+
+    /// Makes `last` fit for a new checkpoint to list its pages without storing them: reads its
+    /// index again if it was seen more than [`REUSE_WITHOUT_REREAD`] ago, and forgets it if that
+    /// read fails.
+    async fn renew(&self, last: &mut Option<Checkpointed>) {
+        let stale = last.as_ref().filter(|c| self.clock.mono().saturating_sub(c.seen) > REUSE_WITHOUT_REREAD).map(|c| c.index.clone());
+        if let Some(index) = stale {
+            let seen = self.clock.mono();
+            let got = self.store.get(&index).await;
+            *last = match got {
+                Ok(Some(b)) => serde_json::from_slice::<CheckpointIndex>(&b).ok().map(|idx| Checkpointed { pages: idx.tables.pages(), index, seen }),
+                _ => None,
+            };
+        }
+    }
+
+    /// Checkpoints `state`, the drive's newest, and starts counting towards the next one. A
+    /// failure is logged, and the next attempt waits a whole interval.
+    async fn checkpoint(&self, id: &DriveId, state: &DriveState, cadence: &mut Cadence) {
+        cadence.commits = 0;
+        cadence.bytes = 0;
+        self.renew(&mut cadence.last).await;
+        let written = self.write_checkpoint(id, state, cadence.last.as_ref()).await;
+        match written {
+            Ok(c) => cadence.last = Some(c),
+            Err(e) => tracing::warn!("checkpoint of {id} at {} failed: {e:#}", state.seq()),
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -590,25 +739,39 @@ impl Pool {
             return Err(CreateError::Exists);
         }
         let id = DriveId::generate();
-        let (state, fork_of) = match source {
-            None => (DriveState::empty(), None),
+        let mut cadence = Cadence::default();
+        let (state, fork_of, deadline) = match source {
+            None => (DriveState::empty(), None, None),
             Some(src) => {
                 // Hold the source's commit lock so the fork includes every acknowledged write.
-                let _g = src.commit_lock.lock().await;
+                let mut src_cadence = src.commit_lock.lock().await;
                 // The fork references content through the source's state, so the source must
                 // still be a drive (format §12.4): a hard delete forgets it before deleting it.
                 if self.drive_by_id(&src.id).is_none() {
                     return Err(CreateError::NotFound);
                 }
                 let s = src.snapshot().fork();
-                self.write_checkpoint(&id, &s).await?;
+                // The fork's first checkpoint shares every segment that is unchanged since the
+                // source's last one (format §9). That one's index vouches for them until 12 hours
+                // after it was seen (§12.4), so the fork must exist by then.
+                self.renew(&mut src_cadence.last).await;
+                let deadline = src_cadence.last.as_ref().map(|r| r.seen + guard::COMMIT_WITHIN);
+                cadence.last = Some(self.write_checkpoint(&id, &s, src_cadence.last.as_ref()).await?);
                 let seq = s.seq();
-                (s, Some(ForkOf { drive_id: src.id.clone(), seq }))
+                (s, Some(ForkOf { drive_id: src.id.clone(), seq }), deadline)
             }
         };
         let desc = DriveDescriptor { format: 1, drive_id: id.clone(), created: self.clock.now(), alias: alias.to_owned(), fork_of };
+        if deadline.is_some_and(|t| self.clock.mono() > t) {
+            let _ = self.store.delete_prefix(&format!("drives/{id}/")).await;
+            return Err(CreateError::Other(anyhow!("creating the fork took too long; try again")));
+        }
         if !self.store.put_new(&format!("drives/{id}/drive.json"), Bytes::from(serde_json::to_vec_pretty(&desc).map_err(anyhow::Error::from)?)).await? {
             return Err(CreateError::Other(anyhow!("drive id collision")));
+        }
+        // The fork's checkpoint is a garbage-collection root from now on (format §12).
+        if let Some(c) = &mut cadence.last {
+            c.seen = self.clock.mono();
         }
         if self.alias_taken(alias) {
             let _ = self.store.delete_prefix(&format!("drives/{id}/")).await;
@@ -617,7 +780,7 @@ impl Pool {
         if let Some(src) = source {
             src.forks.write().unwrap().push(id.clone());
         }
-        Ok(self.register(Drive::new(desc, state), false))
+        Ok(self.register(Drive::new(desc, state, cadence), false))
     }
 
     pub async fn soft_delete(&self, d: &Drive) -> anyhow::Result<()> {
@@ -721,7 +884,7 @@ impl Pool {
         d: &Drive,
         plan: impl FnOnce(&DriveState) -> Result<Txn, CommitError>,
     ) -> Result<(VersionId, Arc<DriveState>), CommitError> {
-        let _g = d.commit_lock.lock().await;
+        let mut cadence = d.commit_lock.lock().await;
         let cur = d.snapshot();
         let txn = plan(&cur)?;
         let now = self.clock.now();
@@ -729,10 +892,11 @@ impl Pool {
         let commit = Commit { format: 1, seq: cur.seq() + 1, time, authority: self.authority.clone(), txns: vec![txn] };
         let next = cur.apply(&commit).map_err(|e| CommitError::Other(anyhow!("planned transaction does not apply: {e}")))?;
         let bytes = Bytes::from(serde_json::to_vec(&commit).map_err(anyhow::Error::from)?);
+        let len = bytes.len();
         if !self.store.put_new(&log_path(&d.id, commit.seq), bytes).await? {
             // Another authority wrote this sequence number: catch up and ask for a new plan.
             let mut s = (*cur).clone();
-            let batches = self.replay(&d.id, &mut s).await?;
+            let batches = self.replay(&d.id, &mut s, &mut cadence).await?;
             let mut last = None;
             for b in batches {
                 last = Some(b.clone());
@@ -747,10 +911,10 @@ impl Pool {
         let batch = feed_for(&commit, &cur, &next);
         let next = Arc::new(next);
         d.install((*next).clone(), batch);
-        if commit.seq.is_multiple_of(CHECKPOINT_EVERY)
-            && let Err(e) = self.write_checkpoint(&d.id, &next).await {
-                tracing::warn!("checkpoint of {} at {} failed: {e:#}", d.id, commit.seq);
-            }
+        cadence.add(len);
+        if cadence.due() {
+            self.checkpoint(&d.id, &next, &mut cadence).await;
+        }
         Ok((VersionId::new(commit.seq, 0), next))
     }
 
@@ -760,12 +924,12 @@ impl Pool {
         if let Some(fork) = &d.desc.fork_of {
             // A fork's namespace before its own log exists only as its first checkpoint, so its
             // point-in-time window starts at the fork point (format §8.5, §9).
-            state = self.load_checkpoint(&format!("drives/{}/checkpoints/{:020}.json", d.id, fork.seq)).await?;
+            state = self.load_checkpoint(&format!("drives/{}/checkpoints/{:020}.json", d.id, fork.seq)).await?.0;
             if state.time().is_some_and(|ct| ct > t) {
                 bail!("that instant is before this fork was made");
             }
         }
-        for commit in self.commits_after(&d.id, state.seq()).await? {
+        for (commit, _) in self.commits_after(&d.id, state.seq()).await? {
             if commit.time > t {
                 break;
             }
@@ -787,12 +951,17 @@ pub enum CreateError {
 
 #[cfg(test)]
 mod tests {
-    use voidfs_core::model::{Actor, Attrs};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::FutureExt;
+    use voidfs_core::model::{Actor, Attrs, Change, CreateChange, RemoveChange, SetChange};
     use voidfs_core::names::Key;
     use voidfs_core::ops::{self, Precondition};
 
     use super::*;
-    use crate::store::Store;
+    use crate::store::{Fault, MemOp, MemStore, Store};
+
+    const HOUR: Duration = Duration::from_secs(3600);
 
     async fn put(pool: &Pool, d: &Drive, key: &str, data: &'static [u8]) -> VersionId {
         let e = voidfs_core::content::from_bytes(&Bytes::from_static(data), pool.params);
@@ -888,5 +1057,235 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, VersionId::new(2, 0));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Checkpoint segments and cadence
+
+    /// A file at the root. Its id and name come from `i`, so that checkpoints come out the same
+    /// on every run.
+    fn file(i: usize) -> Txn {
+        let oid: ObjectId = format!("o-{i:026}").parse().unwrap();
+        let mut set = SetChange::new(oid.clone());
+        set.content = Some(ContentDescriptor::Inline { extents: vec![Extent::Shard { s: ShardHash::of(&i.to_be_bytes()), n: 1 }] });
+        let create = Change::Create(CreateChange { oid: oid.clone(), parent: ObjectId::root(), name: format!("f{i:06}"), kind: Kind::File });
+        Txn { target: oid, op: Op::Put, actor: Actor::system(), changes: vec![create, Change::Set(set)] }
+    }
+
+    fn removal(i: usize) -> Txn {
+        let oid: ObjectId = format!("o-{i:026}").parse().unwrap();
+        Txn { target: oid.clone(), op: Op::Delete, actor: Actor::system(), changes: vec![Change::Remove(RemoveChange { oid, recursive: false })] }
+    }
+
+    fn commit(seq: u64, txns: Vec<Txn>) -> Commit {
+        Commit { format: 1, seq, time: "2026-09-28T00:00:00Z".parse().unwrap(), authority: "test".into(), txns }
+    }
+
+    /// A drive `big` of `n` files, the even-numbered ones, checkpointed at seq 1, and a server
+    /// that has just started on it, so has checked none of the checkpoint's pages itself.
+    async fn big_drive(n: usize, clock: Clock) -> (Arc<MemStore>, Arc<Pool>, Arc<Drive>, DriveState) {
+        let mem = Arc::new(MemStore::new(clock.clone()));
+        let store = Store::Mem(mem.clone());
+        let state = DriveState::empty().apply(&commit(1, (0..n).map(|i| file(2 * i)).collect())).unwrap();
+        {
+            let pool = Pool::open_with(store.clone(), 64 << 20, clock.clone()).await.unwrap();
+            let d = pool.create_drive("big", None).await.unwrap();
+            pool.write_checkpoint(&d.id, &state, None).await.unwrap();
+        }
+        let pool = Pool::open_with(store, 64 << 20, clock).await.unwrap();
+        let d = pool.drive("big").unwrap();
+        (mem, pool, d, state)
+    }
+
+    /// Counts the requests to `mem` that `which` picks, from now on.
+    fn count(mem: &MemStore, which: impl Fn(MemOp, &str) -> bool + Send + Sync + 'static) -> Arc<AtomicUsize> {
+        let n = Arc::new(AtomicUsize::new(0));
+        let counter = n.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if which(op, path) {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            futures::future::ready(Fault::None).boxed()
+        })));
+        n
+    }
+
+    fn page_puts(op: MemOp, path: &str) -> bool {
+        op == MemOp::Put && path.starts_with("pages/")
+    }
+
+    async fn tables(pool: &Pool, c: &Checkpointed) -> CheckpointTables {
+        let b = pool.store.get(&c.index).await.unwrap().unwrap();
+        serde_json::from_slice::<CheckpointIndex>(&b).unwrap().tables
+    }
+
+    /// How many pages each table of `b` lists that the same table of `a` does not.
+    fn new_pages(a: &CheckpointTables, b: &CheckpointTables) -> [usize; 4] {
+        let new = |x: &[SegmentRef], y: &[SegmentRef]| y.iter().filter(|s| x.iter().all(|o| o.page != s.page)).count();
+        [new(&a.entries, &b.entries), new(&a.objects, &b.objects), new(&a.history, &b.history), new(&a.removed, &b.removed)]
+    }
+
+    async fn checkpoints(store: &Store, d: &Drive) -> Vec<u64> {
+        let names = store.list_files(&format!("drives/{}/checkpoints/", d.id), None).await.unwrap();
+        names.iter().filter_map(|n| n.strip_suffix(".json")?.parse().ok()).collect()
+    }
+
+    #[test]
+    fn segments_end_where_the_keys_say_within_the_bounds() {
+        let keys: Vec<String> = (0..200_000).map(|i| format!("o-{i:026}")).collect();
+        let zeros: Vec<u32> = keys.iter().map(|k| key_zeros(k)).collect();
+        let ends = segment_ends(&keys, String::clone);
+        assert_eq!(ends.last(), Some(&keys.len()));
+        let (mut start, mut by_key, mut fallback) = (0, 0, 0);
+        for &end in &ends[..ends.len() - 1] {
+            let n = end - start;
+            assert!((SEGMENT_MIN_ROWS..=SEGMENT_MAX_ROWS).contains(&n), "a segment of {n} rows");
+            // The rows that could end it: from the minimum to the maximum.
+            let window = &zeros[start + SEGMENT_MIN_ROWS - 1..(start + SEGMENT_MAX_ROWS).min(keys.len())];
+            match window.iter().position(|&z| z >= SEGMENT_CUT_BITS) {
+                Some(p) => {
+                    assert_eq!(end, start + SEGMENT_MIN_ROWS + p, "the first cut by key");
+                    by_key += 1;
+                }
+                None => {
+                    let last = window.iter().rposition(|&z| z >= SEGMENT_FALLBACK_BITS);
+                    assert_eq!(end, start + last.map_or(SEGMENT_MAX_ROWS, |p| SEGMENT_MIN_ROWS + p), "the last fallback");
+                    fallback += 1;
+                }
+            }
+            start = end;
+        }
+        assert!(by_key > 0 && fallback > 0, "{by_key} segments cut by key, {fallback} at a fallback");
+        // Keys that never cut end every segment at the maximum.
+        let flat: Vec<String> = keys.iter().filter(|k| key_zeros(k) < SEGMENT_FALLBACK_BITS).take(20_000).cloned().collect();
+        assert_eq!(segment_ends(&flat, String::clone), [SEGMENT_MAX_ROWS, 2 * SEGMENT_MAX_ROWS, 20_000]);
+        assert_eq!(segment_ends(&keys[..SEGMENT_MIN_ROWS], String::clone), [SEGMENT_MIN_ROWS]);
+        assert!(segment_ends(&keys[..0], String::clone).is_empty());
+    }
+
+    /// A row inserted or removed rewrites one or two segments of each table it touches, and a
+    /// server that has just started stores only those: the previous checkpoint vouches for the
+    /// rest (format §8.3, §12.4 option 1).
+    #[tokio::test]
+    async fn a_checkpoint_stores_only_the_segments_that_changed() {
+        let (mem, pool, d, mut state) = big_drive(30_000, Clock::System).await;
+        assert_eq!(d.snapshot().rows(), state.rows(), "a checkpoint loads as the state it was written from");
+        let mut cadence = d.commit_lock.lock().await;
+        let mut prev = tables(&pool, cadence.last.as_ref().unwrap()).await;
+        for t in [&prev.entries, &prev.objects, &prev.history] {
+            assert!(t.len() >= 4, "only {} segments", t.len());
+        }
+        let puts = count(&mem, page_puts);
+        // A file inserted in the middle of every table, then one removed.
+        for (seq, txn, removed) in [(2, file(30_001), 0), (3, removal(14_000), 1)] {
+            state = state.apply(&commit(seq, vec![txn])).unwrap();
+            puts.store(0, Ordering::SeqCst);
+            pool.renew(&mut cadence.last).await;
+            let written = pool.write_checkpoint(&d.id, &state, cadence.last.as_ref()).await.unwrap();
+            let next = tables(&pool, &written).await;
+            let new = new_pages(&prev, &next);
+            assert!(new[..3].iter().all(|n| (1..=2).contains(n)) && new[3] == removed, "seq {seq}: new pages per table {new:?}");
+            assert_eq!(puts.load(Ordering::SeqCst), new.iter().sum::<usize>(), "seq {seq}: only new pages are stored");
+            cadence.last = Some(written);
+            prev = next;
+        }
+        drop(cadence);
+        mem.set_hook(None);
+        let again = Pool::open(pool.store.clone(), 64 << 20).await.unwrap();
+        let d = again.drive("big").unwrap();
+        assert_eq!(d.snapshot().rows(), state.rows(), "with every table in use");
+        // Without the previous checkpoint, a server that has just started stores every page.
+        let puts = count(&mem, page_puts);
+        let all = again.write_checkpoint(&d.id, &state, None).await.unwrap();
+        assert_eq!(puts.load(Ordering::SeqCst), all.pages.len());
+    }
+
+    /// A checkpoint comes after 16 MiB of log when that comes before 1,000 commits, and the next
+    /// is due 1,000 commits after it, counted across a restart (format §8.4).
+    #[tokio::test]
+    async fn checkpoints_follow_the_log_since_the_last_one() {
+        let store = Store::memory().unwrap();
+        let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        let d = pool.create_drive("log", None).await.unwrap();
+        // Commits of about 80 KB: a file of 1,000 extents, all of one shard.
+        let e = voidfs_core::content::from_bytes(&Bytes::from_static(b"x"), pool.params);
+        pool.write_shards(&e.new_shards).await.unwrap();
+        let big = pool.describe(vec![e.extents[0]; 1000]).await.unwrap();
+        let (mut logged, mut last) = (0, 0);
+        while checkpoints(&store, &d).await.is_empty() {
+            let (v, _) = pool
+                .commit(&d, |s| Ok(ops::put(s, "big", big.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?))
+                .await
+                .unwrap();
+            last = store.get(&log_path(&d.id, v.seq)).await.unwrap().unwrap().len() as u64;
+            logged += last;
+            assert!(v.seq < CHECKPOINT_EVERY, "no checkpoint after {logged} bytes of log");
+        }
+        assert!(logged >= CHECKPOINT_LOG_BYTES && logged - last < CHECKPOINT_LOG_BYTES, "a checkpoint after {logged} bytes of log");
+        let first = d.snapshot().seq();
+        assert_eq!(checkpoints(&store, &d).await, [first]);
+        for _ in 0..600 {
+            put(&pool, &d, "small", b"tick").await;
+        }
+        drop((pool, d));
+        let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        let d = pool.drive("log").unwrap();
+        while d.snapshot().seq() < first + CHECKPOINT_EVERY - 1 {
+            put(&pool, &d, "small", b"tick").await;
+        }
+        assert_eq!(checkpoints(&store, &d).await, [first], "counted from the last checkpoint, not from seq 0");
+        put(&pool, &d, "small", b"tick").await;
+        assert_eq!(checkpoints(&store, &d).await, [first, first + CHECKPOINT_EVERY]);
+    }
+
+    /// A fork's first checkpoint lists its source's pages wherever their rows are the same, and
+    /// stores none of those (format §9).
+    #[tokio::test]
+    async fn a_fork_shares_its_sources_segments() {
+        let (mem, pool, src, _) = big_drive(20_000, Clock::System).await;
+        let puts = count(&mem, page_puts);
+        let a = pool.create_drive("fork-a", Some(&src)).await.unwrap();
+        assert_eq!(puts.load(Ordering::SeqCst), 0, "the source has a checkpoint at the fork point");
+        let source = tables(&pool, src.commit_lock.lock().await.last.as_ref().unwrap()).await;
+        let forked = tables(&pool, a.commit_lock.lock().await.last.as_ref().unwrap()).await;
+        assert_eq!(new_pages(&source, &forked), [0; 4]);
+        // After a commit to the source, a fork stores only the segments that commit changed.
+        put(&pool, &src, "f010001", b"new").await;
+        puts.store(0, Ordering::SeqCst);
+        let b = pool.create_drive("fork-b", Some(&src)).await.unwrap();
+        let forked = tables(&pool, b.commit_lock.lock().await.last.as_ref().unwrap()).await;
+        let new = new_pages(&source, &forked);
+        assert!(new[..3].iter().all(|n| (1..=2).contains(n)) && new[3] == 0, "new pages per table {new:?}");
+        assert_eq!(puts.load(Ordering::SeqCst), new.iter().sum::<usize>());
+    }
+
+    /// The previous checkpoint vouches for its pages until 12 hours after its index was seen: a
+    /// server reads the index again once that was 6 hours ago, and gives up on a checkpoint that
+    /// would be written after the 12 (format §12.4).
+    #[tokio::test]
+    async fn an_old_previous_checkpoint_is_read_again() {
+        let clock = Clock::manual("2026-09-28T00:00:00Z".parse().unwrap());
+        let (mem, pool, d, state) = big_drive(2_000, clock.clone()).await;
+        let mut cadence = d.commit_lock.lock().await;
+        let index = cadence.last.as_ref().unwrap().index.clone();
+        let reads = {
+            let index = index.clone();
+            count(&mem, move |op, path| op == MemOp::Get && path == index)
+        };
+        clock.advance(REUSE_WITHOUT_REREAD - Duration::from_secs(1));
+        pool.renew(&mut cadence.last).await;
+        assert!(cadence.last.is_some());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        clock.advance(2 * HOUR);
+        pool.renew(&mut cadence.last).await;
+        assert_eq!((reads.load(Ordering::SeqCst), cadence.last.as_ref().unwrap().seen), (1, clock.mono()));
+        clock.advance(13 * HOUR);
+        let stale = cadence.last.take().unwrap();
+        assert!(pool.write_checkpoint(&d.id, &state, Some(&stale)).await.is_err(), "written too long after the read it relies on");
+        // An index that has gone vouches for nothing.
+        pool.store.delete(&index).await.unwrap();
+        let mut gone = Some(stale);
+        pool.renew(&mut gone).await;
+        assert!(gone.is_none());
     }
 }

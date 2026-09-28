@@ -39,7 +39,8 @@ billing or plans), this page says so.
 - **The plan (§7):**
   - Step 1 has its harness and local results. Still to do: CI, the run in SpaceFS's setup (which
     waits on cloud accounts, §8), and the Mac comparison.
-  - Step 2 has one of its six items done: garbage collection.
+  - Step 2 has two of its six items done: garbage collection and content-defined checkpoint
+    segments.
   - Steps 3–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -58,17 +59,17 @@ Every item of the plan's checklist (§3, 71 items, including the Finder integrat
 
 | Area | Done | Partly | Missing | State |
 |---|---|---|---|---|
-| Engine (E1–E13) | 7 | 2 | 4 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints and garbage collection work. Missing: the small-file path, direct uploads, encryption, retention policies |
+| Engine (E1–E13) | 8 | 1 | 4 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints and garbage collection work. Missing: the small-file path, direct uploads, encryption, retention policies |
 | Storage backends (B1–B8) | 0 | 1 | 7 | Local disk, R2 and versitygw (the local S3 server the benchmarks use) work. Not yet run on AWS S3 or MinIO. No capability probe, no short-lived storage credentials, no adopt or export |
 | Server (S1–S9) | 2 | 4 | 3 | Full S3 subset, extensions and change feed, on one node. Missing: virtual-host addressing, a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
 | Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount (the spike). No agent, journal, CLI, Finder integration, Linux or Windows |
 | SDKs, agents, search (A1–A7) | 0 | 0 | 7 | Stock S3 SDKs and the AWS CLI work; nothing voidfs-specific |
 | Operations (O1–O6) | 0 | 2 | 4 | One binary. A benchmark harness, not yet run in the cloud. No compose file or metrics |
-| **Total** | **9** | **13** | **49** | Of the 28 P0 items: 9 done, 10 partly, 9 missing |
+| **Total** | **10** | **12** | **49** | Of the 28 P0 items: 10 done, 9 partly, 9 missing |
 
 "Partly" means:
-- E1 has no compression, and E11 lacks content-defined segments.
+- E1 has no compression.
 - B1 is not yet run on AWS S3 or MinIO.
 - S1 lacks virtual-host addressing; S3 lacks direct upload and credentials; S5 is memory-only;
   S8 has no operations catalogue.
@@ -80,8 +81,8 @@ The 28 P0 items, which a credible v1 needs:
 
 | Status | Items |
 |---|---|
-| Done (9) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, S2 S3 subset, S4 per-drive authority and change feed |
-| Partly (10) | E1 chunking, E11 checkpoints, B1 backends, S1 S3 server, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount, O1 single binary and compose |
+| Done (10) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, E11 checkpoints, S2 S3 subset, S4 per-drive authority and change feed |
+| Partly (9) | E1 chunking, B1 backends, S1 S3 server, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount, O1 single binary and compose |
 | Missing (9) | B3 capability probe, B5 stored bucket credentials, C1 sign-in, C2 workspaces, C4 bucket connections, D1 client daemon, D5 desktop semantics, D9 CLI, A1 Rust and TypeScript SDKs |
 
 ## 4. Product by product
@@ -253,12 +254,16 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      could delete a shard a new commit referenced. The protocol is model-checked and the
      implementation simulated (`crates/voidfs-server/src/gc/`). It reclaims deleted drives and
      abandoned uploads; old versions in live drives wait for retention policies (E13).
-   - Content-defined checkpoint segments.
+   - Content-defined checkpoint segments. **Done** (E11): a segment ends where a row's key hash
+     has 12 low zero bits, within 256–8,192 rows (format §8.3), so a checkpoint stores only the
+     segments that changed and a fork shares its source's. A checkpoint comes every 1,000
+     commits or 16 MiB of log, counted from the last one and across restarts (§8.4). Loading a
+     checkpoint fetches its segments 32 at a time.
    - The bucket capability probe.
    - Runs on AWS S3 and MinIO, and rclone.
    - Virtual-host addressing.
    - A `docker compose` file, and health checks and metrics.
-   - **Status (2026-09-28):** 1 of 6 done.
+   - **Status (2026-09-28):** 2 of 6 done.
 3. **Win the rows SpaceFS loses.** The work items, with the step 1 evidence and a row-by-row
    baseline, are in [step-3-performance.md](step-3-performance.md). In order of impact:
    - Group commit: one log write per batch of mutations, not per mutation (37 rows).
@@ -327,8 +332,8 @@ plain objects, file locking, offline pinning.
 - **Tools for step 2's backend runs:** rclone and the AWS CLI are not installed on the
   development Mac, and installing them needs the maintainer's go-ahead. MinIO does not run on
   this Mac (it crashes at startup), so its runs belong in CI.
-- **Order of the next steps (proposed):** do content-defined checkpoint segments and the
-  capability probe, then group commit (step 3, item 1), then the rest of step 2.
-  - Segments change the checkpoint writer, which group commit's work (step 3, item 3) moves off
-    the commit path.
+- **Order of the next steps (proposed):** the capability probe, then group commit (step 3,
+  item 1), then the rest of step 2.
+  - Content-defined checkpoint segments came first, because they change the checkpoint writer
+    that step 3, item 3 moves off the commit path. They are done.
   - Group commit moves more rows than anything else (§6).
