@@ -77,6 +77,8 @@ What was built, in `Pool::commit` ([pool.rs](../crates/voidfs-server/src/pool.rs
   wrong keys once a commit held a put and then a rename of the same file.
 - **Unchanged:** the checkpoint cadence counts log entries and their bytes (§8.4), and a
   checkpoint is still written under the lock after the entry that makes it due.
+- **DeleteObjects** queues its keys together and in order (`Pool::commit_all`), so they share log
+  entries: 200 keys at 12 ms went from 2.6 s to 16 ms.
 
 What was left for later:
 - Rename at 8 at once takes two round trips: after an entry lands, the first new request starts

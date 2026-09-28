@@ -469,32 +469,34 @@ pub async fn delete_objects(app: &Arc<App>, ctx: &Ctx, body: Body) -> Result<Res
     let body = BodyReader::new(body, ctx, MAX_SMALL_BODY)?.read_all().await?;
     let req = parse_delete(&body)?;
     let actor = ctx.actor();
+    // Queued together and in order: each key is deleted after the ones before it, as if one at a
+    // time, and they share log entries.
+    let plans = req.keys.iter().filter(|(_, version)| version.is_none()).map(|(key, _)| {
+        let (key, actor) = (key.clone(), actor.clone());
+        move |st: &DriveState| match ops::delete(st, &key, &ops::Precondition::default(), &actor)? {
+            Some(t) => Ok(t),
+            None => Err(CommitError::Op(ops::OpError::NoSuchKey)),
+        }
+    });
+    let mut answers = app.pool.commit_all(&d, plans).await.into_iter();
     let mut out = String::new();
-    for (key, version) in req.keys {
+    for (key, version) in &req.keys {
         if version.is_some() {
             out.push_str(&format!(
                 "<Error><Key>{}</Key><Code>NotImplemented</Code><Message>history is immutable</Message></Error>",
-                xml_escape(&key)
+                xml_escape(key)
             ));
             continue;
         }
-        let (k, pre, actor) = (key.clone(), Default::default(), actor.clone());
-        let r = app
-            .pool
-            .commit(&d, move |st| match ops::delete(st, &k, &pre, &actor)? {
-                Some(t) => Ok(t),
-                None => Err(CommitError::Op(ops::OpError::NoSuchKey)),
-            })
-            .await;
-        match r {
+        match answers.next().expect("an answer per key") {
             Ok(_) | Err(CommitError::Op(ops::OpError::NoSuchKey)) => {
                 if !req.quiet {
-                    out.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(&key)));
+                    out.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(key)));
                 }
             }
             Err(e) => {
                 let e: S3Error = e.into();
-                out.push_str(&format!("<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>", xml_escape(&key), e.code, xml_escape(&e.message)));
+                out.push_str(&format!("<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>", xml_escape(key), e.code, xml_escape(&e.message)));
             }
         }
     }

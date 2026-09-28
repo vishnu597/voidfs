@@ -192,6 +192,22 @@ And one at a time (at 12 ms, p50 in ms):
 - Multipart put 256 MiB (16 parts, twice as many as there are connections) moved the same way
   here, and its bare bucket varied as much as it did (546–1,079 ms in these runs).
 
+## DeleteObjects
+
+The harness has no DeleteObjects scenario. `delete_objects` committed its keys one after another,
+so a request cost one round trip per key; it now queues them together and in order
+(`Pool::commit_all`), so they share log entries. Timed end to end with the bucket 12 ms away
+(versitygw and `voidfs-bench delay` as `local.sh` sets them up, requests signed by `curl
+--aws-sigv4`), deleting 200 keys in one request, three rounds per server start, `main` then this
+branch twice then `main`:
+
+| | main | group | group | main |
+|---|--:|--:|--:|--:|
+| 200 keys, s | 2.62, 2.62, 2.65 | 0.016, 0.016, 0.017 | 0.016, 0.016, 0.016 | 2.62, 2.61, 2.63 |
+
+Every round deleted all 200 keys with no errors. In each run, a request that listed a file and
+then its folder deleted both, as one at a time did.
+
 ## On loopback
 
 The same A B B A on loopback, where round trips cost about 0.3 ms: this is where the committer's

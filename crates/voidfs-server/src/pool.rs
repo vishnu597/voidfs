@@ -991,12 +991,36 @@ impl Pool {
     /// Answers the transaction's version and the drive's state just after it, which has the
     /// commit's earlier transactions in it and not its later ones.
     pub async fn commit(self: &Arc<Self>, d: &Arc<Drive>, plan: impl FnMut(&DriveState) -> Result<Txn, CommitError> + Send + 'static) -> Committed {
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        d.queue.lock().unwrap().push_back(Waiting { plan: Box::new(plan), reply, since: self.clock.mono() });
+        self.commit_all(d, [plan]).await.pop().expect("one answer per plan")
+    }
+
+    /// [`Pool::commit`] for several transactions, queued together and in order, so that each is
+    /// planned after the ones before it and they share log entries. Answers in the same order.
+    pub async fn commit_all<P>(self: &Arc<Self>, d: &Arc<Drive>, plans: impl IntoIterator<Item = P>) -> Vec<Committed>
+    where
+        P: FnMut(&DriveState) -> Result<Txn, CommitError> + Send + 'static,
+    {
+        let plans: Vec<P> = plans.into_iter().collect();
+        let since = self.clock.mono();
+        let answers: Vec<_> = {
+            let mut q = d.queue.lock().unwrap();
+            plans
+                .into_iter()
+                .map(|plan| {
+                    let (reply, answer) = tokio::sync::oneshot::channel();
+                    q.push_back(Waiting { plan: Box::new(plan), reply, since });
+                    answer
+                })
+                .collect()
+        };
         // A task of its own, so that a request that goes away cannot stop a commit that others
         // are waiting on.
         tokio::spawn(self.clone().drain(d.clone()));
-        answer.await.unwrap_or_else(|_| Err(CommitError::Other(anyhow!("the commit was abandoned"))))
+        let mut out = Vec::with_capacity(answers.len());
+        for answer in answers {
+            out.push(answer.await.unwrap_or_else(|_| Err(CommitError::Other(anyhow!("the commit was abandoned")))));
+        }
+        out
     }
 
     /// Commits what is waiting on `d`, a batch at a time, until nothing is. Every mutation starts
@@ -1532,6 +1556,26 @@ mod tests {
         let first = version(&answers[0]);
         assert_eq!(version(&answers[1]), VersionId::new(first.seq + 1, 0));
         assert!(store.get(&log_path(&d.id, first.seq)).await.unwrap().unwrap().len() > BATCH_BYTES);
+    }
+
+    /// Transactions queued together are planned in their order, share log entries up to the
+    /// cap, and each gets its own answer.
+    #[tokio::test]
+    async fn transactions_committed_together_keep_their_order() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = content(&pool, b"one").await;
+        let entries = count(&mem, |op, path| op == MemOp::PutNew && path.contains("/log/"));
+        // The folder can go only once the file in it has.
+        let answers = pool.commit_all(&d, [put_plan("a/x", &one, Precondition::default(), &Arc::default()), delete_plan("a/x"), delete_plan("a/")]).await;
+        assert_eq!(answers.iter().map(version).collect::<Vec<_>>(), [VersionId::new(1, 0), VersionId::new(1, 1), VersionId::new(1, 2)]);
+        assert!(d.snapshot().lookup(&Key::parse("a/").unwrap()).is_none());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let answers = pool.commit_all(&d, (0..BATCH_TXNS + 1).map(|i| put_plan(&format!("k{i}"), &one, Precondition::default(), &runs))).await;
+        assert_eq!(answers.iter().map(version).collect::<Vec<_>>(), (0..BATCH_TXNS as u32).map(|i| VersionId::new(2, i)).chain([VersionId::new(3, 0)]).collect::<Vec<_>>());
+        assert_eq!(entries.load(Ordering::SeqCst), 3);
+        mem.set_hook(None);
     }
 
     /// A mutation that waited longer than [`QUEUE_MAX`] for the log is handed back, not committed
