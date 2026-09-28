@@ -573,8 +573,12 @@ impl Pool {
             None if desc.fork_of.is_some() => bail!("fork {id} has no checkpoint"),
             None => DriveState::empty(),
         };
+        let from = state.seq();
         let drive_feed = self.replay(id, &mut state, &mut cadence).await?;
         let d = Drive::new(desc, state, cadence);
+        // The feed holds every commit replayed, so it can report changes after where the replay
+        // started.
+        *d.feed_floor.write().unwrap() = from;
         for b in drive_feed {
             d.push_feed(b);
         }
@@ -1754,6 +1758,32 @@ mod tests {
         let puts = count(&mem, page_puts);
         let all = again.write_checkpoint(&d.id, &state, None).await.unwrap();
         assert_eq!(puts.load(Ordering::SeqCst), all.pages.len());
+    }
+
+    /// After a restart, the feed reports the changes replayed from the log since the last
+    /// checkpoint, and no earlier ones (protocol §5.6).
+    #[tokio::test]
+    async fn a_reloaded_drive_reports_the_changes_it_replayed() {
+        let store = Store::memory().unwrap();
+        let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        for key in ["a", "b", "c"] {
+            put(&pool, &d, key, b"x").await;
+        }
+        let keys = |d: &Drive, since| d.changes_since(since).map(|bs| bs.iter().flat_map(|b| b.changes.iter().map(|c| c.key.clone())).collect::<Vec<_>>());
+        let again = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        let reloaded = again.drive("d").unwrap();
+        assert_eq!(keys(&reloaded, 0), Some(vec!["a".to_owned(), "b".into(), "c".into()]));
+        assert_eq!(keys(&reloaded, 2), Some(vec!["c".to_owned()]));
+        // With a checkpoint at seq 3, the log is replayed from there.
+        pool.write_checkpoint(&d.id, &d.snapshot(), None).await.unwrap();
+        for key in ["d", "e"] {
+            put(&pool, &d, key, b"x").await;
+        }
+        let again = Pool::open(store, 1 << 20).await.unwrap();
+        let reloaded = again.drive("d").unwrap();
+        assert_eq!(keys(&reloaded, 3), Some(vec!["d".to_owned(), "e".into()]));
+        assert_eq!(keys(&reloaded, 2), None, "before the checkpoint");
     }
 
     /// A checkpoint comes after 16 MiB of log when that comes before 1,000 commits, and the next
