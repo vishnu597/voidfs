@@ -170,6 +170,9 @@ concurrency × 1. At 12 ms: renames and edits from about 95 ms to 25–40 ms, fa
   at the start moved within the spread between runs.
 - Rows at or ahead of SpaceFS's ratio: 21 and 22, against 16 and 19 for `main` in the same
   session. The geometric mean speed-up over the bare bucket went from 2.0× to 2.6×.
+- Against Cloudflare R2, with a 64 MiB cache so that the small-object scenarios fill it: the
+  fan-out gets took 0.6–2.2 ms instead of 75–116, get 1 MiB's p90 2.5 ms instead of 357, and six
+  of the eight edits in 1 MiB files were 19–26% faster, one 1 MiB GET from R2 fewer.
 - Writes: with the cache full, fan-out put 1,000 × 4 KiB at 64 at once is 1–3% slower in p50
   and 1.6–2.6% in round time; one at a time and at 8 at once, nothing shows. Inserting from a
   blocking thread did not help.

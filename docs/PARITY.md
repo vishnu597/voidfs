@@ -200,7 +200,11 @@ What the runs show:
   the bare bucket at any distance, and further ahead than SpaceFS.
 - **Against Cloudflare R2** (23 small-object scenarios, voidfs-server beside the harness on the
   Mac, the bucket about 200 ms per PUT away): reads and metadata ran 15–324× faster than the
-  bare bucket, and every write ran at its concurrency times one PUT, up to 13 s.
+  bare bucket, and every write ran at its concurrency times one PUT, up to 13 s. Run again on
+  29 September with group commit and the shard cache (a 64 MiB cache, so that it fills): writes
+  took 0.6–1.0 s, the fan-out gets 0.6–2.2 ms instead of `main`'s 75–116, and 16 of the 23 rows
+  were at or ahead of SpaceFS's ratio against the earlier run's bare bucket
+  ([bench/results/shard-cache](../bench/results/shard-cache/README.md#against-cloudflare-r2)).
 - **Everything that wrote was held back by one thing:** a drive committed one mutation per
   bucket round trip, because the commit lock was held across the log's conditional PUT. At 8
   operations at once, every write cost 8 round trips; at 64, 64. That is why renames and
