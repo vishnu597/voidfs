@@ -97,7 +97,9 @@ case "$s3" in
 esac
 pids+=($!)
 wait_for "http://127.0.0.1:$s3_port/"
+# Older curl doesn't send the payload hash, which versitygw requires: this is the empty body's.
 curl -sS -f -o /dev/null --aws-sigv4 "aws:amz:us-east-1:s3" --user "$s3_key:$s3_secret" \
+    -H "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
     -X PUT "http://127.0.0.1:$s3_port/bench"
 
 bucket_port="$s3_port"

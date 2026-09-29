@@ -45,10 +45,11 @@ billing or plans), this page says so.
   running in a separate daemon, which is the architecture the FSKit spike chose for voidfs. It
   also shows that the FSKit entitlement can ship with Developer ID.
 - **The plan (§7):**
-  - Step 1 has its harness and local results. Still to do: CI, the run in SpaceFS's setup (which
-    waits on cloud accounts, §8), and the Mac comparison.
+  - Step 1 has its harness, local results and CI. Still to do: the run in SpaceFS's setup
+    (which waits on cloud accounts, §8), and the Mac comparison.
   - Step 2 has three of its six items done: garbage collection, content-defined checkpoint
-    segments and the bucket capability probe.
+    segments and the bucket capability probe. MinIO, rclone and the Compose file are done too;
+    AWS S3, a health endpoint and metrics, and virtual-host addressing are still to do.
   - Step 3 has its first two items done: group commit and the shard cache's admission.
   - Steps 4–10 have not started.
 
@@ -298,8 +299,11 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      region.
    - **Done when:** a table in the same format as theirs is published for both the S3 layer and
      the mount.
-   - **Status (2026-09-28):** the scenarios are ported and have run locally and against R2 (§6).
-     CI against MinIO, the run in SpaceFS's setup, and the Mac comparison are still to do.
+   - **Status (2026-09-29):** the scenarios are ported and have run locally and against R2 (§6).
+     CI (GitHub Actions) runs them on every push to `main` at a tenth of the operations, with
+     versitygw 12 ms away as in the local runs, and keeps the results; MinIO no longer publishes
+     binaries, so the benchmark doesn't use it. The run in SpaceFS's setup and the Mac comparison
+     are still to do.
 2. **Finish the engine** (the Phase 1 exit criteria).
    - Garbage collection first. **Done** (E8): two phases per format §12 as amended by
      [RFC 0002](../rfcs/0002-gc-safe-against-writers.md), which closes a race in draft 1 that
@@ -322,9 +326,20 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      nothing new. Temporary credentials are reported as not probed, until short-lived
      credentials (B4) need them. Checked against versitygw 1.8.0 and Cloudflare R2.
    - Runs on AWS S3 and MinIO, and rclone.
-   - Virtual-host addressing.
-   - A `docker compose` file, and health checks and metrics.
-   - **Status (2026-09-28):** 3 of 6 done.
+     - MinIO: **done**. MinIO no longer publishes binaries or images, and its repository is
+       archived, so CI builds its last release (`RELEASE.2025-10-15T17-29-55Z`) from source and
+       runs the conformance suite and the clients on it. versitygw stands in for it locally.
+     - rclone: **done** ([`tests/interop/rclone_smoke.sh`](../tests/interop/rclone_smoke.sh)):
+       copy with multipart, `check --download`, sync, server-side copy and move, `rcat`. `rclone
+       purge` fails: on a versioned bucket it deletes every version, and voidfs keeps history
+       (protocol §3). `rclone delete` then `rclone rmdir` removes a drive.
+     - AWS S3: waits on a bucket (§8).
+   - Virtual-host addressing (in progress).
+   - A `docker compose` file, and health checks and metrics. The Compose file is **done**
+     ([`deploy/compose/`](../deploy/compose/)): the server's image, its pool in a volume, in a
+     bucket of yours, or in versitygw beside it, which CI brings up and tests. Health is only
+     "answers HTTP" for now; a health endpoint and metrics on a port of their own are to do.
+   - **Status (2026-09-29):** 3 of 6 done; MinIO, rclone and the Compose file too.
 3. **Win the rows SpaceFS loses.** The work items, with the step 1 evidence and a row-by-row
    baseline, are in [step-3-performance.md](step-3-performance.md). In order of impact:
    - Group commit: one log write per batch of mutations, not per mutation (37 rows). **Done**:
@@ -394,13 +409,18 @@ plain objects, file locking, offline pinning.
   so that topology is the like-for-like one; the plan's server in us-east-1 is a second run.
 - **Test data in the SpaceFS trial:** uploading the benchmark data into a trial drive needs the
   account owner's go-ahead each time.
-- **CI:** the repository has no CI yet. Step 1's MinIO runs need a GitHub Actions workflow, which
-  needs the maintainer's go-ahead. So do the bucket checks the capability probe can't make
-  without new objects: that create-if-absent holds when writers race, and that reads and
-  listings see writes at once.
-- **Tools for step 2's backend runs:** rclone and the AWS CLI are not installed on the
-  development Mac, and installing them needs the maintainer's go-ahead. MinIO does not run on
-  this Mac (it crashes at startup), so its runs belong in CI.
+- **CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), added 2026-09-29): tests,
+  clippy and the spec's cases; the conformance suite, boto3 and rclone over memory, local disk,
+  versitygw and MinIO; the Compose files; and on `main`, the release GC model and a small
+  benchmark. Still to add: the bucket checks the capability probe can't make without new
+  objects (that create-if-absent holds when writers race, and that reads and listings see
+  writes at once).
+- **Tools:** rclone and Docker (with Colima) are installed on the development Mac; the AWS CLI is
+  not. MinIO's Homebrew build crashes on this Mac, and MinIO no longer publishes binaries or
+  images, so versitygw is the local S3 server and CI builds MinIO from source.
+- **An AWS S3 bucket for step 2:** the step 1 bucket above would serve too. The maintainer
+  creates it and a key scoped to it ([bench/README.md](../bench/README.md#the-real-run)); then
+  the conformance suite, the clients and a small benchmark run against it.
 - **Order of the next steps (agreed 2026-09-28):** the shard cache's admission (step 3, item 2),
   then the rest of step 2, then fewer sequential round trips per write (step 3, item 3).
   - Content-defined checkpoint segments came first, because they change the checkpoint writer

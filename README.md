@@ -9,7 +9,7 @@ voidfs is the service layer only. The bytes live in a bucket you already have: A
 Cloudflare R2, MinIO, and others. There is no hosted voidfs; you run it.
 
 > **Status: Phase 1 (engine and S3 server), pre-alpha.** The server passes the whole
-> [conformance suite](spec/conformance/) and works with stock boto3 and the AWS CLI. There is
+> [conformance suite](spec/conformance/) and works with stock boto3, rclone and the AWS CLI. There is
 > no Mac drive yet. Garbage collection reclaims deleted drives and abandoned uploads, but every
 > version of a file in a live drive is kept, because there are no retention policies yet. The
 > protocol and on-bucket format are drafts and will change. See the
@@ -53,6 +53,16 @@ VOIDFS_ENDPOINT=http://127.0.0.1:9000 VOIDFS_ACCESS_KEY_ID=<id> VOIDFS_SECRET_AC
   cargo run -p voidfs-conformance
 ```
 
+### With Docker Compose
+
+[`deploy/compose/`](deploy/compose/) runs the server in a container, with its pool in a volume, in
+a bucket of yours, or in a local S3 server beside it:
+
+```bash
+cd deploy/compose && cp example.env .env   # then set the keys in .env
+docker compose up -d --build --wait
+```
+
 ### Checking the bucket
 
 Commits rely on the bucket refusing to create an object that already exists (`If-None-Match: *`,
@@ -94,7 +104,9 @@ collects everything unreferenced in one run.
 | [`crates/voidfs-server`](crates/voidfs-server/) | The S3 server: storage backends, commit log, checkpoints, forks, SigV4, change feed |
 | [`crates/voidfs-conformance`](crates/voidfs-conformance/) | Runs the conformance suite against any endpoint |
 | [`crates/voidfs-bench`](crates/voidfs-bench/), [`bench/`](bench/) | SpaceFS's 49 benchmark scenarios, run through voidfs and against the bare bucket; scripts and results |
-| [`tests/interop/`](tests/interop/) | Checks with stock S3 clients (boto3) |
+| [`tests/interop/`](tests/interop/) | Checks with stock S3 clients (boto3, rclone); `run.sh` runs them and the conformance suite over each kind of store |
+| [`deploy/compose/`](deploy/compose/) | Docker Compose files, and a local S3 server to try it with |
+| [`.github/workflows/`](.github/workflows/) | CI: tests, lints, conformance and clients over memory, disk, versitygw and MinIO, Compose, and on `main` the GC model and a small benchmark |
 | [`rfcs/`](rfcs/) | Proposals for changes to the specs |
 | [`docs/`](docs/) | Research, architecture and roadmap |
 
