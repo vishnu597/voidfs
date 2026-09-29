@@ -265,6 +265,73 @@ per-byte time.
 
 ### Item 3. Fewer sequential round trips per write
 
+**Status (29 September 2026): changes 2 and 3 done; change 1 is a draft RFC,
+[0003](https://github.com/vishnu597/voidfs/pull/12), for review.** Measured in
+[bench/results/write-round-trips](../bench/results/write-round-trips/README.md):
+- **Measured first.** Put 64 MiB on loopback, one at a time, took 300 ms: about 150 ms of CPU in
+  the request's own task and 150 ms waiting for seven batches of four shard uploads. The largest
+  CPU cost was neither FastCDC nor SHA-256 but the upload checksum SDKs send (CRC32): the `crc`
+  crate's default single table runs at 0.5 GB/s, 93–110 ms for 64 MiB. A checkpoint under the
+  commit lock showed at p99.9, not p99: over 20,000 puts of 4 KiB at 12 ms, 32–37 took over
+  100 ms (p50 29–31 ms).
+- **Checkpoints in the background.** In the same probe, p99.9 went from 118–135 ms to 49–56, the
+  slowest write from 145–166 ms to 55–88, and none took over 100 ms; p50 and p99 did not move. A
+  checkpoint of that drive takes 79–87 ms, now off every request's path.
+- **Ingest.** At 12 ms, put 64 MiB went from 371–376 ms (2.3× the bare bucket) to 204–221 ms
+  (1.2–1.4×) eight at once, and from 345 ms (2.5×) to 122 ms (0.9×) one at a time; put 32 MiB
+  from 2.1–2.2× to 1.3× eight at once and 1.05× alone. Of that, the checksum was about 100 ms of
+  64 MiB's 160, and the window of uploads most of the rest. Eight large puts at once are now
+  bound by this one machine's CPU, which the harness, versitygw and the server share.
+- **Over the 49 rows**, relative to the bare bucket in the same run: at 12 ms the geometric mean of
+  the p50 ratios against `main` is 0.987 (writes 0.922), on loopback 0.965 (writes 0.822). At
+  12 ms no row crossed SpaceFS's ratio (20–23 rows are at or ahead, `main` 22–24 in the same
+  session): the large puts are at 1.3×, and SpaceFS's at 1.1–1.2×. On loopback, put 32 and 64 MiB
+  and overwrite 1 MiB crossed: 34–35 rows, `main` 31–32.
+
+What was built:
+- **Checkpoints in the background** (`Pool::commit_batch`, `Pool::checkpoint`). The commit that
+  makes one due starts a task with the state it has just installed, and is answered at once. The
+  commit lock still guards the count towards the next checkpoint; the last checkpoint, whose
+  pages the next one lists without storing them, moved to a lock of its own, which the committer
+  takes with `try_lock` while it holds the commit lock and hands to the task. So there is one
+  checkpoint at a time per drive; if one is still being written when the next is due, the next
+  commit tries again; a failure still waits a whole interval.
+  - Forks and hard deletes take the commit lock and then the checkpoint lock, so they wait for
+    one being written: a fork starts from it, and nothing of a deleted drive is written after it
+    has gone.
+  - The rows are copied, encoded and hashed on a blocking thread.
+  - The index is written within 12 hours of when its state was the drive's, as §12.4 option 1
+    requires of anything that references content through a root. Before, the state was the
+    drive's throughout; now it may not be. Nothing expires versions yet, so a later state still
+    references everything an earlier one did, but a retention policy would change that. A fork's
+    deadline now counts its snapshot too.
+  - A server that stops waits for checkpoints in flight (one cut short would be harmless).
+  - `voidfs_checkpoint_write_seconds` reports how long they take.
+- **Checksums with sixteen tables** (`s3/chunked.rs`): 5.6 GB/s instead of 0.5, the same crate.
+- **Ingest that keeps reading** (`ingest` in `s3/object.rs`): the body is read and cut while up to
+  16 shards or 32 MiB (one larger shard alone) upload; a failure fails the request at once and
+  drops the uploads in flight; nothing is committed until the whole body matched its signature,
+  and `MAX_INGEST` still applies. Shards of 256 KiB or more are hashed on blocking threads, at
+  most one per CPU across requests, so that one body's shards hash in parallel.
+- **The chunker's copy** (`StreamChunker::push`): each shard is copied out and the buffer advanced,
+  instead of split off, which made the next input move the rest of the buffer, up to 16 MiB per
+  shard of about 2 MiB. Each byte is now copied out about 1.4–1.8 times, and the buffer stays at
+  32 MiB with the default chunking and body frames of 16–64 KiB.
+
+What was left for later:
+- Change 1, small files inside their metadata: [RFC 0003](https://github.com/vishnu597/voidfs/pull/12)
+  proposes a `d` extent with up to 4 KiB of content, an `inline-data` feature flag, and
+  checkpoints that store those bytes as shards ("spilling") so that neither checkpoints nor memory
+  grow with them. It needs review before any spec text or code.
+- Multipart uploads of 8 and 16 MiB parts gain little from the window: their time at 12 ms is
+  completion's chain of round trips (item 5).
+- Put 1 MiB and the fan-out puts of 4 KiB, 8 to 64 at once at 12 ms, are 1.5–3.5% slower in p50.
+  Nothing on their path costs more: one at a time, put 4 KiB takes the same time and put 1 MiB
+  2–3% less. Closed-loop clients fall into step with group commit a little differently when each
+  request's own work takes less time.
+- SHA-256 runs twice over a body whose payload hash is signed (the signature's, then the
+  shards'); nothing can share them.
+
 **Problem.** Even alone, a data write takes two bucket round trips one after another: the new
 shards, then the log entry. A 4 KiB put at concurrency 1 took 27.3 ms where a rename, one round
 trip, took 12.8 ms. SpaceFS says it commits in "one wave". The format forbids simply doing the same: a commit

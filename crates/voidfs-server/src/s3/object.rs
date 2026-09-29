@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Object-level operations (protocol §3, §4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -309,30 +309,80 @@ async fn get(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> 
 /// The longest a streamed body may take. What it references must be committed within 12 hours
 /// of the garbage-collection check its first shards relied on (format §12.4).
 const MAX_INGEST: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+/// Shard uploads a body keeps in flight while it is read on...
+const INGEST_UPLOADS: usize = 16;
+/// ...and their size, at most, unless one shard alone is larger.
+const INGEST_BYTES: usize = 32 << 20;
+/// Shards at least this large are hashed on a blocking thread, so that the shards of one body
+/// hash in parallel while it is read on: a 2 MiB shard takes about a millisecond.
+const HASH_ELSEWHERE: usize = 256 << 10;
+/// Blocking threads hashing shards at once, across requests: one per CPU. Past that, a shard is
+/// hashed where its upload runs, which is as fast when there is no idle core anyway.
+static HASHERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get()))));
 
-/// Streams a body into shards; returns the content's extents.
+/// Streams a body into shards; returns the content's extents. The body is read and cut while
+/// the shards cut from it so far hash and upload, up to [`INGEST_UPLOADS`] and [`INGEST_BYTES`]
+/// at once.
 async fn ingest(pool: &Pool, mut reader: BodyReader) -> Result<Vec<Extent>, S3Error> {
     let started = pool.clock.mono();
-    let mut chunker = StreamChunker::new(pool.params);
-    let mut shards: Vec<Shard> = Vec::new();
-    let mut extents = Vec::new();
-    let store = async |shards: &mut Vec<Shard>, extents: &mut Vec<Extent>| -> Result<(), S3Error> {
-        if shards.is_empty() {
-            return Ok(());
+    let mut chunker = Some(StreamChunker::new(pool.params));
+    // One for each shard cut, in order, filled in once it is uploaded.
+    let mut extents: Vec<Option<Extent>> = Vec::new();
+    // Shards cut and not uploading yet, with their places in `extents`, and the uploads in
+    // flight, which answer their extents.
+    let mut cut: VecDeque<(usize, Bytes)> = VecDeque::new();
+    let mut uploads = futures::stream::FuturesUnordered::new();
+    let mut in_flight = 0;
+    loop {
+        while let Some((_, b)) = cut.front()
+            && (uploads.is_empty() || (uploads.len() < INGEST_UPLOADS && in_flight + b.len() <= INGEST_BYTES))
+        {
+            let (i, bytes) = cut.pop_front().expect("a shard was just seen");
+            in_flight += bytes.len();
+            uploads.push(async move {
+                let hasher = if bytes.len() < HASH_ELSEWHERE { None } else { HASHERS.clone().try_acquire_owned().ok() };
+                let s = match hasher {
+                    Some(permit) => {
+                        tokio::task::spawn_blocking(move || {
+                            let s = Shard::new(bytes);
+                            drop(permit);
+                            s
+                        })
+                        .await?
+                    }
+                    None => Shard::new(bytes),
+                };
+                pool.write_shards(std::slice::from_ref(&s)).await?;
+                anyhow::Ok((i, Extent::Shard { s: s.hash, n: s.bytes.len() as u64 }))
+            });
         }
-        pool.write_shards(shards).await?;
-        extents.extend(shards.iter().map(|s| Extent::Shard { s: s.hash, n: s.bytes.len() as u64 }));
-        shards.clear();
-        Ok(())
-    };
-    while let Some(data) = reader.next().await? {
-        shards.extend(chunker.push(&data));
-        if shards.len() >= 4 {
-            store(&mut shards, &mut extents).await?;
+        // The body is read on only once what it gave so far is uploading.
+        let reading = chunker.is_some() && cut.is_empty();
+        if !reading && uploads.is_empty() {
+            break;
+        }
+        // Reading the body is cancel-safe: a piece is taken from it only when it is returned.
+        // An error returns at once, and drops the uploads in flight.
+        tokio::select! {
+            Some(done) = uploads.next(), if !uploads.is_empty() => {
+                let (i, e) = done?;
+                in_flight -= e.len() as usize;
+                extents[i] = Some(e);
+            }
+            data = reader.next(), if reading => {
+                let shards = match data? {
+                    Some(data) => chunker.as_mut().expect("still reading").push_unhashed(&data),
+                    None => chunker.take().expect("still reading").finish_unhashed(),
+                };
+                for b in shards {
+                    cut.push_back((extents.len(), b));
+                    extents.push(None);
+                }
+            }
         }
     }
-    shards.extend(chunker.finish());
-    store(&mut shards, &mut extents).await?;
+    let extents: Vec<Extent> = extents.into_iter().map(|e| e.expect("every shard was uploaded")).collect();
     // Nothing is committed until the whole body matched its signature.
     reader.finish()?;
     if pool.clock.mono().saturating_sub(started) > MAX_INGEST {
@@ -963,4 +1013,187 @@ pub async fn list_uploads(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Respon
             }
     }
     Ok(xml(200, format!("<ListMultipartUploadsResult xmlns=\"{S3_NS}\"><Bucket>{}</Bucket><IsTruncated>false</IsTruncated>{out}</ListMultipartUploadsResult>", xml_escape(ctx.bucket()))))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use futures::FutureExt;
+    use rand::{RngExt, SeedableRng};
+    use voidfs_core::model::{Chunking, CommitGuard, Features, PoolDescriptor};
+
+    use super::*;
+    use crate::sigv4::{Authenticated, KeyInfo, Payload};
+    use crate::store::{Fault, MemOp, MemStore, Store};
+
+    type Sender = futures::channel::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>;
+
+    fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        (0..len).map(|_| rng.random()).collect()
+    }
+
+    /// A pool that cuts shards of 64 bytes to 1 KiB, so that a small body makes many.
+    async fn pool(mem: &Arc<MemStore>) -> Arc<Pool> {
+        pool_cutting(mem, Chunking { min: 64, avg: 256, max: 1024, ..Chunking::default() }).await
+    }
+
+    async fn pool_cutting(mem: &Arc<MemStore>, chunking: Chunking) -> Arc<Pool> {
+        let desc = PoolDescriptor {
+            format: voidfs_core::FORMAT_VERSION,
+            pool_id: "p-ingest".into(),
+            created: Timestamp::now(),
+            features: Features { compatible: vec![], incompatible: vec![] },
+            chunking,
+            hash: "sha256".into(),
+            commit_guard: CommitGuard::CreateIfAbsent,
+        };
+        let store = Store::mem(mem.clone());
+        store.put(crate::probe::DESCRIPTOR, Bytes::from(serde_json::to_vec(&desc).unwrap())).await.unwrap();
+        Pool::open(store, 1 << 20).await.unwrap()
+    }
+
+    /// A body read as a request with `payload` would be, which arrives through the sender.
+    fn body(payload: Payload) -> (BodyReader, Sender) {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let key = KeyInfo { id: "k".into(), secret: "s".into(), scope: crate::sigv4::Scope::Admin, drives: None };
+        let auth = Authenticated { key, payload, signing_key: [0; 32], scope: String::new(), amz_date: String::new(), seed_signature: String::new() };
+        let ctx = Ctx {
+            method: Method::PUT,
+            bucket: Some("d".into()),
+            key: Some("k".into()),
+            virtual_host: false,
+            query: super::super::util::Query::parse(""),
+            headers: http::HeaderMap::new(),
+            auth,
+        };
+        (BodyReader::new(Body::from_stream(rx), &ctx, MAX_PUT).unwrap(), tx)
+    }
+
+    fn shard_puts(op: MemOp, path: &str) -> bool {
+        op == MemOp::Put && path.starts_with("shards/")
+    }
+
+    /// Makes shard uploads wait until the sender says `true`, except that `fail` picks, by
+    /// count from 1, uploads that fail at once instead. Counts the uploads started.
+    fn hold(mem: &MemStore, fail: impl Fn(usize) -> bool + Send + Sync + 'static) -> (tokio::sync::watch::Sender<bool>, Arc<AtomicUsize>) {
+        let (release, released) = tokio::sync::watch::channel(false);
+        let started = Arc::new(AtomicUsize::new(0));
+        let n = started.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if !shard_puts(op, path) {
+                return futures::future::ready(Fault::None).boxed();
+            }
+            if fail(n.fetch_add(1, Ordering::SeqCst) + 1) {
+                return futures::future::ready(Fault::Fail).boxed();
+            }
+            let mut released = released.clone();
+            async move {
+                let _ = released.wait_for(|r| *r).await;
+                Fault::None
+            }
+            .boxed()
+        })));
+        (release, started)
+    }
+
+    async fn reached(n: &AtomicUsize, at_least: usize) {
+        while n.load(Ordering::SeqCst) < at_least {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Shards upload while the body is still arriving, no more than [`INGEST_UPLOADS`] at once,
+    /// and the extents are those of the whole body cut in one pass.
+    #[tokio::test]
+    async fn a_body_uploads_while_it_is_read() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let pool = pool(&mem).await;
+        let data = Bytes::from(random_bytes(7, 200_000));
+        let (reader, tx) = body(Payload::Unsigned);
+        let (release, started) = hold(&mem, |_| false);
+        let ingesting = tokio::spawn({
+            let pool = pool.clone();
+            async move { ingest(&pool, reader).await }
+        });
+        // Half the body, which cuts far more shards than the window holds.
+        for piece in data[..100_000].chunks(4096) {
+            tx.unbounded_send(Ok(Bytes::copy_from_slice(piece))).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), reached(&started, INGEST_UPLOADS)).await.expect("uploads start while the body is read");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(started.load(Ordering::SeqCst), INGEST_UPLOADS, "a full window, and no more, before the body has ended");
+        release.send(true).unwrap();
+        for piece in data[100_000..].chunks(4096) {
+            tx.unbounded_send(Ok(Bytes::copy_from_slice(piece))).unwrap();
+        }
+        drop(tx);
+        let extents = ingesting.await.unwrap().unwrap();
+        let whole = voidfs_core::content::from_bytes(&data, pool.params);
+        assert_eq!(extents, content::normalize(whole.extents));
+        for e in &extents {
+            let Extent::Shard { s, .. } = e else { panic!("{e:?}") };
+            assert!(pool.store.exists(&format!("shards/{}", s.object_path())).await.unwrap());
+        }
+    }
+
+    /// Shards large enough to hash on other threads, uploads that finish out of order: the
+    /// extents are still the body's, in order.
+    #[tokio::test]
+    async fn shards_hashed_elsewhere_keep_their_order() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let pool = pool_cutting(&mem, Chunking { min: HASH_ELSEWHERE as u32, avg: 512 << 10, max: 1 << 20, ..Chunking::default() }).await;
+        let delays = Arc::new(std::sync::Mutex::new(rand::rngs::StdRng::seed_from_u64(3)));
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            let wait = if shard_puts(op, path) { delays.lock().unwrap().random_range(0..20) } else { 0 };
+            async move {
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                Fault::None
+            }
+            .boxed()
+        })));
+        let data = Bytes::from(random_bytes(10, 12 << 20));
+        let (reader, tx) = body(Payload::Unsigned);
+        for piece in data.chunks(64 << 10) {
+            tx.unbounded_send(Ok(Bytes::copy_from_slice(piece))).unwrap();
+        }
+        drop(tx);
+        let extents = ingest(&pool, reader).await.unwrap();
+        let whole = voidfs_core::content::from_bytes(&data, pool.params);
+        assert!(whole.extents.len() > INGEST_UPLOADS, "{} shards", whole.extents.len());
+        assert_eq!(extents, content::normalize(whole.extents));
+    }
+
+    /// An upload that fails fails the body at once, and the uploads still in flight are dropped.
+    #[tokio::test]
+    async fn a_failed_upload_stops_the_rest() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let pool = pool(&mem).await;
+        let data = random_bytes(8, 100_000);
+        let (reader, tx) = body(Payload::Unsigned);
+        let (release, started) = hold(&mem, |n| n == 3);
+        tx.unbounded_send(Ok(Bytes::from(data))).unwrap();
+        drop(tx);
+        let failed = tokio::time::timeout(Duration::from_secs(10), ingest(&pool, reader)).await.expect("the failure does not wait for the rest");
+        assert_eq!(failed.unwrap_err().status, 500);
+        let n = started.load(Ordering::SeqCst);
+        assert!((3..=INGEST_UPLOADS).contains(&n), "{n} uploads started");
+        release.send(true).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(pool.store.list_recursive("shards/").await.unwrap().is_empty(), "none of the dropped uploads went on");
+    }
+
+    /// A body that does not match its signature fails after it is uploaded, before anything
+    /// could commit it.
+    #[tokio::test]
+    async fn a_body_that_does_not_match_its_signature_fails() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let pool = pool(&mem).await;
+        let (reader, tx) = body(Payload::Sha256([0; 32]));
+        tx.unbounded_send(Ok(Bytes::from(random_bytes(9, 10_000)))).unwrap();
+        drop(tx);
+        assert_eq!(ingest(&pool, reader).await.unwrap_err().code, "XAmzContentSHA256Mismatch");
+    }
 }
