@@ -284,7 +284,8 @@ impl BodyReader {
         Ok(BodyReader { body, hasher, chunked, pending: Default::default(), checksum, decoded_length, read: 0, limit })
     }
 
-    /// The next piece of content, or `None` at the end.
+    /// The next piece of content, or `None` at the end. Cancel-safe: it waits only for the next
+    /// frame of the body, and takes nothing from it before that.
     pub async fn next(&mut self) -> Result<Option<Bytes>, S3Error> {
         loop {
             if let Some(b) = self.pending.pop_front() {

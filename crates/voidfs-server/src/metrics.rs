@@ -267,6 +267,8 @@ pub struct PoolMetrics {
     pub commits_failed: IntCounter,
     pub checkpoints_written: IntCounter,
     pub checkpoints_failed: IntCounter,
+    /// How long each checkpoint took to write, in the background.
+    pub checkpoint_write: Histogram,
     pub drives_live: IntGauge,
     pub drives_deleted: IntGauge,
     /// One per [`GC_PHASES`], 1 for the run's phase as last read.
@@ -305,6 +307,7 @@ impl PoolMetrics {
         let log_write = histogram(&r, "voidfs_commit_log_write_seconds", "Time to write each log entry, whether or not it was written.", LATENCY);
         let commits = counters(&r, "voidfs_commits_total", "Log entries: written, lost to another server's entry (then planned again), or failed.", &["outcome"]);
         let checkpoints = counters(&r, "voidfs_checkpoints_total", "Checkpoints written, and attempts that failed.", &["outcome"]);
+        let checkpoint_write = histogram(&r, "voidfs_checkpoint_write_seconds", "Time to write each checkpoint, in the background, whether or not it was written.", LATENCY);
         let drives = gauges(&r, "voidfs_drives", "Drives this server has open: live, and soft-deleted.", &["state"]);
         let phase = gauges(&r, "voidfs_gc_phase", "The phase of the garbage-collection run in gc/pending.json, as last read (every minute): 1 for the current one.", &["phase"]);
         let steps = counters(&r, "voidfs_gc_steps_total", "Steps of --gc-interval garbage collection, by outcome.", &["outcome"]);
@@ -319,6 +322,7 @@ impl PoolMetrics {
             commits_failed: commits.with_label_values(&["failed"]),
             checkpoints_written: checkpoints.with_label_values(&["written"]),
             checkpoints_failed: checkpoints.with_label_values(&["failed"]),
+            checkpoint_write,
             drives_live: drives.with_label_values(&["live"]),
             drives_deleted: drives.with_label_values(&["deleted"]),
             gc_phase: GC_PHASES.map(|p| phase.with_label_values(&[p])),

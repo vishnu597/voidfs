@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Content-defined chunking with FastCDC-2020, normalization level 1 (format §4.1).
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use fastcdc::v2020::FastCDC;
 
 use crate::ids::ShardHash;
@@ -91,20 +91,41 @@ impl StreamChunker {
 
     /// Adds input; returns every shard whose boundary is now certain.
     pub fn push(&mut self, data: &[u8]) -> Vec<Shard> {
+        self.push_unhashed(data).into_iter().map(Shard::new).collect()
+    }
+
+    /// Ends the stream; returns the remaining shards.
+    pub fn finish(self) -> Vec<Shard> {
+        self.finish_unhashed().into_iter().map(Shard::new).collect()
+    }
+
+    /// [`StreamChunker::push`], leaving the shards' bytes for the caller to hash.
+    pub fn push_unhashed(&mut self, data: &[u8]) -> Vec<Bytes> {
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
         // A cut point depends on at most `max` bytes, so it is final once that much is held.
         while self.buf.len() >= self.p.max {
             let (_, end) = FastCDC::new(&self.buf, self.p.min, self.p.avg, self.p.max).cut(0, self.buf.len());
-            out.push(Shard::new(self.buf.split_to(end).freeze()));
+            // A copy, and the buffer advanced past it: splitting the shard off would share the
+            // buffer, and the next input would then move all of it after the cut, up to `max`
+            // bytes for every shard, to a new allocation.
+            out.push(Bytes::copy_from_slice(&self.buf[..end]));
+            self.buf.advance(end);
         }
         out
     }
 
-    /// Ends the stream; returns the remaining shards.
-    pub fn finish(mut self) -> Vec<Shard> {
+    /// [`StreamChunker::finish`], leaving the shards' bytes for the caller to hash.
+    pub fn finish_unhashed(mut self) -> Vec<Bytes> {
         let rest = self.buf.split().freeze();
-        shards(&rest, self.p)
+        let mut at = 0;
+        cut(&rest, self.p)
+            .into_iter()
+            .map(|len| {
+                at += len;
+                rest.slice(at - len..at)
+            })
+            .collect()
     }
 }
 
@@ -158,6 +179,27 @@ pub(crate) mod tests {
             }
             got.extend(c.finish());
             assert_eq!(got, expected, "piece size {piece}");
+        }
+    }
+
+    proptest::proptest! {
+        /// However the input is split, the stream cuts what one pass over all of it does, and
+        /// its buffer stays within a few times the largest shard and piece.
+        #[test]
+        fn streaming_matches_one_shot_for_any_split(seed in 0u64..1000, len in 0usize..20_000, pieces in proptest::collection::vec(1usize..3000, 1..20)) {
+            let data = Bytes::from(random_bytes(seed, len));
+            let largest = pieces.iter().max().copied().unwrap_or(1);
+            let mut c = StreamChunker::new(SMALL);
+            let mut got = Vec::new();
+            let (mut at, mut i) = (0, 0);
+            while at < data.len() {
+                let n = pieces[i % pieces.len()].min(data.len() - at);
+                got.extend(c.push(&data[at..at + n]));
+                proptest::prop_assert!(c.buf.capacity() <= 4 * (SMALL.max + largest), "a buffer of {} bytes", c.buf.capacity());
+                (at, i) = (at + n, i + 1);
+            }
+            got.extend(c.finish());
+            proptest::prop_assert_eq!(got, shards(&data, SMALL));
         }
     }
 

@@ -156,6 +156,7 @@ or a private network, and never publish it. No label names a drive or a key.
 | `voidfs_commit_transactions` | | Transactions in each log entry written: group commit's batches (histogram) |
 | `voidfs_commit_log_write_seconds` | | Time to write each log entry (histogram) |
 | `voidfs_commits_total`, `voidfs_checkpoints_total` | `outcome` | Log entries written, lost to another server's, or failed; checkpoints written or failed |
+| `voidfs_checkpoint_write_seconds` | | Time to write each checkpoint, in the background after the commit that made it due (histogram) |
 | `voidfs_gc_phase` | `phase` | The garbage-collection run in `gc/pending.json`: `none`, `marking`, `waiting` or `deleting` |
 | `voidfs_gc_steps_total`, `voidfs_gc_last_step`, `voidfs_gc_last_step_timestamp_seconds` | `outcome` | Steps of `--gc-interval` collection, and the last one |
 | `voidfs_gc_deleted_objects_total`, `voidfs_gc_deleted_bytes_total` | | What collection deleted |

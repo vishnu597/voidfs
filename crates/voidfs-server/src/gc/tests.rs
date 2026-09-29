@@ -388,11 +388,59 @@ async fn checkpoints_and_history_are_roots() {
     for i in 0..1001 {
         put(&pool, &a, "counter", format!("tick {i}").as_bytes()).await.unwrap();
     }
+    pool.finish_checkpoints().await;
     assert!(sim.store.exists(&format!("drives/{}/checkpoints/{:020}.json", a.id, 1000)).await.unwrap());
     sim.clock.advance(SECOND);
     assert_eq!(step(&pool, &offline()).await.unwrap().outcome, Outcome::NothingToCollect);
     assert!(sim.has(b"tick 0").await, "old versions stay");
     assert_eq!(sim.read("a", "counter").await.unwrap(), b"tick 1000");
+}
+
+/// Checkpoints are written in the background, and one is written only within 12 hours of when
+/// its state was the drive's (§12.4, option 1). One held up longer is dropped: the pages it had
+/// stored are garbage, and a run collects them and nothing the drive references.
+#[tokio::test]
+async fn a_checkpoint_held_up_too_long_leaves_only_garbage() {
+    let sim = Sim::new();
+    let pool = sim.pool().await;
+    let a = pool.create_drive("a", None).await.unwrap();
+    let (release, released) = tokio::sync::watch::channel(false);
+    let held = Arc::new(AtomicUsize::new(0));
+    let h = held.clone();
+    sim.mem.set_hook(Some(Arc::new(move |op, path| {
+        if op != MemOp::Put || !path.starts_with("pages/") {
+            return futures::future::ready(Fault::None).boxed();
+        }
+        h.fetch_add(1, Ordering::SeqCst);
+        let mut released = released.clone();
+        async move {
+            let _ = released.wait_for(|r| *r).await;
+            Fault::None
+        }
+        .boxed()
+    })));
+    for i in 0..1000 {
+        put(&pool, &a, "counter", format!("tick {i}").as_bytes()).await.unwrap();
+    }
+    while held.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    sim.clock.advance(13 * HOUR);
+    release.send(true).unwrap();
+    pool.finish_checkpoints().await;
+    sim.mem.set_hook(None);
+    assert!(sim.store.list_files(&format!("drives/{}/checkpoints/", a.id), None).await.unwrap().is_empty());
+    let orphans: HashSet<ShardHash> = sim.objects().await.difference(&referenced(&pool).await.unwrap()).copied().collect();
+    assert!(!orphans.is_empty() && orphans.len() <= held.load(Ordering::SeqCst), "{} orphans", orphans.len());
+    let opts = Options::default();
+    sim.clock.advance(2 * DAY);
+    let r = step(&pool, &opts).await.unwrap();
+    assert!(matches!(r.outcome, Outcome::Proposed { candidates, .. } if candidates == orphans.len()), "{r}");
+    sim.clock.advance(25 * HOUR);
+    assert!(matches!(step(&pool, &opts).await.unwrap().outcome, Outcome::Deleted { objects, .. } if objects == orphans.len()));
+    assert!(sim.objects().await.is_disjoint(&orphans));
+    assert_eq!(sim.read("a", "counter").await.unwrap(), b"tick 999");
+    assert!(sim.has(b"tick 0").await, "old versions stay");
 }
 
 #[tokio::test]
