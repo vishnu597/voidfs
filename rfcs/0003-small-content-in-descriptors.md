@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed (draft for review) |
+| Status | Accepted (2026-09-29), not yet implemented |
 | Author(s) | voidfs maintainers |
 | Created | 2026-09-29 |
 | Affects | format |
@@ -192,6 +192,17 @@ log entry, which §8.5 lets a deployment delete, and log entries would become GC
 lands before its shard would name missing content if the shard's upload failed.
 
 ## Open questions
+
+Accepted as proposed (29 September 2026), which settles them so:
+1. Checkpoints never carry `d` extents; every checkpoint spills. The implementation measures what
+   that costs a checkpoint of a drive with many fresh small files, and a later RFC may relax it.
+2. One format-wide maximum, 4,096 bytes; no `inline_max` in `voidfs.json`. Writers may use less.
+3. How an operator turns the flag on is not part of the format; the implementation's pull request
+   decides it, within what [The feature flag](#the-feature-flag) requires.
+4. `d` extents may appear beside `s` and `z` extents, as the design says; the first writer uses
+   them only for whole files of at most 4 KiB.
+
+As they were asked:
 
 1. **Spill in the checkpoint, or later?** Spilling makes a checkpoint of a drive with many fresh
    small files take longer (one upload per small version, in parallel). An alternative is to let a
