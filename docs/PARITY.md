@@ -2,12 +2,12 @@
 
 *Stocktake of 2026-09-28, brought up to date the same day after content-defined checkpoints, the
 capability probe, group commit and the shard cache's admission, and on 2026-09-29 after
-virtual-host addressing; the first was taken on 2026-09-27.*
+virtual-host addressing and then health checks and metrics; the first was taken on 2026-09-27.*
 
 Sources:
 - the voidfs code on `main` at `0ff3f2d` (garbage collection, content-defined checkpoints, the
   capability probe, group commit and the shard cache's admission merged), with virtual-host
-  addressing on top;
+  addressing, and health checks and metrics, on top;
 - the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
 - the benchmark results in [`bench/results/`](../bench/results/);
 - SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog, read again on 28
@@ -48,9 +48,9 @@ billing or plans), this page says so.
 - **The plan (§7):**
   - Step 1 has its harness, local results and CI. Still to do: the run in SpaceFS's setup
     (which waits on cloud accounts, §8), and the Mac comparison.
-  - Step 2 has five of its six items done: garbage collection, content-defined checkpoint
-    segments, the bucket capability probe, runs on AWS S3, MinIO and rclone, and virtual-host
-    addressing. The Compose file is done too; a health endpoint and metrics are to do.
+  - Step 2 is done: garbage collection, content-defined checkpoint segments, the bucket
+    capability probe, runs on AWS S3, MinIO and rclone, virtual-host addressing, and the
+    Compose file with health checks and metrics.
   - Step 3 has its first two items done: group commit and the shard cache's admission.
   - Steps 4–10 have not started.
 
@@ -76,8 +76,8 @@ Every item of the plan's checklist (§3, 65 items, including the Finder integrat
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
 | Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount (the spike). No agent, journal, CLI, Finder integration, Linux or Windows |
 | SDKs, agents, search (A1–A7) | 0 | 0 | 7 | Stock S3 SDKs and the AWS CLI work; nothing voidfs-specific |
-| Operations (O1–O6) | 0 | 2 | 4 | One binary. A benchmark harness, not yet run in the cloud. No compose file or metrics |
-| **Total** | **12** | **11** | **42** | Of the 28 P0 items: 12 done, 8 partly, 8 missing |
+| Operations (O1–O6) | 1 | 2 | 3 | One binary, with a Compose file. Health checks and Prometheus metrics on a port of their own. A benchmark harness, not yet run in the cloud. No tracing, Helm chart or audit |
+| **Total** | **13** | **11** | **41** | Of the 28 P0 items: 13 done, 7 partly, 8 missing |
 
 Earlier stocktakes counted 71 items and 6 more missing than the rows add up to; the checklist has
 65. The P0 counts were right.
@@ -88,14 +88,15 @@ Earlier stocktakes counted 71 items and 6 more missing than the rows add up to; 
 - S3 lacks direct upload and credentials; S5 is memory-only; S8 has no operations catalogue.
 - C3 keys can't be minted or revoked.
 - D3 is read-only, D6 relies on the kernel's read-ahead only, and D11 is the spike's shell.
-- O1 has no compose file. O5 has run locally and against R2, not yet in SpaceFS's setup.
+- O4 has health checks and metrics, not tracing or structured logs. O5 has run locally and
+  against R2, not yet in SpaceFS's setup.
 
 The 28 P0 items, which a credible v1 needs:
 
 | Status | Items |
 |---|---|
-| Done (12) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, E11 checkpoints, B3 capability probe, S1 S3 server, S2 S3 subset, S4 per-drive authority and change feed |
-| Partly (8) | E1 chunking, B1 backends, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount, O1 single binary and compose |
+| Done (13) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, E11 checkpoints, B3 capability probe, S1 S3 server, S2 S3 subset, S4 per-drive authority and change feed, O1 single binary and compose |
+| Partly (7) | E1 chunking, B1 backends, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount |
 | Missing (8) | B5 stored bucket credentials, C1 sign-in, C2 workspaces, C4 bucket connections, D1 client daemon, D5 desktop semantics, D9 CLI, A1 Rust and TypeScript SDKs |
 
 ## 4. Product by product
@@ -346,11 +347,29 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      the host the request used (`/<key>` rather than `/<drive>/<key>`). The conformance runner
      runs every case either way (`--virtual-host <domain>`): 35/35 both ways, and boto3, the
      Rust SDK, curl's SigV4 and all three `aws-chunked` forms work.
-   - A `docker compose` file, and health checks and metrics. The Compose file is **done**
-     ([`deploy/compose/`](../deploy/compose/)): the server's image, its pool in a volume, in a
-     bucket of yours, or in versitygw beside it, which CI brings up and tests. Health is only
-     "answers HTTP" for now; a health endpoint and metrics on a port of their own are to do.
-   - **Status (2026-09-29):** 5 of 6 done, and the Compose file.
+   - A `docker compose` file, and health checks and metrics. **Done** (O1, and O4 but for
+     tracing and structured logs). The Compose file ([`deploy/compose/`](../deploy/compose/))
+     runs the server's image with its pool in a volume, in a bucket of yours, or in versitygw
+     beside it, which CI brings up and tests.
+     - `--admin-listen <address>` serves `/healthz`, `/readyz` and `/metrics` on a port of their
+       own, since on the S3 port every path is a drive. It is off unless given: nothing on it is
+       authenticated, and a second default port would collide wherever several servers run.
+     - `/readyz` answers 200 once the pool is open, while the bucket answers. The server's own
+       requests to the bucket vouch for it when the last one succeeded within 30 seconds;
+       otherwise a HEAD of `voidfs.json` checks, at most once every 5 seconds.
+     - `/metrics` (Prometheus) counts requests to the S3 port and to the bucket by operation,
+       with their latency; the shard and page caches' hits, misses, evictions and size; group
+       commit's transactions per log entry and log-write latency; garbage collection's phase and
+       last step; drives open and uptime. No label names a drive or a key.
+     - The Compose file's health check is `/readyz`, from inside the container; the admin port is
+       not published. CI checks the endpoints over every kind of store and in Compose.
+     - Recording costs nothing the benchmark can tell from the spread between identical runs: the
+       49 rows at 12 ms and twelve runs on loopback, with focused runs of the small reads and
+       writes ([results](../bench/results/health-metrics/README.md)). The harness can now count
+       voidfs's requests to the bucket per scenario (`BENCH_BUCKET_REQUESTS=1`): no read in the
+       49 rows reaches the bucket, and a multipart upload reads its part records one after
+       another when it completes.
+   - **Status (2026-09-29):** done (6 of 6).
 3. **Win the rows SpaceFS loses.** The work items, with the step 1 evidence and a row-by-row
    baseline, are in [step-3-performance.md](step-3-performance.md). In order of impact:
    - Group commit: one log write per batch of mutations, not per mutation (37 rows). **Done**:
@@ -421,9 +440,9 @@ plain objects, file locking, offline pinning.
 - **Test data in the SpaceFS trial:** uploading the benchmark data into a trial drive needs the
   account owner's go-ahead each time.
 - **CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), added 2026-09-29): tests,
-  clippy and the spec's cases; the conformance suite, boto3 and rclone over memory, local disk,
-  versitygw and MinIO; the Compose files; and on `main`, the release GC model and a small
-  benchmark. Still to add: the bucket checks the capability probe can't make without new
+  clippy and the spec's cases; the conformance suite, boto3, rclone and the admin endpoints over
+  memory, local disk, versitygw and MinIO; the Compose files; and on `main`, the release GC model
+  and a small benchmark. Still to add: the bucket checks the capability probe can't make without new
   objects (that create-if-absent holds when writers race, and that reads and listings see
   writes at once).
 - **Tools:** rclone and Docker (with Colima) are installed on the development Mac; the AWS CLI is
@@ -437,6 +456,6 @@ plain objects, file locking, offline pinning.
   then the rest of step 2, then fewer sequential round trips per write (step 3, item 3).
   - Content-defined checkpoint segments came first, because they change the checkpoint writer
     that step 3, item 3 moves off the commit path. The capability probe and group commit came
-    next. All three are done.
+    next. All three are done, and so is the rest of step 2 (2026-09-29).
   - Item 2 is done. Item 3's small-file path is a format change and needs an RFC first; with
     group commit done, it is what most of the remaining write and edit rows wait on.

@@ -128,6 +128,22 @@ pub enum Outcome {
     WouldDelete { candidates: usize, bytes: u64 },
 }
 
+impl Outcome {
+    /// Its name in metrics ([`crate::metrics::GC_OUTCOMES`]).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Outcome::Nothing => "nothing",
+            Outcome::NothingToCollect => "nothing_to_collect",
+            Outcome::Proposed { .. } => "proposed",
+            Outcome::Waiting { .. } => "waiting",
+            Outcome::Deleted { .. } => "deleted",
+            Outcome::Abandoned => "abandoned",
+            Outcome::Busy => "busy",
+            Outcome::WouldDelete { .. } => "dry_run",
+        }
+    }
+}
+
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.outcome {
@@ -237,10 +253,26 @@ pub async fn step(pool: &Pool, opts: &Options) -> anyhow::Result<Report> {
 pub async fn run_periodically(pool: Arc<Pool>, opts: Options, every: Duration) {
     loop {
         tokio::time::sleep(every).await;
-        match step(&pool, &opts).await {
+        let stepped = step(&pool, &opts).await;
+        record(&pool, &stepped);
+        match stepped {
             Ok(r) => tracing::info!("garbage collection: {r}"),
             Err(e) => tracing::warn!("garbage collection failed: {e:#}"),
         }
+    }
+}
+
+/// Records a step's outcome in the pool's metrics.
+fn record(pool: &Pool, stepped: &anyhow::Result<Report>) {
+    match stepped {
+        Ok(r) => {
+            let (objects, bytes) = match r.outcome {
+                Outcome::Deleted { objects, bytes } => (objects, bytes),
+                _ => (0, 0),
+            };
+            pool.metrics.gc_step(r.outcome.name(), objects, bytes);
+        }
+        Err(_) => pool.metrics.gc_step("failed", 0, 0),
     }
 }
 

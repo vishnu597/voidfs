@@ -616,7 +616,7 @@ pub async fn report(store: &Store, bucket: Option<&Bucket>, guard: CommitGuard) 
 /// Whether a HEAD and a listing give modification times, which garbage collection needs (format
 /// §12).
 async fn modification_times(store: &Store) -> String {
-    let Store::Dal(op) = store else { return "kept by this store".into() };
+    let Some(op) = store.operator() else { return "kept by this store".into() };
     let head = match store.modified(DESCRIPTOR).await {
         Ok(Some(_)) => "HEAD gives them".to_owned(),
         Ok(None) => "HEAD found no voidfs.json".to_owned(),
@@ -636,7 +636,7 @@ async fn modification_times(store: &Store) -> String {
 /// Whether the bucket accepts a presigned request: a HEAD of `voidfs.json`, which reads nothing
 /// and is answered whether or not the object exists.
 async fn presigned(store: &Store, b: &Bucket) -> String {
-    let Store::Dal(op) = store else { return "not applicable".into() };
+    let Some(op) = store.operator() else { return "not applicable".into() };
     let answer = async {
         let p = op.presign_stat(DESCRIPTOR, Duration::from_secs(300)).await?;
         let mut req = http::Request::builder().method(p.method().clone()).uri(p.uri().clone());
@@ -665,7 +665,7 @@ mod tests {
 
     fn mem() -> (Arc<MemStore>, Store) {
         let m = Arc::new(MemStore::new(Clock::System));
-        (m.clone(), Store::Mem(m))
+        (m.clone(), Store::mem(m))
     }
 
     fn fault_on_put_new(m: &MemStore, fault: Fault) {

@@ -45,6 +45,12 @@ A setting of 4 gives a 12 ms round trip, which is the bare bucket's `head` time 
 run. The relay's timer adds about 2 ms each way on macOS, so the setting is not the round trip;
 the bare `head` row of each run shows the real figure.
 
+The harness counts its own requests, not the ones voidfs-server sends the bucket for them.
+`BENCH_BUCKET_REQUESTS=1` starts the server with its admin listener, and the harness reads the
+server's metrics before and after each scenario's measured rounds: the results then have
+voidfs's requests to the bucket per operation, by kind (`--voidfs-metrics <url>` does the same
+for a server of your own).
+
 ## The harness
 
 ```bash

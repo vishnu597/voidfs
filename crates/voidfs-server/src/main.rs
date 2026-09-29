@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `voidfs-server`: serves voidfs drives over the S3 protocol from a pool in your bucket.
 
+mod admin;
 mod clock;
 mod gc;
+mod metrics;
 mod pool;
 mod probe;
 mod s3;
@@ -33,6 +35,10 @@ struct Args {
     /// Address to listen on.
     #[arg(long, env = "VOIDFS_LISTEN", default_value = "127.0.0.1:9000")]
     listen: SocketAddr,
+    /// Address for the admin endpoints, /healthz, /readyz and /metrics (Prometheus). Off unless
+    /// given. Nothing on it is authenticated: keep it on loopback or a private network.
+    #[arg(long, env = "VOIDFS_ADMIN_LISTEN")]
+    admin_listen: Option<SocketAddr>,
     /// Endpoint of an S3-compatible service, for R2, MinIO and others.
     #[arg(long, env = "VOIDFS_S3_ENDPOINT", global = true)]
     s3_endpoint: Option<String>,
@@ -216,6 +222,23 @@ async fn main() -> anyhow::Result<()> {
         keys.insert(KeyInfo { id: id.into(), secret: secret.into(), scope: scope.parse().map_err(anyhow::Error::msg)?, drives: None });
     }
 
+    // Before the pool opens, which can take a while: liveness answers meanwhile, and readiness
+    // says why not.
+    let admin = admin::Admin::new();
+    if let Some(addr) = args.admin_listen {
+        if same_port(addr, args.listen) {
+            bail!("--admin-listen {addr} would share the S3 port, --listen {}", args.listen);
+        }
+        let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("listening on {addr} for the admin endpoints"))?;
+        tracing::info!("admin endpoints on http://{addr}: /healthz, /readyz, /metrics (not authenticated)");
+        let router = admin::router(admin.clone());
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!("the admin listener stopped: {e}");
+            }
+        });
+    }
+
     let pool = open_pool(&args).await?;
     tracing::info!("pool {} open with {} drives, commit guard {}", pool.desc.pool_id, pool.list_drives().len(), probe::guard_name(pool.desc.commit_guard));
     if let Some(every) = args.gc_interval {
@@ -225,14 +248,42 @@ async fn main() -> anyhow::Result<()> {
     for d in &args.virtual_host_domains {
         tracing::info!("serving virtual-host requests to *.{d}");
     }
-    let app = Arc::new(s3::App { pool, keys, domains: s3::Domains::new(args.virtual_host_domains) });
+    let app = Arc::new(s3::App { pool, keys, domains: s3::Domains::new(args.virtual_host_domains), metrics: metrics::S3Metrics::new() });
     let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("listening on {}", args.listen))?;
     tracing::info!("serving on http://{}", args.listen);
-    axum::serve(listener, s3::router(app)).with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
+    admin.serving(app.clone());
+    axum::serve(listener, s3::router(app)).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tracing::info!("stopping: finishing the requests in progress");
+        admin.stopping();
     })
     .await?;
     Ok(())
+}
+
+/// Resolves on Ctrl-C, or on SIGTERM, which `docker stop` and Kubernetes send.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+                return;
+            }
+            Err(e) => tracing::warn!("SIGTERM will not stop the server gracefully: {e}"),
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Whether listening on both would take the same port: the same address, or the same port where
+/// either is every address.
+fn same_port(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() != 0 && a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
 #[cfg(test)]
@@ -278,6 +329,21 @@ mod tests {
         assert!(Args::try_parse_from(["voidfs-server", "--commit-guard", "none"]).is_err());
         let a = Args::try_parse_from(["voidfs-server", "gc", "--commit-guard", "external"]).unwrap();
         assert_eq!(a.commit_guard, Guard::External);
+    }
+
+    #[test]
+    fn the_admin_listener_is_off_by_default_and_apart_from_s3() {
+        let a = Args::try_parse_from(["voidfs-server"]).unwrap();
+        assert_eq!(a.admin_listen, None);
+        let a = Args::try_parse_from(["voidfs-server", "--admin-listen", "127.0.0.1:9001"]).unwrap();
+        assert_eq!(a.admin_listen, Some("127.0.0.1:9001".parse().unwrap()));
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert!(same_port(addr("127.0.0.1:9000"), addr("127.0.0.1:9000")));
+        assert!(same_port(addr("0.0.0.0:9000"), addr("127.0.0.1:9000")));
+        assert!(same_port(addr("127.0.0.1:9000"), addr("[::]:9000")));
+        assert!(!same_port(addr("127.0.0.1:9001"), addr("127.0.0.1:9000")));
+        assert!(!same_port(addr("127.0.0.1:9000"), addr("127.0.0.2:9000")));
+        assert!(!same_port(addr("127.0.0.1:0"), addr("127.0.0.1:0")));
     }
 
     #[test]

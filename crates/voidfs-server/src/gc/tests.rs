@@ -40,7 +40,7 @@ impl Sim {
     fn new() -> Sim {
         let clock = Clock::manual(start());
         let mem = Arc::new(MemStore::new(clock.clone()));
-        Sim { store: Store::Mem(mem.clone()), mem, clock }
+        Sim { store: Store::mem(mem.clone()), mem, clock }
     }
 
     async fn pool(&self) -> Arc<Pool> {
@@ -147,6 +147,35 @@ async fn a_run_waits_out_the_grace_period() {
     sim.clock.advance(2 * HOUR);
     assert_eq!(step(&pool, &opts).await.unwrap().outcome, Outcome::Deleted { objects: 1, bytes: 3 });
     assert!(!sim.has(b"old").await);
+}
+
+#[tokio::test]
+async fn metrics_report_the_phase_and_the_last_step() {
+    use crate::metrics::{encode, sample};
+    let sim = Sim::new();
+    let pool = sim.pool().await;
+    let text = encode(pool.gather_metrics());
+    assert_eq!(sample(&text, r#"voidfs_gc_phase{phase="none"}"#), Some(1.0));
+    garbage(&pool, b"old").await;
+    sim.clock.advance(2 * DAY);
+    let opts = Options::default();
+    record(&pool, &step(&pool, &opts).await);
+    let text = encode(pool.gather_metrics());
+    assert_eq!(sample(&text, r#"voidfs_gc_phase{phase="waiting"}"#), Some(1.0));
+    assert_eq!(sample(&text, r#"voidfs_gc_phase{phase="none"}"#), Some(0.0));
+    assert_eq!(sample(&text, r#"voidfs_gc_last_step{outcome="proposed"}"#), Some(1.0));
+    sim.clock.advance(DAY + HOUR);
+    record(&pool, &step(&pool, &opts).await);
+    let text = encode(pool.gather_metrics());
+    assert_eq!(sample(&text, r#"voidfs_gc_phase{phase="none"}"#), Some(1.0));
+    assert_eq!(sample(&text, r#"voidfs_gc_last_step{outcome="deleted"}"#), Some(1.0));
+    assert_eq!(sample(&text, r#"voidfs_gc_steps_total{outcome="proposed"}"#), Some(1.0));
+    assert_eq!(sample(&text, "voidfs_gc_deleted_objects_total"), Some(1.0));
+    assert_eq!(sample(&text, "voidfs_gc_deleted_bytes_total"), Some(3.0));
+    record(&pool, &step(&pool, &Options { grace: HOUR, ..Options::default() }).await);
+    let text = encode(pool.gather_metrics());
+    assert_eq!(sample(&text, r#"voidfs_gc_last_step{outcome="failed"}"#), Some(1.0));
+    assert_eq!(sample(&text, r#"voidfs_gc_last_step{outcome="deleted"}"#), Some(0.0));
 }
 
 #[tokio::test]
@@ -387,7 +416,7 @@ async fn the_buckets_clock_decides_when_phase_2_is_due() {
     let server = Clock::manual(start());
     server.advance(2 * HOUR);
     let mem = Arc::new(MemStore::new(bucket.clone()));
-    let store = Store::Mem(mem);
+    let store = Store::mem(mem);
     let pool = Pool::open_with(store.clone(), 1 << 20, server.clone()).await.unwrap();
     garbage(&pool, b"old").await;
     for c in [&bucket, &server] {

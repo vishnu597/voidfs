@@ -22,6 +22,8 @@
 #                 layer on the client host.
 #   BENCH_SERVER_BIN  a voidfs-server binary to use instead of this checkout's release build,
 #                 for comparing server changes
+#   BENCH_BUCKET_REQUESTS=1  also record voidfs's requests to the bucket in each scenario's
+#                 measured rounds, from the server's metrics (its admin listener on VOIDFS_PORT + 1)
 #   S3_PORT, VOIDFS_PORT   loopback ports (default 7070 and 9000; the relay uses S3_PORT + 1)
 #
 # Loopback numbers are not comparable with SpaceFS's cloud run: there is no network latency,
@@ -113,11 +115,20 @@ if [[ -n "${BENCH_ONE_WAY_MS:-}" ]]; then
     distance="emulated with \`voidfs-bench delay --one-way-ms $BENCH_ONE_WAY_MS\` between the bucket and both voidfs-server and the harness's bare target (timer granularity adds about 2 ms each way; the bare head row shows the real round trip). The harness reaches voidfs-server over loopback, as SpaceFS's reached its layer on the client host"
 fi
 
+admin_args=()
+bench_args=()
+if [[ "${BENCH_BUCKET_REQUESTS:-0}" == 1 ]]; then
+    admin_port=$((voidfs_port + 1))
+    admin_args=(--admin-listen "127.0.0.1:$admin_port")
+    bench_args=(--voidfs-metrics "http://127.0.0.1:$admin_port/metrics")
+fi
+
 RUST_LOG=warn "${BENCH_SERVER_BIN:-$root/target/release/voidfs-server}" \
     --store s3:bench/voidfs-pool --listen "127.0.0.1:$voidfs_port" \
     --s3-endpoint "http://127.0.0.1:$bucket_port" --s3-region us-east-1 \
     --s3-access-key-id "$s3_key" --s3-secret-access-key "$s3_secret" \
     --access-key-id "$vf_key" --secret-access-key "$vf_secret" \
+    ${admin_args[@]+"${admin_args[@]}"} \
     > "$work/logs/voidfs.log" 2>&1 &
 pids+=($!)
 wait_for "http://127.0.0.1:$voidfs_port/"
@@ -137,4 +148,5 @@ VOIDFS_S3_ACCESS_KEY_ID="$s3_key" VOIDFS_S3_SECRET_ACCESS_KEY="$s3_secret" \
     --label "distance to the bucket=$distance" \
     --label "voidfs server=voidfs-server release build, s3: store in that bucket, 512 MiB shard cache" \
     --label "commit=$commit" \
+    ${bench_args[@]+"${bench_args[@]}"} \
     "$@"

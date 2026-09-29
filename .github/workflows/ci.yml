@@ -122,6 +122,18 @@ jobs:
         run: |
           set -a; . deploy/compose/.env; set +a
           VOIDFS_ENDPOINT=http://127.0.0.1:9000 target/debug/voidfs-conformance
+      - name: Admin endpoints inside the container, and not published
+        working-directory: deploy/compose
+        run: |
+          compose="docker compose -f compose.yaml -f compose.versitygw.yaml"
+          $compose exec -T voidfs curl -fsS http://127.0.0.1:9001/readyz
+          $compose exec -T voidfs curl -fsS http://127.0.0.1:9001/metrics > "$RUNNER_TEMP/metrics.txt"
+          grep -q '^voidfs_s3_requests_total{op="put",status="2xx"} [1-9]' "$RUNNER_TEMP/metrics.txt"
+          grep -q '^voidfs_bucket_requests_total{op="put_new"} [1-9]' "$RUNNER_TEMP/metrics.txt"
+          if curl -s -o /dev/null --max-time 2 http://127.0.0.1:9001/healthz; then
+            echo "the admin port is reachable from the host" >&2
+            exit 1
+          fi
       - name: Logs
         if: failure()
         working-directory: deploy/compose

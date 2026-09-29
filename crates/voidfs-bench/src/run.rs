@@ -7,6 +7,7 @@
 //! overwrites, renames, folder moves), worker `w` only ever touches object `w`, so no two
 //! operations race on one key.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -39,6 +40,35 @@ pub struct Settings {
     pub nonce: u64,
     /// Short lowercase tag naming this run's drives and prefixes.
     pub tag: String,
+    pub metrics: Option<MetricsSource>,
+}
+
+/// voidfs-server's metrics, read before and after each scenario's measured rounds.
+pub struct MetricsSource {
+    url: String,
+    http: reqwest::Client,
+}
+
+impl MetricsSource {
+    pub fn new(url: String) -> MetricsSource {
+        MetricsSource { url, http: reqwest::Client::new() }
+    }
+
+    /// voidfs's requests to the bucket so far, by operation.
+    async fn bucket_requests(&self) -> anyhow::Result<BTreeMap<String, u64>> {
+        let text = self.http.get(&self.url).send().await?.error_for_status()?.text().await?;
+        Ok(bucket_requests(&text))
+    }
+}
+
+/// The `voidfs_bucket_requests_total` series of a scrape, by operation.
+fn bucket_requests(text: &str) -> BTreeMap<String, u64> {
+    text.lines()
+        .filter_map(|l| {
+            let (op, value) = l.strip_prefix("voidfs_bucket_requests_total{op=\"")?.split_once("\"} ")?;
+            Some((op.to_owned(), value.parse::<f64>().ok()? as u64))
+        })
+        .collect()
 }
 
 /// What every worker of a scenario reads.
@@ -133,6 +163,11 @@ pub async fn scenario(targets: &[Arc<Target>], index: usize, s: &'static Scenari
         }
     }
 
+    let voidfs = targets.iter().position(|t| t.flavor == Flavor::Voidfs);
+    let scraped = match (&set.metrics, voidfs) {
+        (Some(m), Some(_)) => m.bucket_requests().await.map_err(|e| log(&format!("  reading voidfs's metrics failed: {e:#}"))).ok(),
+        _ => None,
+    };
     for round in 0..set.rounds {
         // Alternate which target goes first, so drift over time does not favour either.
         let mut order: Vec<usize> = (0..targets.len()).collect();
@@ -154,6 +189,12 @@ pub async fn scenario(targets: &[Arc<Target>], index: usize, s: &'static Scenari
                 stats.first_error.as_ref().map(|e| format!(" (first: {e})")).unwrap_or_default()
             ));
             results[i].rounds.push(stats);
+        }
+    }
+    if let (Some(m), Some(i), Some(before)) = (&set.metrics, voidfs, scraped) {
+        match m.bucket_requests().await {
+            Ok(after) => results[i].bucket_requests = Some(after.into_iter().map(|(op, n)| (op.clone(), n.saturating_sub(before.get(&op).copied().unwrap_or(0)))).collect()),
+            Err(e) => log(&format!("  reading voidfs's metrics failed: {e:#}")),
         }
     }
 
@@ -455,5 +496,19 @@ async fn verify(t: &Target, st: &State, s: &Scenario) -> anyhow::Result<bool> {
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_requests_are_read_from_a_scrape() {
+        let text = "# HELP voidfs_bucket_requests_total Requests to the bucket.\n# TYPE voidfs_bucket_requests_total counter\n\
+                    voidfs_bucket_requests_total{op=\"get\"} 12\nvoidfs_bucket_requests_total{op=\"put_new\"} 3\n\
+                    voidfs_bucket_request_errors_total{op=\"get\"} 1\n";
+        let got = bucket_requests(text);
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), [("get".to_owned(), 12), ("put_new".to_owned(), 3)]);
     }
 }

@@ -126,6 +126,47 @@ soft-deleted more than 30 days ago (`--expire-deleted-drives`) and aborts multip
 more than 7 days (`--abort-uploads`). Only when no server is using the pool, `--offline --grace 0`
 collects everything unreferenced in one run.
 
+### Health checks and metrics
+
+`--admin-listen <address>` (or `VOIDFS_ADMIN_LISTEN`) serves three endpoints on a port of their
+own, since on the S3 port every path is a drive. It is off unless given.
+
+| Endpoint | Answers |
+|---|---|
+| `GET /healthz` | 200 while the process is up |
+| `GET /readyz` | 200 once the pool is open and the S3 port listening, while the bucket answers; 503 and the reason otherwise, and while shutting down. The server's own requests to the bucket vouch for it if the last one succeeded within 30 seconds; otherwise a HEAD of `voidfs.json` checks, at most once every 5 seconds |
+| `GET /metrics` | Prometheus's text format, below |
+
+```bash
+cargo run --release -p voidfs-server -- --store memory --admin-listen 127.0.0.1:9001
+curl http://127.0.0.1:9001/readyz
+```
+
+Nothing on the admin port is authenticated, as is usual for these endpoints: keep it on loopback
+or a private network, and never publish it. No label names a drive or a key.
+
+| Series | Labels | What |
+|---|---|---|
+| `voidfs_s3_requests_total` | `op`, `status` (`2xx` to `5xx`) | Requests to the S3 port |
+| `voidfs_s3_request_duration_seconds` | `op` | Their latency until the response's headers (histogram) |
+| `voidfs_bucket_requests_total`, `voidfs_bucket_request_errors_total` | `op` | Requests to the bucket (or the `fs:` or `memory` store), and those that failed |
+| `voidfs_bucket_request_duration_seconds` | `op` | Their latency (histogram) |
+| `voidfs_cache_hits_total`, `voidfs_cache_misses_total`, `voidfs_cache_evictions_total` | `cache` (`shard`, `page`) | Reads served from memory, and from the bucket; entries evicted for room |
+| `voidfs_cache_bytes`, `voidfs_cache_entries`, `voidfs_cache_capacity_bytes` | `cache` | What each cache holds, and the most it may |
+| `voidfs_commit_transactions` | | Transactions in each log entry written: group commit's batches (histogram) |
+| `voidfs_commit_log_write_seconds` | | Time to write each log entry (histogram) |
+| `voidfs_commits_total`, `voidfs_checkpoints_total` | `outcome` | Log entries written, lost to another server's, or failed; checkpoints written or failed |
+| `voidfs_gc_phase` | `phase` | The garbage-collection run in `gc/pending.json`: `none`, `marking`, `waiting` or `deleting` |
+| `voidfs_gc_steps_total`, `voidfs_gc_last_step`, `voidfs_gc_last_step_timestamp_seconds` | `outcome` | Steps of `--gc-interval` collection, and the last one |
+| `voidfs_gc_deleted_objects_total`, `voidfs_gc_deleted_bytes_total` | | What collection deleted |
+| `voidfs_drives` | `state` (`live`, `deleted`) | Drives open |
+| `voidfs_uptime_seconds`, `voidfs_build_info` | `version` | The process |
+
+The S3 port's `op` is one of `list_drives`, `drive`, `list`, `get`, `head`, `put`, `copy`,
+`delete`, `multipart`, `extension` (the `x-voidfs-*` requests) and `other`. The bucket's is one of
+`get`, `head`, `put`, `put_new` (create-if-absent), `delete`, `delete_prefix` and `list`; a listing
+or a deletion by prefix may take several requests.
+
 ## Repository
 
 | Path | What |

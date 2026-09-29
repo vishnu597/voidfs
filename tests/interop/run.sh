@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Starts voidfs-server over one kind of store, with throwaway keys, and runs the conformance
-# suite (path-style and virtual-host style) and the stock-client checks against it. CI runs it
-# for each store; so can you:
+# suite (path-style and virtual-host style), the stock-client checks and the admin listener's
+# checks against it. CI runs it for each store; so can you:
 #
 #   cargo build -p voidfs-server -p voidfs-conformance
 #   tests/interop/run.sh memory        # or fs, versitygw, minio
@@ -12,7 +12,7 @@
 # python3 can import it (CI sets VOIDFS_INTEROP_REQUIRE_ALL=1 so that nothing is skipped).
 #
 #   VOIDFS_SERVER_BIN, VOIDFS_CONFORMANCE_BIN   binaries (default: target/debug)
-#   S3_PORT, VOIDFS_PORT                        loopback ports (default 7070 and 9000)
+#   S3_PORT, VOIDFS_PORT, ADMIN_PORT            loopback ports (default 7070, 9000 and 9001)
 
 set -euo pipefail
 
@@ -22,6 +22,7 @@ server="${VOIDFS_SERVER_BIN:-$root/target/debug/voidfs-server}"
 conformance="${VOIDFS_CONFORMANCE_BIN:-$root/target/debug/voidfs-conformance}"
 s3_port="${S3_PORT:-7070}"
 voidfs_port="${VOIDFS_PORT:-9000}"
+admin_port="${ADMIN_PORT:-$((voidfs_port + 1))}"
 require_all="${VOIDFS_INTEROP_REQUIRE_ALL:-0}"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/voidfs-interop.XXXXXX")"
@@ -101,12 +102,21 @@ export VOIDFS_SECRET_ACCESS_KEY="$(random 'A-Za-z0-9' 40)"
 export VOIDFS_READ_ACCESS_KEY_ID="VR$(random 'A-Z2-7' 18)"
 export VOIDFS_READ_SECRET_ACCESS_KEY="$(random 'A-Za-z0-9' 40)"
 export VOIDFS_ENDPOINT="http://127.0.0.1:$voidfs_port"
+if "$server" "${store_args[@]}" --listen "127.0.0.1:$voidfs_port" --admin-listen "0.0.0.0:$voidfs_port" > "$work/same-port.log" 2>&1; then
+    echo "the server started with the admin listener on the S3 port" >&2
+    exit 1
+fi
+grep -q "would share the S3 port" "$work/same-port.log" || { cat "$work/same-port.log" >&2; exit 1; }
 # Names under localhost reach the loopback address without DNS (curl and these checks see to it).
 RUST_LOG=warn "$server" "${store_args[@]}" --listen "127.0.0.1:$voidfs_port" --virtual-host-domain s3.localhost \
+    --admin-listen "127.0.0.1:$admin_port" \
     --key "$VOIDFS_READ_ACCESS_KEY_ID:$VOIDFS_READ_SECRET_ACCESS_KEY:read" > "$work/voidfs.log" 2>&1 &
-pids+=($!)
+server_pid=$!
+pids+=($server_pid)
 wait_for "$VOIDFS_ENDPOINT/"
 
+echo "== admin listener ($store)"
+"$root/tests/interop/admin.sh" "http://127.0.0.1:$admin_port"
 echo "== conformance ($store)"
 "$conformance"
 echo "== conformance, virtual-host style ($store)"
@@ -127,3 +137,20 @@ elif [[ "$require_all" == 1 ]]; then
 else
     echo "skipped: boto3 is not installed (pip install boto3)"
 fi
+echo "== SIGTERM stops the server gracefully ($store)"
+kill -TERM "$server_pid"
+for _ in $(seq 1 50); do
+    kill -0 "$server_pid" 2> /dev/null || break
+    sleep 0.1
+done
+if kill -0 "$server_pid" 2> /dev/null; then
+    echo "the server did not stop within 5 s of SIGTERM" >&2
+    exit 1
+fi
+status=0
+wait "$server_pid" || status=$?
+if [[ "$status" != 0 ]]; then
+    echo "the server exited with status $status on SIGTERM" >&2
+    exit 1
+fi
+echo "stopped, with status 0"

@@ -42,11 +42,27 @@ Set `VOIDFS_STORE=s3:<bucket>/<prefix>` and the `VOIDFS_S3_*` settings in `.env`
 `https://<account>.r2.cloudflarestorage.com` and the region `auto`. For AWS S3, leave the
 endpoint out and set the bucket's region.
 
-## Health
+## Health and metrics
 
-The container is healthy once the server answers HTTP: an unsigned request gets `403`. A health
-endpoint and metrics that don't share the S3 port are still to come
-([PARITY.md §7](../../docs/PARITY.md#7-step-by-step-plan), step 2).
+The server's admin endpoints, `/healthz`, `/readyz` and `/metrics` (see the
+[README](../../README.md#health-checks-and-metrics)), listen on `127.0.0.1:9001` inside the
+container. The container is healthy once `/readyz` answers 200: the pool is open and the bucket
+answers. To look for yourself:
+
+```bash
+docker compose exec voidfs curl -s http://127.0.0.1:9001/readyz
+docker compose exec voidfs curl -s http://127.0.0.1:9001/metrics
+```
+
+Nothing on the admin port is authenticated, so it is not published, and shouldn't be. For
+Prometheus in another container on the Compose network, set `VOIDFS_ADMIN_LISTEN=0.0.0.0:9001` in
+`.env` and scrape `voidfs:9001`. Keep the port 9001, which the health check uses, and leave it out
+of `ports:`.
+
+`docker compose stop` (SIGTERM) stops the server gracefully: it stops taking connections, finishes
+the requests in progress, and `/readyz` answers 503 meanwhile. A client following a drive's change
+feed as Server-Sent Events keeps its connection open, so then Docker kills the server after its
+10-second timeout, as before.
 
 ## Checking it
 
@@ -58,5 +74,6 @@ set -a; . deploy/compose/.env; set +a
 VOIDFS_ENDPOINT=http://127.0.0.1:9000 tests/interop/rclone_smoke.sh
 ```
 
-CI brings up `compose.yaml` with `compose.versitygw.yaml` and runs the conformance suite against
-it on every pull request.
+CI brings up `compose.yaml` with `compose.versitygw.yaml` on every pull request, runs the
+conformance suite against it, and checks the admin endpoints from inside the container and that
+the host can't reach them.

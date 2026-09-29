@@ -21,17 +21,20 @@ services:
     environment:
       VOIDFS_ACCESS_KEY_ID: ${VOIDFS_ACCESS_KEY_ID:?set VOIDFS_ACCESS_KEY_ID in .env}
       VOIDFS_SECRET_ACCESS_KEY: ${VOIDFS_SECRET_ACCESS_KEY:?set VOIDFS_SECRET_ACCESS_KEY in .env}
+      # The admin endpoints (/healthz, /readyz, /metrics), unauthenticated and not published.
+      # 0.0.0.0:9001 opens them to the other containers on this network, for Prometheus.
+      VOIDFS_ADMIN_LISTEN: ${VOIDFS_ADMIN_LISTEN:-127.0.0.1:9001}
     ports:
       - "${VOIDFS_PORT:-127.0.0.1:9000}:9000"
     volumes:
       - voidfs-data:/data
-    # Any HTTP answer means the server is up; an unsigned request gets 403.
+    # Ready once the pool is open and the bucket answers (the admin listener's port stays 9001).
     healthcheck:
-      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://127.0.0.1:9000/"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9001/readyz"]
       interval: 10s
       timeout: 3s
       retries: 3
-      start_period: 10s
+      start_period: 30s
     restart: unless-stopped
 
 volumes:

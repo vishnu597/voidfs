@@ -91,6 +91,11 @@ pub struct TargetResult {
     pub bytes_up: u64,
     #[serde(default)]
     pub bytes_down: u64,
+    /// For voidfs, with `--voidfs-metrics`: the requests it sent to the bucket during the
+    /// measured rounds, by operation, from its metrics. That includes its read of
+    /// `gc/pending.json` once a minute; the other target's rounds in between send it none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_requests: Option<BTreeMap<String, u64>>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -317,7 +322,36 @@ pub fn markdown(run: &RunFile) -> String {
             let _ = writeln!(out, "[^{}]: {short}", i + 1);
         }
     }
+    bucket_requests(run, &mut out);
     out
+}
+
+/// A table of voidfs's requests to the bucket per operation, in the order the scenarios ran, if
+/// the run recorded them.
+fn bucket_requests(run: &RunFile, out: &mut String) {
+    let rows: Vec<(&ScenarioResult, &BTreeMap<String, u64>, usize)> = run
+        .scenarios
+        .iter()
+        .filter_map(|s| {
+            let r = s.results.get("voidfs")?;
+            Some((s, r.bucket_requests.as_ref()?, r.rounds.iter().map(|x| x.ops).sum::<usize>()))
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let mut ops: Vec<&str> = rows.iter().flat_map(|(_, b, _)| b.iter().filter(|(_, n)| **n > 0).map(|(op, _)| op.as_str())).collect();
+    ops.sort();
+    ops.dedup();
+    let _ = writeln!(out, "\n## voidfs's requests to the bucket\n");
+    let _ = writeln!(out, "Per operation, over the measured rounds, from voidfs-server's metrics (including its read of `gc/pending.json` once a minute).\n");
+    let _ = writeln!(out, "| Scenario | Operations | Requests per operation | {} |", ops.join(" | "));
+    let _ = writeln!(out, "|---|--:|--:|{}", "--:|".repeat(ops.len()));
+    for (s, b, n) in rows {
+        let per = |x: u64| if n == 0 { "–".to_owned() } else { format!("{:.2}", x as f64 / n as f64) };
+        let cells: Vec<String> = ops.iter().map(|op| b.get(*op).copied().filter(|x| *x > 0).map(per).unwrap_or_default()).collect();
+        let _ = writeln!(out, "| {} | {n} | {} | {} |", s.name, per(b.values().sum()), cells.join(" | "));
+    }
 }
 
 #[cfg(test)]

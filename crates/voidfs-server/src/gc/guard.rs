@@ -161,6 +161,12 @@ impl Guard {
         self.state.lock().unwrap().view.clone()
     }
 
+    /// The phase of the run in the view, `Some(None)` if there is none, and `None` if
+    /// `gc/pending.json` has not been read yet.
+    pub fn phase(&self) -> Option<Option<Phase>> {
+        self.current().map(|v| v.run.as_ref().map(|r| r.phase))
+    }
+
     /// The view's generation, taken before a read so that [`Guard::confirmed`] can tell whether
     /// the view changed while the read was in flight.
     pub fn generation(&self) -> Option<u64> {

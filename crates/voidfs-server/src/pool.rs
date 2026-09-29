@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use futures::StreamExt;
@@ -21,6 +21,7 @@ use voidfs_core::state::{DriveState, Rows};
 
 use crate::clock::Clock;
 use crate::gc::guard::{self, Guard};
+use crate::metrics::PoolMetrics;
 use crate::probe;
 
 /// A checkpoint is due this many commits after the last one (format §8.4)...
@@ -401,6 +402,7 @@ pub struct Pool {
     /// no other of their locks is held while taking it.
     registry: std::sync::Mutex<()>,
     authority: String,
+    pub metrics: PoolMetrics,
 }
 
 /// What a cache keeps of `b`: a copy holding only these bytes. A slice keeps its whole buffer
@@ -471,23 +473,37 @@ impl Pool {
             }
         }
         let params = Params::from_pool(&desc.chunking)?;
+        let page_bytes = cache_bytes / 8 + 1;
+        let metrics = PoolMetrics::new(cache_bytes, page_bytes);
         // Least recently used first: shards and pages never change, so the ones used last are the
         // ones to keep. moka's default (TinyLFU) admits an entry only if it was used more often
         // than everything it would evict, so a full cache turned every new shard away.
-        let cache = |bytes| moka::sync::Cache::builder().weigher(|_: &ShardHash, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX)).max_capacity(bytes).eviction_policy(moka::policy::EvictionPolicy::lru()).build();
+        let cache = |bytes, evictions: prometheus::IntCounter| {
+            moka::sync::Cache::builder()
+                .weigher(|_: &ShardHash, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX))
+                .max_capacity(bytes)
+                .eviction_policy(moka::policy::EvictionPolicy::lru())
+                .eviction_listener(move |_, _, cause| {
+                    if cause == moka::notification::RemovalCause::Size {
+                        evictions.inc();
+                    }
+                })
+                .build()
+        };
         let pool = Arc::new(Pool {
             store,
             desc,
             params,
             clock,
             guard: Guard::new(REUSE_CAPACITY),
-            shards: cache(cache_bytes),
-            pages: cache(cache_bytes / 8 + 1),
+            shards: cache(cache_bytes, metrics.shards.evictions.clone()),
+            pages: cache(page_bytes, metrics.pages.evictions.clone()),
             drives: RwLock::new(HashMap::new()),
             aliases: RwLock::new(HashMap::new()),
             registry: std::sync::Mutex::new(()),
             deleted: RwLock::new(HashMap::new()),
             authority: format!("a-{}", uuid::Uuid::new_v4()),
+            metrics,
         });
         let ids: Vec<DriveId> = pool.store.list_dirs("drives/").await?.iter().filter_map(|d| d.parse().ok()).collect();
         let loads = futures::stream::iter(ids)
@@ -724,8 +740,14 @@ impl Pool {
         self.renew(&mut cadence.last).await;
         let written = self.write_checkpoint(id, state, cadence.last.as_ref()).await;
         match written {
-            Ok(c) => cadence.last = Some(c),
-            Err(e) => tracing::warn!("checkpoint of {id} at {} failed: {e:#}", state.seq()),
+            Ok(c) => {
+                self.metrics.checkpoints_written.inc();
+                cadence.last = Some(c);
+            }
+            Err(e) => {
+                self.metrics.checkpoints_failed.inc();
+                tracing::warn!("checkpoint of {id} at {} failed: {e:#}", state.seq());
+            }
         }
     }
 
@@ -734,8 +756,10 @@ impl Pool {
 
     pub async fn shard(&self, h: &ShardHash) -> anyhow::Result<Bytes> {
         if let Some(b) = self.shards.get(h) {
+            self.metrics.shards.hits.inc();
             return Ok(b);
         }
+        self.metrics.shards.misses.inc();
         let generation = self.guard.generation();
         let b = self.store.get(&guard::Kind::Shard.path(h)).await?.ok_or_else(|| anyhow!("shard {h} is missing"))?;
         if ShardHash::of(&b) != *h {
@@ -748,8 +772,10 @@ impl Pool {
 
     pub async fn page(&self, h: &ShardHash) -> anyhow::Result<Bytes> {
         if let Some(b) = self.pages.get(h) {
+            self.metrics.pages.hits.inc();
             return Ok(b);
         }
+        self.metrics.pages.misses.inc();
         let generation = self.guard.generation();
         let b = self.store.get(&guard::Kind::Page.path(h)).await?.ok_or_else(|| anyhow!("page {h} is missing"))?;
         self.guard.confirmed(*h, generation);
@@ -782,6 +808,30 @@ impl Pool {
     pub fn forget(&self, h: &ShardHash) {
         self.shards.invalidate(h);
         self.pages.invalidate(h);
+    }
+
+    /// The pool's metrics, with what they report as of now: the caches' sizes, the drives, and
+    /// the phase of garbage collection as last read.
+    pub fn gather_metrics(&self) -> Vec<prometheus::proto::MetricFamily> {
+        let m = &self.metrics;
+        for (cache, series) in [(&self.shards, &m.shards), (&self.pages, &m.pages)] {
+            // Counts are kept up to date lazily; this settles them first.
+            cache.run_pending_tasks();
+            series.bytes.set(i64::try_from(cache.weighted_size()).unwrap_or(i64::MAX));
+            series.entries.set(i64::try_from(cache.entry_count()).unwrap_or(i64::MAX));
+        }
+        m.drives_live.set(self.aliases.read().unwrap().len() as i64);
+        m.drives_deleted.set(self.deleted.read().unwrap().len() as i64);
+        let phase = self.guard.phase().map(|p| match p {
+            Some(crate::gc::Phase::Marking) => 1,
+            Some(crate::gc::Phase::Waiting) => 2,
+            Some(crate::gc::Phase::Deleting) => 3,
+            None => 0,
+        });
+        for (i, g) in m.gc_phase.iter().enumerate() {
+            g.set(i64::from(phase == Some(i)));
+        }
+        m.gather()
     }
 
     /// The full extent list of a content descriptor.
@@ -1123,16 +1173,22 @@ impl Pool {
             if txns.is_empty() {
                 return rest;
             }
+            let n = txns.len();
             let commit = Commit { format: 1, seq, time, authority: self.authority.clone(), txns };
             let written = match serde_json::to_vec(&commit) {
                 Ok(bytes) => {
                     let len = bytes.len();
-                    self.create(&log_path(&d.id, seq), Bytes::from(bytes)).await.map(|created| created.then_some(len))
+                    let started = Instant::now();
+                    let created = self.create(&log_path(&d.id, seq), Bytes::from(bytes)).await;
+                    self.metrics.log_write.observe(started.elapsed().as_secs_f64());
+                    created.map(|created| created.then_some(len))
                 }
                 Err(e) => Err(e.into()),
             };
             match written {
                 Ok(Some(len)) => {
+                    self.metrics.commits_written.inc();
+                    self.metrics.batch.observe(n as f64);
                     d.install(state.clone(), FeedBatch { seq, time, changes });
                     cadence.add(len);
                     if cadence.due() {
@@ -1146,6 +1202,7 @@ impl Pool {
                 // Another authority wrote this sequence number: catch up, and plan everything
                 // again against what it wrote (format §7.2).
                 Ok(None) => {
+                    self.metrics.commits_lost.inc();
                     let failed = match self.catch_up(d, &cur, cadence).await {
                         Err(e) => Some(format!("catching up with the log: {e:#}")),
                         Ok(()) if attempts >= BATCH_ATTEMPTS => None,
@@ -1161,6 +1218,7 @@ impl Pool {
                 }
                 // Whether it was written is not known, so none of it may be reported as done.
                 Err(e) => {
+                    self.metrics.commits_failed.inc();
                     for (w, _) in held {
                         let _ = w.reply.send(Err(CommitError::Other(anyhow!("writing log entry {seq}: {e:#}"))));
                     }
@@ -1405,7 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn a_batch_that_keeps_losing_is_handed_back() {
         let mem = Arc::new(MemStore::new(Clock::System));
-        let store = Store::Mem(mem.clone());
+        let store = Store::mem(mem.clone());
         let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
         let d = pool.create_drive("d", None).await.unwrap();
         let one = content(&pool, b"one").await;
@@ -1440,7 +1498,7 @@ mod tests {
     #[tokio::test]
     async fn a_batch_plans_each_transaction_after_the_ones_before_it() {
         let mem = Arc::new(MemStore::new(Clock::System));
-        let pool = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.unwrap();
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
         let d = pool.create_drive("d", None).await.unwrap();
         let (one, two) = (content(&pool, b"one").await, content(&pool, b"two").await);
         let entries = count(&mem, |op, path| op == MemOp::PutNew && path.contains("/log/"));
@@ -1473,7 +1531,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_transaction_leaves_the_rest_of_its_batch() {
         let mem = Arc::new(MemStore::new(Clock::System));
-        let pool = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.unwrap();
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
         let d = pool.create_drive("d", None).await.unwrap();
         let one = content(&pool, b"one").await;
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1572,7 +1630,7 @@ mod tests {
     #[tokio::test]
     async fn transactions_committed_together_keep_their_order() {
         let mem = Arc::new(MemStore::new(Clock::System));
-        let pool = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.unwrap();
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
         let d = pool.create_drive("d", None).await.unwrap();
         let one = content(&pool, b"one").await;
         let entries = count(&mem, |op, path| op == MemOp::PutNew && path.contains("/log/"));
@@ -1622,7 +1680,7 @@ mod tests {
     #[tokio::test]
     async fn a_pool_does_not_open_where_create_if_absent_is_not_honoured() {
         let mem = Arc::new(MemStore::new(Clock::System));
-        let store = Store::Mem(mem.clone());
+        let store = Store::mem(mem.clone());
         let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
         put(&pool, &pool.create_drive("d", None).await.unwrap(), "x", b"x").await;
         let before = mem.peek("voidfs.json").unwrap();
@@ -1644,7 +1702,7 @@ mod tests {
     async fn a_pool_just_created_where_create_if_absent_is_ignored_is_removed() {
         let mem = Arc::new(MemStore::new(Clock::System));
         on_put_new(&mem, Fault::Unconditional);
-        let e = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.err().unwrap();
+        let e = Pool::open(Store::mem(mem.clone()), 1 << 20).await.err().unwrap();
         assert!(format!("{e:#}").contains("--commit-guard external"), "{e:#}");
         assert!(mem.peek("voidfs.json").is_none());
     }
@@ -1654,7 +1712,7 @@ mod tests {
         // The store rejects conditional writes outright; the external guard sends none.
         let mem = Arc::new(MemStore::new(Clock::System));
         on_put_new(&mem, Fault::Fail);
-        let store = Store::Mem(mem.clone());
+        let store = Store::mem(mem.clone());
         let p1 = Pool::open_as(store.clone(), 1 << 20, Clock::System, CommitGuard::External).await.unwrap();
         let desc: PoolDescriptor = serde_json::from_slice(&mem.peek("voidfs.json").unwrap()).unwrap();
         assert_eq!(desc.commit_guard, CommitGuard::External);
@@ -1698,7 +1756,7 @@ mod tests {
     /// that has just started on it, so has checked none of the checkpoint's pages itself.
     async fn big_drive(n: usize, clock: Clock) -> (Arc<MemStore>, Arc<Pool>, Arc<Drive>, DriveState) {
         let mem = Arc::new(MemStore::new(clock.clone()));
-        let store = Store::Mem(mem.clone());
+        let store = Store::mem(mem.clone());
         let state = DriveState::empty().apply(&commit(1, (0..n).map(|i| file(2 * i)).collect())).unwrap();
         {
             let pool = Pool::open_with(store.clone(), 64 << 20, clock.clone()).await.unwrap();
@@ -1960,9 +2018,9 @@ mod tests {
     #[tokio::test]
     async fn a_full_cache_keeps_new_shards_and_pages() {
         let mem = Arc::new(MemStore::new(Clock::System));
-        let pool = Pool::open(Store::Mem(mem.clone()), 1 << 20).await.unwrap();
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
         // Sixteen objects fill each cache; the page cache holds an eighth of the shard cache.
-        for (kind, cache, size) in [(guard::Kind::Shard, &pool.shards, 64 << 10), (guard::Kind::Page, &pool.pages, 8 << 10)] {
+        for (kind, cache, series, size) in [(guard::Kind::Shard, &pool.shards, &pool.metrics.shards, 64 << 10), (guard::Kind::Page, &pool.pages, &pool.metrics.pages, 8 << 10)] {
             let old = blobs(&format!("{kind:?} old"), 16, size);
             write_as(&pool, kind, &old).await;
             cache.run_pending_tasks();
@@ -1991,6 +2049,10 @@ mod tests {
             pool.forget(&written.0);
             assert_eq!(read_as(&pool, kind, &written.0).await, written.1);
             assert_eq!(gets.load(Ordering::SeqCst), 2, "{kind:?}: one forgotten is fetched again");
+            cache.run_pending_tasks();
+            assert_eq!(series.evictions.get(), 2, "{kind:?}: the two new objects each evicted an old one; forgetting one is not an eviction");
+            assert_eq!(series.misses.get(), 2, "{kind:?}: a miss for each fetch");
+            assert_eq!(series.hits.get(), 16 * 20 + 1 + 2 + 1, "{kind:?}: a hit for every other read");
         }
     }
 
@@ -1999,7 +2061,7 @@ mod tests {
     async fn a_tree_reads_whatever_the_page_cache_keeps() {
         let mem = Arc::new(MemStore::new(Clock::System));
         // The page cache holds one byte, so each page goes at the next housekeeping.
-        let pool = Pool::open(Store::Mem(mem.clone()), 0).await.unwrap();
+        let pool = Pool::open(Store::mem(mem.clone()), 0).await.unwrap();
         let extents: Vec<Extent> = (0..3_000u32).map(|i| Extent::Shard { s: ShardHash::of(&i.to_be_bytes()), n: 1 }).collect();
         let desc = pool.describe(extents.clone()).await.unwrap();
         assert!(matches!(desc, ContentDescriptor::Tree { .. }));
@@ -2014,5 +2076,68 @@ mod tests {
             futures::future::ready(Fault::None).boxed()
         })));
         assert_eq!(pool.extents(&desc).await.unwrap(), extents);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Metrics
+
+    /// A put, then two reads of what it wrote: both hit the shard cache. A server that has just
+    /// started misses once, reading the shard from the bucket, and then hits.
+    #[tokio::test]
+    async fn metrics_count_cache_hits_and_bucket_requests() {
+        use crate::metrics::{BucketOp, encode, sample};
+        let store = Store::memory().unwrap();
+        let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        let d = pool.create_drive("counted", None).await.unwrap();
+        put(&pool, &d, "a", b"hello").await;
+        assert_eq!(read(&pool, &d, "a").await.unwrap(), b"hello");
+        assert_eq!(read(&pool, &d, "a").await.unwrap(), b"hello");
+        let text = encode(pool.gather_metrics());
+        assert_eq!(sample(&text, r#"voidfs_cache_hits_total{cache="shard"}"#), Some(2.0));
+        assert_eq!(sample(&text, r#"voidfs_cache_misses_total{cache="shard"}"#), Some(0.0));
+        assert_eq!(sample(&text, r#"voidfs_cache_entries{cache="shard"}"#), Some(1.0));
+        assert_eq!(sample(&text, r#"voidfs_cache_bytes{cache="shard"}"#), Some(5.0));
+        assert_eq!(sample(&text, r#"voidfs_drives{state="live"}"#), Some(1.0));
+        let fresh = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        let d = fresh.drive("counted").unwrap();
+        let gets = store.metrics.requests(BucketOp::Get);
+        assert_eq!(read(&fresh, &d, "a").await.unwrap(), b"hello");
+        assert_eq!(read(&fresh, &d, "a").await.unwrap(), b"hello");
+        assert_eq!(store.metrics.requests(BucketOp::Get), gets + 1, "one read from the bucket");
+        let text = encode(fresh.gather_metrics());
+        assert_eq!(sample(&text, r#"voidfs_cache_misses_total{cache="shard"}"#), Some(1.0));
+        assert_eq!(sample(&text, r#"voidfs_cache_hits_total{cache="shard"}"#), Some(1.0));
+        let text = encode(store.metrics.gather());
+        assert_eq!(sample(&text, r#"voidfs_bucket_requests_total{op="get"}"#), Some((gets + 1) as f64));
+        assert_eq!(sample(&text, r#"voidfs_bucket_request_errors_total{op="get"}"#), Some(0.0));
+        assert!(sample(&text, r#"voidfs_bucket_requests_total{op="put_new"}"#).unwrap() >= 2.0, "voidfs.json, drive.json and the log entry");
+    }
+
+    /// Each log entry's transactions go into the batch histogram; a lost race is counted too.
+    #[tokio::test]
+    async fn metrics_count_transactions_per_log_entry() {
+        use crate::metrics::{encode, sample};
+        let pool = Pool::open(Store::memory().unwrap(), 1 << 20).await.unwrap();
+        let d = pool.create_drive("batched", None).await.unwrap();
+        put(&pool, &d, "one", b"1").await;
+        let desc = content(&pool, b"2").await;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let plans = (0..3).map(|i| put_plan(&format!("k{i}"), &desc, Precondition::default(), &runs)).collect();
+        assert!(batch(&pool, &d, plans).await.iter().all(|a| a.is_ok()));
+        let text = encode(pool.gather_metrics());
+        assert_eq!(sample(&text, r#"voidfs_commits_total{outcome="written"}"#), Some(2.0));
+        assert_eq!(sample(&text, "voidfs_commit_transactions_count"), Some(2.0));
+        assert_eq!(sample(&text, "voidfs_commit_transactions_sum"), Some(4.0));
+        assert_eq!(sample(&text, r#"voidfs_commit_transactions_bucket{le="1"}"#), Some(1.0));
+        assert_eq!(sample(&text, r#"voidfs_commit_transactions_bucket{le="2"}"#), Some(1.0));
+        assert_eq!(sample(&text, r#"voidfs_commit_transactions_bucket{le="4"}"#), Some(2.0));
+        assert_eq!(sample(&text, "voidfs_commit_log_write_seconds_count"), Some(2.0));
+        // Another server writes the next entry first.
+        let other = Pool::open(pool.store.clone(), 1 << 20).await.unwrap();
+        put(&other, &other.drive("batched").unwrap(), "elsewhere", b"3").await;
+        put(&pool, &d, "after", b"4").await;
+        let text = encode(pool.gather_metrics());
+        assert_eq!(sample(&text, r#"voidfs_commits_total{outcome="lost_race"}"#), Some(1.0));
+        assert_eq!(sample(&text, r#"voidfs_commits_total{outcome="written"}"#), Some(3.0));
     }
 }

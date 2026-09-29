@@ -92,6 +92,11 @@ struct RunArgs {
     /// Drives are named `<prefix>-<run>-<nn>`.
     #[arg(long, default_value = "vfbench")]
     voidfs_drive_prefix: String,
+    /// voidfs-server's metrics, for example http://127.0.0.1:9001/metrics (its `--admin-listen`).
+    /// With it, each scenario records the requests voidfs sent to the bucket in its measured
+    /// rounds.
+    #[arg(long, env = "VOIDFS_METRICS_URL")]
+    voidfs_metrics: Option<String>,
 
     #[command(flatten)]
     bucket: Bucket,
@@ -264,6 +269,7 @@ async fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         samples: args.samples,
         nonce,
         tag: tag.clone(),
+        metrics: args.voidfs_metrics.clone().map(run::MetricsSource::new),
     };
     let mut file = RunFile {
         harness: format!("voidfs-bench {}", env!("CARGO_PKG_VERSION")),
