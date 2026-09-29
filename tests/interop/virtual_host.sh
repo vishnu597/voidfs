@@ -8,8 +8,8 @@
 #         tests/interop/virtual_host.sh [domain]
 #
 # The domain defaults to s3.localhost. Every name under it connects to the endpoint
-# (`curl --connect-to`), so no DNS is needed. Needs curl 7.86 or later. Exits non-zero at the
-# first failure.
+# (`curl --connect-to`), so no DNS is needed. Needs curl 8.5 or later: 7.88, in Debian 12, signs
+# query strings in a way servers reject. Exits non-zero at the first failure.
 
 set -euo pipefail
 
@@ -28,9 +28,10 @@ trap 'rm -rf "$out"' EXIT
 req() {
     local method=$1 host=$2 path=$3
     shift 3
+    # curl before 8 signs the payload's hash without sending it; name the payload explicitly.
     status=$(curl -sS -o "$out/body" -D "$out/headers" -w '%{http_code}' -X "$method" \
         --aws-sigv4 "aws:amz:us-east-1:s3" --user "$VOIDFS_ACCESS_KEY_ID:$VOIDFS_SECRET_ACCESS_KEY" \
-        --connect-to "::$addr" "$@" "http://$host:$port$path")
+        -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" --connect-to "::$addr" "$@" "http://$host:$port$path")
 }
 
 header() {

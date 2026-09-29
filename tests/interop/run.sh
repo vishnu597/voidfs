@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Starts voidfs-server over one kind of store, with throwaway keys, and runs the conformance
-# suite and the stock-client checks against it. CI runs it for each store; so can you:
+# suite (path-style and virtual-host style) and the stock-client checks against it. CI runs it
+# for each store; so can you:
 #
 #   cargo build -p voidfs-server -p voidfs-conformance
 #   tests/interop/run.sh memory        # or fs, versitygw, minio
@@ -93,13 +94,21 @@ export VOIDFS_SECRET_ACCESS_KEY="$(random 'A-Za-z0-9' 40)"
 export VOIDFS_READ_ACCESS_KEY_ID="VR$(random 'A-Z2-7' 18)"
 export VOIDFS_READ_SECRET_ACCESS_KEY="$(random 'A-Za-z0-9' 40)"
 export VOIDFS_ENDPOINT="http://127.0.0.1:$voidfs_port"
-RUST_LOG=warn "$server" "${store_args[@]}" --listen "127.0.0.1:$voidfs_port" \
+# Names under localhost reach the loopback address without DNS (curl and these checks see to it).
+RUST_LOG=warn "$server" "${store_args[@]}" --listen "127.0.0.1:$voidfs_port" --virtual-host-domain s3.localhost \
     --key "$VOIDFS_READ_ACCESS_KEY_ID:$VOIDFS_READ_SECRET_ACCESS_KEY:read" > "$work/voidfs.log" 2>&1 &
 pids+=($!)
 wait_for "$VOIDFS_ENDPOINT/"
 
 echo "== conformance ($store)"
 "$conformance"
+echo "== conformance, virtual-host style ($store)"
+"$conformance" --virtual-host s3.localhost
+echo "== aws-chunked, both styles ($store)"
+python3 "$root/tests/interop/aws_chunked.py"
+VOIDFS_ADDRESSING=virtual VOIDFS_ENDPOINT="http://s3.localhost:$voidfs_port" python3 "$root/tests/interop/aws_chunked.py"
+echo "== virtual-host with curl ($store)"
+VOIDFS_ENDPOINT="http://s3.localhost:$voidfs_port" "$root/tests/interop/virtual_host.sh"
 echo "== rclone ($store)"
 "$root/tests/interop/rclone_smoke.sh"
 echo "== boto3 ($store)"
