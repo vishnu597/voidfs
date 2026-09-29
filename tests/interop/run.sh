@@ -36,7 +36,7 @@ cleanup() {
 trap cleanup EXIT
 
 # `tr` gets SIGPIPE when `head` has enough; that is expected, so not under pipefail.
-random() { (set +o pipefail; LC_ALL=C tr -dc "$1" < /dev/urandom | head -c "$2"); }
+random() { (set +o pipefail; LC_ALL=C tr -dc "$1" < /dev/urandom 2> /dev/null | head -c "$2"); }
 wait_for() {
     for _ in $(seq 1 100); do
         curl -s -o /dev/null "$1" && return 0
@@ -64,7 +64,14 @@ case "$store" in
         fi
         pids+=($!)
         wait_for "http://127.0.0.1:$s3_port/"
-        # MinIO answers before it is ready for requests; retry the bucket's creation briefly.
+        # MinIO answers, and then resets connections, until it is ready.
+        if [[ "$store" == minio ]]; then
+            for _ in $(seq 1 300); do
+                curl -s -f -o /dev/null "http://127.0.0.1:$s3_port/minio/health/ready" && break
+                sleep 0.1
+            done
+        fi
+        # Retry the bucket's creation briefly all the same.
         # Older curl doesn't send the payload hash, which versitygw requires: this is the empty body's.
         created=0
         for _ in $(seq 1 50); do

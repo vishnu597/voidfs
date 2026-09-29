@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """Uploads `aws-chunked` bodies in the three forms protocol §2 requires, signed by hand, since
-SDKs send them only over HTTPS. Also checks that a signature must cover `host`, which no SDK
-leaves out.
+SDKs send them only over HTTPS. Also checks that a signature must cover `host`, and that header
+authentication must send `x-amz-content-sha256`, which SDKs never leave out.
 
     VOIDFS_ENDPOINT=http://127.0.0.1:9000 VOIDFS_ACCESS_KEY_ID=... VOIDFS_SECRET_ACCESS_KEY=... \
         python3 tests/interop/aws_chunked.py
@@ -45,10 +45,11 @@ def hm(k, m):
     return hmac.new(k, m.encode(), hashlib.sha256).digest()
 
 
-def request(method, key, body=b"", headers=None, payload=None, chunks=None, trailer=None, tamper=False, sign_host=True):
+def request(method, key, body=b"", headers=None, payload=None, chunks=None, trailer=None, tamper=False, sign_host=True, payload_header=True):
     """Signs and sends one request. With `chunks`, the body is aws-chunked in the form `payload`
     names, with `trailer` as (name, value) if given; `tamper` corrupts one chunk signature;
-    `sign_host=False` leaves `host` out of the signature."""
+    `sign_host=False` leaves `host` out of the signature; `payload_header=False` signs the
+    payload's hash without sending x-amz-content-sha256, as curl 7.88 does."""
     host = f"{drive}.{endpoint.netloc}" if virtual else endpoint.netloc
     path = "/" + urllib.parse.quote(key) if virtual else f"/{drive}" + ("/" + urllib.parse.quote(key) if key else "")
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -60,9 +61,11 @@ def request(method, key, body=b"", headers=None, payload=None, chunks=None, trai
         h["x-amz-decoded-content-length"] = str(sum(len(c) for c in chunks))
         if trailer:
             h["x-amz-trailer"] = trailer[0]
-    h["x-amz-content-sha256"] = payload or hashlib.sha256(body).hexdigest()
+    payload_hash = payload or hashlib.sha256(body).hexdigest()
+    if payload_header:
+        h["x-amz-content-sha256"] = payload_hash
     names = sorted(n for n in h if sign_host or n != "host")
-    canonical = "\n".join([method, path, "", *(f"{n}:{h[n]}" for n in names), "", ";".join(names), h["x-amz-content-sha256"]])
+    canonical = "\n".join([method, path, "", *(f"{n}:{h[n]}" for n in names), "", ";".join(names), payload_hash])
     signing_key = hm(hm(hm(hm(("AWS4" + secret).encode(), day), "us-east-1"), "s3"), "aws4_request")
     to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
     seed = hmac.new(signing_key, to_sign.encode(), hashlib.sha256).hexdigest()
@@ -121,6 +124,10 @@ check("and nothing was written", status == 404)
 status, body = request("PUT", "up/nohost.txt", body=b"x", sign_host=False)
 check("a signature that leaves out host is refused, as S3 refuses it", status == 403 and b"AccessDenied" in body, body)
 status, _ = request("GET", "up/nohost.txt")
+check("and nothing was written", status == 404)
+status, body = request("PUT", "up/nohash.txt", body=b"x", payload_header=False)
+check("header auth without x-amz-content-sha256 is refused, as S3 refuses it", status == 400 and b"InvalidRequest" in body, body)
+status, _ = request("GET", "up/nohash.txt")
 check("and nothing was written", status == 404)
 status, _ = request("DELETE", "", headers={"x-voidfs-hard-delete": "true"})
 check("hard-delete drive", status == 204)

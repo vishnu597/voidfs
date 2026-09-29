@@ -4,6 +4,16 @@ Every change to the [protocol](protocol.md), the [format](format.md) and the
 [conformance suite](conformance/) is recorded here, newest first. Drafts may change
 incompatibly; entries say when they do.
 
+## Draft 1, revision 4: header authentication sends its payload hash (2026-09-29)
+
+- **Protocol §2:** a request signed in the `Authorization` header MUST send
+  `x-amz-content-sha256`, and a server rejects one without it with `400 InvalidRequest`, as S3
+  does. Servers had assumed `UNSIGNED-PAYLOAD` instead, so a client that signed the body's hash
+  without sending the header (curl 7.88 does) got `403 SignatureDoesNotMatch`, which pointed at
+  the wrong problem. SDKs, boto3, the AWS CLI, rclone and curl 8 always send it. There is no
+  conformance case: the runner's signer always sends it. `tests/interop/aws_chunked.py` checks
+  it.
+
 ## Draft 1, revision 3: the signature covers `host` (2026-09-29)
 
 - **Protocol §2:** `host` MUST be in `SignedHeaders`, in either addressing style, and a server
