@@ -25,3 +25,4 @@ RFCs are never deleted. A later RFC that replaces one says so, and the old one i
 |---|---|---|
 | [0001](0001-metadata-in-the-bucket.md) | Drive metadata as a commit log and checkpoints in the bucket | Accepted |
 | [0002](0002-gc-safe-against-writers.md) | Garbage collection that is safe against writers | Implemented |
+| [0003](0003-small-content-in-descriptors.md) | Small content inside the content descriptor | Proposed |
