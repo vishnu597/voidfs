@@ -68,6 +68,11 @@ struct Args {
     /// default; `voidfs-server gc` does one step on demand.
     #[arg(long, env = "VOIDFS_GC_INTERVAL", value_parser = clock::parse_duration)]
     gc_interval: Option<Duration>,
+    /// Also serve `<drive>.<domain>/<key>` (virtual-host addressing) under this domain, which
+    /// needs a wildcard DNS name `*.<domain>` pointing at the server (repeatable). Requests to
+    /// the domain itself, or to any other host, stay path-style (`/<drive>/<key>`).
+    #[arg(long = "virtual-host-domain", env = "VOIDFS_VIRTUAL_HOST_DOMAIN", value_delimiter = ',', value_parser = s3::parse_domain)]
+    virtual_host_domains: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -217,7 +222,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("collecting garbage every {}s", every.as_secs());
         tokio::spawn(gc::run_periodically(pool.clone(), gc::Options::default(), every));
     }
-    let app = Arc::new(s3::App { pool, keys });
+    for d in &args.virtual_host_domains {
+        tracing::info!("serving virtual-host requests to *.{d}");
+    }
+    let app = Arc::new(s3::App { pool, keys, domains: s3::Domains::new(args.virtual_host_domains) });
     let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("listening on {}", args.listen))?;
     tracing::info!("serving on http://{}", args.listen);
     axum::serve(listener, s3::router(app)).with_graceful_shutdown(async {
@@ -270,5 +278,13 @@ mod tests {
         assert!(Args::try_parse_from(["voidfs-server", "--commit-guard", "none"]).is_err());
         let a = Args::try_parse_from(["voidfs-server", "gc", "--commit-guard", "external"]).unwrap();
         assert_eq!(a.commit_guard, Guard::External);
+    }
+
+    #[test]
+    fn virtual_host_domains_parse() {
+        assert!(Args::try_parse_from(["voidfs-server"]).unwrap().virtual_host_domains.is_empty());
+        let a = Args::try_parse_from(["voidfs-server", "--virtual-host-domain", "S3.Example.com.", "--virtual-host-domain", "localhost"]).unwrap();
+        assert_eq!(a.virtual_host_domains, ["s3.example.com", "localhost"]);
+        assert!(Args::try_parse_from(["voidfs-server", "--virtual-host-domain", "*.example.com"]).is_err());
     }
 }

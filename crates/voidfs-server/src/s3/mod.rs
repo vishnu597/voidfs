@@ -4,6 +4,7 @@
 mod bucket;
 mod chunked;
 mod error;
+mod host;
 mod object;
 mod util;
 
@@ -15,6 +16,7 @@ use axum::response::Response;
 use http::{Method, Request};
 
 pub use error::S3Error;
+pub use host::{Domains, parse_domain};
 use util::{Ctx, Query};
 
 use crate::pool::Pool;
@@ -23,6 +25,8 @@ use crate::sigv4::{self, Keys};
 pub struct App {
     pub pool: Arc<Pool>,
     pub keys: Keys,
+    /// Domains for virtual-host addressing; empty for path-style only.
+    pub domains: Domains,
 }
 
 pub fn router(app: Arc<App>) -> axum::Router {
@@ -53,9 +57,15 @@ async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
 async fn route(app: &Arc<App>, req: Request<Body>) -> Result<Response, S3Error> {
     let (parts, body) = req.into_parts();
     let auth = sigv4::verify(parts.method.as_str(), &parts.uri, &parts.headers, &app.keys, chrono::Utc::now()).map_err(S3Error::auth)?;
-    let (bucket, key) = util::split_path(parts.uri.path())?;
+    // The signature covers the request as sent, host included, so the drive is taken from the
+    // host only now.
+    let virtual_host = app.domains.drive(&parts.uri, &parts.headers);
+    let (bucket, key) = match &virtual_host {
+        Some(drive) => (Some(drive.clone()), util::split_key(parts.uri.path())?),
+        None => util::split_path(parts.uri.path())?,
+    };
     let query = Query::parse(parts.uri.query().unwrap_or(""));
-    let ctx = Ctx { method: parts.method, bucket, key, query, headers: parts.headers, auth };
+    let ctx = Ctx { method: parts.method, bucket, key, virtual_host: virtual_host.is_some(), query, headers: parts.headers, auth };
     match (&ctx.bucket, &ctx.key) {
         (None, _) => bucket::service(app, &ctx).await,
         (Some(_), None) => bucket::dispatch(app, &ctx, body).await,

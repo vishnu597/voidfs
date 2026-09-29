@@ -919,9 +919,8 @@ async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) 
     let mut resp = xml(
         200,
         format!(
-            "<CompleteMultipartUploadResult xmlns=\"{S3_NS}\"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
-            xml_escape(ctx.bucket()),
-            xml_escape(key),
+            "<CompleteMultipartUploadResult xmlns=\"{S3_NS}\"><Location>{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+            xml_escape(&ctx.location(Some(key))),
             xml_escape(ctx.bucket()),
             xml_escape(key),
             xml_escape(&etag)

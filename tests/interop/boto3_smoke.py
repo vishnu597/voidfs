@@ -6,13 +6,19 @@
         python3 tests/interop/boto3_smoke.py
 
 Needs `pip install boto3`. Exits non-zero at the first failure.
+
+With VOIDFS_ADDRESSING=virtual, requests go to `<drive>.<endpoint host>` instead, for a server
+started with `--virtual-host-domain <endpoint host>`. Names under `localhost` resolve to the
+loopback address here, as they do in curl and browsers, so `http://s3.localhost:9000` needs no DNS.
 """
 
 import hashlib
 import io
 import os
+import socket
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -22,6 +28,10 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 endpoint = os.environ["VOIDFS_ENDPOINT"]
+addressing = os.environ.get("VOIDFS_ADDRESSING", "path")
+if urllib.parse.urlsplit(endpoint).hostname.endswith(".localhost"):
+    resolve = socket.getaddrinfo
+    socket.getaddrinfo = lambda host, *a, **k: resolve("127.0.0.1" if host.endswith(".localhost") else host, *a, **k)
 s3 = boto3.client(
     "s3",
     endpoint_url=endpoint,
@@ -30,7 +40,7 @@ s3 = boto3.client(
     region_name="us-east-1",
     # voidfs accepts only Signature Version 4, which boto3 does not use for presigned URLs
     # unless asked to.
-    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}, retries={"max_attempts": 1}),
+    config=Config(signature_version="s3v4", s3={"addressing_style": addressing}, retries={"max_attempts": 1}),
 )
 bucket = f"interop-{uuid.uuid4().hex[:10]}"
 passed = 0
@@ -115,6 +125,12 @@ s3.delete_object(Bucket=bucket, Key="copy.txt")
 check("delete", error_code(lambda: s3.head_object(Bucket=bucket, Key="copy.txt")) in ("404", "NoSuchKey"))
 r = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": f"list/item-{i}.txt"} for i in range(5)]})
 check("delete objects", len(r.get("Deleted", [])) == 5)
+
+up = s3.create_multipart_upload(Bucket=bucket, Key="parts.bin")
+p = s3.upload_part(Bucket=bucket, Key="parts.bin", UploadId=up["UploadId"], PartNumber=1, Body=b"y" * 100)
+r = s3.complete_multipart_upload(Bucket=bucket, Key="parts.bin", UploadId=up["UploadId"], MultipartUpload={"Parts": [{"PartNumber": 1, "ETag": p["ETag"]}]})
+want = "/parts.bin" if addressing == "virtual" else f"/{bucket}/parts.bin"
+check("complete multipart location", r["Location"] == want and r["Bucket"] == bucket, r["Location"])
 
 up = s3.create_multipart_upload(Bucket=bucket, Key="aborted.bin")
 s3.upload_part(Bucket=bucket, Key="aborted.bin", UploadId=up["UploadId"], PartNumber=1, Body=b"x" * 100)

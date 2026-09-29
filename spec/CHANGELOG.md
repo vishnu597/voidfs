@@ -4,6 +4,15 @@ Every change to the [protocol](protocol.md), the [format](format.md) and the
 [conformance suite](conformance/) is recorded here, newest first. Drafts may change
 incompatibly; entries say when they do.
 
+## Draft 1, revision 3: the signature covers `host` (2026-09-29)
+
+- **Protocol §2:** `host` MUST be in `SignedHeaders`, in either addressing style, and a server
+  rejects a signature that leaves it out with `403 AccessDenied`, as S3 does. Signature Version
+  4 already required it, and every SDK, boto3, the AWS CLI, rclone and curl sign it; servers had
+  not checked. With virtual-host addressing the host names the drive, so an unsigned host would
+  let one signature reach any drive. There is no conformance case: the runner signs with
+  `aws-sigv4`, which always signs `host`. `tests/interop/aws_chunked.py` checks it.
+
 ## Draft 1, revision 2: garbage collection (2026-09-27)
 
 [RFC 0002](../rfcs/0002-gc-safe-against-writers.md). Drafts may change incompatibly; this does

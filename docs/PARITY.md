@@ -1,12 +1,13 @@
 # voidfs and SpaceFS: parity status and plan
 
 *Stocktake of 2026-09-28, brought up to date the same day after content-defined checkpoints, the
-capability probe, group commit and the shard cache's admission; the first was taken on
-2026-09-27.*
+capability probe, group commit and the shard cache's admission, and on 2026-09-29 after
+virtual-host addressing; the first was taken on 2026-09-27.*
 
 Sources:
-- the voidfs code on `main` at `634267e` (garbage collection, content-defined checkpoints, the
-  capability probe and group commit merged), with the shard cache's admission on top;
+- the voidfs code on `main` at `0ff3f2d` (garbage collection, content-defined checkpoints, the
+  capability probe, group commit and the shard cache's admission merged), with virtual-host
+  addressing on top;
 - the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
 - the benchmark results in [`bench/results/`](../bench/results/);
 - SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog, read again on 28
@@ -47,9 +48,9 @@ billing or plans), this page says so.
 - **The plan (§7):**
   - Step 1 has its harness, local results and CI. Still to do: the run in SpaceFS's setup
     (which waits on cloud accounts, §8), and the Mac comparison.
-  - Step 2 has four of its six items done: garbage collection, content-defined checkpoint
-    segments, the bucket capability probe, and runs on AWS S3, MinIO and rclone. The Compose
-    file is done too; a health endpoint and metrics, and virtual-host addressing, are to do.
+  - Step 2 has five of its six items done: garbage collection, content-defined checkpoint
+    segments, the bucket capability probe, runs on AWS S3, MinIO and rclone, and virtual-host
+    addressing. The Compose file is done too; a health endpoint and metrics are to do.
   - Step 3 has its first two items done: group commit and the shard cache's admission.
   - Steps 4–10 have not started.
 
@@ -71,12 +72,12 @@ Every item of the plan's checklist (§3, 65 items, including the Finder integrat
 |---|---|---|---|---|
 | Engine (E1–E13) | 8 | 1 | 4 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints and garbage collection work. Missing: the small-file path, direct uploads, encryption, retention policies |
 | Storage backends (B1–B8) | 1 | 1 | 6 | Local disk, R2 and versitygw (the local S3 server the benchmarks use) work. Not yet run on AWS S3 or MinIO. A capability probe checks the bucket at start. No short-lived storage credentials, no adopt or export |
-| Server (S1–S9) | 2 | 4 | 3 | Full S3 subset, extensions and change feed, on one node. Missing: virtual-host addressing, a disk cache tier, several nodes, several regions, quotas |
+| Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed, on one node. Missing: a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
 | Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount (the spike). No agent, journal, CLI, Finder integration, Linux or Windows |
 | SDKs, agents, search (A1–A7) | 0 | 0 | 7 | Stock S3 SDKs and the AWS CLI work; nothing voidfs-specific |
 | Operations (O1–O6) | 0 | 2 | 4 | One binary. A benchmark harness, not yet run in the cloud. No compose file or metrics |
-| **Total** | **11** | **12** | **42** | Of the 28 P0 items: 11 done, 9 partly, 8 missing |
+| **Total** | **12** | **11** | **42** | Of the 28 P0 items: 12 done, 8 partly, 8 missing |
 
 Earlier stocktakes counted 71 items and 6 more missing than the rows add up to; the checklist has
 65. The P0 counts were right.
@@ -84,8 +85,7 @@ Earlier stocktakes counted 71 items and 6 more missing than the rows add up to; 
 "Partly" means:
 - E1 has no compression.
 - B1 is not yet run on AWS S3 or MinIO.
-- S1 lacks virtual-host addressing; S3 lacks direct upload and credentials; S5 is memory-only;
-  S8 has no operations catalogue.
+- S3 lacks direct upload and credentials; S5 is memory-only; S8 has no operations catalogue.
 - C3 keys can't be minted or revoked.
 - D3 is read-only, D6 relies on the kernel's read-ahead only, and D11 is the spike's shell.
 - O1 has no compose file. O5 has run locally and against R2, not yet in SpaceFS's setup.
@@ -94,15 +94,15 @@ The 28 P0 items, which a credible v1 needs:
 
 | Status | Items |
 |---|---|
-| Done (11) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, E11 checkpoints, B3 capability probe, S2 S3 subset, S4 per-drive authority and change feed |
-| Partly (9) | E1 chunking, B1 backends, S1 S3 server, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount, O1 single binary and compose |
+| Done (12) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, E11 checkpoints, B3 capability probe, S1 S3 server, S2 S3 subset, S4 per-drive authority and change feed |
+| Partly (8) | E1 chunking, B1 backends, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount, O1 single binary and compose |
 | Missing (8) | B5 stored bucket credentials, C1 sign-in, C2 workspaces, C4 bucket connections, D1 client daemon, D5 desktop semantics, D9 CLI, A1 Rust and TypeScript SDKs |
 
 ## 4. Product by product
 
 | SpaceFS | voidfs today |
 |---|---|
-| S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 35 conformance cases. Missing: virtual-host addressing, direct uploads, storage credentials |
+| S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 35 conformance cases, path or virtual-host addressing. Missing: direct uploads, storage credentials |
 | macOS app: writable mount, transfers (pause, resume, speed limits), previews, video reviews, Space Search, Finder badges | Read-only FSKit mount and a menu-bar shell |
 | `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version | None |
 | Linux FUSE mount | None (step 9) |
@@ -338,12 +338,19 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
        it checks. Of the 23 small-object scenarios, 20 are at or ahead of SpaceFS's ratio to the
        bare bucket and 16 faster than it; put 4 KiB and the two fan-out puts of 4 KiB are behind
        ([results](../bench/results/aws-small-objects.md)).
-   - Virtual-host addressing (in progress).
+   - Virtual-host addressing. **Done** (S1): with `--virtual-host-domain <domain>` (repeatable),
+     `<drive>.<domain>/<key>` reaches the same drive and key as `/<drive>/<key>`, which keeps
+     working. The domain itself, and any other host, stay path-style, and without the flag
+     nothing changes. The signature is checked on the request as sent, and must cover `host` in
+     either style, as S3 requires (`403 AccessDenied` otherwise). Locations name the path on
+     the host the request used (`/<key>` rather than `/<drive>/<key>`). The conformance runner
+     runs every case either way (`--virtual-host <domain>`): 35/35 both ways, and boto3, the
+     Rust SDK, curl's SigV4 and all three `aws-chunked` forms work.
    - A `docker compose` file, and health checks and metrics. The Compose file is **done**
      ([`deploy/compose/`](../deploy/compose/)): the server's image, its pool in a volume, in a
      bucket of yours, or in versitygw beside it, which CI brings up and tests. Health is only
      "answers HTTP" for now; a health endpoint and metrics on a port of their own are to do.
-   - **Status (2026-09-29):** 4 of 6 done, and the Compose file.
+   - **Status (2026-09-29):** 5 of 6 done, and the Compose file.
 3. **Win the rows SpaceFS loses.** The work items, with the step 1 evidence and a row-by-row
    baseline, are in [step-3-performance.md](step-3-performance.md). In order of impact:
    - Group commit: one log write per batch of mutations, not per mutation (37 rows). **Done**:

@@ -53,6 +53,37 @@ VOIDFS_ENDPOINT=http://127.0.0.1:9000 VOIDFS_ACCESS_KEY_ID=<id> VOIDFS_SECRET_AC
   cargo run -p voidfs-conformance
 ```
 
+### Virtual-host addressing
+
+Drives are always served path-style, at `https://voidfs.example.com/<drive>/<key>`. To also
+serve `https://<drive>.voidfs.example.com/<key>`, which some S3 clients use by default:
+
+1. Point a wildcard DNS name, `*.voidfs.example.com`, at the server as well as
+   `voidfs.example.com` itself.
+2. Give TLS a certificate for both names (for example from Let's Encrypt, which issues wildcard
+   certificates through its DNS challenge).
+3. Start the server with `--virtual-host-domain voidfs.example.com` (or
+   `VOIDFS_VIRTUAL_HOST_DOMAIN`). Repeat it, or separate names with commas, to serve several
+   names. The longest name that matches wins.
+
+Requests to `voidfs.example.com` itself, and to any other name or address, stay path-style.
+Clients sign the `Host` header, so a proxy in front of the server must pass it through
+unchanged (nginx: `proxy_set_header Host $host;`). A wildcard certificate covers only one
+label, so a drive whose name contains dots, such as `a.b`, gets a certificate error at
+`a.b.voidfs.example.com`: reach it path-style.
+
+To try it locally, `curl` and browsers resolve every name under `localhost` to the loopback address:
+
+```bash
+cargo run --release -p voidfs-server -- --store memory --virtual-host-domain s3.localhost
+curl --aws-sigv4 aws:amz:us-east-1:s3 --user <id>:<secret> -X PUT http://footage.s3.localhost:9000/
+VOIDFS_ENDPOINT=http://127.0.0.1:9000 VOIDFS_ACCESS_KEY_ID=<id> VOIDFS_SECRET_ACCESS_KEY=<secret> \
+  cargo run -p voidfs-conformance -- --virtual-host s3.localhost
+```
+
+`tests/interop/` has more checks in this style: `virtual_host.sh` (curl), and `boto3_smoke.py` and
+`aws_chunked.py` with `VOIDFS_ADDRESSING=virtual`.
+
 ### With Docker Compose
 
 [`deploy/compose/`](deploy/compose/) runs the server in a container, with its pool in a volume, in

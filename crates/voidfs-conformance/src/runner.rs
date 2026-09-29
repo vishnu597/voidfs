@@ -45,6 +45,9 @@ pub struct Runner {
     keys: HashMap<String, Key>,
     /// Print every request and response while running.
     pub verbose: bool,
+    /// Send `/<drive>/<key>` as `/<key>` to host `<drive>.<domain>` (virtual-host addressing),
+    /// still connecting to the endpoint. `/` goes to `<domain>` itself.
+    pub virtual_host: Option<String>,
 }
 
 struct Response {
@@ -61,7 +64,7 @@ impl Runner {
         let url: http::Uri = endpoint.parse()?;
         let authority = url.authority().ok_or_else(|| anyhow::anyhow!("endpoint has no host"))?.to_string();
         let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build()?;
-        Ok(Runner { client, endpoint, authority, keys, verbose: false })
+        Ok(Runner { client, endpoint, authority, keys, verbose: false, virtual_host: None })
     }
 
     pub async fn run_case(&self, case: &Case) -> CaseResult {
@@ -135,8 +138,9 @@ impl Runner {
         body: Vec<u8>,
         key: &Key,
     ) -> Result<Response, String> {
+        let (host, path) = self.address(path);
         let uri = if query.is_empty() { format!("{}{}", self.endpoint, path) } else { format!("{}{}?{}", self.endpoint, path, query) };
-        headers.push(("host".into(), self.authority.clone()));
+        headers.push(("host".into(), host));
         let (signed, extra): (Vec<_>, Vec<_>) = headers.into_iter().partition(|(k, _)| !unsigned.contains(k));
 
         let identity = Credentials::new(&key.id, &key.secret, None, None, "voidfs-conformance").into();
@@ -173,6 +177,18 @@ impl Runner {
             .collect();
         let body = resp.bytes().await.map_err(|e| format!("reading body: {e}"))?.to_vec();
         Ok(Response { status, headers, body })
+    }
+
+    /// The host and path a path-style request is sent with.
+    fn address(&self, path: &str) -> (String, String) {
+        let Some(domain) = &self.virtual_host else { return (self.authority.clone(), path.to_owned()) };
+        let port = self.authority.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map(|(_, p)| format!(":{p}")).unwrap_or_default();
+        let rest = path.strip_prefix('/').unwrap_or(path);
+        if rest.is_empty() {
+            return (format!("{domain}{port}"), "/".into());
+        }
+        let (drive, key) = rest.split_once('/').unwrap_or((rest, ""));
+        (format!("{drive}.{domain}{port}"), format!("/{key}"))
     }
 
     fn expect(&self, step: &Step, resp: &Response, vars: &mut Vars) -> Result<(), String> {
@@ -253,4 +269,21 @@ fn fresh_drive_name() -> String {
     let mut rng = rand::rng();
     let suffix: String = (0..10).map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char).collect();
     format!("vfc-{suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_host_addresses() {
+        let keys = HashMap::from([("admin".to_string(), Key { id: "a".into(), secret: "s".into() })]);
+        let mut r = Runner::new("http://127.0.0.1:9100", keys).unwrap();
+        assert_eq!(r.address("/d/k%20x"), ("127.0.0.1:9100".into(), "/d/k%20x".into()));
+        r.virtual_host = Some("s3.localhost".into());
+        assert_eq!(r.address("/"), ("s3.localhost:9100".into(), "/".into()));
+        assert_eq!(r.address("/d"), ("d.s3.localhost:9100".into(), "/".into()));
+        assert_eq!(r.address("/d/"), ("d.s3.localhost:9100".into(), "/".into()));
+        assert_eq!(r.address("/d/a/b%20c"), ("d.s3.localhost:9100".into(), "/a/b%20c".into()));
+    }
 }

@@ -99,6 +99,8 @@ pub enum AuthError {
     Expired,
     #[error("header {0} must be signed")]
     UnsignedExtensionHeader(String),
+    #[error("the signature must cover the host header")]
+    UnsignedHost,
     #[error("the authorization mechanism you have provided is not supported; use AWS4-HMAC-SHA256 (for boto3, signature_version='s3v4')")]
     SigV2,
 }
@@ -113,6 +115,8 @@ impl AuthError {
             AuthError::Skewed => ("RequestTimeTooSkewed", 403),
             AuthError::Expired => ("AccessDenied", 403),
             AuthError::UnsignedExtensionHeader(_) => ("InvalidArgument", 400),
+            // As S3 answers it.
+            AuthError::UnsignedHost => ("AccessDenied", 403),
             AuthError::SigV2 => ("InvalidRequest", 400),
         }
     }
@@ -285,6 +289,10 @@ pub fn verify(method: &str, uri: &http::Uri, headers: &HeaderMap, keys: &Keys, n
             return Err(AuthError::UnsignedExtensionHeader(n.to_owned()));
         }
     }
+    // SigV4 requires it, and with virtual-host addressing the host names the drive.
+    if !p.signed_headers.iter().any(|s| s == "host") {
+        return Err(AuthError::UnsignedHost);
+    }
 
     let payload = match p.payload_hash.as_str() {
         "UNSIGNED-PAYLOAD" => Payload::Unsigned,
@@ -369,6 +377,25 @@ mod tests {
         assert!(r.uri().query().unwrap().contains("X-Amz-Signature"));
         let a = check(&r).unwrap();
         assert_eq!(a.payload, Payload::Unsigned);
+    }
+
+    #[test]
+    fn refuses_a_signature_that_leaves_out_the_host() {
+        let r = signed("GET", "http://127.0.0.1:9000/a.txt", &[], b"", false);
+        let auth = r.headers()["authorization"].to_str().unwrap().to_owned();
+        let date = &r.headers()["x-amz-date"];
+        let (scope, _) = auth.split_once(", SignedHeaders=").unwrap();
+        let signed_headers = "x-amz-content-sha256;x-amz-date";
+        let payload = r.headers()["x-amz-content-sha256"].to_str().unwrap();
+        let canonical = format!("GET\n/a.txt\n\nx-amz-content-sha256:{payload}\nx-amz-date:{}\n\n{signed_headers}\n{payload}", date.to_str().unwrap());
+        let credential_scope = scope.rsplit_once("Credential=").unwrap().1.split_once('/').unwrap().1;
+        let to_sign = format!("AWS4-HMAC-SHA256\n{}\n{credential_scope}\n{}", date.to_str().unwrap(), sha256_hex(canonical.as_bytes()));
+        let day = &date.to_str().unwrap()[..8];
+        let sig = hex::encode(hmac(&signing_key(&"s".repeat(40), day, "auto"), to_sign.as_bytes()));
+        let mut h = r.headers().clone();
+        h.insert("authorization", format!("{scope}, SignedHeaders={signed_headers}, Signature={sig}").parse().unwrap());
+        assert_eq!(verify("GET", r.uri(), &h, &keys(), Utc::now()).unwrap_err(), AuthError::UnsignedHost);
+        assert_eq!(AuthError::UnsignedHost.s3_code(), ("AccessDenied", 403));
     }
 
     #[test]

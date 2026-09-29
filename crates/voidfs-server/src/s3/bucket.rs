@@ -120,7 +120,7 @@ async fn create(app: &Arc<App>, ctx: &Ctx) -> Result<Response, S3Error> {
         CreateError::NotFound => S3Error::no_bucket(),
         CreateError::Other(e) => S3Error::from(e),
     })?;
-    let mut b = empty(200).header("location", format!("/{}", d.alias)).header("x-voidfs-drive-id", d.id.as_str());
+    let mut b = empty(200).header("location", ctx.location(None)).header("x-voidfs-drive-id", d.id.as_str());
     if let Some(src) = &source {
         b = b.header("x-voidfs-fork-source-id", src.id.as_str()).header("x-voidfs-fork-point", d.desc.created.to_string());
     }
