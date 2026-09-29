@@ -57,12 +57,9 @@ async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
 async fn route(app: &Arc<App>, req: Request<Body>) -> Result<Response, S3Error> {
     let (parts, body) = req.into_parts();
     let auth = sigv4::verify(parts.method.as_str(), &parts.uri, &parts.headers, &app.keys, chrono::Utc::now()).map_err(S3Error::auth)?;
-    // The signature covers the request as sent, so the drive is taken from the host only now,
-    // and only from a signed host: otherwise the same signature would reach any drive.
+    // The signature covers the request as sent, host included, so the drive is taken from the
+    // host only now.
     let virtual_host = app.domains.drive(&parts.uri, &parts.headers);
-    if virtual_host.is_some() && !auth.host_signed {
-        return Err(S3Error::auth(sigv4::AuthError::UnsignedHost));
-    }
     let (bucket, key) = match &virtual_host {
         Some(drive) => (Some(drive.clone()), util::split_key(parts.uri.path())?),
         None => util::split_path(parts.uri.path())?,

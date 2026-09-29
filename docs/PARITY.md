@@ -325,9 +325,9 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - Virtual-host addressing. **Done** (S1): with `--virtual-host-domain <domain>` (repeatable),
      `<drive>.<domain>/<key>` reaches the same drive and key as `/<drive>/<key>`, which keeps
      working. The domain itself, and any other host, stay path-style, and without the flag
-     nothing changes. The signature is checked on the request as sent, and must cover `host`
-     when the host names the drive. Locations name the path on the host the request used
-     (`/<key>` rather than `/<drive>/<key>`). The conformance runner runs every case either way
+     nothing changes. The signature is checked on the request as sent, and must cover `host` in
+     either style, as S3 requires (`403 AccessDenied` otherwise). Locations name the path on
+     the host the request used (`/<key>` rather than `/<drive>/<key>`). The conformance runner runs every case either way
      (`--virtual-host <domain>`): 35/35 both ways, and boto3, the Rust SDK, curl's SigV4 and all
      three `aws-chunked` forms work.
    - A `docker compose` file, and health checks and metrics.

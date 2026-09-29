@@ -81,8 +81,6 @@ pub struct Authenticated {
     pub scope: String,
     pub amz_date: String,
     pub seed_signature: String,
-    /// `host` is in `SignedHeaders`, so the host can name the drive (virtual-host addressing).
-    pub host_signed: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -101,7 +99,7 @@ pub enum AuthError {
     Expired,
     #[error("header {0} must be signed")]
     UnsignedExtensionHeader(String),
-    #[error("the host header must be signed when it names the drive")]
+    #[error("the signature must cover the host header")]
     UnsignedHost,
     #[error("the authorization mechanism you have provided is not supported; use AWS4-HMAC-SHA256 (for boto3, signature_version='s3v4')")]
     SigV2,
@@ -116,7 +114,9 @@ impl AuthError {
             AuthError::SignatureMismatch => ("SignatureDoesNotMatch", 403),
             AuthError::Skewed => ("RequestTimeTooSkewed", 403),
             AuthError::Expired => ("AccessDenied", 403),
-            AuthError::UnsignedExtensionHeader(_) | AuthError::UnsignedHost => ("InvalidArgument", 400),
+            AuthError::UnsignedExtensionHeader(_) => ("InvalidArgument", 400),
+            // As S3 answers it.
+            AuthError::UnsignedHost => ("AccessDenied", 403),
             AuthError::SigV2 => ("InvalidRequest", 400),
         }
     }
@@ -289,6 +289,10 @@ pub fn verify(method: &str, uri: &http::Uri, headers: &HeaderMap, keys: &Keys, n
             return Err(AuthError::UnsignedExtensionHeader(n.to_owned()));
         }
     }
+    // SigV4 requires it, and with virtual-host addressing the host names the drive.
+    if !p.signed_headers.iter().any(|s| s == "host") {
+        return Err(AuthError::UnsignedHost);
+    }
 
     let payload = match p.payload_hash.as_str() {
         "UNSIGNED-PAYLOAD" => Payload::Unsigned,
@@ -301,8 +305,7 @@ pub fn verify(method: &str, uri: &http::Uri, headers: &HeaderMap, keys: &Keys, n
             Payload::Sha256(out)
         }
     };
-    let host_signed = p.signed_headers.iter().any(|h| h == "host");
-    Ok(Authenticated { key: key.clone(), payload, signing_key: skey, scope, amz_date: p.amz_date, seed_signature: p.signature, host_signed })
+    Ok(Authenticated { key: key.clone(), payload, signing_key: skey, scope, amz_date: p.amz_date, seed_signature: p.signature })
 }
 
 #[cfg(test)]
@@ -366,7 +369,6 @@ mod tests {
         let a = check(&r).unwrap();
         assert_eq!(a.key.scope, Scope::Admin);
         assert_eq!(a.payload, Payload::Sha256(Sha256::digest(b"WORLD").into()));
-        assert!(a.host_signed);
     }
 
     #[test]
@@ -375,11 +377,10 @@ mod tests {
         assert!(r.uri().query().unwrap().contains("X-Amz-Signature"));
         let a = check(&r).unwrap();
         assert_eq!(a.payload, Payload::Unsigned);
-        assert!(a.host_signed);
     }
 
     #[test]
-    fn reports_a_signature_that_leaves_out_the_host() {
+    fn refuses_a_signature_that_leaves_out_the_host() {
         let r = signed("GET", "http://127.0.0.1:9000/a.txt", &[], b"", false);
         let auth = r.headers()["authorization"].to_str().unwrap().to_owned();
         let date = &r.headers()["x-amz-date"];
@@ -393,10 +394,8 @@ mod tests {
         let sig = hex::encode(hmac(&signing_key(&"s".repeat(40), day, "auto"), to_sign.as_bytes()));
         let mut h = r.headers().clone();
         h.insert("authorization", format!("{scope}, SignedHeaders={signed_headers}, Signature={sig}").parse().unwrap());
-        let a = verify("GET", r.uri(), &h, &keys(), Utc::now()).unwrap();
-        assert!(!a.host_signed);
-        h.insert("host", "other.example.com".parse().unwrap());
-        assert!(verify("GET", r.uri(), &h, &keys(), Utc::now()).is_ok(), "an unsigned host can be changed");
+        assert_eq!(verify("GET", r.uri(), &h, &keys(), Utc::now()).unwrap_err(), AuthError::UnsignedHost);
+        assert_eq!(AuthError::UnsignedHost.s3_code(), ("AccessDenied", 403));
     }
 
     #[test]

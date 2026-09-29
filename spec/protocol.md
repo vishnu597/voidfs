@@ -87,6 +87,9 @@ succeeds.
   unless configured otherwise (boto3: `signature_version="s3v4"`).
 - **Extension headers** (`x-voidfs-*`) MUST be included in `SignedHeaders`. A server MUST reject
   a request that carries an unsigned `x-voidfs-*` header with `400 InvalidArgument`.
+- **Host:** `host` MUST be included in `SignedHeaders`, as Signature Version 4 requires, in
+  either addressing style: in virtual-host style it names the drive. A server MUST reject a
+  signature that leaves it out with `403 AccessDenied`, as S3 does.
 - **Access keys:** the id is `VF` followed by 18 characters from `A–Z2–7` (20 in total). The
   secret is 40 characters. Keys are issued by the deployment's control plane.
 
