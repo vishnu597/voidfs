@@ -8,6 +8,7 @@ Step 3, item 2 of the [parity plan](../../../docs/step-3-performance.md#item-2-s
 |---|---|
 | `probe-main-*`, `full-main-*` | `main` at `634267e`: moka's default admission (TinyLFU) for the shard and page caches |
 | `probe-lru-*`, `full-lru-*` | This branch: least recently used first, and the caches keep their own copy of what they hold |
+| `r2-main`, `r2-lru` | The same two builds against Cloudflare R2, with a 64 MiB cache ([below](#against-cloudflare-r2)) |
 
 Both binaries were built with `cargo build --release -p voidfs-server` and passed with
 `BENCH_SERVER_BIN`; the files' `commit` and `voidfs server` labels say which is which. The change
@@ -141,6 +142,55 @@ Rows that moved by 3% or more:
   and get 4 KiB (sub-millisecond). In the focused runs below, the two edits came out at +1.8%
   and −3.5% (−7.2% and −7.0% relative to the bare bucket), and in the first round they were
   −1.4% and 0.0%: the spread between runs, not the build.
+
+## Against Cloudflare R2
+
+*29 September 2026 (UTC), after the merge.* The 23 scenarios whose objects are 1 MiB or smaller,
+at a quarter of the operations, as in the [27 September run](../r2-small-objects.md) (`--exclude
+32m --exclude 64m --exclude 256m --ops-scale 0.25`), voidfs target only. voidfs-server ran on the
+Mac beside the harness, each build on a pool of its own in the bucket, with `--cache-mib 64`: the
+scenarios write about 0.5 GB, which never filled the default 512 MiB cache on 27 September. One
+run of each build, `main` (`634267e`) first, then the branch (`32d8216`). No errors.
+
+p50 in ms, and the highest round p90 of the run. The bare bucket was not run again; its column is
+from 27 September, when a 1 MiB GET took 166 ms and a 4 KiB PUT 218 ms:
+
+| Scenario | main | branch | Change | Bare bucket (27 Sep) |
+|---|--:|--:|--:|--:|
+| fanout get 200 × 256 KiB, 32 at once | 116.1 (390.2) | 2.2 (3.5) | −98% | 204.2 |
+| fanout get 1000 × 4 KiB, 32 at once | 75.7 (228.3) | 0.6 (1.1) | −99% | 114.3 |
+| fanout get 1000 × 4 KiB, 64 at once | 75.2 (238.7) | 1.8 (3.2) | −98% | 120.6 |
+| get 1 MiB | 1.0 (356.6) | 1.6 (2.5) | p90 −99% | 166.4 |
+| delete 4 KiB, middle of 1 MiB | 979.8 | 738.4 | −25% | 540.4 |
+| patch 16 × 4 KiB in 1 MiB | 1030.1 | 767.3 | −26% | 545.8 |
+| insert 4 KiB, middle of 1 MiB | 956.1 | 757.5 | −21% | 550.1 |
+| write at 4 KiB in 1 MiB | 955.4 | 759.4 | −21% | 551.6 |
+| delete 4 KiB, start of 1 MiB | 944.2 | 743.0 | −21% | 578.9 |
+| insert 4 KiB, start of 1 MiB | 942.8 | 767.0 | −19% | 540.9 |
+| truncate 4 KiB, end of 1 MiB | 878.4 | 799.3 | −9% | 592.7 |
+| append 4 KiB to 1 MiB | 731.2 | 760.9 | +4% | 673.8 |
+| puts, overwrites and fan-out puts (7 rows) | 593–750 | 588–758 | −10% to +6% | 207–320 |
+
+- **Reads.** With the cache full, `main` sent the fan-out gets to R2, 75–116 ms each; the branch
+  serves them in 0.6–2.2 ms. Get 1 MiB's p50 was a hit in both builds, but in one of `main`'s
+  rounds at least a tenth of the reads went to R2 (p90 357 ms).
+- **Edits in 1 MiB files, 19–26% faster** for six of the eight: an edit reads the file's shard,
+  which `main` had turned away and fetched from R2 again, one 1 MiB GET. Truncate at the end moved
+  less, and append not at all; at 12 ms, the appends in 32 and 64 MiB files did not move either.
+- **Writes** moved by −10% to +6% with no pattern, from one run of each build.
+- **Group commit on a real bucket.** Against the 27 September run of `c434fcb`, before group
+  commit: edits and small puts went from 1.5–1.8 s to 0.6–1.0 s, and the fan-out puts from 6.5–13 s
+  to 0.6–0.7 s. Relative to that day's bare bucket (not run again, so only a guide), the branch's
+  small puts are 2.2–3.0× slower (SpaceFS: 1.7–3.1× in its setup): the shards and then the log
+  entry, each a PUT of about 200 ms here (step 3, item 3). The edits in 1 MiB files are 1.1–1.4×
+  slower, within SpaceFS's ratio for six of the eight; delete in the middle is just short (1.37×
+  against 1.36×), and append, which SpaceFS does at parity, is not.
+- Scored the same way against that day's bare bucket, 16 of the 23 rows are at or ahead of
+  SpaceFS's ratio with the branch, and 8 with `main`: the three fan-out gets and five edits in
+  1 MiB files are the difference.
+- The runs took 8 and 7 minutes and sent 7,558 requests each to voidfs-server. Requests from
+  voidfs-server to R2 were not counted. The two pools held 11,875 objects afterwards, which were
+  deleted (`voidfs-bench purge`); nothing is left under the benchmark's prefix.
 
 ## Writes: the cost of inserts
 

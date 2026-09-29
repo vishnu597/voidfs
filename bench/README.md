@@ -203,6 +203,12 @@ to voidfs-server. Afterwards the voidfs pool held 5,992 objects, which were dele
 reclaims what they held: with the server stopped, `voidfs-server gc --offline --grace 0` does it
 at once.
 
+Run again on 29 September with group commit, voidfs only and a 64 MiB cache so that it fills
+([results](results/shard-cache/README.md#against-cloudflare-r2)): edits and small puts took
+0.6–1.0 s instead of 1.5–1.8, and the fan-out puts 0.6–0.7 s instead of 6.5–13. With the cache
+full, `main`'s fan-out gets went to the bucket (75–116 ms) and the shard cache's fix brought them
+to 0.6–2.2 ms.
+
 ## Findings: where voidfs is far from parity, and why
 
 The biggest first. The file references point at the code at `c434fcb`. The step-3 plan that
