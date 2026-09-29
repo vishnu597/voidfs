@@ -39,6 +39,10 @@ struct Args {
     /// Print every request and response.
     #[arg(long, short)]
     verbose: bool,
+    /// Address drives as `<drive>.<domain>` (virtual-host style) instead of by path, still
+    /// connecting to --endpoint. The server must serve the domain (`--virtual-host-domain`).
+    #[arg(long, env = "VOIDFS_VIRTUAL_HOST", value_name = "DOMAIN")]
+    virtual_host: Option<String>,
 }
 
 #[tokio::main]
@@ -72,6 +76,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
     let mut runner = Runner::new(&need(args.endpoint, "--endpoint")?, keys)?;
     runner.verbose = args.verbose;
+    runner.virtual_host = args.virtual_host;
 
     let (mut pass, mut fail, mut skip) = (0, 0, 0);
     for case in selected {

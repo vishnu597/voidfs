@@ -24,6 +24,8 @@ pub struct Ctx {
     pub method: Method,
     pub bucket: Option<String>,
     pub key: Option<String>,
+    /// The drive came from the host (`<drive>.<domain>/<key>`), not the path.
+    pub virtual_host: bool,
     pub query: Query,
     pub headers: HeaderMap,
     pub auth: Authenticated,
@@ -52,6 +54,16 @@ impl Ctx {
 
     pub fn key(&self) -> &str {
         self.key.as_deref().unwrap_or_default()
+    }
+
+    /// The path of this request's drive, or of `key` in it, on the host the request was sent to.
+    pub fn location(&self, key: Option<&str>) -> String {
+        match (self.virtual_host, key) {
+            (true, None) => "/".into(),
+            (true, Some(k)) => format!("/{k}"),
+            (false, None) => format!("/{}", self.bucket()),
+            (false, Some(k)) => format!("/{}/{k}", self.bucket()),
+        }
     }
 
     /// The live drive this request names, if this key may reach it.
@@ -157,11 +169,12 @@ impl Query {
     }
 }
 
+fn decode(s: &str) -> Result<String, S3Error> {
+    percent_decode_str(s).decode_utf8().map(|c| c.into_owned()).map_err(|_| S3Error::invalid("the path is not valid UTF-8"))
+}
+
 /// Splits a request path into a drive name and a key, both decoded.
 pub fn split_path(path: &str) -> Result<(Option<String>, Option<String>), S3Error> {
-    let decode = |s: &str| {
-        percent_decode_str(s).decode_utf8().map(|c| c.into_owned()).map_err(|_| S3Error::invalid("the path is not valid UTF-8"))
-    };
     let rest = path.strip_prefix('/').unwrap_or(path);
     if rest.is_empty() {
         return Ok((None, None));
@@ -171,6 +184,12 @@ pub fn split_path(path: &str) -> Result<(Option<String>, Option<String>), S3Erro
         Some((b, "")) => Ok((Some(decode(b)?), None)),
         Some((b, k)) => Ok((Some(decode(b)?), Some(decode(k)?))),
     }
+}
+
+/// The decoded key of a virtual-host request, whose path holds only the key.
+pub fn split_key(path: &str) -> Result<Option<String>, S3Error> {
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    if rest.is_empty() { Ok(None) } else { decode(rest).map(Some) }
 }
 
 pub fn xml_escape(s: &str) -> String {
@@ -357,6 +376,10 @@ mod tests {
         assert_eq!(split_path("/d/").unwrap(), (Some("d".into()), None));
         assert_eq!(split_path("/d/a%20b/%C3%A9/").unwrap(), (Some("d".into()), Some("a b/é/".into())));
         assert!(split_path("/d/%FF").is_err());
+        assert_eq!(split_key("/").unwrap(), None);
+        assert_eq!(split_key("/a%20b/%C3%A9/").unwrap(), Some("a b/é/".into()));
+        assert_eq!(split_key("/d/k").unwrap(), Some("d/k".into()), "the whole path is the key");
+        assert!(split_key("/%FF").is_err());
     }
 
     #[test]
