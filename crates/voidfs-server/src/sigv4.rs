@@ -101,6 +101,8 @@ pub enum AuthError {
     UnsignedExtensionHeader(String),
     #[error("the signature must cover the host header")]
     UnsignedHost,
+    #[error("Missing required header for this request: x-amz-content-sha256")]
+    MissingPayloadHash,
     #[error("the authorization mechanism you have provided is not supported; use AWS4-HMAC-SHA256 (for boto3, signature_version='s3v4')")]
     SigV2,
 }
@@ -117,6 +119,7 @@ impl AuthError {
             AuthError::UnsignedExtensionHeader(_) => ("InvalidArgument", 400),
             // As S3 answers it.
             AuthError::UnsignedHost => ("AccessDenied", 403),
+            AuthError::MissingPayloadHash => ("InvalidRequest", 400),
             AuthError::SigV2 => ("InvalidRequest", 400),
         }
     }
@@ -200,7 +203,8 @@ fn parse(uri: &http::Uri, headers: &HeaderMap) -> Result<Parsed, AuthError> {
         let get = |k: &str| fields.get(k).copied().ok_or_else(|| AuthError::Malformed(format!("missing {k}")));
         let (key_id, date, region) = parse_credential(get("Credential")?)?;
         let amz_date = header("x-amz-date").ok_or_else(|| AuthError::Malformed("missing x-amz-date".into()))?.to_owned();
-        let payload_hash = header("x-amz-content-sha256").unwrap_or("UNSIGNED-PAYLOAD").to_owned();
+        // S3 requires it with header authentication; presigned URLs are UNSIGNED-PAYLOAD.
+        let payload_hash = header("x-amz-content-sha256").ok_or(AuthError::MissingPayloadHash)?.to_owned();
         return Ok(Parsed {
             key_id,
             date,
@@ -377,6 +381,16 @@ mod tests {
         assert!(r.uri().query().unwrap().contains("X-Amz-Signature"));
         let a = check(&r).unwrap();
         assert_eq!(a.payload, Payload::Unsigned);
+    }
+
+    #[test]
+    fn header_auth_needs_the_payload_hash_header() {
+        let mut r = signed("GET", "http://127.0.0.1:9000/a.txt", &[], b"", false);
+        r.headers_mut().remove("x-amz-content-sha256");
+        assert_eq!(check(&r).unwrap_err(), AuthError::MissingPayloadHash);
+        assert_eq!(AuthError::MissingPayloadHash.s3_code(), ("InvalidRequest", 400));
+        // A presigned URL has no such header.
+        assert!(check(&signed("GET", "http://127.0.0.1:9000/a.txt", &[], b"", true)).is_ok());
     }
 
     #[test]

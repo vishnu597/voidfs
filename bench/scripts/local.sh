@@ -43,7 +43,7 @@ fi
 mkdir -p "$work/bucket" "$work/logs"
 
 # `tr` gets SIGPIPE when `head` has enough; that is expected, so not under pipefail.
-random() { (set +o pipefail; LC_ALL=C tr -dc "$1" < /dev/urandom | head -c "$2"); }
+random() { (set +o pipefail; LC_ALL=C tr -dc "$1" < /dev/urandom 2> /dev/null | head -c "$2"); }
 s3_key="LOCAL$(random 'A-Z2-7' 15)"
 s3_secret="$(random 'A-Za-z0-9' 40)"
 vf_key="VF$(random 'A-Z2-7' 18)"

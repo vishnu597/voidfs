@@ -90,6 +90,10 @@ succeeds.
 - **Host:** `host` MUST be included in `SignedHeaders`, as Signature Version 4 requires, in
   either addressing style: in virtual-host style it names the drive. A server MUST reject a
   signature that leaves it out with `403 AccessDenied`, as S3 does.
+- **Payload hash:** a request signed in the `Authorization` header MUST send
+  `x-amz-content-sha256` (a hash, `UNSIGNED-PAYLOAD` or an `aws-chunked` form). A server MUST
+  reject one without it with `400 InvalidRequest`, as S3 does. A presigned URL carries none: its
+  payload is unsigned.
 - **Access keys:** the id is `VF` followed by 18 characters from `A–Z2–7` (20 in total). The
   secret is 40 characters. Keys are issued by the deployment's control plane.
 
