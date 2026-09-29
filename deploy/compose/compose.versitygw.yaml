@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Adds a bucket beside voidfs-server: versitygw, an S3 server over a local volume, which honours
+# the create-if-absent writes voidfs's log needs (format §7.2). From this directory:
+#
+#   docker compose -f compose.yaml -f compose.versitygw.yaml up -d --build
+#
+# MinIO would do the same job, but it no longer publishes images or binaries.
+
+services:
+  bucket-init:
+    image: busybox:1.37
+    # versitygw's posix backend keeps each bucket as a directory.
+    command: ["mkdir", "-p", "/data/voidfs"]
+    volumes:
+      - bucket-data:/data
+
+  versitygw:
+    image: versity/versitygw:v1.8.0
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+    environment:
+      ROOT_ACCESS_KEY_ID: ${BUCKET_ACCESS_KEY_ID:?set BUCKET_ACCESS_KEY_ID in .env}
+      ROOT_SECRET_ACCESS_KEY: ${BUCKET_SECRET_ACCESS_KEY:?set BUCKET_SECRET_ACCESS_KEY in .env}
+      VGW_ARGS: --port :7070 --keep-alive
+      VGW_BACKEND: posix
+      VGW_BACKEND_ARG: /data
+    volumes:
+      - bucket-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "7070"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  voidfs:
+    depends_on:
+      versitygw:
+        condition: service_healthy
+    environment:
+      VOIDFS_STORE: s3:voidfs/pool
+      VOIDFS_S3_ENDPOINT: http://versitygw:7070
+      VOIDFS_S3_ACCESS_KEY_ID: ${BUCKET_ACCESS_KEY_ID}
+      VOIDFS_S3_SECRET_ACCESS_KEY: ${BUCKET_SECRET_ACCESS_KEY}
+
+volumes:
+  bucket-data:
