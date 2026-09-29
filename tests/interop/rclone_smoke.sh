@@ -26,7 +26,7 @@ export RCLONE_CONFIG_VOIDFS_SECRET_ACCESS_KEY="$VOIDFS_SECRET_ACCESS_KEY"
 export RCLONE_CONFIG_VOIDFS_REGION=us-east-1
 export RCLONE_CONFIG_VOIDFS_FORCE_PATH_STYLE=true
 
-bucket="interop-rclone-$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 10 || true)"
+bucket="interop-rclone-$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2> /dev/null | head -c 10 || true)"
 remote="voidfs:$bucket"
 passed=0
 rc() { rclone --retries 1 --low-level-retries 1 --stats 0 "$@"; }

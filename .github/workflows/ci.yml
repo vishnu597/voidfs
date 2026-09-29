@@ -22,8 +22,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  RCLONE_VERSION: v1.75.1
-  RCLONE_SHA256: 982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab
+  # Not RCLONE_*: rclone reads those as its own flags.
+  CI_RCLONE_VERSION: v1.75.1
+  CI_RCLONE_SHA256: 982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab
   VERSITYGW_VERSION: v1.8.0
   VERSITYGW_SHA256: 2ba2c734d10d2c4e651d03182cb4b246656bc735a2f282db7b0b73fba6073467
   # MinIO's last release. It no longer publishes binaries or images, so CI builds it from source.
@@ -61,10 +62,10 @@ jobs:
         run: |
           python -m pip install --quiet boto3
           cd "$RUNNER_TEMP"
-          curl -fsSLO "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip"
-          echo "${RCLONE_SHA256}  rclone-${RCLONE_VERSION}-linux-amd64.zip" | sha256sum -c -
-          unzip -q "rclone-${RCLONE_VERSION}-linux-amd64.zip"
-          sudo install "rclone-${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/
+          curl -fsSLO "https://downloads.rclone.org/${CI_RCLONE_VERSION}/rclone-${CI_RCLONE_VERSION}-linux-amd64.zip"
+          echo "${CI_RCLONE_SHA256}  rclone-${CI_RCLONE_VERSION}-linux-amd64.zip" | sha256sum -c -
+          unzip -q "rclone-${CI_RCLONE_VERSION}-linux-amd64.zip"
+          sudo install "rclone-${CI_RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/
       - name: Install versitygw
         if: matrix.store == 'versitygw'
         run: |
