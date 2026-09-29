@@ -243,14 +243,13 @@ struct Checkpointed {
 }
 
 /// What a drive's commit lock guards besides its log: when the next checkpoint is due (format
-/// §8.4), and what the last one listed.
+/// §8.4).
 #[derive(Default)]
 struct Cadence {
-    /// Commits since the last checkpoint, or since an attempt at one failed.
+    /// Commits since the last checkpoint was started.
     commits: u64,
     /// Their size as stored.
     bytes: u64,
-    last: Option<Checkpointed>,
 }
 
 impl Cadence {
@@ -299,6 +298,10 @@ pub struct Drive {
     state: RwLock<Arc<DriveState>>,
     /// Held while a batch is committed, and by anything that must see every acknowledged write.
     commit_lock: tokio::sync::Mutex<Cadence>,
+    /// The drive's last checkpoint, whose pages the next one lists without storing them again.
+    /// Held while a checkpoint is written, so that there is one at a time. Whatever takes both
+    /// locks takes the commit lock first.
+    checkpoint: Arc<tokio::sync::Mutex<Option<Checkpointed>>>,
     /// Mutations waiting for the next commit, in the order they arrived.
     queue: std::sync::Mutex<VecDeque<Waiting>>,
     feed: RwLock<VecDeque<FeedBatch>>,
@@ -332,15 +335,16 @@ impl From<OpError> for CommitError {
 }
 
 impl Drive {
-    fn new(desc: DriveDescriptor, state: DriveState, cadence: Cadence) -> Drive {
+    fn new(desc: DriveDescriptor, state: Arc<DriveState>, cadence: Cadence, last: Option<Checkpointed>) -> Drive {
         let (notify, _) = tokio::sync::watch::channel(state.seq());
         let floor = state.seq();
         Drive {
             id: desc.drive_id.clone(),
             alias: desc.alias.clone(),
             desc,
-            state: RwLock::new(Arc::new(state)),
+            state: RwLock::new(state),
             commit_lock: tokio::sync::Mutex::new(cadence),
+            checkpoint: Arc::new(tokio::sync::Mutex::new(last)),
             queue: std::sync::Mutex::new(VecDeque::new()),
             feed: RwLock::new(VecDeque::new()),
             feed_floor: RwLock::new(floor),
@@ -590,17 +594,14 @@ impl Pool {
         let Some(b) = self.store.get(&format!("drives/{id}/drive.json")).await? else { return Ok(None) };
         let desc: DriveDescriptor = serde_json::from_slice(&b).context("reading drive.json")?;
         let mut cadence = Cadence::default();
-        let mut state = match self.latest_checkpoint(id).await? {
-            Some((s, c)) => {
-                cadence.last = Some(c);
-                s
-            }
+        let (mut state, last) = match self.latest_checkpoint(id).await? {
+            Some((s, c)) => (s, Some(c)),
             None if desc.fork_of.is_some() => bail!("fork {id} has no checkpoint"),
-            None => DriveState::empty(),
+            None => (DriveState::empty(), None),
         };
         let from = state.seq();
         let drive_feed = self.replay(id, &mut state, &mut cadence).await?;
-        let d = Drive::new(desc, state, cadence);
+        let d = Drive::new(desc, Arc::new(state), cadence, last);
         // The feed holds every commit replayed, so it can report changes after where the replay
         // started.
         *d.feed_floor.write().unwrap() = from;
@@ -683,37 +684,45 @@ impl Pool {
         Ok((state, Checkpointed { index: path.to_owned(), pages: t.pages(), seen }))
     }
 
-    /// Writes a checkpoint of `state` (format §8) and returns it. Pages that `reuse` lists are
-    /// not stored again; the others go through the garbage-collection guard like any page.
-    async fn write_checkpoint(&self, id: &DriveId, state: &DriveState, reuse: Option<&Checkpointed>) -> anyhow::Result<Checkpointed> {
-        let rows = state.rows();
-        let mut pages = Vec::new();
-        let tables = CheckpointTables {
-            entries: segments("entries", &rows.entries, |e| format!("{}/{}{}", e.parent, e.name, if e.kind == Kind::Folder { "/" } else { "" }), &mut pages),
-            objects: segments("objects", &rows.objects, |o| o.oid.to_string(), &mut pages),
-            history: segments("history", &rows.history, |h| format!("{}@{:020}.{}", h.oid, h.version.seq, h.version.idx), &mut pages),
-            removed: segments("removed", &rows.removed, |r| format!("{}@{}", r.key, r.oid), &mut pages),
-        };
+    /// Writes a checkpoint of `state` (format §8) and returns it. `state` was the drive's own at
+    /// `seen`, which vouches for the content its rows reference (format §12.4, option 1). Pages
+    /// that `reuse` lists are not stored again; the others go through the garbage-collection
+    /// guard like any page.
+    async fn write_checkpoint(&self, id: &DriveId, state: Arc<DriveState>, seen: Duration, reuse: Option<&Checkpointed>) -> anyhow::Result<Checkpointed> {
+        let seq = state.seq();
+        let time = state.time();
+        // Copying the rows out, encoding and hashing them takes hundreds of milliseconds of CPU
+        // for a drive of 600,000 rows: not on an async worker.
+        let (tables, pages, stats) = tokio::task::spawn_blocking(move || {
+            let rows = state.rows();
+            let mut pages = Vec::new();
+            let tables = CheckpointTables {
+                entries: segments("entries", &rows.entries, |e| format!("{}/{}{}", e.parent, e.name, if e.kind == Kind::Folder { "/" } else { "" }), &mut pages),
+                objects: segments("objects", &rows.objects, |o| o.oid.to_string(), &mut pages),
+                history: segments("history", &rows.history, |h| format!("{}@{:020}.{}", h.oid, h.version.seq, h.version.idx), &mut pages),
+                removed: segments("removed", &rows.removed, |r| format!("{}@{}", r.key, r.oid), &mut pages),
+            };
+            (tables, pages, serde_json::json!({ "objects": rows.objects.len(), "bytes": state.live_bytes() }))
+        })
+        .await?;
         let listed = tables.pages();
         let (reused, new): (Vec<Page>, Vec<Page>) = pages.into_iter().partition(|p| reuse.is_some_and(|r| r.pages.contains(&p.hash)));
         self.write_pages(&new).await?;
+        let now = self.clock.mono();
+        if now.saturating_sub(seen) > guard::COMMIT_WITHIN {
+            bail!("the state was the drive's too long ago to vouch for the content it references");
+        }
         if let Some(r) = reuse
             && !reused.is_empty()
-            && self.clock.mono().saturating_sub(r.seen) > guard::COMMIT_WITHIN
+            && now.saturating_sub(r.seen) > guard::COMMIT_WITHIN
         {
             bail!("the previous checkpoint was seen too long ago to vouch for its pages");
         }
-        let idx = CheckpointIndex {
-            format: 1,
-            seq: state.seq(),
-            time: state.time(),
-            tables,
-            stats: serde_json::json!({ "objects": rows.objects.len(), "bytes": state.live_bytes() }),
-        };
-        let name = format!("drives/{id}/checkpoints/{:020}.json", state.seq());
+        let idx = CheckpointIndex { format: 1, seq, time, tables, stats };
+        let name = format!("drives/{id}/checkpoints/{seq:020}.json");
         self.store.put(&name, Bytes::from(serde_json::to_vec(&idx)?)).await?;
         let seen = self.clock.mono();
-        self.store.put(&format!("drives/{id}/_last_checkpoint"), Bytes::from(format!("{{\"seq\":{}}}", state.seq()))).await?;
+        self.store.put(&format!("drives/{id}/_last_checkpoint"), Bytes::from(format!("{{\"seq\":{seq}}}"))).await?;
         Ok(Checkpointed { index: name, pages: listed, seen })
     }
 
@@ -732,22 +741,31 @@ impl Pool {
         }
     }
 
-    /// Checkpoints `state`, the drive's newest, and starts counting towards the next one. A
-    /// failure is logged, and the next attempt waits a whole interval.
-    async fn checkpoint(&self, id: &DriveId, state: &DriveState, cadence: &mut Cadence) {
-        cadence.commits = 0;
-        cadence.bytes = 0;
-        self.renew(&mut cadence.last).await;
-        let written = self.write_checkpoint(id, state, cadence.last.as_ref()).await;
+    /// Checkpoints `state`, which was the drive's newest at `seen`, after `last`, and makes it
+    /// the last. A failure is logged, and the next attempt waits a whole interval.
+    async fn checkpoint(&self, id: &DriveId, state: Arc<DriveState>, seen: Duration, last: &mut Option<Checkpointed>) {
+        let started = Instant::now();
+        let seq = state.seq();
+        self.renew(last).await;
+        let written = self.write_checkpoint(id, state, seen, last.as_ref()).await;
+        self.metrics.checkpoint_write.observe(started.elapsed().as_secs_f64());
         match written {
             Ok(c) => {
                 self.metrics.checkpoints_written.inc();
-                cadence.last = Some(c);
+                *last = Some(c);
             }
             Err(e) => {
                 self.metrics.checkpoints_failed.inc();
-                tracing::warn!("checkpoint of {id} at {} failed: {e:#}", state.seq());
+                tracing::warn!("checkpoint of {id} at {seq} failed: {e:#}");
             }
+        }
+    }
+
+    /// Waits for the checkpoints being written in the background.
+    pub async fn finish_checkpoints(&self) {
+        let drives: Vec<Arc<Drive>> = self.drives.read().unwrap().values().cloned().collect();
+        for d in drives {
+            drop(d.checkpoint.lock().await);
         }
     }
 
@@ -900,26 +918,30 @@ impl Pool {
             return Err(CreateError::Exists);
         }
         let id = DriveId::generate();
-        let mut cadence = Cadence::default();
+        let mut last = None;
         let (state, fork_of, deadline) = match source {
-            None => (DriveState::empty(), None, None),
+            None => (Arc::new(DriveState::empty()), None, None),
             Some(src) => {
-                // Hold the source's commit lock so the fork includes every acknowledged write.
-                let mut src_cadence = src.commit_lock.lock().await;
+                // Hold the source's commit lock so the fork includes every acknowledged write,
+                // and its checkpoint lock so that its last checkpoint is not still being written.
+                let _committing = src.commit_lock.lock().await;
+                let mut src_last = src.checkpoint.lock().await;
                 // The fork references content through the source's state, so the source must
                 // still be a drive (format §12.4): a hard delete forgets it before deleting it.
                 if self.drive_by_id(&src.id).is_none() {
                     return Err(CreateError::NotFound);
                 }
-                let s = src.snapshot().fork();
+                let seen = self.clock.mono();
+                let s = Arc::new(src.snapshot().fork());
                 // The fork's first checkpoint shares every segment that is unchanged since the
                 // source's last one (format §9). That one's index vouches for them until 12 hours
-                // after it was seen (§12.4), so the fork must exist by then.
-                self.renew(&mut src_cadence.last).await;
-                let deadline = src_cadence.last.as_ref().map(|r| r.seen + guard::COMMIT_WITHIN);
-                cadence.last = Some(self.write_checkpoint(&id, &s, src_cadence.last.as_ref()).await?);
+                // after it was seen, and the source's state for the content it references until
+                // 12 hours after `seen` (§12.4), so the fork must exist by then.
+                self.renew(&mut src_last).await;
+                let vouched = src_last.as_ref().map_or(seen, |r| r.seen.min(seen));
+                last = Some(self.write_checkpoint(&id, s.clone(), seen, src_last.as_ref()).await?);
                 let seq = s.seq();
-                (s, Some(ForkOf { drive_id: src.id.clone(), seq }), deadline)
+                (s, Some(ForkOf { drive_id: src.id.clone(), seq }), Some(vouched + guard::COMMIT_WITHIN))
             }
         };
         let desc = DriveDescriptor { format: 1, drive_id: id.clone(), created: self.clock.now(), alias: alias.to_owned(), fork_of };
@@ -931,7 +953,7 @@ impl Pool {
             return Err(CreateError::Other(anyhow!("drive id collision")));
         }
         // The fork's checkpoint is a garbage-collection root from now on (format §12).
-        if let Some(c) = &mut cadence.last {
+        if let Some(c) = &mut last {
             c.seen = self.clock.mono();
         }
         if self.alias_taken(alias) {
@@ -941,7 +963,7 @@ impl Pool {
         if let Some(src) = source {
             src.forks.write().unwrap().push(id.clone());
         }
-        Ok(self.register(Drive::new(desc, state, cadence), false))
+        Ok(self.register(Drive::new(desc, state, Cadence::default(), last), false))
     }
 
     pub async fn soft_delete(&self, d: &Drive) -> anyhow::Result<()> {
@@ -999,15 +1021,18 @@ impl Pool {
     /// Permanently deletes a drive by id, whether or not this server has loaded it.
     ///
     /// The drive is forgotten first, so that no new request can reference content through it,
-    /// and commits and forks already running finish before `drive.json` goes, which is when the
-    /// drive stops being a garbage-collection root. If the deletion fails part way, the server
-    /// no longer serves the drive, and what is left in the bucket is loaded again on restart
-    /// only if `drive.json` survived.
+    /// and commits, forks and a checkpoint already running finish before `drive.json` goes, which
+    /// is when the drive stops being a garbage-collection root. If the deletion fails part way,
+    /// the server no longer serves the drive, and what is left in the bucket is loaded again on
+    /// restart only if `drive.json` survived.
     pub async fn hard_delete_id(&self, id: &DriveId) -> anyhow::Result<()> {
         let d = self.drive_by_id(id);
         self.forget_drive(id);
         let _g = match &d {
-            Some(d) => Some(d.commit_lock.lock().await),
+            Some(d) => {
+                let committing = d.commit_lock.lock().await;
+                Some((committing, d.checkpoint.lock().await))
+            }
             None => None,
         };
         self.store.delete(&format!("drives/{id}/drive.json")).await?;
@@ -1112,7 +1137,7 @@ impl Pool {
     /// A mutation is answered only once the commit is written, unless its plan failed against
     /// the drive's state as installed, before any transaction of the batch: a failure may rest
     /// on an earlier transaction that is never written.
-    async fn commit_batch(&self, d: &Drive, cadence: &mut Cadence, batch: Vec<Waiting>) -> Vec<Waiting> {
+    async fn commit_batch(self: &Arc<Self>, d: &Drive, cadence: &mut Cadence, batch: Vec<Waiting>) -> Vec<Waiting> {
         let now = self.clock.mono();
         let (mut batch, late): (Vec<Waiting>, Vec<Waiting>) = batch.into_iter().partition(|w| now.saturating_sub(w.since) <= QUEUE_MAX);
         for w in late {
@@ -1191,8 +1216,15 @@ impl Pool {
                     self.metrics.batch.observe(n as f64);
                     d.install(state.clone(), FeedBatch { seq, time, changes });
                     cadence.add(len);
-                    if cadence.due() {
-                        self.checkpoint(&d.id, &state, cadence).await;
+                    // Nothing ties a checkpoint to the commit that made it due (format §8), so it
+                    // is written in the background, from the state just installed. If the last
+                    // one is still being written, the next commit tries again.
+                    if cadence.due()
+                        && let Ok(mut last) = d.checkpoint.clone().try_lock_owned()
+                    {
+                        *cadence = Cadence::default();
+                        let (pool, id, seen) = (self.clone(), d.id.clone(), self.clock.mono());
+                        tokio::spawn(async move { pool.checkpoint(&id, state, seen, &mut last).await });
                     }
                     for (w, answer) in held {
                         let _ = w.reply.send(answer);
@@ -1346,6 +1378,11 @@ mod tests {
         futures::future::join_all(tasks).await.into_iter().map(Result::unwrap).collect()
     }
 
+    /// Waits for the checkpoint `d` is writing in the background, if any.
+    async fn settle(d: &Drive) {
+        drop(d.checkpoint.lock().await);
+    }
+
     fn version(a: &Committed) -> VersionId {
         a.as_ref().map(|(v, _)| *v).unwrap_or_else(|e| panic!("{e:?}"))
     }
@@ -1385,6 +1422,7 @@ mod tests {
             for _ in 0..CHECKPOINT_EVERY {
                 put(&pool, &a, "counter", b"tick").await;
             }
+            settle(&a).await;
             assert!(store.exists(&format!("drives/{}/checkpoints/{:020}.json", a.id, CHECKPOINT_EVERY)).await.unwrap());
             let b = pool.create_drive("beta", Some(&a)).await.unwrap();
             put(&pool, &b, "docs/a.txt", b"forked").await;
@@ -1761,7 +1799,7 @@ mod tests {
         {
             let pool = Pool::open_with(store.clone(), 64 << 20, clock.clone()).await.unwrap();
             let d = pool.create_drive("big", None).await.unwrap();
-            pool.write_checkpoint(&d.id, &state, None).await.unwrap();
+            pool.write_checkpoint(&d.id, Arc::new(state.clone()), pool.clock.mono(), None).await.unwrap();
         }
         let pool = Pool::open_with(store, 64 << 20, clock).await.unwrap();
         let d = pool.drive("big").unwrap();
@@ -1841,8 +1879,8 @@ mod tests {
     async fn a_checkpoint_stores_only_the_segments_that_changed() {
         let (mem, pool, d, mut state) = big_drive(30_000, Clock::System).await;
         assert_eq!(d.snapshot().rows(), state.rows(), "a checkpoint loads as the state it was written from");
-        let mut cadence = d.commit_lock.lock().await;
-        let mut prev = tables(&pool, cadence.last.as_ref().unwrap()).await;
+        let mut last = d.checkpoint.lock().await;
+        let mut prev = tables(&pool, last.as_ref().unwrap()).await;
         for t in [&prev.entries, &prev.objects, &prev.history] {
             assert!(t.len() >= 4, "only {} segments", t.len());
         }
@@ -1851,23 +1889,23 @@ mod tests {
         for (seq, txn, removed) in [(2, file(30_001), 0), (3, removal(14_000), 1)] {
             state = state.apply(&commit(seq, vec![txn])).unwrap();
             puts.store(0, Ordering::SeqCst);
-            pool.renew(&mut cadence.last).await;
-            let written = pool.write_checkpoint(&d.id, &state, cadence.last.as_ref()).await.unwrap();
+            pool.renew(&mut last).await;
+            let written = pool.write_checkpoint(&d.id, Arc::new(state.clone()), pool.clock.mono(), last.as_ref()).await.unwrap();
             let next = tables(&pool, &written).await;
             let new = new_pages(&prev, &next);
             assert!(new[..3].iter().all(|n| (1..=2).contains(n)) && new[3] == removed, "seq {seq}: new pages per table {new:?}");
             assert_eq!(puts.load(Ordering::SeqCst), new.iter().sum::<usize>(), "seq {seq}: only new pages are stored");
-            cadence.last = Some(written);
+            *last = Some(written);
             prev = next;
         }
-        drop(cadence);
+        drop(last);
         mem.set_hook(None);
         let again = Pool::open(pool.store.clone(), 64 << 20).await.unwrap();
         let d = again.drive("big").unwrap();
         assert_eq!(d.snapshot().rows(), state.rows(), "with every table in use");
         // Without the previous checkpoint, a server that has just started stores every page.
         let puts = count(&mem, page_puts);
-        let all = again.write_checkpoint(&d.id, &state, None).await.unwrap();
+        let all = again.write_checkpoint(&d.id, Arc::new(state), again.clock.mono(), None).await.unwrap();
         assert_eq!(puts.load(Ordering::SeqCst), all.pages.len());
     }
 
@@ -1887,7 +1925,7 @@ mod tests {
         assert_eq!(keys(&reloaded, 0), Some(vec!["a".to_owned(), "b".into(), "c".into()]));
         assert_eq!(keys(&reloaded, 2), Some(vec!["c".to_owned()]));
         // With a checkpoint at seq 3, the log is replayed from there.
-        pool.write_checkpoint(&d.id, &d.snapshot(), None).await.unwrap();
+        pool.write_checkpoint(&d.id, d.snapshot(), pool.clock.mono(), None).await.unwrap();
         for key in ["d", "e"] {
             put(&pool, &d, key, b"x").await;
         }
@@ -1911,6 +1949,7 @@ mod tests {
         let (mut logged, mut last) = (0, 0);
         while checkpoints(&store, &d).await.is_empty() {
             let v = version(&pool.commit(&d, put_plan("big", &big, Precondition::default(), &Arc::default())).await);
+            settle(&d).await;
             last = store.get(&log_path(&d.id, v.seq)).await.unwrap().unwrap().len() as u64;
             logged += last;
             assert!(v.seq < CHECKPOINT_EVERY, "no checkpoint after {logged} bytes of log");
@@ -1927,8 +1966,10 @@ mod tests {
         while d.snapshot().seq() < first + CHECKPOINT_EVERY - 1 {
             put(&pool, &d, "small", b"tick").await;
         }
+        settle(&d).await;
         assert_eq!(checkpoints(&store, &d).await, [first], "counted from the last checkpoint, not from seq 0");
         put(&pool, &d, "small", b"tick").await;
+        settle(&d).await;
         assert_eq!(checkpoints(&store, &d).await, [first, first + CHECKPOINT_EVERY]);
     }
 
@@ -1940,14 +1981,14 @@ mod tests {
         let puts = count(&mem, page_puts);
         let a = pool.create_drive("fork-a", Some(&src)).await.unwrap();
         assert_eq!(puts.load(Ordering::SeqCst), 0, "the source has a checkpoint at the fork point");
-        let source = tables(&pool, src.commit_lock.lock().await.last.as_ref().unwrap()).await;
-        let forked = tables(&pool, a.commit_lock.lock().await.last.as_ref().unwrap()).await;
+        let source = tables(&pool, src.checkpoint.lock().await.as_ref().unwrap()).await;
+        let forked = tables(&pool, a.checkpoint.lock().await.as_ref().unwrap()).await;
         assert_eq!(new_pages(&source, &forked), [0; 4]);
         // After a commit to the source, a fork stores only the segments that commit changed.
         put(&pool, &src, "f010001", b"new").await;
         puts.store(0, Ordering::SeqCst);
         let b = pool.create_drive("fork-b", Some(&src)).await.unwrap();
-        let forked = tables(&pool, b.commit_lock.lock().await.last.as_ref().unwrap()).await;
+        let forked = tables(&pool, b.checkpoint.lock().await.as_ref().unwrap()).await;
         let new = new_pages(&source, &forked);
         assert!(new[..3].iter().all(|n| (1..=2).contains(n)) && new[3] == 0, "new pages per table {new:?}");
         assert_eq!(puts.load(Ordering::SeqCst), new.iter().sum::<usize>());
@@ -1960,27 +2001,174 @@ mod tests {
     async fn an_old_previous_checkpoint_is_read_again() {
         let clock = Clock::manual("2026-09-28T00:00:00Z".parse().unwrap());
         let (mem, pool, d, state) = big_drive(2_000, clock.clone()).await;
-        let mut cadence = d.commit_lock.lock().await;
-        let index = cadence.last.as_ref().unwrap().index.clone();
+        let mut last = d.checkpoint.lock().await;
+        let index = last.as_ref().unwrap().index.clone();
         let reads = {
             let index = index.clone();
             count(&mem, move |op, path| op == MemOp::Get && path == index)
         };
         clock.advance(REUSE_WITHOUT_REREAD - Duration::from_secs(1));
-        pool.renew(&mut cadence.last).await;
-        assert!(cadence.last.is_some());
+        pool.renew(&mut last).await;
+        assert!(last.is_some());
         assert_eq!(reads.load(Ordering::SeqCst), 0);
         clock.advance(2 * HOUR);
-        pool.renew(&mut cadence.last).await;
-        assert_eq!((reads.load(Ordering::SeqCst), cadence.last.as_ref().unwrap().seen), (1, clock.mono()));
+        pool.renew(&mut last).await;
+        assert_eq!((reads.load(Ordering::SeqCst), last.as_ref().unwrap().seen), (1, clock.mono()));
         clock.advance(13 * HOUR);
-        let stale = cadence.last.take().unwrap();
-        assert!(pool.write_checkpoint(&d.id, &state, Some(&stale)).await.is_err(), "written too long after the read it relies on");
+        let stale = last.take().unwrap();
+        assert!(pool.write_checkpoint(&d.id, Arc::new(state), clock.mono(), Some(&stale)).await.is_err(), "written too long after the read it relies on");
         // An index that has gone vouches for nothing.
         pool.store.delete(&index).await.unwrap();
         let mut gone = Some(stale);
         pool.renew(&mut gone).await;
         assert!(gone.is_none());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Checkpoints in the background
+
+    /// Requests to a [`MemStore`] held back by [`hold`].
+    struct Held {
+        release: tokio::sync::watch::Sender<bool>,
+        /// Requests held so far.
+        held: Arc<AtomicUsize>,
+    }
+
+    /// Holds the requests to `mem` that `which` picks until [`Held::release`] says `true`.
+    fn hold(mem: &MemStore, which: impl Fn(MemOp, &str) -> bool + Send + Sync + 'static) -> Held {
+        let (release, released) = tokio::sync::watch::channel(false);
+        let held = Arc::new(AtomicUsize::new(0));
+        let h = held.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if !which(op, path) {
+                return futures::future::ready(Fault::None).boxed();
+            }
+            h.fetch_add(1, Ordering::SeqCst);
+            let mut released = released.clone();
+            async move {
+                let _ = released.wait_for(|r| *r).await;
+                Fault::None
+            }
+            .boxed()
+        })));
+        Held { release, held }
+    }
+
+    fn index_puts(op: MemOp, path: &str) -> bool {
+        op == MemOp::Put && path.contains("/checkpoints/")
+    }
+
+    /// Waits until `n` has reached `at_least`.
+    async fn reached(n: &AtomicUsize, at_least: usize) {
+        while n.load(Ordering::SeqCst) < at_least {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Commits `n` puts of `desc` to `d`, one after another; returns the last one's version.
+    async fn ticks(pool: &Arc<Pool>, d: &Arc<Drive>, desc: &ContentDescriptor, n: u64) -> VersionId {
+        let mut v = VersionId::new(0, 0);
+        for _ in 0..n {
+            v = version(&pool.commit(d, put_plan("tick", desc, Precondition::default(), &Arc::default())).await);
+        }
+        v
+    }
+
+    /// Nothing ties a checkpoint to the commit that made it due (format §8): the commit is
+    /// answered, and later ones are written, while the checkpoint is. There is one at a time: a
+    /// drive due again meanwhile starts the next with its first commit after.
+    #[tokio::test]
+    async fn checkpoints_do_not_hold_up_commits() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let tick = content(&pool, b"tick").await;
+        let h = hold(&mem, index_puts);
+        let limit = Duration::from_secs(60);
+        tokio::time::timeout(limit, ticks(&pool, &d, &tick, CHECKPOINT_EVERY + 5)).await.expect("commits go on while a checkpoint is written");
+        reached(&h.held, 1).await;
+        // Due again, while the first is still being written.
+        tokio::time::timeout(limit, ticks(&pool, &d, &tick, CHECKPOINT_EVERY)).await.unwrap();
+        assert_eq!(h.held.load(Ordering::SeqCst), 1, "one checkpoint at a time");
+        h.release.send(true).unwrap();
+        settle(&d).await;
+        assert_eq!(checkpoints(&pool.store, &d).await, [CHECKPOINT_EVERY]);
+        let v = ticks(&pool, &d, &tick, 1).await;
+        settle(&d).await;
+        assert_eq!(checkpoints(&pool.store, &d).await, [CHECKPOINT_EVERY, v.seq]);
+        assert_eq!(pool.metrics.checkpoints_written.get(), 2);
+    }
+
+    /// A hard delete waits for the checkpoint being written, so that nothing of the drive is
+    /// written after it has gone.
+    #[tokio::test]
+    async fn a_hard_delete_waits_for_a_checkpoint_being_written() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let tick = content(&pool, b"tick").await;
+        let h = hold(&mem, index_puts);
+        ticks(&pool, &d, &tick, CHECKPOINT_EVERY).await;
+        reached(&h.held, 1).await;
+        let deleting = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.hard_delete("d").await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!deleting.is_finished(), "the hard delete waits for the checkpoint");
+        h.release.send(true).unwrap();
+        assert!(deleting.await.unwrap());
+        assert!(pool.store.list_recursive(&format!("drives/{}/", d.id)).await.unwrap().is_empty(), "nothing of the drive is left");
+    }
+
+    /// A fork waits for its source's checkpoint being written, so that it starts from that one
+    /// (format §9).
+    #[tokio::test]
+    async fn a_fork_waits_for_a_checkpoint_being_written() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let tick = content(&pool, b"tick").await;
+        let index = format!("drives/{}/checkpoints/", d.id);
+        let h = hold(&mem, move |op, path| index_puts(op, path) && path.starts_with(&index));
+        ticks(&pool, &d, &tick, CHECKPOINT_EVERY).await;
+        reached(&h.held, 1).await;
+        let forking = tokio::spawn({
+            let (pool, d) = (pool.clone(), d.clone());
+            async move { pool.create_drive("fork", Some(&d)).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!forking.is_finished(), "the fork waits for the checkpoint");
+        h.release.send(true).unwrap();
+        let fork = forking.await.unwrap();
+        assert_eq!(checkpoints(&pool.store, &d).await, [CHECKPOINT_EVERY]);
+        assert_eq!(checkpoints(&pool.store, &fork).await, [CHECKPOINT_EVERY]);
+    }
+
+    /// A checkpoint's rows reference content on the strength of its state having been the
+    /// drive's (format §12.4, option 1), so it is written within 12 hours of that. One held up
+    /// longer fails, and the next is due a whole interval later.
+    #[tokio::test]
+    async fn a_checkpoint_of_a_state_seen_too_long_ago_is_not_written() {
+        let clock = Clock::manual("2026-09-28T00:00:00Z".parse().unwrap());
+        let mem = Arc::new(MemStore::new(clock.clone()));
+        let pool = Pool::open_with(Store::mem(mem.clone()), 1 << 20, clock.clone()).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let tick = content(&pool, b"tick").await;
+        let h = hold(&mem, page_puts);
+        ticks(&pool, &d, &tick, CHECKPOINT_EVERY).await;
+        reached(&h.held, 1).await;
+        clock.advance(13 * HOUR);
+        h.release.send(true).unwrap();
+        settle(&d).await;
+        assert!(checkpoints(&pool.store, &d).await.is_empty());
+        assert_eq!((pool.metrics.checkpoints_written.get(), pool.metrics.checkpoints_failed.get()), (0, 1));
+        ticks(&pool, &d, &tick, CHECKPOINT_EVERY - 1).await;
+        settle(&d).await;
+        assert!(checkpoints(&pool.store, &d).await.is_empty(), "a failure waits a whole interval");
+        ticks(&pool, &d, &tick, 1).await;
+        settle(&d).await;
+        assert_eq!(checkpoints(&pool.store, &d).await, [2 * CHECKPOINT_EVERY]);
     }
 
     // -----------------------------------------------------------------------------------------
