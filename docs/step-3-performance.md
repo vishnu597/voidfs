@@ -265,8 +265,8 @@ per-byte time.
 
 ### Item 3. Fewer sequential round trips per write
 
-**Status (29 September 2026): changes 2 and 3 done; change 1 is a draft RFC,
-[0003](https://github.com/vishnu597/voidfs/pull/12), for review.** Measured in
+**Status (29 September 2026): changes 2 and 3 done; change 1 is
+[RFC 0003](../rfcs/0003-small-content-in-descriptors.md), accepted, not yet implemented.** Measured in
 [bench/results/write-round-trips](../bench/results/write-round-trips/README.md):
 - **Measured first.** Put 64 MiB on loopback, one at a time, took 300 ms: about 150 ms of CPU in
   the request's own task and 150 ms waiting for seven batches of four shard uploads. The largest
@@ -319,10 +319,10 @@ What was built:
   32 MiB with the default chunking and body frames of 16–64 KiB.
 
 What was left for later:
-- Change 1, small files inside their metadata: [RFC 0003](https://github.com/vishnu597/voidfs/pull/12)
-  proposes a `d` extent with up to 4 KiB of content, an `inline-data` feature flag, and
-  checkpoints that store those bytes as shards ("spilling") so that neither checkpoints nor memory
-  grow with them. It needs review before any spec text or code.
+- Change 1, small files inside their metadata: [RFC 0003](../rfcs/0003-small-content-in-descriptors.md),
+  accepted on 29 September, specifies a `d` extent with up to 4 KiB of content, an `inline-data`
+  feature flag, and checkpoints that store those bytes as shards ("spilling") so that neither
+  checkpoints nor memory grow with them. Its spec text, conformance cases and code come next.
 - Multipart uploads of 8 and 16 MiB parts gain little from the window: their time at 12 ms is
   completion's chain of round trips (item 5).
 - Put 1 MiB and the fan-out puts of 4 KiB, 8 to 64 at once at 12 ms, are 1.5–3.5% slower in p50.

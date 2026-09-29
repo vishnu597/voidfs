@@ -4,7 +4,7 @@
 away through `BENCH_ONE_WAY_MS=4 bench/scripts/local.sh` and on loopback, with voidfs-server's
 512 MiB cache. Step 3, item 3 of the [parity plan](../../../docs/PARITY.md#7-step-by-step-plan),
 changes 2 and 3 ([step-3-performance.md](../../../docs/step-3-performance.md#item-3-fewer-sequential-round-trips-per-write));
-change 1 is [RFC 0003](https://github.com/vishnu597/voidfs/pull/12), a draft.*
+change 1 is [RFC 0003](../../../rfcs/0003-small-content-in-descriptors.md), accepted and not yet implemented.*
 
 | Files | voidfs-server |
 |---|---|

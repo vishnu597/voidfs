@@ -42,8 +42,9 @@ billing or plans), this page says so.
     fan-out gets far ahead. Large puts now upload while they read the body, and checkpoints no
     longer hold up commits: put 64 MiB takes 1.3× the bare bucket's time eight at once and 0.9×
     alone, from 2.2× and 2.5×. What holds back most of the other rows is that a small write still
-    takes its shard, then its log entry, one after the other (a format change, drafted as RFC
-    0003); then patch, and large reads that only the real run can judge.
+    takes its shard, then its log entry, one after the other (a format change, RFC 0003,
+    accepted and not yet implemented); then patch, and large reads that only the real run can
+    judge.
 - **SpaceFS's Mac app is now understood** (§5). It is a native FSKit module with its core in Rust,
   running in a separate daemon, which is the architecture the FSKit spike chose for voidfs. It
   also shows that the FSKit entitlement can ship with Developer ID.
@@ -55,7 +56,7 @@ billing or plans), this page says so.
     Compose file with health checks and metrics.
   - Step 3 has its first two items done, group commit and the shard cache's admission, and the
     third's server changes: checkpoints in the background and pipelined ingest. Its small-file
-    path is a draft RFC.
+    path has an accepted RFC and is next.
   - Steps 4–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -295,7 +296,7 @@ What holds back the 27–28 rows voidfs does not yet win at 12 ms
   overwrite 1 MiB and fan-out put 1,000 × 4 KiB at 64 within 13–26%; put 1 MiB and the fan-out
   put at 32 within 35–38%. Edits inside 32 and 64 MiB files, now that the shard they rewrite is
   cached, take 34–44 ms where SpaceFS's ratio needs 17–41. Step 3, item 3; for small files it
-  needs the format change drafted as [RFC 0003](https://github.com/vishnu597/voidfs/pull/12).
+  needs the format change in [RFC 0003](../rfcs/0003-small-content-in-descriptors.md) (accepted).
   Puts of 32 and 64 MiB, which took twice the bare bucket's time taking in the body, now take
   1.3× eight at once and 0.9–1.05× alone (29 September).
 - **Patch rewrites a shard once per edit (patch in 1 MiB, and in 64 MiB in one run).** Item 4.
@@ -412,7 +413,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      the commit path. **Pipelined ingest and background checkpoints done**: put 64 MiB at 12 ms
      takes 1.3× the bare bucket's time eight at once (from 2.2×) and 0.9× alone, and writes that
      land on a checkpoint no longer wait for it. The small-file path is
-     [RFC 0003](https://github.com/vishnu597/voidfs/pull/12), a draft for review.
+     [RFC 0003](../rfcs/0003-small-content-in-descriptors.md), accepted, not yet implemented.
    - Patch that rewrites each touched shard once, and a multipart completion without a chain
      of round trips.
    - Parallel and coalesced shard fetch for cold and large reads, once the harness can measure
@@ -420,7 +421,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - **Done when:** every one of the 49 rows is at least as fast as SpaceFS's.
    - **Status (2026-09-29):** group commit, the shard cache's admission, pipelined ingest and
      background checkpoints are done; 20–24 of the 49 rows are there in the local 12 ms runs, and
-     34–35 on loopback. Next: review RFC 0003 (small files), then items 4–7.
+     34–35 on loopback. Next: implement RFC 0003 (small files), then items 4–7.
 4. **Client core, CLI and Rust SDK.**
    - `crates/client`: cache, journal, upload queue, change-feed client.
    - Direct uploads (§4.11), and short-lived storage credentials: R2, AWS STS, and presigned URLs
