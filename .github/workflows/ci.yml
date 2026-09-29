@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tests, lints and the spec's cases on every push and pull request; conformance and stock
+# clients over each kind of store; the Compose files. On main (and on demand), also the release
+# model of garbage collection and a small benchmark with the bucket 12 ms away.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Not RCLONE_*: rclone reads those as its own flags.
+  CI_RCLONE_VERSION: v1.75.1
+  CI_RCLONE_SHA256: 982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab
+  VERSITYGW_VERSION: v1.8.0
+  VERSITYGW_SHA256: 2ba2c734d10d2c4e651d03182cb4b246656bc735a2f282db7b0b73fba6073467
+  # MinIO's last release. It no longer publishes binaries or images, so CI builds it from source.
+  MINIO_VERSION: RELEASE.2025-10-15T17-29-55Z
+
+jobs:
+  test:
+    name: Tests and lints
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: python3 spec/conformance/validate.py
+
+  interop:
+    name: Conformance and clients (${{ matrix.store }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [memory, fs, versitygw, minio]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install boto3 and rclone
+        run: |
+          python -m pip install --quiet boto3
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://downloads.rclone.org/${CI_RCLONE_VERSION}/rclone-${CI_RCLONE_VERSION}-linux-amd64.zip"
+          echo "${CI_RCLONE_SHA256}  rclone-${CI_RCLONE_VERSION}-linux-amd64.zip" | sha256sum -c -
+          unzip -q "rclone-${CI_RCLONE_VERSION}-linux-amd64.zip"
+          sudo install "rclone-${CI_RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/
+      - name: Install versitygw
+        if: matrix.store == 'versitygw'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://github.com/versity/versitygw/releases/download/${VERSITYGW_VERSION}/versitygw_${VERSITYGW_VERSION}_Linux_x86_64.tar.gz"
+          echo "${VERSITYGW_SHA256}  versitygw_${VERSITYGW_VERSION}_Linux_x86_64.tar.gz" | sha256sum -c -
+          tar xzf "versitygw_${VERSITYGW_VERSION}_Linux_x86_64.tar.gz"
+          sudo install "versitygw_${VERSITYGW_VERSION}_Linux_x86_64/versitygw" /usr/local/bin/
+      - uses: actions/setup-go@v7
+        if: matrix.store == 'minio'
+        with:
+          go-version: "1.25"
+          cache: false
+      - uses: actions/cache@v6
+        if: matrix.store == 'minio'
+        id: minio
+        with:
+          path: ~/minio-bin
+          key: minio-${{ env.MINIO_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build MinIO
+        if: matrix.store == 'minio' && steps.minio.outputs.cache-hit != 'true'
+        run: CGO_ENABLED=0 GOBIN="$HOME/minio-bin" go install "github.com/minio/minio@${MINIO_VERSION}"
+      - if: matrix.store == 'minio'
+        run: echo "$HOME/minio-bin" >> "$GITHUB_PATH"
+      - run: cargo build --locked -p voidfs-server -p voidfs-conformance
+      - run: tests/interop/run.sh ${{ matrix.store }}
+        env:
+          VOIDFS_INTEROP_REQUIRE_ALL: "1"
+
+  compose:
+    name: Docker Compose (with versitygw)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start voidfs-server and versitygw
+        working-directory: deploy/compose
+        run: |
+          random() { (set +o pipefail; LC_ALL=C tr -dc "$1" < /dev/urandom | head -c "$2"); }
+          {
+            echo "VOIDFS_ACCESS_KEY_ID=VF$(random 'A-Z2-7' 18)"
+            echo "VOIDFS_SECRET_ACCESS_KEY=$(random 'A-Za-z0-9' 40)"
+            read_id="VR$(random 'A-Z2-7' 18)"; read_secret="$(random 'A-Za-z0-9' 40)"
+            echo "VOIDFS_KEYS=${read_id}:${read_secret}:read"
+            echo "VOIDFS_READ_ACCESS_KEY_ID=${read_id}"
+            echo "VOIDFS_READ_SECRET_ACCESS_KEY=${read_secret}"
+            echo "BUCKET_ACCESS_KEY_ID=LOCAL$(random 'A-Z2-7' 15)"
+            echo "BUCKET_SECRET_ACCESS_KEY=$(random 'A-Za-z0-9' 40)"
+          } > .env
+          docker compose -f compose.yaml -f compose.versitygw.yaml up -d --build --wait
+      - run: cargo build --locked -p voidfs-conformance
+      - name: Conformance against the containers
+        run: |
+          set -a; . deploy/compose/.env; set +a
+          VOIDFS_ENDPOINT=http://127.0.0.1:9000 target/debug/voidfs-conformance
+      - name: Logs
+        if: failure()
+        working-directory: deploy/compose
+        run: docker compose -f compose.yaml -f compose.versitygw.yaml logs
+      - name: Stop
+        if: always()
+        working-directory: deploy/compose
+        run: docker compose -f compose.yaml -f compose.versitygw.yaml down -v
+
+  gc-model:
+    name: Garbage collection model (release)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --locked -p voidfs-server gc::model -- --ignored
+
+  bench:
+    name: Benchmark, bucket 12 ms away (a tenth of the operations)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install versitygw
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://github.com/versity/versitygw/releases/download/${VERSITYGW_VERSION}/versitygw_${VERSITYGW_VERSION}_Linux_x86_64.tar.gz"
+          echo "${VERSITYGW_SHA256}  versitygw_${VERSITYGW_VERSION}_Linux_x86_64.tar.gz" | sha256sum -c -
+          tar xzf "versitygw_${VERSITYGW_VERSION}_Linux_x86_64.tar.gz"
+          sudo install "versitygw_${VERSITYGW_VERSION}_Linux_x86_64/versitygw" /usr/local/bin/
+      # Shared runners vary run to run: the results are a record, not a pass or fail.
+      - run: bench/scripts/local.sh --ops-scale 0.1
+        env:
+          BENCH_ONE_WAY_MS: "4"
+          BENCH_OUT: ${{ runner.temp }}/bench
+          BENCH_NAME: ci-rtt12-${{ github.sha }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-${{ github.sha }}
+          path: ${{ runner.temp }}/bench
