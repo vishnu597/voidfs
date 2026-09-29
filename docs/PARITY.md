@@ -47,9 +47,9 @@ billing or plans), this page says so.
 - **The plan (§7):**
   - Step 1 has its harness, local results and CI. Still to do: the run in SpaceFS's setup
     (which waits on cloud accounts, §8), and the Mac comparison.
-  - Step 2 has three of its six items done: garbage collection, content-defined checkpoint
-    segments and the bucket capability probe. MinIO, rclone and the Compose file are done too;
-    AWS S3, a health endpoint and metrics, and virtual-host addressing are still to do.
+  - Step 2 has four of its six items done: garbage collection, content-defined checkpoint
+    segments, the bucket capability probe, and runs on AWS S3, MinIO and rclone. The Compose
+    file is done too; a health endpoint and metrics, and virtual-host addressing, are to do.
   - Step 3 has its first two items done: group commit and the shard cache's admission.
   - Steps 4–10 have not started.
 
@@ -333,13 +333,17 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
        copy with multipart, `check --download`, sync, server-side copy and move, `rcat`. `rclone
        purge` fails: on a versioned bucket it deletes every version, and voidfs keeps history
        (protocol §3). `rclone delete` then `rclone rmdir` removes a drive.
-     - AWS S3: waits on a bucket (§8).
+     - AWS S3: **done** (29 September, from this Mac over home internet to us-east-1). The
+       conformance suite passes (35/35), rclone does (10/10), and the probe reads every setting
+       it checks. Of the 23 small-object scenarios, 20 are at or ahead of SpaceFS's ratio to the
+       bare bucket and 16 faster than it; put 4 KiB and the two fan-out puts of 4 KiB are behind
+       ([results](../bench/results/aws-small-objects.md)).
    - Virtual-host addressing (in progress).
    - A `docker compose` file, and health checks and metrics. The Compose file is **done**
      ([`deploy/compose/`](../deploy/compose/)): the server's image, its pool in a volume, in a
      bucket of yours, or in versitygw beside it, which CI brings up and tests. Health is only
      "answers HTTP" for now; a health endpoint and metrics on a port of their own are to do.
-   - **Status (2026-09-29):** 3 of 6 done; MinIO, rclone and the Compose file too.
+   - **Status (2026-09-29):** 4 of 6 done, and the Compose file.
 3. **Win the rows SpaceFS loses.** The work items, with the step 1 evidence and a row-by-row
    baseline, are in [step-3-performance.md](step-3-performance.md). In order of impact:
    - Group commit: one log write per batch of mutations, not per mutation (37 rows). **Done**:
@@ -418,9 +422,10 @@ plain objects, file locking, offline pinning.
 - **Tools:** rclone and Docker (with Colima) are installed on the development Mac; the AWS CLI is
   not. MinIO's Homebrew build crashes on this Mac, and MinIO no longer publishes binaries or
   images, so versitygw is the local S3 server and CI builds MinIO from source.
-- **An AWS S3 bucket for step 2:** the step 1 bucket above would serve too. The maintainer
-  creates it and a key scoped to it ([bench/README.md](../bench/README.md#the-real-run)); then
-  the conformance suite, the clients and a small benchmark run against it.
+- **An AWS S3 bucket** in us-east-1, with a key scoped to it, exists since 2026-09-29 (made as
+  in [bench/README.md](../bench/README.md#the-real-run); the key is in `.env.aws`, which git
+  ignores). Step 2's runs used it; step 1's real run can too. Runs against it are asked for
+  first, and `voidfs-bench/` is emptied after each.
 - **Order of the next steps (agreed 2026-09-28):** the shard cache's admission (step 3, item 2),
   then the rest of step 2, then fewer sequential round trips per write (step 3, item 3).
   - Content-defined checkpoint segments came first, because they change the checkpoint writer

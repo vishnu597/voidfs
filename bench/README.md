@@ -209,6 +209,30 @@ Run again on 29 September with group commit, voidfs only and a 64 MiB cache so t
 full, `main`'s fan-out gets went to the bucket (75–116 ms) and the shard cache's fix brought them
 to 0.6–2.2 ms.
 
+### Against AWS S3
+
+The same 23 scenarios on 29 September 2026, against a bucket in us-east-1, with voidfs-server on
+this Mac beside the harness and the default 512 MiB cache: SpaceFS's topology, but over a home
+internet connection rather than from us-east4, so the bare bucket's `head` took 36 ms and a
+4 KiB put 56 ms. Group commit and the shard cache were in. Full table:
+[aws-small-objects](results/aws-small-objects.md).
+
+| Scenarios | voidfs | Bare S3 bucket | Result |
+|---|--:|--:|---|
+| get 4 KiB, `head`, get 1 MiB | 0.3–1.7 ms | 36–341 ms | 99–199× faster |
+| fan-out gets (3 rows) | 1.0–3.5 ms | 53–394 ms | 31–114× faster |
+| list 200 keys | 2.3 ms | 61 ms | 27× faster |
+| move a folder of 200 files | 126 ms | 3,216 ms | 26× faster |
+| edits in 1 MiB files (8 rows) | 313–466 ms | 552–877 ms | 1.3–2.4× faster |
+| puts and overwrites, 4 KiB and 1 MiB | 154–401 ms | 55–320 ms | 1.3–3.0× slower |
+| fan-out puts (3 rows) | 169–349 ms | 56–281 ms | 1.2–3.5× slower |
+
+20 of the 23 rows are at or ahead of SpaceFS's ratio to the bare bucket; put 4 KiB and the two
+fan-out puts of 4 KiB are behind, held back by finding 2. The edits in 1 MiB files beat the bare
+bucket here: the bare side downloads the file and uploads it again over the home connection,
+where voidfs reads it from its cache. No operation failed. The run took 5 minutes; afterwards
+everything under `voidfs-bench/` was deleted.
+
 ## Findings: where voidfs is far from parity, and why
 
 The biggest first. The file references point at the code at `c434fcb`. The step-3 plan that
