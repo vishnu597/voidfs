@@ -244,10 +244,18 @@ pub struct PoolDescriptor {
     pub commit_guard: CommitGuard,
 }
 
-/// The incompatible features this implementation understands (none yet).
-pub const KNOWN_INCOMPATIBLE_FEATURES: &[&str] = &[];
+/// The feature that lets content descriptors hold data extents (format §3.1, §5).
+pub const INLINE_DATA: &str = "inline-data";
+
+/// The incompatible features this implementation understands.
+pub const KNOWN_INCOMPATIBLE_FEATURES: &[&str] = &[INLINE_DATA];
 
 impl PoolDescriptor {
+    /// Whether the pool lists `feature` in `features.incompatible`.
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.incompatible.iter().any(|f| f == feature)
+    }
+
     /// Refuse pools this reader cannot read correctly (format §3, §3.1).
     pub fn check_readable(&self) -> Result<(), String> {
         if self.format != crate::FORMAT_VERSION {
@@ -596,6 +604,9 @@ mod tests {
             commit_guard: CommitGuard::CreateIfAbsent,
         };
         assert!(p.check_readable().is_ok());
+        p.features.incompatible.push(INLINE_DATA.into());
+        assert!(p.check_readable().is_ok());
+        assert!(p.has(INLINE_DATA));
         p.features.incompatible.push("encryption".into());
         assert!(p.check_readable().is_err());
     }

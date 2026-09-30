@@ -269,6 +269,10 @@ pub struct PoolMetrics {
     pub checkpoints_failed: IntCounter,
     /// How long each checkpoint took to write, in the background.
     pub checkpoint_write: Histogram,
+    /// Shards checkpoints stored for the data extents of their rows (format §8.2).
+    pub checkpoint_spilled: IntCounter,
+    /// How long putting what a checkpoint spilled into the drive's state held its commit lock.
+    pub checkpoint_swap: Histogram,
     pub drives_live: IntGauge,
     pub drives_deleted: IntGauge,
     /// One per [`GC_PHASES`], 1 for the run's phase as last read.
@@ -308,6 +312,8 @@ impl PoolMetrics {
         let commits = counters(&r, "voidfs_commits_total", "Log entries: written, lost to another server's entry (then planned again), or failed.", &["outcome"]);
         let checkpoints = counters(&r, "voidfs_checkpoints_total", "Checkpoints written, and attempts that failed.", &["outcome"]);
         let checkpoint_write = histogram(&r, "voidfs_checkpoint_write_seconds", "Time to write each checkpoint, in the background, whether or not it was written.", LATENCY);
+        let checkpoint_spilled = counter(&r, "voidfs_checkpoint_spilled_shards_total", "Shards checkpoints stored for content held in data extents, which checkpoints never carry.");
+        let checkpoint_swap = histogram(&r, "voidfs_checkpoint_swap_seconds", "Time each checkpoint held its drive's commit lock to put the shards it stored in place of data extents.", LATENCY);
         let drives = gauges(&r, "voidfs_drives", "Drives this server has open: live, and soft-deleted.", &["state"]);
         let phase = gauges(&r, "voidfs_gc_phase", "The phase of the garbage-collection run in gc/pending.json, as last read (every minute): 1 for the current one.", &["phase"]);
         let steps = counters(&r, "voidfs_gc_steps_total", "Steps of --gc-interval garbage collection, by outcome.", &["outcome"]);
@@ -323,6 +329,8 @@ impl PoolMetrics {
             checkpoints_written: checkpoints.with_label_values(&["written"]),
             checkpoints_failed: checkpoints.with_label_values(&["failed"]),
             checkpoint_write,
+            checkpoint_spilled,
+            checkpoint_swap,
             drives_live: drives.with_label_values(&["live"]),
             drives_deleted: drives.with_label_values(&["deleted"]),
             gc_phase: GC_PHASES.map(|p| phase.with_label_values(&[p])),

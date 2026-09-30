@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use bytes::Bytes;
+use futures::StreamExt;
 use voidfs_core::ids::ShardHash;
 
 use super::{PENDING, PendingRecord, Phase};
@@ -35,6 +36,9 @@ pub const RENEW_WITHIN: Duration = Duration::from_secs(50 * 60);
 /// A write commits within this long of the check it relies on: half the minimum grace period
 /// (§12.4).
 pub const COMMIT_WITHIN: Duration = Duration::from_secs(12 * 3600);
+/// Uploads one call of [`Guard::admit`] keeps in flight: a checkpoint may store thousands of
+/// small shards at once (format §8.2).
+pub const ADMIT_UPLOADS: usize = 32;
 /// How long a write waits for a run that is deleting objects it needs.
 const DELETING_WAIT: Duration = Duration::from_secs(120);
 const DELETING_POLL: Duration = Duration::from_millis(250);
@@ -226,8 +230,9 @@ impl Guard {
                 self.refresh(store, clock).await?;
                 continue;
             }
-            let puts = upload.iter().chain(&rescue).map(|(h, b)| async move { store.put(&kind.path(h), b.clone()).await });
-            for r in futures::future::join_all(puts).await {
+            let owned: Vec<(ShardHash, Bytes)> = upload.iter().chain(&rescue).map(|(h, b)| (*h, b.clone())).collect();
+            let mut puts = futures::stream::iter(owned).map(|(h, b)| async move { store.put(&kind.path(&h), b).await }).buffer_unordered(ADMIT_UPLOADS);
+            while let Some(r) = puts.next().await {
                 r?;
             }
             for (h, _) in &upload {

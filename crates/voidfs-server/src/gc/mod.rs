@@ -565,6 +565,9 @@ pub async fn referenced(pool: &Pool) -> anyhow::Result<HashSet<ShardHash>> {
                 // Completing or aborting the upload may delete it while this runs.
                 let Some(b) = store.get(&path).await? else { continue };
                 let part: Part = serde_json::from_slice(&b).with_context(|| format!("reading {path}"))?;
+                if voidfs_core::model::data_len(&part.extents) > 0 {
+                    bail!("{path} holds a data extent, which part records never do (format §11)");
+                }
                 refs.extents(&part.extents);
             }
         }
