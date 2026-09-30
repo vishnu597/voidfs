@@ -4,6 +4,25 @@ Every change to the [protocol](protocol.md), the [format](format.md) and the
 [conformance suite](conformance/) is recorded here, newest first. Drafts may change
 incompatibly; entries say when they do.
 
+## Draft 1, revision 5: small content inside the content descriptor (2026-09-29)
+
+[RFC 0003](../rfcs/0003-small-content-in-descriptors.md). Readers that do not implement it refuse
+pools that use it, through the new feature flag; nothing else changes for them.
+
+- **Format §3.1:** the `inline-data` incompatible feature, added by an operator once every writer
+  of the pool implements it.
+- **Format §5:** a third extent kind, the data extent `{ "d": "<base64>" }`, holds up to 4,096
+  bytes of a file's content in its descriptor, so a small file needs no shard. Not in manifest
+  pages (§5.1) or multipart staging records (§11).
+- **Format §7.7:** a data extent contributes to the ETag exactly what a shard extent with the same
+  bytes would, so where the bytes live never shows.
+- **Format §8.2:** checkpoints never carry data extents: their writer stores the bytes as shards
+  and lists shard extents instead, and history rows carry an equivalent descriptor.
+- **Format §12:** data extents reference nothing; the shards a checkpoint stores for them are
+  referenced by it.
+- **Conformance:** `small-files-roundtrip`, `small-file-edits` and `small-file-history`. A client
+  cannot tell whether a server used data extents; these check that nothing shows either way.
+
 ## Draft 1, revision 4: header authentication sends its payload hash (2026-09-29)
 
 - **Protocol §2:** a request signed in the `Authorization` header MUST send

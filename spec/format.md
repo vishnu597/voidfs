@@ -17,7 +17,7 @@ with nothing but read access to the bucket. The design rationale is in
 | **Drive** | A filesystem: a tree of folders and files with a complete, ordered history. |
 | **Object** | A file, folder or symbolic link in a drive. Identified by an **object id** that does not change when the object is renamed or moved. |
 | **Shard** | An immutable run of content bytes, named by its SHA-256. |
-| **Content** | The bytes of one version of a file, described as an ordered list of **extents** (shards and runs of zeros). |
+| **Content** | The bytes of one version of a file, described as an ordered list of **extents** (shards, runs of zeros, and small runs of bytes held in the list itself). |
 | **Commit** | One object in a drive's log. It holds one or more transactions and has a sequence number. |
 | **Transaction** | An atomic change to a drive. Every transaction is exactly one **version**. |
 | **Checkpoint** | The complete state of a drive at one sequence number, stored as sorted segments. |
@@ -88,6 +88,16 @@ except to add feature flags as §3.1 allows.
 - Features in `features.compatible` MAY be ignored by readers.
 - Feature names are lowercase words joined with hyphens. Names are allocated by RFC.
 
+Defined features:
+
+| Feature | Kind | Meaning |
+|---|---|---|
+| `inline-data` | incompatible | Content descriptors may hold data extents, `{ "d": … }` (§5). [RFC 0003](../rfcs/0003-small-content-in-descriptors.md) |
+
+*(informative)* Writers read `voidfs.json` when they start. A feature is therefore added by an
+operator, after every writer of the pool implements it, never by a writer that finds it missing;
+writers use it once they have read it.
+
 Reserved names, not defined in format 1: `shard-zstd` (compressed shards), `encryption`
 (encrypted shards and metadata), `external-extents` (extents that point at existing objects in
 the bucket, for adopting a bucket in place), `binary-metadata`.
@@ -138,14 +148,32 @@ The content of a file version is a **content descriptor**, one of:
 { "root": "<sha256>", "size": 1099511627776 }
 ```
 
+```json
+{ "extents": [ { "d": "aGVsbG8sIHdvcmxkCg==" } ] }
+```
+
 - An extent `{ "s": h, "n": len }` is the whole shard `h`, which is `len` bytes long.
 - An extent `{ "z": len }` is `len` zero bytes that are not stored (sparse regions, and the gap
   left by extending a file).
+- An extent `{ "d": b }`, a **data extent**, is the bytes whose standard base64 encoding (RFC 4648
+  §4, with padding) is `b`. Its length is the length of those bytes, which MUST be at least 1. A
+  writer uses data extents only in a pool that lists `inline-data` (§3.1).
 - The content is the concatenation of its extents in order. Its size is the sum of their
   lengths. The empty file is `{ "extents": [] }`.
 - Adjacent `z` extents SHOULD be merged. Extent lengths MUST be greater than zero.
+- The `d` extents of one descriptor MUST NOT hold more than 4,096 bytes in total. They MAY appear
+  anywhere in an `extents` list, beside `s` and `z` extents. They MUST NOT appear in manifest
+  pages (§5.1), where content is large enough to need a tree, nor in multipart staging records
+  (§11), whose parts a completed upload joins into one descriptor that the limit would not fit.
+- Readers MUST reject a descriptor with an invalid `d` (not base64, empty, or over the limit).
 - A descriptor with more than 1,024 extents MUST be stored as a **manifest tree** and referenced
   with `root`.
+
+*(informative)* A data extent lets a small file need no shard, so that writing it takes one
+request to the bucket, the commit, instead of two one after the other. voidfs-server uses them
+only for whole files of at most 4,096 bytes: a descriptor of one `d` extent, or none for the
+empty file. Data extents beside shards would let an append to a large file skip uploading a new
+last shard, at the cost of chunk boundaries that are no longer content-defined.
 
 ### 5.1 Manifest trees
 
@@ -159,7 +187,8 @@ A manifest page is a JSON object stored at `pages/<h0h1>/<h2h3>/<sha256(page byt
 { "kind": "node", "children": [ { "page": "<sha256>", "size": 2147483648 }, … ] }
 ```
 
-- A page holds at most 1,024 extents or children.
+- A page holds at most 1,024 extents or children. A leaf's extents are `s` and `z` extents only
+  (§5).
 - `size` is the total content size under that child.
 - `root` names a page, and `size` in the descriptor is the total size.
 - The tree need not be balanced, but writers SHOULD keep leaves between 256 and 1,024 extents so
@@ -264,6 +293,10 @@ MUST NOT reference an object that is not yet stored.
 A successful write of the commit object is the moment the transactions become durable. A server
 MUST NOT acknowledge a mutation before that.
 
+*(informative)* A data extent (§5) references no shard, so the §12.4 checks do not apply to its
+bytes, and a transaction that sets content held only in data extents needs no request but the
+commit.
+
 ### 7.5 Changes
 
 A transaction's `changes` are drawn from this set. Paths do not appear in the log; the namespace
@@ -305,7 +338,7 @@ The current record of an object, as `set` builds it:
 |---|---|---|
 | `content` | content descriptor | Files only |
 | `size` | integer | Files: content size. Folders: 0 |
-| `etag` | string | Quoted, opaque, and changes whenever the content changes. Writers SHOULD derive it from the content descriptor, so that a restore or a same-pool copy keeps the ETag: `"\"" + hex(sha256(d)) + "\""`, where `d` is `voidfs-inline\0` followed, for each extent, by `s`, the 32-byte hash and the u64 length, or by `z` and the u64 length; or, for a tree, `voidfs-tree\0`, the root hash and the u64 size |
+| `etag` | string | Quoted, opaque, and changes whenever the content changes. Writers SHOULD derive it from the content descriptor, so that a restore or a same-pool copy keeps the ETag: `"\"" + hex(sha256(d)) + "\""`, where `d` is `voidfs-inline\0` followed, for each extent, by `s`, the 32-byte hash and the u64 length, or by `z` and the u64 length; or, for a tree, `voidfs-tree\0`, the root hash and the u64 size. A data extent contributes exactly what a shard extent holding the same bytes would: `s`, the SHA-256 of its bytes, and their length. A file then has the same ETag whether its bytes are in a descriptor or in a shard |
 | `attrs.content_type` | string | MIME type |
 | `attrs.meta` | object | User metadata (`x-amz-meta-*`), names lowercased |
 | `attrs.mtime` | timestamp | Modification time as set by a client (mounts). Defaults to the commit's `time` |
@@ -354,8 +387,19 @@ the keys of the first and last rows, encoded as strings in the forms below.
 | `removed` | the key the object had when removed, then `oid`, encoded `"<key>@<oid>"` | `{ "key", "oid", "version", "time" }`: one row per object that is out of the namespace and still retained. Deleted when the object is put back or its history expires. Serves the protocol's "recently deleted" listing |
 
 `history` holds every version of every object that is still retained (§10), including versions
-inherited from a fork's parent (§9). It carries each version's content descriptor, so a reader
-never needs an old commit to read an old version.
+inherited from a fork's parent (§9). It carries each version's content descriptor, or an
+equivalent of it (below), so a reader never needs an old commit to read an old version.
+
+A checkpoint MUST NOT contain data extents (§5). For each `objects` and `history` row whose
+content has them, the writer of the checkpoint:
+1. stores the bytes of each `d` extent as a shard (§4), with the §12.4 checks as for any shard;
+2. lists the row with a descriptor in which each `d` extent is replaced by
+   `{ "s": sha256(bytes), "n": length }`, merging nothing else.
+
+The two descriptors are **equivalent**: the same bytes, and the same ETag (§7.7). A reader that
+loads a checkpoint and then the log after it sees `s` extents for versions up to the checkpoint,
+and possibly `d` extents after. Nothing may depend on which: content is compared through ETags,
+not descriptors. A fork's first checkpoint (§9) follows the same rule.
 
 ### 8.3 Reuse
 
@@ -456,8 +500,9 @@ part is recorded at `drives/<drive-id>/uploads/<upload-id>/<part number, 5 digit
 ```
 
 and the upload itself at `uploads/<upload-id>/upload.json` (`{ "key", "created", "actor",
-"attrs" }`). Completing the upload is one transaction whose content is the concatenation of the
-parts' extents. The staging prefix is then deleted.
+"attrs" }`). A part's `extents` are `s` and `z` extents only (§5). Completing the upload is one
+transaction whose content is the concatenation of the parts' extents. The staging prefix is then
+deleted.
 
 An upload open longer than 7 days MAY be aborted by the authority. While open, its records are
 GC roots.
@@ -471,6 +516,10 @@ A shard or page is **referenced** if any of these reaches it (the **roots**):
   tree, including soft-deleted drives until they are hard-deleted (§10);
 - any checkpoint index still readable under §8.5, through its segments and their rows;
 - any open multipart staging record (§11).
+
+A data extent (§5) references nothing. The shards a checkpoint stores for its data extents
+(§8.2) are referenced by that checkpoint; a checkpoint that fails before its index is written
+leaves them unreferenced, like its segments.
 
 GC deletes shards and pages that are not referenced. Because content is shared across drives
 and uploads race with collection, it MUST follow this protocol. The design and the argument for
