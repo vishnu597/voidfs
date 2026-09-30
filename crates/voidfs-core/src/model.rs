@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -15,19 +16,28 @@ fn is_false(b: &bool) -> bool {
 // ---------------------------------------------------------------------------------------------
 // Content (format §5)
 
-/// One run of content: a whole shard, or zeros that are not stored.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// The most bytes the data extents of one content descriptor may hold (format §5).
+pub const MAX_DATA_BYTES: usize = 4096;
+
+/// One run of content: a whole shard, zeros that are not stored, or bytes held in the descriptor
+/// itself (a data extent, format §5).
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Extent {
     Shard { s: ShardHash, n: u64 },
     Zero { z: u64 },
+    Data {
+        #[serde(with = "data")]
+        d: Bytes,
+    },
 }
 
 impl Extent {
     pub fn len(&self) -> u64 {
-        match *self {
-            Extent::Shard { n, .. } => n,
-            Extent::Zero { z } => z,
+        match self {
+            Extent::Shard { n, .. } => *n,
+            Extent::Zero { z } => *z,
+            Extent::Data { d } => d.len() as u64,
         }
     }
 
@@ -36,19 +46,71 @@ impl Extent {
     }
 
     pub fn shard(&self) -> Option<ShardHash> {
-        match *self {
-            Extent::Shard { s, .. } => Some(s),
-            Extent::Zero { .. } => None,
+        match self {
+            Extent::Shard { s, .. } => Some(*s),
+            Extent::Zero { .. } | Extent::Data { .. } => None,
         }
+    }
+}
+
+/// How many bytes the data extents among `extents` hold.
+pub fn data_len(extents: &[Extent]) -> usize {
+    extents.iter().map(|e| if let Extent::Data { d } = e { d.len() } else { 0 }).sum()
+}
+
+/// A data extent in JSON: standard base64 with padding, of at least one byte (format §5).
+mod data {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use bytes::Bytes;
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(d: &Bytes, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(d))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Bytes, D::Error> {
+        let text = std::borrow::Cow::<str>::deserialize(de)?;
+        let d = STANDARD.decode(text.as_bytes()).map_err(D::Error::custom)?;
+        if d.is_empty() || d.len() > super::MAX_DATA_BYTES {
+            return Err(D::Error::custom(format!("a data extent holds 1 to {} bytes, not {}", super::MAX_DATA_BYTES, d.len())));
+        }
+        Ok(Bytes::from(d))
     }
 }
 
 /// How a file version's content is described: inline extents, or a manifest tree.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, try_from = "Described")]
 pub enum ContentDescriptor {
     Inline { extents: Vec<Extent> },
     Tree { root: ShardHash, size: u64 },
+}
+
+/// A content descriptor as parsed, before its data extents are checked against the limit.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Described {
+    Inline { extents: Vec<Extent> },
+    Tree { root: ShardHash, size: u64 },
+}
+
+impl TryFrom<Described> for ContentDescriptor {
+    type Error = String;
+
+    fn try_from(d: Described) -> Result<Self, String> {
+        match d {
+            Described::Inline { extents } => {
+                let n = data_len(&extents);
+                if n > MAX_DATA_BYTES {
+                    return Err(format!("the data extents of a content descriptor hold {n} bytes, more than {MAX_DATA_BYTES}"));
+                }
+                Ok(ContentDescriptor::Inline { extents })
+            }
+            Described::Tree { root, size } => Ok(ContentDescriptor::Tree { root, size }),
+        }
+    }
 }
 
 impl ContentDescriptor {
@@ -63,8 +125,14 @@ impl ContentDescriptor {
         }
     }
 
+    /// Whether it holds any data extents (format §5), which checkpoints never carry (§8.2).
+    pub fn has_data(&self) -> bool {
+        matches!(self, ContentDescriptor::Inline { extents } if extents.iter().any(|e| matches!(e, Extent::Data { .. })))
+    }
+
     /// A strong validator derived from the content description (format §7.7): identical
-    /// descriptions give identical ETags, and any change to the bytes changes it.
+    /// descriptions give identical ETags, and any change to the bytes changes it. A data extent
+    /// counts as the shard extent holding the same bytes, so where the bytes live never shows.
     pub fn etag(&self) -> String {
         let mut h = Sha256::new();
         match self {
@@ -81,6 +149,11 @@ impl ContentDescriptor {
                             h.update(*b"z");
                             h.update(z.to_be_bytes());
                         }
+                        Extent::Data { d } => {
+                            h.update(*b"s");
+                            h.update(Sha256::digest(d));
+                            h.update((d.len() as u64).to_be_bytes());
+                        }
                     }
                 }
             }
@@ -96,10 +169,30 @@ impl ContentDescriptor {
 
 /// A manifest-tree page (format §5.1).
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", try_from = "Page")]
 pub enum ManifestPage {
     Leaf { extents: Vec<Extent> },
     Node { children: Vec<PageRef> },
+}
+
+/// A manifest page as parsed, before its extents are checked.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Page {
+    Leaf { extents: Vec<Extent> },
+    Node { children: Vec<PageRef> },
+}
+
+impl TryFrom<Page> for ManifestPage {
+    type Error = &'static str;
+
+    fn try_from(p: Page) -> Result<Self, Self::Error> {
+        match p {
+            Page::Leaf { extents } if data_len(&extents) > 0 => Err("a manifest page holds a data extent"),
+            Page::Leaf { extents } => Ok(ManifestPage::Leaf { extents }),
+            Page::Node { children } => Ok(ManifestPage::Node { children }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -151,10 +244,18 @@ pub struct PoolDescriptor {
     pub commit_guard: CommitGuard,
 }
 
-/// The incompatible features this implementation understands (none yet).
-pub const KNOWN_INCOMPATIBLE_FEATURES: &[&str] = &[];
+/// The feature that lets content descriptors hold data extents (format §3.1, §5).
+pub const INLINE_DATA: &str = "inline-data";
+
+/// The incompatible features this implementation understands.
+pub const KNOWN_INCOMPATIBLE_FEATURES: &[&str] = &[INLINE_DATA];
 
 impl PoolDescriptor {
+    /// Whether the pool lists `feature` in `features.incompatible`.
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.incompatible.iter().any(|f| f == feature)
+    }
+
     /// Refuse pools this reader cannot read correctly (format §3, §3.1).
     pub fn check_readable(&self) -> Result<(), String> {
         if self.format != crate::FORMAT_VERSION {
@@ -420,6 +521,61 @@ mod tests {
     }
 
     #[test]
+    fn data_extents_are_standard_base64() {
+        let d = ContentDescriptor::Inline { extents: vec![Extent::Data { d: Bytes::from_static(b"hello, world\n") }, Extent::Zero { z: 2 }] };
+        let j = serde_json::to_string(&d).unwrap();
+        assert_eq!(j, r#"{"extents":[{"d":"aGVsbG8sIHdvcmxkCg=="},{"z":2}]}"#);
+        assert_eq!(serde_json::from_str::<ContentDescriptor>(&j).unwrap(), d);
+        assert_eq!(d.size(), 15);
+        assert!(d.has_data());
+        assert_eq!(d.clone(), serde_json::from_value(serde_json::to_value(&d).unwrap()).unwrap(), "through a value, as in a commit");
+    }
+
+    /// Readers reject a descriptor with an invalid data extent (format §5): not base64, empty,
+    /// or over 4,096 bytes in all.
+    #[test]
+    fn invalid_data_extents_are_refused() {
+        let parse = |j: &str| serde_json::from_str::<ContentDescriptor>(j);
+        let d = |n: usize| format!(r#"{{"d":"{}"}}"#, base64::Engine::encode(&base64::engine::general_purpose::STANDARD, vec![7u8; n]));
+        assert!(parse(&format!(r#"{{"extents":[{}]}}"#, d(MAX_DATA_BYTES))).is_ok());
+        assert!(parse(&format!(r#"{{"extents":[{},{{"z":1}},{}]}}"#, d(2048), d(2048))).is_ok());
+        for bad in [
+            r#"{"extents":[{"d":""}]}"#.to_owned(),
+            r#"{"extents":[{"d":"aGk"}]}"#.to_owned(),
+            r#"{"extents":[{"d":"aGk=\n"}]}"#.to_owned(),
+            r#"{"extents":[{"d":"a-_k"}]}"#.to_owned(),
+            r#"{"extents":[{"d":7}]}"#.to_owned(),
+            format!(r#"{{"extents":[{}]}}"#, d(MAX_DATA_BYTES + 1)),
+            format!(r#"{{"extents":[{},{}]}}"#, d(2048), d(2049)),
+        ] {
+            assert!(parse(&bad).is_err(), "{bad}");
+        }
+        // Wherever a descriptor is parsed: a commit's change, and a checkpoint's rows.
+        let change = format!(r#"{{"set":{{"oid":"root","content":{{"extents":[{},{}]}}}}}}"#, d(4000), d(97));
+        assert!(serde_json::from_str::<Change>(&change).is_err());
+        assert!(serde_json::from_str::<Change>(&change.replace(&d(97), &d(96))).is_ok());
+        // Never in a manifest page.
+        let h = ShardHash::of(b"x");
+        assert!(serde_json::from_str::<ManifestPage>(&format!(r#"{{"kind":"leaf","extents":[{{"s":"{h}","n":1}}]}}"#)).is_ok());
+        assert!(serde_json::from_str::<ManifestPage>(&format!(r#"{{"kind":"leaf","extents":[{{"s":"{h}","n":1}},{}]}}"#, d(1))).is_err());
+    }
+
+    /// A data extent contributes to the ETag what the shard extent with the same bytes does
+    /// (format §7.7). The value is pinned: a change to it would change every ETag.
+    #[test]
+    fn a_data_extent_has_the_etag_of_the_same_bytes_in_a_shard() {
+        let bytes = Bytes::from_static(b"hello, world\n");
+        let data = ContentDescriptor::Inline { extents: vec![Extent::Data { d: bytes.clone() }] };
+        let shard = ContentDescriptor::Inline { extents: vec![Extent::Shard { s: ShardHash::of(&bytes), n: 13 }] };
+        assert_eq!(data.etag(), shard.etag());
+        // sha256("voidfs-inline\0" || "s" || sha256(bytes) || u64be(13)), computed apart from this code.
+        assert_eq!(data.etag(), "\"6b71c1b094b82c72ac0e6fecdd8f05fe2ef1b7a3299ba3038000581335fe8f01\"");
+        let mixed = |e: Extent| ContentDescriptor::Inline { extents: vec![Extent::Zero { z: 3 }, e, Extent::Shard { s: ShardHash::of(b"x"), n: 1 }] };
+        assert_eq!(mixed(Extent::Data { d: bytes.clone() }).etag(), mixed(Extent::Shard { s: ShardHash::of(&bytes), n: 13 }).etag());
+        assert_ne!(data.etag(), ContentDescriptor::Inline { extents: vec![Extent::Data { d: Bytes::from_static(b"hello, world!") }] }.etag());
+    }
+
+    #[test]
     fn changes_are_externally_tagged() {
         let c = Change::Remove(RemoveChange { oid: ObjectId::root(), recursive: false });
         assert_eq!(serde_json::to_string(&c).unwrap(), r#"{"remove":{"oid":"root"}}"#);
@@ -448,6 +604,9 @@ mod tests {
             commit_guard: CommitGuard::CreateIfAbsent,
         };
         assert!(p.check_readable().is_ok());
+        p.features.incompatible.push(INLINE_DATA.into());
+        assert!(p.check_readable().is_ok());
+        assert!(p.has(INLINE_DATA));
         p.features.incompatible.push("encryption".into());
         assert!(p.check_readable().is_err());
     }

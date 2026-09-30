@@ -47,6 +47,12 @@ impl Sim {
         Pool::open_with(self.store.clone(), 64 << 20, self.clock.clone()).await.unwrap()
     }
 
+    /// A pool that holds small content in descriptors (format §5).
+    async fn inline_pool(&self) -> Arc<Pool> {
+        let features = [voidfs_core::model::INLINE_DATA.to_owned()];
+        Pool::open_creating(self.store.clone(), 64 << 20, self.clock.clone(), CommitGuard::CreateIfAbsent, &features).await.unwrap()
+    }
+
     /// The hashes of every shard and page in the bucket.
     async fn objects(&self) -> HashSet<ShardHash> {
         list_objects(&self.store).await.unwrap().into_iter().map(|o| o.hash).collect()
@@ -67,6 +73,7 @@ impl Sim {
             match e {
                 Extent::Shard { s, .. } => out.extend_from_slice(&self.store.get(&format!("shards/{}", s.object_path())).await.ok()??),
                 Extent::Zero { z } => out.resize(out.len() + z as usize, 0),
+                Extent::Data { d } => out.extend_from_slice(&d),
             }
         }
         Some(out)
@@ -94,6 +101,14 @@ async fn put(pool: &Arc<Pool>, d: &Arc<Drive>, key: &str, data: &[u8]) -> anyhow
     let e = voidfs_core::content::from_bytes(&Bytes::copy_from_slice(data), pool.params);
     pool.write_shards(&e.new_shards).await?;
     let desc = pool.describe(e.extents).await?;
+    let key = key.to_owned();
+    pool.commit(d, move |s| Ok(ops::put(s, &key, desc.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?)).await.map_err(|e| anyhow!("{e:?}"))?;
+    Ok(())
+}
+
+/// Puts `data` at `key`, held in its descriptor.
+async fn put_held(pool: &Arc<Pool>, d: &Arc<Drive>, key: &str, data: &[u8]) -> anyhow::Result<()> {
+    let desc = voidfs_core::model::ContentDescriptor::Inline { extents: voidfs_core::content::inline(data) };
     let key = key.to_owned();
     pool.commit(d, move |s| Ok(ops::put(s, &key, desc.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?)).await.map_err(|e| anyhow!("{e:?}"))?;
     Ok(())
@@ -441,6 +456,113 @@ async fn a_checkpoint_held_up_too_long_leaves_only_garbage() {
     assert!(sim.objects().await.is_disjoint(&orphans));
     assert_eq!(sim.read("a", "counter").await.unwrap(), b"tick 999");
     assert!(sim.has(b"tick 0").await, "old versions stay");
+}
+
+/// Content held in a descriptor references nothing (format §12): a shard of the same bytes is
+/// garbage, and collecting it loses nothing.
+#[tokio::test]
+async fn data_extents_reference_nothing() {
+    let sim = Sim::new();
+    let pool = sim.inline_pool().await;
+    let a = pool.create_drive("a", None).await.unwrap();
+    put_held(&pool, &a, "small", b"held").await.unwrap();
+    assert!(referenced(&pool).await.unwrap().is_empty());
+    pool.write_shards(&[voidfs_core::chunk::Shard::new(Bytes::from_static(b"held"))]).await.unwrap();
+    sim.clock.advance(SECOND);
+    assert_eq!(step(&pool, &offline()).await.unwrap().outcome, Outcome::Deleted { objects: 1, bytes: 4 });
+    assert!(!sim.has(b"held").await);
+    assert_eq!(sim.read("a", "small").await.unwrap(), b"held");
+}
+
+/// A checkpoint stores its data extents as shards, and references them from then on: a run keeps
+/// them, including those of old versions, and those the drive's state took in place of its data
+/// extents that later commits reference again.
+#[tokio::test]
+async fn spilled_shards_are_referenced_by_their_checkpoint() {
+    let sim = Sim::new();
+    let pool = sim.inline_pool().await;
+    let a = pool.create_drive("a", None).await.unwrap();
+    for i in 0..1000 {
+        put_held(&pool, &a, "counter", format!("tick {i}").as_bytes()).await.unwrap();
+    }
+    pool.finish_checkpoints().await;
+    assert!(sim.store.exists(&format!("drives/{}/checkpoints/{:020}.json", a.id, 1000)).await.unwrap());
+    assert!(sim.has(b"tick 0").await && sim.has(b"tick 999").await);
+    // A restore of the first version commits the shard the state took for it.
+    let oid = a.snapshot().lookup(&Key::parse("counter").unwrap()).unwrap();
+    let first = a.snapshot().history(&oid).unwrap()[0].clone();
+    assert!(matches!(first.content, Some(voidfs_core::model::ContentDescriptor::Inline { ref extents }) if matches!(extents[..], [Extent::Shard { .. }])));
+    pool.commit(&a, move |s| Ok(ops::restore(s, "counter", first.version, &Precondition::default(), &Actor::system())?)).await.unwrap();
+    sim.clock.advance(SECOND);
+    assert_eq!(step(&pool, &offline()).await.unwrap().outcome, Outcome::NothingToCollect);
+    assert_eq!(sim.read("a", "counter").await.unwrap(), b"tick 0");
+    assert!(sim.has(b"tick 500").await, "old versions stay");
+}
+
+/// A checkpoint that fails part way has stored the shards it spilled, which nothing references:
+/// a run collects them with its segments, and nothing the drive references, whose content is
+/// still in its log.
+#[tokio::test]
+async fn a_checkpoint_that_fails_leaves_its_spilled_shards_as_garbage() {
+    let sim = Sim::new();
+    let pool = sim.inline_pool().await;
+    let a = pool.create_drive("a", None).await.unwrap();
+    let (release, released) = tokio::sync::watch::channel(false);
+    let held = Arc::new(AtomicUsize::new(0));
+    let h = held.clone();
+    sim.mem.set_hook(Some(Arc::new(move |op, path| {
+        if op != MemOp::Put || !path.starts_with("pages/") {
+            return futures::future::ready(Fault::None).boxed();
+        }
+        h.fetch_add(1, Ordering::SeqCst);
+        let mut released = released.clone();
+        async move {
+            let _ = released.wait_for(|r| *r).await;
+            Fault::None
+        }
+        .boxed()
+    })));
+    for i in 0..1000 {
+        put_held(&pool, &a, "counter", format!("tick {i}").as_bytes()).await.unwrap();
+    }
+    while held.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // The shards were stored before the segments.
+    assert!(sim.has(b"tick 0").await);
+    sim.clock.advance(13 * HOUR);
+    release.send(true).unwrap();
+    pool.finish_checkpoints().await;
+    sim.mem.set_hook(None);
+    assert!(sim.store.list_files(&format!("drives/{}/checkpoints/", a.id), None).await.unwrap().is_empty());
+    let spilled: HashSet<ShardHash> = (0..1000).map(|i| ShardHash::of(format!("tick {i}").as_bytes())).collect();
+    let orphans: HashSet<ShardHash> = sim.objects().await.difference(&referenced(&pool).await.unwrap()).copied().collect();
+    assert!(orphans.is_superset(&spilled) && orphans.len() <= spilled.len() + held.load(Ordering::SeqCst), "{} orphans", orphans.len());
+    let opts = Options::default();
+    sim.clock.advance(2 * DAY);
+    assert!(matches!(step(&pool, &opts).await.unwrap().outcome, Outcome::Proposed { candidates, .. } if candidates == orphans.len()));
+    sim.clock.advance(25 * HOUR);
+    assert!(matches!(step(&pool, &opts).await.unwrap().outcome, Outcome::Deleted { objects, .. } if objects == orphans.len()));
+    assert!(sim.objects().await.is_empty());
+    assert_eq!(sim.read("a", "counter").await.unwrap(), b"tick 999");
+    let s = a.snapshot();
+    assert!(s.history(&s.lookup(&Key::parse("counter").unwrap()).unwrap()).unwrap().iter().all(|r| r.content.as_ref().unwrap().has_data()), "the state kept its data extents");
+}
+
+/// A part record never holds a data extent (format §11): one that does is not understood, so a
+/// run stops rather than guess what it references.
+#[tokio::test]
+async fn a_part_record_with_a_data_extent_stops_a_run() {
+    let sim = Sim::new();
+    let pool = sim.inline_pool().await;
+    let a = pool.create_drive("a", None).await.unwrap();
+    let dir = format!("drives/{}/uploads/0000-aaaa/", a.id);
+    sim.store.put(&format!("{dir}upload.json"), Bytes::from_static(br#"{"key":"k","created":"2026-09-27T00:00:00Z","actor":{"kind":"system","id":"t"},"attrs":{}}"#)).await.unwrap();
+    sim.store.put(&format!("{dir}00001.json"), Bytes::from_static(br#"{"part":1,"size":2,"etag":"\"x\"","extents":[{"d":"aGk="}]}"#)).await.unwrap();
+    let e = referenced(&pool).await.unwrap_err();
+    assert!(format!("{e:#}").contains("part records never do"), "{e:#}");
+    sim.clock.advance(SECOND);
+    assert!(step(&pool, &offline()).await.is_err());
 }
 
 #[tokio::test]

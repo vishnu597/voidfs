@@ -12,9 +12,9 @@ use http::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use voidfs_core::chunk::{Shard, StreamChunker};
-use voidfs_core::content::{self, EditError, Edited};
+use voidfs_core::content::{self, EditError, Edited, Source};
 use voidfs_core::ids::{ObjectId, ShardHash, Timestamp, VersionId};
-use voidfs_core::model::{Attrs, ContentDescriptor, Extent, HistoryRow, Kind, ObjectRecord, Op};
+use voidfs_core::model::{Attrs, ContentDescriptor, Extent, HistoryRow, Kind, MAX_DATA_BYTES, ObjectRecord, Op};
 use voidfs_core::names::Key;
 use voidfs_core::ops::{self, AttrsPatch};
 use voidfs_core::state::DriveState;
@@ -276,12 +276,13 @@ async fn get(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> 
         .map(move |piece| {
             let pool = pool.clone();
             async move {
-                match piece.shard {
-                    Some(h) => {
+                match piece.source {
+                    Source::Shard(h) => {
                         let bytes = pool.shard(&h).await.map_err(std::io::Error::other)?;
                         Ok::<_, std::io::Error>(vec![bytes.slice(piece.offset as usize..(piece.offset + piece.len) as usize)])
                     }
-                    None => {
+                    Source::Data(b) => Ok(vec![b]),
+                    Source::Zeros => {
                         const ZEROS: usize = 1 << 20;
                         let mut left = piece.len as usize;
                         let mut out = Vec::new();
@@ -324,7 +325,10 @@ static HASHERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
 /// Streams a body into shards; returns the content's extents. The body is read and cut while
 /// the shards cut from it so far hash and upload, up to [`INGEST_UPLOADS`] and [`INGEST_BYTES`]
 /// at once.
-async fn ingest(pool: &Pool, mut reader: BodyReader) -> Result<Vec<Extent>, S3Error> {
+///
+/// With `inline`, a body of at most [`MAX_DATA_BYTES`] is held in its descriptor instead, and
+/// uploads nothing (format §5): the body is read that far before anything is cut.
+async fn ingest(pool: &Pool, mut reader: BodyReader, inline: bool) -> Result<Vec<Extent>, S3Error> {
     let started = pool.clock.mono();
     let mut chunker = Some(StreamChunker::new(pool.params));
     // One for each shard cut, in order, filled in once it is uploaded.
@@ -332,6 +336,21 @@ async fn ingest(pool: &Pool, mut reader: BodyReader) -> Result<Vec<Extent>, S3Er
     // Shards cut and not uploading yet, with their places in `extents`, and the uploads in
     // flight, which answer their extents.
     let mut cut: VecDeque<(usize, Bytes)> = VecDeque::new();
+    if inline {
+        let mut head = bytes::BytesMut::new();
+        while head.len() <= MAX_DATA_BYTES {
+            let Some(data) = reader.next().await? else {
+                // Nothing is committed until the whole body matched its signature.
+                reader.finish()?;
+                return Ok(content::inline(&head));
+            };
+            head.extend_from_slice(&data);
+        }
+        for b in chunker.as_mut().expect("still reading").push_unhashed(&head) {
+            cut.push_back((extents.len(), b));
+            extents.push(None);
+        }
+    }
     let mut uploads = futures::stream::FuturesUnordered::new();
     let mut in_flight = 0;
     loop {
@@ -408,7 +427,7 @@ async fn put(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Re
     let attrs = ctx.attrs_for_put()?;
     let pre = ctx.precondition();
     let reader = BodyReader::new(body, ctx, MAX_PUT)?;
-    let extents = ingest(&app.pool, reader).await?;
+    let extents = ingest(&app.pool, reader, app.pool.inline_data).await?;
     let desc = app.pool.describe(extents).await?;
     let actor = ctx.actor();
     let (v, s) = commit(app, d, move |st| Ok(ops::put(st, &key, desc.clone(), attrs.clone(), Op::Put, &pre, &actor)?)).await?;
@@ -598,6 +617,39 @@ fn compute(extents: &[Extent], edit: &Edit, size: Option<u64>, fetched: &HashMap
     Ok(e)
 }
 
+/// Where an edit's result is held (format §5): content of at most [`MAX_DATA_BYTES`] in one data
+/// extent, if the pool has them, and anything else in shards and zeros only. Content of zeros
+/// alone needs neither, and stays as it is.
+async fn held(pool: &Pool, edited: Edited, fetched: &mut HashMap<ShardHash, Bytes>) -> Result<Edited, S3Error> {
+    let size = content::size(&edited.extents);
+    if pool.inline_data && size <= MAX_DATA_BYTES as u64 && edited.extents.iter().any(|e| !matches!(e, Extent::Zero { .. })) {
+        for s in &edited.new_shards {
+            fetched.insert(s.hash, s.bytes.clone());
+        }
+        let bytes = loop {
+            match content::materialize(&edited.extents, &mut |h: &ShardHash| fetched.get(h).cloned()) {
+                Ok(b) => break b,
+                Err(EditError::MissingShard(h)) => {
+                    fetched.insert(h, pool.shard(&h).await?);
+                }
+                Err(e) => return Err(S3Error::internal(e.to_string())),
+            }
+        };
+        return Ok(Edited { extents: content::inline(&bytes), new_shards: Vec::new() });
+    }
+    if voidfs_core::model::data_len(&edited.extents) == 0 {
+        return Ok(edited);
+    }
+    let spilled = content::spill(&edited.extents);
+    let mut new_shards = edited.new_shards;
+    for s in spilled.new_shards {
+        if !new_shards.iter().any(|n| n.hash == s.hash) {
+            new_shards.push(s);
+        }
+    }
+    Ok(Edited { extents: spilled.extents, new_shards })
+}
+
 fn edit_range(edit: &Edit, size: u64) -> Vec<(u64, u64)> {
     match edit {
         Edit::Write { offset, data } => vec![((*offset).min(size), offset + data.len() as u64)],
@@ -646,6 +698,7 @@ async fn run_edit(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, edit: Edit, size: O
                 Err(e) => return Err(S3Error::invalid(e.to_string())),
             }
         };
+        let edited = held(&app.pool, edited, &mut fetched).await?;
         app.pool.write_shards(&edited.new_shards).await?;
         let desc = app.pool.describe(edited.extents).await?;
         let (key, patch, pre, actor) = (key.clone(), patch.clone(), pre.clone(), actor.clone());
@@ -900,9 +953,13 @@ async fn upload_part(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result
         let ss = sd.snapshot();
         let oid = ss.lookup(&parse_key(k)?).ok_or_else(S3Error::no_key)?;
         let r = ss.record(&oid).ok_or_else(S3Error::no_key)?;
-        app.pool.extents(r.content.as_ref().unwrap_or(&ContentDescriptor::empty())).await?
+        let extents = app.pool.extents(r.content.as_ref().unwrap_or(&ContentDescriptor::empty())).await?;
+        // A part holds no data extents (format §11): a small source's bytes go to a shard.
+        let spilled = content::spill(&extents);
+        app.pool.write_shards(&spilled.new_shards).await?;
+        spilled.extents
     } else {
-        ingest(&app.pool, BodyReader::new(body, ctx, MAX_PUT)?).await?
+        ingest(&app.pool, BodyReader::new(body, ctx, MAX_PUT)?, false).await?
     };
     let size = content::size(&extents);
     let etag = ContentDescriptor::Inline { extents: extents.clone() }.etag();
@@ -921,7 +978,11 @@ async fn parts_of(app: &App, dir: &str) -> Result<Vec<PartRecord>, S3Error> {
             continue;
         }
         if let Some(b) = app.pool.store.get(&format!("{dir}{name}")).await? {
-            out.push(serde_json::from_slice::<PartRecord>(&b).map_err(anyhow::Error::from)?);
+            let p = serde_json::from_slice::<PartRecord>(&b).map_err(anyhow::Error::from)?;
+            if voidfs_core::model::data_len(&p.extents) > 0 {
+                return Err(S3Error::internal(format!("{dir}{name} holds a data extent, which part records never do (format §11)")));
+            }
+            out.push(p);
         }
     }
     out.sort_by_key(|p| p.part);
@@ -956,7 +1017,7 @@ async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) 
         if i + 1 < wanted.len() && p.size < MIN_PART {
             return Err(S3Error::new(400, "EntityTooSmall", format!("part {n} is smaller than 5 MiB")));
         }
-        extents.extend(p.extents.iter().copied());
+        extents.extend(p.extents.iter().cloned());
     }
     let desc = app.pool.describe(content::normalize(extents)).await?;
     let pre = ctx.precondition();
@@ -1116,7 +1177,7 @@ mod tests {
         let (release, started) = hold(&mem, |_| false);
         let ingesting = tokio::spawn({
             let pool = pool.clone();
-            async move { ingest(&pool, reader).await }
+            async move { ingest(&pool, reader, true).await }
         });
         // Half the body, which cuts far more shards than the window holds.
         for piece in data[..100_000].chunks(4096) {
@@ -1160,7 +1221,7 @@ mod tests {
             tx.unbounded_send(Ok(Bytes::copy_from_slice(piece))).unwrap();
         }
         drop(tx);
-        let extents = ingest(&pool, reader).await.unwrap();
+        let extents = ingest(&pool, reader, true).await.unwrap();
         let whole = voidfs_core::content::from_bytes(&data, pool.params);
         assert!(whole.extents.len() > INGEST_UPLOADS, "{} shards", whole.extents.len());
         assert_eq!(extents, content::normalize(whole.extents));
@@ -1176,13 +1237,245 @@ mod tests {
         let (release, started) = hold(&mem, |n| n == 3);
         tx.unbounded_send(Ok(Bytes::from(data))).unwrap();
         drop(tx);
-        let failed = tokio::time::timeout(Duration::from_secs(10), ingest(&pool, reader)).await.expect("the failure does not wait for the rest");
+        let failed = tokio::time::timeout(Duration::from_secs(10), ingest(&pool, reader, true)).await.expect("the failure does not wait for the rest");
         assert_eq!(failed.unwrap_err().status, 500);
         let n = started.load(Ordering::SeqCst);
         assert!((3..=INGEST_UPLOADS).contains(&n), "{n} uploads started");
         release.send(true).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(pool.store.list_recursive("shards/").await.unwrap().is_empty(), "none of the dropped uploads went on");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Content held in descriptors (format §5)
+
+    /// An app over `mem` whose pool has the default chunking and lists `features`, with a drive
+    /// `d`.
+    async fn app_with(mem: &Arc<MemStore>, features: &[&str]) -> (Arc<App>, Arc<Drive>) {
+        let features: Vec<String> = features.iter().map(|f| (*f).to_owned()).collect();
+        let store = Store::mem(mem.clone());
+        let pool = Pool::open_creating(store, 1 << 20, crate::clock::Clock::System, CommitGuard::CreateIfAbsent, &features).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        (Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new() }), d)
+    }
+
+    /// Sends a request for `key` of drive `d` as the admin key, with `payload` as what its
+    /// signature says of the body.
+    async fn send_as(app: &Arc<App>, method: Method, key: &str, query: &str, headers: &[(&str, &str)], body: &[u8], payload: Payload) -> Result<Response, S3Error> {
+        let key_info = KeyInfo { id: "k".into(), secret: "s".into(), scope: crate::sigv4::Scope::Admin, drives: None };
+        let auth = Authenticated { key: key_info, payload, signing_key: [0; 32], scope: String::new(), amz_date: String::new(), seed_signature: String::new() };
+        let mut map = http::HeaderMap::new();
+        for (k, v) in headers {
+            map.insert(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        let ctx = Ctx { method, bucket: Some("d".into()), key: Some(key.into()), virtual_host: false, query: super::super::util::Query::parse(query), headers: map, auth };
+        dispatch(app, &ctx, Body::from(body.to_vec())).await
+    }
+
+    async fn send(app: &Arc<App>, method: Method, key: &str, query: &str, headers: &[(&str, &str)], body: &[u8]) -> Response {
+        send_as(app, method, key, query, headers, body, Payload::Unsigned).await.unwrap_or_else(|e| panic!("{} {}", e.code, e.message))
+    }
+
+    async fn read_back(app: &Arc<App>, key: &str) -> Vec<u8> {
+        let r = send(app, Method::GET, key, "", &[], b"").await;
+        axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()
+    }
+
+    fn content_of(d: &Drive, key: &str) -> Vec<Extent> {
+        let s = d.snapshot();
+        match s.record(&s.lookup(&Key::parse(key).unwrap()).unwrap()).unwrap().content.clone().unwrap() {
+            ContentDescriptor::Inline { extents } => extents,
+            t => panic!("{t:?}"),
+        }
+    }
+
+    /// Records the writes to `mem` from now on, as `shard`, `log` or the path.
+    fn writes(mem: &MemStore) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if matches!(op, MemOp::Put | MemOp::PutNew) {
+                let what = if path.starts_with("shards/") { "shard".to_owned() } else if path.contains("/log/") { "log".to_owned() } else { path.to_owned() };
+                log.lock().unwrap().push(what);
+            }
+            futures::future::ready(Fault::None).boxed()
+        })));
+        seen
+    }
+
+    fn taken(w: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        std::mem::take(&mut *w.lock().unwrap())
+    }
+
+    /// With `inline-data`, a put of at most 4,096 bytes writes one object to the bucket, the log
+    /// entry, and its ETag is the one the same bytes have in a shard. Past that, and without the
+    /// feature, the shard goes first.
+    #[tokio::test]
+    async fn a_small_put_is_one_request_to_the_bucket() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[voidfs_core::model::INLINE_DATA]).await;
+        let w = writes(&mem);
+        for n in [0, 1, 4095, 4096, 4097] {
+            let data = random_bytes(n as u64, n);
+            let key = format!("k{n}");
+            let r = send(&app, Method::PUT, &key, "", &[], &data).await;
+            let in_shards = content::from_bytes(&Bytes::from(data.clone()), app.pool.params);
+            assert_eq!(r.headers()["etag"], ContentDescriptor::Inline { extents: in_shards.extents.clone() }.etag(), "{n} bytes");
+            if n <= MAX_DATA_BYTES {
+                assert_eq!(taken(&w), ["log"], "{n} bytes");
+                assert_eq!(content_of(&d, &key), content::inline(&data));
+            } else {
+                assert_eq!(taken(&w), ["shard", "log"], "{n} bytes");
+                assert_eq!(content_of(&d, &key), in_shards.extents);
+            }
+            assert_eq!(read_back(&app, &key).await, data);
+        }
+        // Held apart from the request's buffers.
+        let Extent::Data { d: held } = &content_of(&d, "k4096")[0] else { panic!() };
+        assert_eq!(held.len(), 4096);
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let w = writes(&mem);
+        send(&app, Method::PUT, "k", "", &[], &random_bytes(1, 4096)).await;
+        assert_eq!(taken(&w), ["shard", "log"], "without the feature");
+        assert!(matches!(content_of(&d, "k")[..], [Extent::Shard { .. }]));
+    }
+
+    /// A small body is checked against its signature before anything commits it.
+    #[tokio::test]
+    async fn a_small_put_that_does_not_match_its_signature_commits_nothing() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[voidfs_core::model::INLINE_DATA]).await;
+        let w = writes(&mem);
+        let e = send_as(&app, Method::PUT, "k", "", &[], b"small", Payload::Sha256([0; 32])).await.unwrap_err();
+        assert_eq!(e.code, "XAmzContentSHA256Mismatch");
+        assert!(taken(&w).is_empty());
+        assert_eq!(d.snapshot().seq(), 0);
+        let good: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(b"small").into();
+        send_as(&app, Method::PUT, "k", "", &[], b"small", Payload::Sha256(good)).await.unwrap();
+        assert_eq!(taken(&w), ["log"]);
+    }
+
+    /// An edit whose result is at most 4,096 bytes is held in the descriptor, with no shard
+    /// uploaded; one that grows past it gets shards; content of zeros alone stays zeros.
+    #[tokio::test]
+    async fn edits_hold_small_results_in_the_descriptor() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[voidfs_core::model::INLINE_DATA]).await;
+        let mut want = random_bytes(3, 4096);
+        send(&app, Method::PUT, "f", "", &[], &want).await;
+        let w = writes(&mem);
+        let data = |d: &Drive| content_of(d, "f").iter().any(|e| matches!(e, Extent::Data { .. }));
+        // Over the limit.
+        send(&app, Method::PUT, "f", "x-voidfs-write", &[("x-voidfs-offset", "4094")], b"WXYZ").await;
+        want.truncate(4094);
+        want.extend_from_slice(b"WXYZ");
+        assert_eq!(taken(&w), ["shard", "log"]);
+        assert!(!data(&d));
+        // Back under it: the shard is read, and nothing but the log entry is written.
+        app.pool.forget(&content_of(&d, "f")[0].shard().unwrap());
+        send(&app, Method::PUT, "f", "x-voidfs-write", &[("x-voidfs-offset", "0"), ("x-voidfs-size", "4000")], b"").await;
+        want.truncate(4000);
+        assert_eq!(taken(&w), ["log"]);
+        assert_eq!(content_of(&d, "f"), content::inline(&want));
+        // A splice over it, and a patch back under it.
+        send(&app, Method::PUT, "f", "x-voidfs-splice", &[("x-voidfs-offset", "100")], &[b'a'; 200]).await;
+        want.splice(100..100, [b'a'; 200]);
+        assert_eq!(taken(&w), ["shard", "log"]);
+        let patch = voidfs_core::patch::encode(&[voidfs_core::patch::Edit { offset: 10, data: b"patched" }]);
+        send(&app, Method::POST, "f", "x-voidfs-patch", &[("x-voidfs-size", "3900")], &patch).await;
+        want[10..17].copy_from_slice(b"patched");
+        want.truncate(3900);
+        assert_eq!(taken(&w), ["log"]);
+        assert!(data(&d));
+        // A write past the end leaves zeros in it, still under.
+        send(&app, Method::PUT, "f", "x-voidfs-write", &[("x-voidfs-offset", "4000")], b"Q").await;
+        want.resize(4000, 0);
+        want.push(b'Q');
+        assert_eq!(taken(&w), ["log"]);
+        assert_eq!(content_of(&d, "f"), content::inline(&want));
+        assert_eq!(read_back(&app, "f").await, want);
+        // Zeros alone are stored as zeros.
+        send(&app, Method::PUT, "z", "x-voidfs-write", &[("x-voidfs-offset", "0"), ("x-voidfs-size", "4096")], b"").await;
+        assert_eq!(content_of(&d, "z"), [Extent::Zero { z: 4096 }]);
+        assert_eq!(taken(&w), ["log"]);
+        // A write far past the end of a small file leaves its data extent untouched by the edit,
+        // and over the limit: the extent goes to a shard of its own.
+        send(&app, Method::PUT, "g", "", &[], &[7; 100]).await;
+        taken(&w);
+        send(&app, Method::PUT, "g", "x-voidfs-write", &[("x-voidfs-offset", "5000")], b"!").await;
+        assert_eq!(taken(&w), ["shard", "shard", "log"]);
+        assert!(matches!(content_of(&d, "g")[..], [Extent::Shard { n: 100, .. }, Extent::Zero { z: 4900 }, Extent::Shard { n: 1, .. }]));
+        assert_eq!(read_back(&app, "g").await, [&[7; 100][..], &[0; 4900], b"!"].concat());
+    }
+
+    /// A server of a pool without the feature never holds content in a descriptor, even where
+    /// the content it edits has some (the feature was added after it started).
+    #[tokio::test]
+    async fn without_the_feature_edits_hold_nothing_in_the_descriptor() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let small = random_bytes(4, 100);
+        let (key, desc) = ("f".to_owned(), ContentDescriptor::Inline { extents: content::inline(&small) });
+        app.pool
+            .commit(&d, move |st| Ok(ops::put(st, &key, desc.clone(), Attrs::default(), Op::Put, &Default::default(), &voidfs_core::model::Actor::system())?))
+            .await
+            .unwrap();
+        let w = writes(&mem);
+        // Past a gap, so that the edit itself leaves the data extent as it is.
+        send(&app, Method::PUT, "f", "x-voidfs-write", &[("x-voidfs-offset", "200")], b"!").await;
+        assert_eq!(taken(&w), ["shard", "shard", "log"]);
+        assert!(matches!(content_of(&d, "f")[..], [Extent::Shard { n: 100, .. }, Extent::Zero { z: 100 }, Extent::Shard { n: 1, .. }]));
+        assert_eq!(read_back(&app, "f").await, [&small[..], &[0; 100], b"!"].concat());
+    }
+
+    /// A copy keeps the descriptor, data extents and all; a multipart part copied from a small
+    /// file holds a shard instead (format §11), and so does the completed upload.
+    #[tokio::test]
+    async fn copies_keep_the_descriptor_and_parts_never_hold_data() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[voidfs_core::model::INLINE_DATA]).await;
+        let small = random_bytes(5, 3000);
+        let put = send(&app, Method::PUT, "src", "", &[], &small).await;
+        let w = writes(&mem);
+        send(&app, Method::PUT, "dst", "", &[("x-amz-copy-source", "/d/src")], b"").await;
+        assert_eq!(taken(&w), ["log"]);
+        assert_eq!(content_of(&d, "dst"), content_of(&d, "src"));
+        let r = send(&app, Method::HEAD, "dst", "", &[], b"").await;
+        assert_eq!(r.headers()["etag"], put.headers()["etag"]);
+        let created = send(&app, Method::POST, "mp", "uploads", &[], b"").await;
+        let xml = String::from_utf8(axum::body::to_bytes(created.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        let id = xml.split("<UploadId>").nth(1).unwrap().split("</UploadId>").next().unwrap().to_owned();
+        taken(&w);
+        let part = send(&app, Method::PUT, "mp", &format!("partNumber=1&uploadId={id}"), &[("x-amz-copy-source", "/d/src")], b"").await;
+        let body = String::from_utf8(axum::body::to_bytes(part.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        let etag = body.split("<ETag>").nth(1).unwrap().split("</ETag>").next().unwrap().replace("&quot;", "\"");
+        let written = taken(&w);
+        assert_eq!(written[0], "shard", "{written:?}");
+        let record = mem.peek(&format!("drives/{}/uploads/{id}/00001.json", d.id)).unwrap();
+        let record: PartRecord = serde_json::from_slice(&record).unwrap();
+        assert_eq!(record.extents, [Extent::Shard { s: ShardHash::of(&small), n: 3000 }]);
+        let done = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>");
+        send(&app, Method::POST, "mp", &format!("uploadId={id}"), &[], done.as_bytes()).await;
+        assert_eq!(content_of(&d, "mp"), record.extents);
+        assert_eq!(read_back(&app, "mp").await, small);
+    }
+
+    /// A part record that holds a data extent is not one this server wrote (format §11): the
+    /// upload does not complete from it.
+    #[tokio::test]
+    async fn a_part_record_with_a_data_extent_is_refused() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[voidfs_core::model::INLINE_DATA]).await;
+        let created = send(&app, Method::POST, "mp", "uploads", &[], b"").await;
+        let xml = String::from_utf8(axum::body::to_bytes(created.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        let id = xml.split("<UploadId>").nth(1).unwrap().split("</UploadId>").next().unwrap().to_owned();
+        let rec = PartRecord { part: 1, size: 2, etag: "\"x\"".into(), extents: content::inline(b"hi") };
+        app.pool.store.put(&format!("drives/{}/uploads/{id}/00001.json", d.id), Bytes::from(serde_json::to_vec(&rec).unwrap())).await.unwrap();
+        let done = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part></CompleteMultipartUpload>";
+        let e = send_as(&app, Method::POST, "mp", &format!("uploadId={id}"), &[], done.as_bytes(), Payload::Unsigned).await.unwrap_err();
+        assert!(e.message.contains("part records never do"), "{}", e.message);
+        assert!(d.snapshot().lookup(&Key::parse("mp").unwrap()).is_none());
     }
 
     /// A body that does not match its signature fails after it is uploaded, before anything
@@ -1194,6 +1487,6 @@ mod tests {
         let (reader, tx) = body(Payload::Sha256([0; 32]));
         tx.unbounded_send(Ok(Bytes::from(random_bytes(9, 10_000)))).unwrap();
         drop(tx);
-        assert_eq!(ingest(&pool, reader).await.unwrap_err().code, "XAmzContentSHA256Mismatch");
+        assert_eq!(ingest(&pool, reader, true).await.unwrap_err().code, "XAmzContentSHA256Mismatch");
     }
 }

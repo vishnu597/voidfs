@@ -58,6 +58,13 @@ struct Args {
     /// and an existing pool opens only with its own.
     #[arg(long, env = "VOIDFS_COMMIT_GUARD", value_enum, default_value = "create-if-absent", global = true)]
     commit_guard: Guard,
+    /// A feature of the on-bucket format that a pool this server creates uses from the start
+    /// (repeatable): `inline-data` holds files of up to 4 KiB in the log, so that a small write
+    /// takes one request to the bucket instead of two. Servers and readers that don't implement
+    /// a feature refuse a pool that has it. An existing pool keeps its features; add one with
+    /// `voidfs-server pool enable`.
+    #[arg(long = "new-pool-feature", env = "VOIDFS_NEW_POOL_FEATURES", value_delimiter = ',', global = true)]
+    new_pool_features: Vec<String>,
     /// Admin access key id clients sign with. Generated and printed if not given.
     #[arg(long, env = "VOIDFS_ACCESS_KEY_ID")]
     access_key_id: Option<String>,
@@ -89,6 +96,9 @@ enum Command {
     /// at least the grace period later, deletes those still unreferenced. Drives soft-deleted
     /// longer than their window are hard-deleted, and stale multipart uploads aborted, first.
     Gc(GcArgs),
+    /// Change the pool in the store.
+    #[command(subcommand)]
+    Pool(PoolCommand),
     /// Check what the bucket supports, and report whether a server could write the pool there.
     ///
     /// Checks create-if-absent writes, lifecycle rules, versioning, object lock, CORS, presigned
@@ -96,6 +106,20 @@ enum Command {
     /// creates voidfs.json again, must be refused by the bucket. Exits with status 1 if a server
     /// started with the same options would refuse to open the pool.
     Probe,
+}
+
+#[derive(Subcommand)]
+enum PoolCommand {
+    /// Add a feature of the on-bucket format to the pool (format §3.1).
+    ///
+    /// Servers and readers that don't implement the feature refuse the pool from then on, and
+    /// servers use it once they restart, since they read the pool's descriptor when they start.
+    /// So run this only once every server that writes the pool implements it, then restart them.
+    /// A feature cannot be removed.
+    Enable {
+        /// The feature: `inline-data` holds files of up to 4 KiB in the log (RFC 0003).
+        feature: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -178,7 +202,9 @@ async fn open_pool(args: &Args) -> anyhow::Result<Arc<pool::Pool>> {
     if let Some(b) = &bucket {
         probe::check_bucket(b).await.context("checking the bucket")?;
     }
-    pool::Pool::open_as(store, args.cache_mib * 1024 * 1024, clock::Clock::System, args.commit_guard.into()).await.context("opening the pool")
+    // An empty value, as from VOIDFS_NEW_POOL_FEATURES= in the environment, names none.
+    let features: Vec<String> = args.new_pool_features.iter().filter(|f| !f.is_empty()).cloned().collect();
+    pool::Pool::open_creating(store, args.cache_mib * 1024 * 1024, clock::Clock::System, args.commit_guard.into(), &features).await.context("opening the pool")
 }
 
 #[tokio::main]
@@ -191,6 +217,15 @@ async fn main() -> anyhow::Result<()> {
             let pool = open_pool(&args).await?;
             let report = gc::step(&pool, &opts).await?;
             println!("{report}");
+            return Ok(());
+        }
+        Some(Command::Pool(PoolCommand::Enable { feature })) => {
+            let (store, _) = open_store(&args)?;
+            if pool::enable_feature(&store, feature).await? {
+                println!("The pool lists {feature} now. Restart its servers to use it: they read voidfs.json when they start.");
+            } else {
+                println!("The pool already lists {feature}.");
+            }
             return Ok(());
         }
         Some(Command::Probe) => {
@@ -240,7 +275,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pool = open_pool(&args).await?;
-    tracing::info!("pool {} open with {} drives, commit guard {}", pool.desc.pool_id, pool.list_drives().len(), probe::guard_name(pool.desc.commit_guard));
+    tracing::info!(
+        "pool {} open with {} drives, commit guard {}, features {:?}",
+        pool.desc.pool_id,
+        pool.list_drives().len(),
+        probe::guard_name(pool.desc.commit_guard),
+        pool.desc.features.incompatible
+    );
     if let Some(every) = args.gc_interval {
         tracing::info!("collecting garbage every {}s", every.as_secs());
         tokio::spawn(gc::run_periodically(pool.clone(), gc::Options::default(), every));
@@ -331,6 +372,17 @@ mod tests {
         assert!(Args::try_parse_from(["voidfs-server", "--commit-guard", "none"]).is_err());
         let a = Args::try_parse_from(["voidfs-server", "gc", "--commit-guard", "external"]).unwrap();
         assert_eq!(a.commit_guard, Guard::External);
+    }
+
+    #[test]
+    fn pool_features_parse() {
+        assert!(Args::try_parse_from(["voidfs-server"]).unwrap().new_pool_features.is_empty());
+        let a = Args::try_parse_from(["voidfs-server", "--new-pool-feature", "inline-data"]).unwrap();
+        assert_eq!(a.new_pool_features, ["inline-data"]);
+        let a = Args::try_parse_from(["voidfs-server", "pool", "enable", "inline-data", "--store", "fs:/tmp/p"]).unwrap();
+        assert!(matches!(a.command, Some(Command::Pool(PoolCommand::Enable { ref feature })) if feature == "inline-data"));
+        assert_eq!(a.store, "fs:/tmp/p");
+        assert!(Args::try_parse_from(["voidfs-server", "pool", "enable"]).is_err());
     }
 
     #[test]

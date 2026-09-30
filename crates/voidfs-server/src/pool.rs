@@ -14,10 +14,11 @@ use voidfs_core::chunk::{Params, Shard};
 use voidfs_core::ids::{DriveId, ObjectId, ShardHash, Timestamp, VersionId};
 use voidfs_core::manifest::{self, Page};
 use voidfs_core::model::{
-    Chunking, Commit, CommitGuard, ContentDescriptor, DriveDescriptor, Extent, Features, ForkOf, Kind, Op, PoolDescriptor, Txn,
+    Chunking, Commit, CommitGuard, ContentDescriptor, DriveDescriptor, Extent, Features, ForkOf, INLINE_DATA, KNOWN_INCOMPATIBLE_FEATURES, Kind, Op, PoolDescriptor,
+    Txn,
 };
 use voidfs_core::ops::OpError;
-use voidfs_core::state::{DriveState, Rows};
+use voidfs_core::state::{DriveState, Rows, Spilled};
 
 use crate::clock::Clock;
 use crate::gc::guard::{self, Guard};
@@ -300,10 +301,14 @@ pub struct Drive {
     commit_lock: tokio::sync::Mutex<Cadence>,
     /// The drive's last checkpoint, whose pages the next one lists without storing them again.
     /// Held while a checkpoint is written, so that there is one at a time. Whatever takes both
-    /// locks takes the commit lock first.
+    /// locks takes this one first: a checkpoint takes the commit lock at its end, to put what it
+    /// spilled into the state (format §8.2).
     checkpoint: Arc<tokio::sync::Mutex<Option<Checkpointed>>>,
     /// Mutations waiting for the next commit, in the order they arrived.
     queue: std::sync::Mutex<VecDeque<Waiting>>,
+    /// Whether a task is draining `queue`: there is at most one. Set and cleared only while
+    /// `queue` is locked.
+    draining: std::sync::atomic::AtomicBool,
     feed: RwLock<VecDeque<FeedBatch>>,
     /// The oldest seq the feed can still report changes after.
     feed_floor: RwLock<u64>,
@@ -346,6 +351,7 @@ impl Drive {
             commit_lock: tokio::sync::Mutex::new(cadence),
             checkpoint: Arc::new(tokio::sync::Mutex::new(last)),
             queue: std::sync::Mutex::new(VecDeque::new()),
+            draining: std::sync::atomic::AtomicBool::new(false),
             feed: RwLock::new(VecDeque::new()),
             feed_floor: RwLock::new(floor),
             notify,
@@ -397,6 +403,9 @@ pub struct Pool {
     pub clock: Clock,
     /// Which shards and pages a commit may reference without uploading them (format §12.4).
     pub guard: Guard,
+    /// Whether the pool lists `inline-data`, so that content may be held in data extents
+    /// (format §3.1, §5). Read when the pool opens, as the rest of `voidfs.json` is.
+    pub inline_data: bool,
     shards: moka::sync::Cache<ShardHash, Bytes>,
     pages: moka::sync::Cache<ShardHash, Bytes>,
     drives: RwLock<HashMap<DriveId, Arc<Drive>>>,
@@ -434,6 +443,22 @@ impl Pool {
     /// store must first be seen to honour it (format §7.2): a pool it has just created in a store
     /// that does not is removed again.
     pub async fn open_as(store: crate::store::Store, cache_bytes: u64, clock: Clock, guard: CommitGuard) -> anyhow::Result<Arc<Pool>> {
+        Pool::open_creating(store, cache_bytes, clock, guard, &[]).await
+    }
+
+    /// [`Pool::open_as`], creating a new pool with `features` listed in `features.incompatible`
+    /// (format §3.1). An existing pool keeps its own: a feature is added to one with
+    /// [`enable_feature`], once every server that writes it implements the feature.
+    pub async fn open_creating(store: crate::store::Store, cache_bytes: u64, clock: Clock, guard: CommitGuard, features: &[String]) -> anyhow::Result<Arc<Pool>> {
+        if let Some(f) = features.iter().find(|f| !KNOWN_INCOMPATIBLE_FEATURES.contains(&f.as_str())) {
+            bail!("this server does not implement the feature {f:?}; it knows {KNOWN_INCOMPATIBLE_FEATURES:?}");
+        }
+        let mut incompatible: Vec<String> = Vec::new();
+        for f in features {
+            if !incompatible.contains(f) {
+                incompatible.push(f.clone());
+            }
+        }
         let (desc, bytes, created) = match store.get(probe::DESCRIPTOR).await? {
             Some(b) => (serde_json::from_slice::<PoolDescriptor>(&b).context("reading voidfs.json")?, b, false),
             None => {
@@ -441,7 +466,7 @@ impl Pool {
                     format: voidfs_core::FORMAT_VERSION,
                     pool_id: format!("p-{}", uuid::Uuid::new_v4()),
                     created: clock.now(),
-                    features: Features { compatible: vec![], incompatible: vec![] },
+                    features: Features { compatible: vec![], incompatible },
                     chunking: Chunking::default(),
                     hash: "sha256".into(),
                     commit_guard: guard,
@@ -456,12 +481,17 @@ impl Pool {
                     }
                 };
                 if !created {
-                    return Box::pin(Pool::open_as(store, cache_bytes, clock, guard)).await;
+                    return Box::pin(Pool::open_creating(store, cache_bytes, clock, guard, features)).await;
                 }
                 (d, b, true)
             }
         };
         desc.check_readable().map_err(|e| anyhow!(e))?;
+        for f in features.iter().filter(|f| !desc.has(f)) {
+            tracing::warn!(
+                "the pool does not list {f}, and it is not new, so --new-pool-feature does not add it. Once every server that writes the pool implements {f}, add it with `voidfs-server pool enable {f}`, then restart them"
+            );
+        }
         if let Some(why) = probe::guard_mismatch(desc.commit_guard, guard) {
             bail!("{why}");
         }
@@ -496,6 +526,7 @@ impl Pool {
         };
         let pool = Arc::new(Pool {
             store,
+            inline_data: desc.has(INLINE_DATA),
             desc,
             params,
             clock,
@@ -684,17 +715,21 @@ impl Pool {
         Ok((state, Checkpointed { index: path.to_owned(), pages: t.pages(), seen }))
     }
 
-    /// Writes a checkpoint of `state` (format §8) and returns it. `state` was the drive's own at
-    /// `seen`, which vouches for the content its rows reference (format §12.4, option 1). Pages
-    /// that `reuse` lists are not stored again; the others go through the garbage-collection
-    /// guard like any page.
-    async fn write_checkpoint(&self, id: &DriveId, state: Arc<DriveState>, seen: Duration, reuse: Option<&Checkpointed>) -> anyhow::Result<Checkpointed> {
+    /// Writes a checkpoint of `state` (format §8) and returns it, with what it spilled. `state`
+    /// was the drive's own at `seen`, which vouches for the content its rows reference (format
+    /// §12.4, option 1). Pages that `reuse` lists are not stored again; the others go through the
+    /// garbage-collection guard like any page.
+    ///
+    /// A checkpoint holds no data extents (format §8.2): each is stored as a shard, through the
+    /// guard like any shard, and its row lists the shard instead.
+    async fn write_checkpoint(&self, id: &DriveId, state: Arc<DriveState>, seen: Duration, reuse: Option<&Checkpointed>) -> anyhow::Result<(Checkpointed, Spilled)> {
         let seq = state.seq();
         let time = state.time();
         // Copying the rows out, encoding and hashing them takes hundreds of milliseconds of CPU
         // for a drive of 600,000 rows: not on an async worker.
-        let (tables, pages, stats) = tokio::task::spawn_blocking(move || {
-            let rows = state.rows();
+        let (tables, pages, stats, spilled) = tokio::task::spawn_blocking(move || {
+            let mut rows = state.rows();
+            let spilled = rows.spill();
             let mut pages = Vec::new();
             let tables = CheckpointTables {
                 entries: segments("entries", &rows.entries, |e| format!("{}/{}{}", e.parent, e.name, if e.kind == Kind::Folder { "/" } else { "" }), &mut pages),
@@ -702,11 +737,13 @@ impl Pool {
                 history: segments("history", &rows.history, |h| format!("{}@{:020}.{}", h.oid, h.version.seq, h.version.idx), &mut pages),
                 removed: segments("removed", &rows.removed, |r| format!("{}@{}", r.key, r.oid), &mut pages),
             };
-            (tables, pages, serde_json::json!({ "objects": rows.objects.len(), "bytes": state.live_bytes() }))
+            (tables, pages, serde_json::json!({ "objects": rows.objects.len(), "bytes": state.live_bytes() }), spilled)
         })
         .await?;
         let listed = tables.pages();
         let (reused, new): (Vec<Page>, Vec<Page>) = pages.into_iter().partition(|p| reuse.is_some_and(|r| r.pages.contains(&p.hash)));
+        self.write_shards(&spilled.shards).await?;
+        self.metrics.checkpoint_spilled.inc_by(spilled.shards.len() as u64);
         self.write_pages(&new).await?;
         let now = self.clock.mono();
         if now.saturating_sub(seen) > guard::COMMIT_WITHIN {
@@ -723,7 +760,7 @@ impl Pool {
         self.store.put(&name, Bytes::from(serde_json::to_vec(&idx)?)).await?;
         let seen = self.clock.mono();
         self.store.put(&format!("drives/{id}/_last_checkpoint"), Bytes::from(format!("{{\"seq\":{seq}}}"))).await?;
-        Ok(Checkpointed { index: name, pages: listed, seen })
+        Ok((Checkpointed { index: name, pages: listed, seen }, spilled))
     }
 
     /// Makes `last` fit for a new checkpoint to list its pages without storing them: reads its
@@ -742,23 +779,44 @@ impl Pool {
     }
 
     /// Checkpoints `state`, which was the drive's newest at `seen`, after `last`, and makes it
-    /// the last. A failure is logged, and the next attempt waits a whole interval.
-    async fn checkpoint(&self, id: &DriveId, state: Arc<DriveState>, seen: Duration, last: &mut Option<Checkpointed>) {
+    /// the last. A failure is logged, and the next attempt waits a whole interval. The caller
+    /// holds the drive's checkpoint lock, which `last` is.
+    ///
+    /// Then puts what the checkpoint spilled into the drive's state, so that the state holds no
+    /// more bytes in data extents than the log since this checkpoint has.
+    async fn checkpoint(&self, d: &Drive, state: Arc<DriveState>, seen: Duration, last: &mut Option<Checkpointed>) {
         let started = Instant::now();
         let seq = state.seq();
         self.renew(last).await;
-        let written = self.write_checkpoint(id, state, seen, last.as_ref()).await;
+        let written = self.write_checkpoint(&d.id, state, seen, last.as_ref()).await;
         self.metrics.checkpoint_write.observe(started.elapsed().as_secs_f64());
         match written {
-            Ok(c) => {
+            Ok((c, spilled)) => {
                 self.metrics.checkpoints_written.inc();
                 *last = Some(c);
+                self.swap_in(d, &spilled).await;
             }
             Err(e) => {
                 self.metrics.checkpoints_failed.inc();
-                tracing::warn!("checkpoint of {id} at {seq} failed: {e:#}");
+                tracing::warn!("checkpoint of {} at {seq} failed: {e:#}", d.id);
             }
         }
+    }
+
+    /// Puts the descriptors a checkpoint of `d` spilled into its state in place of those they
+    /// replaced, wherever the state still has them (format §8.2). The checkpoint references their
+    /// shards from now on, which is what a later commit or checkpoint relies on to reference them
+    /// (format §12.4, option 1).
+    async fn swap_in(&self, d: &Drive, spilled: &Spilled) {
+        if spilled.objects.is_empty() && spilled.versions.is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        let _committing = d.commit_lock.lock().await;
+        let waited = started.elapsed();
+        let next = d.snapshot().with_spilled(spilled);
+        *d.state.write().unwrap() = Arc::new(next);
+        self.metrics.checkpoint_swap.observe((started.elapsed() - waited).as_secs_f64());
     }
 
     /// Waits for the checkpoints being written in the background.
@@ -922,10 +980,11 @@ impl Pool {
         let (state, fork_of, deadline) = match source {
             None => (Arc::new(DriveState::empty()), None, None),
             Some(src) => {
-                // Hold the source's commit lock so the fork includes every acknowledged write,
-                // and its checkpoint lock so that its last checkpoint is not still being written.
-                let _committing = src.commit_lock.lock().await;
+                // Hold the source's checkpoint lock so that its last checkpoint is not still
+                // being written, and its commit lock so the fork includes every acknowledged
+                // write.
                 let mut src_last = src.checkpoint.lock().await;
+                let _committing = src.commit_lock.lock().await;
                 // The fork references content through the source's state, so the source must
                 // still be a drive (format §12.4): a hard delete forgets it before deleting it.
                 if self.drive_by_id(&src.id).is_none() {
@@ -939,7 +998,10 @@ impl Pool {
                 // 12 hours after `seen` (§12.4), so the fork must exist by then.
                 self.renew(&mut src_last).await;
                 let vouched = src_last.as_ref().map_or(seen, |r| r.seen.min(seen));
-                last = Some(self.write_checkpoint(&id, s.clone(), seen, src_last.as_ref()).await?);
+                let (written, spilled) = self.write_checkpoint(&id, s.clone(), seen, src_last.as_ref()).await?;
+                last = Some(written);
+                // The fork's own checkpoint references what it spilled; the source's does not.
+                let s = Arc::new(s.with_spilled(&spilled));
                 let seq = s.seq();
                 (s, Some(ForkOf { drive_id: src.id.clone(), seq }), Some(vouched + guard::COMMIT_WITHIN))
             }
@@ -1030,8 +1092,8 @@ impl Pool {
         self.forget_drive(id);
         let _g = match &d {
             Some(d) => {
-                let committing = d.commit_lock.lock().await;
-                Some((committing, d.checkpoint.lock().await))
+                let checkpointing = d.checkpoint.lock().await;
+                Some((checkpointing, d.commit_lock.lock().await))
             }
             None => None,
         };
@@ -1086,20 +1148,24 @@ impl Pool {
     {
         let plans: Vec<P> = plans.into_iter().collect();
         let since = self.clock.mono();
-        let answers: Vec<_> = {
+        let (answers, start): (Vec<_>, bool) = {
             let mut q = d.queue.lock().unwrap();
-            plans
+            let answers = plans
                 .into_iter()
                 .map(|plan| {
                     let (reply, answer) = tokio::sync::oneshot::channel();
                     q.push_back(Waiting { plan: Box::new(plan), reply, since });
                     answer
                 })
-                .collect()
+                .collect();
+            (answers, !d.draining.swap(true, std::sync::atomic::Ordering::Relaxed))
         };
         // A task of its own, so that a request that goes away cannot stop a commit that others
-        // are waiting on.
-        tokio::spawn(self.clone().drain(d.clone()));
+        // are waiting on; and only one, so that what else waits for the commit lock waits for one
+        // batch, not for a task per mutation queued ahead of it.
+        if start {
+            tokio::spawn(self.clone().drain(d.clone()));
+        }
         let mut out = Vec::with_capacity(answers.len());
         for answer in answers {
             out.push(answer.await.unwrap_or_else(|_| Err(CommitError::Other(anyhow!("the commit was abandoned")))));
@@ -1107,21 +1173,34 @@ impl Pool {
         out
     }
 
-    /// Commits what is waiting on `d`, a batch at a time, until nothing is. Every mutation starts
-    /// one of these, and whichever holds the commit lock takes everything waiting, so a batch is
-    /// what queued up while the one before it was being written.
+    /// Commits what is waiting on `d`, a batch at a time, until nothing is. A mutation starts one
+    /// of these unless one is running, and it takes everything waiting each time it holds the
+    /// commit lock, so a batch is what queued up while the one before it was being written.
     async fn drain(self: Arc<Self>, d: Arc<Drive>) {
+        use std::sync::atomic::Ordering;
+        /// Lets the next mutation start another task if this one panics.
+        struct Unwinding<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Unwinding<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+        let _unwinding = Unwinding(&d.draining);
         loop {
             // Taken for each batch, so that forks and deletions of the drive get their turn.
             let mut cadence = d.commit_lock.lock().await;
             let batch: Vec<Waiting> = {
                 let mut q = d.queue.lock().unwrap();
+                if q.is_empty() {
+                    // Under the queue's lock, so that a mutation queued after this starts a task.
+                    d.draining.store(false, Ordering::Relaxed);
+                    return;
+                }
                 let n = q.len().min(BATCH_TXNS);
                 q.drain(..n).collect()
             };
-            if batch.is_empty() {
-                return;
-            }
             let rest = self.commit_batch(&d, &mut cadence, batch).await;
             let mut q = d.queue.lock().unwrap();
             for w in rest.into_iter().rev() {
@@ -1137,7 +1216,7 @@ impl Pool {
     /// A mutation is answered only once the commit is written, unless its plan failed against
     /// the drive's state as installed, before any transaction of the batch: a failure may rest
     /// on an earlier transaction that is never written.
-    async fn commit_batch(self: &Arc<Self>, d: &Drive, cadence: &mut Cadence, batch: Vec<Waiting>) -> Vec<Waiting> {
+    async fn commit_batch(self: &Arc<Self>, d: &Arc<Drive>, cadence: &mut Cadence, batch: Vec<Waiting>) -> Vec<Waiting> {
         let now = self.clock.mono();
         let (mut batch, late): (Vec<Waiting>, Vec<Waiting>) = batch.into_iter().partition(|w| now.saturating_sub(w.since) <= QUEUE_MAX);
         for w in late {
@@ -1223,8 +1302,8 @@ impl Pool {
                         && let Ok(mut last) = d.checkpoint.clone().try_lock_owned()
                     {
                         *cadence = Cadence::default();
-                        let (pool, id, seen) = (self.clone(), d.id.clone(), self.clock.mono());
-                        tokio::spawn(async move { pool.checkpoint(&id, state, seen, &mut last).await });
+                        let (pool, d, seen) = (self.clone(), d.clone(), self.clock.mono());
+                        tokio::spawn(async move { pool.checkpoint(&d, state, seen, &mut last).await });
                     }
                     for (w, answer) in held {
                         let _ = w.reply.send(answer);
@@ -1296,6 +1375,36 @@ impl Pool {
         }
         Ok(state)
     }
+}
+
+/// Adds `feature` to the incompatible features of the pool in `store` (format §3.1), unless it
+/// already lists it; returns whether it added it. Readers that do not implement the feature refuse
+/// the pool from then on, and servers use it once they have read `voidfs.json` again, when they
+/// next start. Members of `voidfs.json` this server does not know are kept.
+pub async fn enable_feature(store: &crate::store::Store, feature: &str) -> anyhow::Result<bool> {
+    if !KNOWN_INCOMPATIBLE_FEATURES.contains(&feature) {
+        bail!("this server does not implement the feature {feature:?}; it knows {KNOWN_INCOMPATIBLE_FEATURES:?}");
+    }
+    let Some(bytes) = store.get(probe::DESCRIPTOR).await? else {
+        bail!("there is no pool here yet (no {}). A server creates one when it starts; --new-pool-feature {feature} creates it with the feature", probe::DESCRIPTOR);
+    };
+    let desc: PoolDescriptor = serde_json::from_slice(&bytes).context("reading voidfs.json")?;
+    desc.check_readable().map_err(|e| anyhow!(e))?;
+    if desc.has(feature) {
+        return Ok(false);
+    }
+    let mut json: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let features = json.as_object_mut().and_then(|o| o.get_mut("features")).and_then(|f| f.as_object_mut()).ok_or_else(|| anyhow!("voidfs.json has no features object"))?;
+    let listed = features.entry("incompatible").or_insert_with(|| serde_json::json!([]));
+    listed.as_array_mut().ok_or_else(|| anyhow!("features.incompatible in voidfs.json is not a list"))?.push(feature.into());
+    store.put(probe::DESCRIPTOR, Bytes::from(serde_json::to_vec_pretty(&json)?)).await?;
+    // Another change made at the same moment would have been lost: check this one stuck.
+    let again = store.get(probe::DESCRIPTOR).await?.ok_or_else(|| anyhow!("voidfs.json vanished"))?;
+    let again: PoolDescriptor = serde_json::from_slice(&again).context("reading voidfs.json again")?;
+    if !again.has(feature) || again.pool_id != desc.pool_id {
+        bail!("voidfs.json changed while {feature} was being added; try again");
+    }
+    Ok(true)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1405,6 +1514,7 @@ mod tests {
             match e {
                 Extent::Shard { s, .. } => out.extend_from_slice(&pool.shard(&s).await.unwrap()),
                 Extent::Zero { z } => out.resize(out.len() + z as usize, 0),
+                Extent::Data { d } => out.extend_from_slice(&d),
             }
         }
         Some(out)
@@ -1644,7 +1754,7 @@ mod tests {
         assert_eq!(versions, expected);
         // Transactions of about 80 KB: a file of 1,000 extents, all of one shard.
         let e = voidfs_core::content::from_bytes(&Bytes::from_static(b"x"), pool.params);
-        let big = pool.describe(vec![e.extents[0]; 1000]).await.unwrap();
+        let big = pool.describe(vec![e.extents[0].clone(); 1000]).await.unwrap();
         let plans = (0..30).map(|i| put_plan(&format!("big{i}"), &big, Precondition::default(), &runs)).collect();
         let answers = batch(&pool, &d, plans).await;
         let seqs: HashSet<u64> = answers.iter().map(|a| version(a).seq).collect();
@@ -1656,7 +1766,7 @@ mod tests {
             assert!(c.txns.len() > 1 && size <= BATCH_BYTES, "seq {}: {} transactions, {size} bytes", c.seq, c.txns.len());
         }
         // A transaction larger than the cap commits, alone.
-        let huge = ContentDescriptor::Inline { extents: vec![e.extents[0]; 20_000] };
+        let huge = ContentDescriptor::Inline { extents: vec![e.extents[0].clone(); 20_000] };
         let answers = batch(&pool, &d, vec![put_plan("huge", &huge, Precondition::default(), &runs), put_plan("small", &one, Precondition::default(), &runs)]).await;
         let first = version(&answers[0]);
         assert_eq!(version(&answers[1]), VersionId::new(first.seq + 1, 0));
@@ -1890,7 +2000,7 @@ mod tests {
             state = state.apply(&commit(seq, vec![txn])).unwrap();
             puts.store(0, Ordering::SeqCst);
             pool.renew(&mut last).await;
-            let written = pool.write_checkpoint(&d.id, Arc::new(state.clone()), pool.clock.mono(), last.as_ref()).await.unwrap();
+            let (written, _) = pool.write_checkpoint(&d.id, Arc::new(state.clone()), pool.clock.mono(), last.as_ref()).await.unwrap();
             let next = tables(&pool, &written).await;
             let new = new_pages(&prev, &next);
             assert!(new[..3].iter().all(|n| (1..=2).contains(n)) && new[3] == removed, "seq {seq}: new pages per table {new:?}");
@@ -1905,7 +2015,7 @@ mod tests {
         assert_eq!(d.snapshot().rows(), state.rows(), "with every table in use");
         // Without the previous checkpoint, a server that has just started stores every page.
         let puts = count(&mem, page_puts);
-        let all = again.write_checkpoint(&d.id, Arc::new(state), again.clock.mono(), None).await.unwrap();
+        let (all, _) = again.write_checkpoint(&d.id, Arc::new(state), again.clock.mono(), None).await.unwrap();
         assert_eq!(puts.load(Ordering::SeqCst), all.pages.len());
     }
 
@@ -1945,7 +2055,7 @@ mod tests {
         // Commits of about 80 KB: a file of 1,000 extents, all of one shard.
         let e = voidfs_core::content::from_bytes(&Bytes::from_static(b"x"), pool.params);
         pool.write_shards(&e.new_shards).await.unwrap();
-        let big = pool.describe(vec![e.extents[0]; 1000]).await.unwrap();
+        let big = pool.describe(vec![e.extents[0].clone(); 1000]).await.unwrap();
         let (mut logged, mut last) = (0, 0);
         while checkpoints(&store, &d).await.is_empty() {
             let v = version(&pool.commit(&d, put_plan("big", &big, Precondition::default(), &Arc::default())).await);
@@ -2169,6 +2279,313 @@ mod tests {
         ticks(&pool, &d, &tick, 1).await;
         settle(&d).await;
         assert_eq!(checkpoints(&pool.store, &d).await, [2 * CHECKPOINT_EVERY]);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Content held in descriptors (format §5, §8.2)
+
+    /// A pool that lists `inline-data`.
+    async fn inline_pool(mem: &Arc<MemStore>) -> Arc<Pool> {
+        let pool = Pool::open_creating(Store::mem(mem.clone()), 1 << 20, Clock::System, CommitGuard::CreateIfAbsent, &[INLINE_DATA.into()]).await.unwrap();
+        assert!(pool.inline_data);
+        pool
+    }
+
+    /// Content held in its descriptor.
+    fn held(data: &[u8]) -> ContentDescriptor {
+        ContentDescriptor::Inline { extents: voidfs_core::content::inline(data) }
+    }
+
+    /// Rows as a checkpoint lists them: rows equal after this are the same bytes with the same
+    /// ETags, wherever the bytes are held.
+    fn spilled(rows: &Rows) -> Rows {
+        let mut r = rows.clone();
+        r.spill();
+        r
+    }
+
+    fn holds_data(rows: &Rows) -> bool {
+        rows.objects.iter().filter_map(|r| r.content.as_ref()).chain(rows.history.iter().filter_map(|r| r.content.as_ref())).any(ContentDescriptor::has_data)
+    }
+
+    /// The rows of the checkpoint `c`, as stored.
+    async fn stored_rows(pool: &Pool, c: &Checkpointed) -> Rows {
+        pool.load_checkpoint(&c.index).await.unwrap().0.rows()
+    }
+
+    /// Checkpoints `d` as its commits would, and waits for it.
+    async fn checkpoint_now(pool: &Arc<Pool>, d: &Arc<Drive>) {
+        let mut last = d.checkpoint.clone().lock_owned().await;
+        pool.checkpoint(d, d.snapshot(), pool.clock.mono(), &mut last).await;
+    }
+
+    /// A checkpoint stores each distinct small content as a shard and lists shard extents; the
+    /// state in memory takes them too. A server that starts again loads the checkpoint, then
+    /// replays the log after it, which has data extents again, to the same state.
+    #[tokio::test]
+    async fn a_checkpoint_spills_data_extents_and_the_state_takes_the_shards() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let d = pool.create_drive("d", None).await.unwrap();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let plans = (0..40).map(|i| put_plan(&format!("f{i}"), &held(format!("file {}", i % 30).as_bytes()), Precondition::default(), &runs)).collect();
+        batch(&pool, &d, plans).await;
+        pool.commit(&d, put_plan("f0", &held(b"second"), Precondition::default(), &runs)).await.unwrap();
+        let before = d.snapshot();
+        assert!(holds_data(&before.rows()));
+        let shard_puts = count(&mem, |op, path| op == MemOp::Put && path.starts_with("shards/"));
+        checkpoint_now(&pool, &d).await;
+        assert_eq!(shard_puts.load(Ordering::SeqCst), 31, "each distinct content once");
+        assert_eq!(pool.metrics.checkpoint_spilled.get(), 31);
+        for i in 0..30 {
+            assert!(mem.peek(&format!("shards/{}", ShardHash::of(format!("file {i}").as_bytes()).object_path())).is_some());
+        }
+        let last = d.checkpoint.lock().await.as_ref().map(|c| c.index.clone()).unwrap();
+        let stored = pool.load_checkpoint(&last).await.unwrap().0.rows();
+        assert!(!holds_data(&stored), "a checkpoint never carries data extents");
+        assert_eq!(stored, spilled(&before.rows()));
+        let now = d.snapshot();
+        assert_eq!(now.seq(), before.seq());
+        assert_eq!(now.rows(), stored, "the state took what the checkpoint spilled");
+        assert_eq!(pool.metrics.checkpoint_swap.get_sample_count(), 1);
+        // More small content, in the log after the checkpoint.
+        pool.commit(&d, put_plan("f1", &held(b"after"), Precondition::default(), &runs)).await.unwrap();
+        mem.set_hook(None);
+        let again = Pool::open(pool.store.clone(), 1 << 20).await.unwrap();
+        let reloaded = again.drive("d").unwrap();
+        assert_eq!(reloaded.snapshot().rows(), d.snapshot().rows(), "checkpoint, then the log");
+        assert!(holds_data(&reloaded.snapshot().rows()));
+        for (key, data) in [("f0", &b"second"[..]), ("f1", b"after"), ("f29", b"file 29"), ("f35", b"file 5")] {
+            assert_eq!(read(&again, &reloaded, key).await.unwrap(), data, "{key}");
+        }
+        let oid = before.lookup(&Key::parse("f0").unwrap()).unwrap();
+        let snap = reloaded.snapshot();
+        let first = &snap.history(&oid).unwrap()[0];
+        assert_eq!((first.etag.clone(), first.content.clone()), (held(b"file 0").etag(), Some(spilled_desc(&held(b"file 0")))));
+    }
+
+    fn spilled_desc(c: &ContentDescriptor) -> ContentDescriptor {
+        let ContentDescriptor::Inline { extents } = c else { panic!() };
+        ContentDescriptor::Inline { extents: voidfs_core::content::spill(extents).extents }
+    }
+
+    /// What a checkpoint spilled goes into the state as it is when the checkpoint is written,
+    /// not as it was when it began: commits made meanwhile stay, and a file they changed keeps
+    /// its new content.
+    #[tokio::test]
+    async fn the_state_takes_what_was_spilled_only_where_it_is_unchanged() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let d = pool.create_drive("d", None).await.unwrap();
+        let runs = Arc::new(AtomicUsize::new(0));
+        for (key, data) in [("a", &b"alpha"[..]), ("b", b"beta")] {
+            pool.commit(&d, put_plan(key, &held(data), Precondition::default(), &runs)).await.unwrap();
+        }
+        let h = hold(&mem, index_puts);
+        let checkpointing = tokio::spawn({
+            let (pool, d) = (pool.clone(), d.clone());
+            async move { checkpoint_now(&pool, &d).await }
+        });
+        reached(&h.held, 1).await;
+        // Meanwhile `b` changes, and `c` is new.
+        pool.commit(&d, put_plan("b", &held(b"beta 2"), Precondition::default(), &runs)).await.unwrap();
+        pool.commit(&d, put_plan("c", &held(b"gamma"), Precondition::default(), &runs)).await.unwrap();
+        let seq = d.snapshot().seq();
+        h.release.send(true).unwrap();
+        checkpointing.await.unwrap();
+        let s = d.snapshot();
+        assert_eq!(s.seq(), seq, "the commits made meanwhile are still there");
+        let content = |key: &str| s.record(&s.lookup(&Key::parse(key).unwrap()).unwrap()).unwrap().content.clone().unwrap();
+        assert_eq!(content("a"), spilled_desc(&held(b"alpha")));
+        assert_eq!(content("b"), held(b"beta 2"));
+        assert_eq!(content("c"), held(b"gamma"));
+        let b = s.lookup(&Key::parse("b").unwrap()).unwrap();
+        let versions: Vec<_> = s.history(&b).unwrap().iter().map(|r| r.content.clone().unwrap()).collect();
+        assert_eq!(versions, [spilled_desc(&held(b"beta")), held(b"beta 2")]);
+        mem.set_hook(None);
+        let again = Pool::open(pool.store.clone(), 1 << 20).await.unwrap();
+        assert_eq!(again.drive("d").unwrap().snapshot().rows(), s.rows());
+    }
+
+    /// A checkpoint that spills many shards keeps a bounded number of uploads in flight.
+    #[tokio::test]
+    async fn a_checkpoint_spills_a_bounded_number_at_once() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let d = pool.create_drive("d", None).await.unwrap();
+        let plans = (0..200).map(|i| put_plan(&format!("f{i}"), &held(format!("{i}").as_bytes()), Precondition::default(), &Arc::default())).collect();
+        batch(&pool, &d, plans).await;
+        let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (n, m) = (now.clone(), most.clone());
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if !(op == MemOp::Put && path.starts_with("shards/")) {
+                return futures::future::ready(Fault::None).boxed();
+            }
+            let (n, m) = (n.clone(), m.clone());
+            async move {
+                m.fetch_max(n.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                n.fetch_sub(1, Ordering::SeqCst);
+                Fault::None
+            }
+            .boxed()
+        })));
+        checkpoint_now(&pool, &d).await;
+        assert_eq!(pool.metrics.checkpoint_spilled.get(), 200);
+        assert_eq!(most.load(Ordering::SeqCst), guard::ADMIT_UPLOADS);
+    }
+
+    /// A fork's first checkpoint spills too, and the fork's state takes what it spilled. Its
+    /// source's state does not: only a drive's own checkpoints vouch for its content.
+    #[tokio::test]
+    async fn a_forks_first_checkpoint_spills() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let src = pool.create_drive("src", None).await.unwrap();
+        pool.commit(&src, put_plan("a", &held(b"shared"), Precondition::default(), &Arc::default())).await.unwrap();
+        let fork = pool.create_drive("fork", Some(&src)).await.unwrap();
+        assert!(holds_data(&src.snapshot().rows()));
+        assert!(!holds_data(&fork.snapshot().rows()));
+        let stored = stored_rows(&pool, fork.checkpoint.lock().await.as_ref().unwrap()).await;
+        assert_eq!(stored, fork.snapshot().rows());
+        assert_eq!(spilled(&src.snapshot().rows()), stored);
+        assert_eq!(read(&pool, &fork, "a").await.unwrap(), b"shared");
+    }
+
+    /// A checkpoint that has spilled takes the commit lock to swap, while forks and hard deletes
+    /// wait for it: they take the checkpoint lock first, so neither waits for the other in turn.
+    #[tokio::test]
+    async fn forks_and_hard_deletes_wait_for_a_checkpoint_that_spills() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let d = pool.create_drive("d", None).await.unwrap();
+        pool.commit(&d, put_plan("a", &held(b"small"), Precondition::default(), &Arc::default())).await.unwrap();
+        let h = hold(&mem, index_puts);
+        let checkpointing = tokio::spawn({
+            let (pool, d) = (pool.clone(), d.clone());
+            async move { checkpoint_now(&pool, &d).await }
+        });
+        reached(&h.held, 1).await;
+        let forking = tokio::spawn({
+            let (pool, d) = (pool.clone(), d.clone());
+            async move { pool.create_drive("fork", Some(&d)).await.unwrap() }
+        });
+        // Commits go on while the fork waits for the checkpoint.
+        tokio::time::timeout(Duration::from_secs(10), pool.commit(&d, put_plan("b", &held(b"more"), Precondition::default(), &Arc::default()))).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!forking.is_finished());
+        h.release.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), checkpointing).await.expect("no deadlock").unwrap();
+        let fork = tokio::time::timeout(Duration::from_secs(10), forking).await.expect("no deadlock").unwrap();
+        assert_eq!(read(&pool, &fork, "b").await.unwrap(), b"more");
+        // Likewise a hard delete.
+        let h = hold(&mem, index_puts);
+        let checkpointing = tokio::spawn({
+            let (pool, d) = (pool.clone(), d.clone());
+            async move { checkpoint_now(&pool, &d).await }
+        });
+        reached(&h.held, 1).await;
+        let deleting = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.hard_delete("d").await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!deleting.is_finished());
+        h.release.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), checkpointing).await.expect("no deadlock").unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(10), deleting).await.expect("no deadlock").unwrap());
+    }
+
+    /// A new pool lists the features a server is started with; an existing one keeps its own,
+    /// and has one added only by [`enable_feature`], which keeps what it does not know of
+    /// `voidfs.json`. A pool listing a feature this server does not implement is refused.
+    #[tokio::test]
+    async fn features_are_added_to_new_pools_or_enabled() {
+        let store = Store::memory().unwrap();
+        assert!(format!("{:#}", enable_feature(&store, INLINE_DATA).await.unwrap_err()).contains("no pool here yet"));
+        let open = |features: Vec<String>| {
+            let store = store.clone();
+            async move { Pool::open_creating(store, 1 << 20, Clock::System, CommitGuard::CreateIfAbsent, &features).await }
+        };
+        assert!(open(vec!["shard-zstd".into()]).await.is_err(), "not implemented");
+        assert!(store.get(probe::DESCRIPTOR).await.unwrap().is_none());
+        assert!(!open(vec![]).await.unwrap().inline_data);
+        assert!(!open(vec![INLINE_DATA.into()]).await.unwrap().inline_data, "not a new pool");
+        let mut json: serde_json::Value = serde_json::from_slice(&store.get(probe::DESCRIPTOR).await.unwrap().unwrap()).unwrap();
+        json["future_member"] = serde_json::json!({ "kept": true });
+        store.put(probe::DESCRIPTOR, Bytes::from(serde_json::to_vec(&json).unwrap())).await.unwrap();
+        assert!(enable_feature(&store, "shard-zstd").await.is_err());
+        assert!(enable_feature(&store, INLINE_DATA).await.unwrap());
+        assert!(!enable_feature(&store, INLINE_DATA).await.unwrap(), "already");
+        let json: serde_json::Value = serde_json::from_slice(&store.get(probe::DESCRIPTOR).await.unwrap().unwrap()).unwrap();
+        assert_eq!(json["features"]["incompatible"], serde_json::json!([INLINE_DATA]));
+        assert_eq!(json["future_member"], serde_json::json!({ "kept": true }));
+        assert!(open(vec![]).await.unwrap().inline_data);
+        let fresh = Store::memory().unwrap();
+        let pool = Pool::open_creating(fresh.clone(), 1 << 20, Clock::System, CommitGuard::CreateIfAbsent, &[INLINE_DATA.into()]).await.unwrap();
+        assert!(pool.inline_data);
+        let desc: PoolDescriptor = serde_json::from_slice(&fresh.get(probe::DESCRIPTOR).await.unwrap().unwrap()).unwrap();
+        assert_eq!(desc.features.incompatible, [INLINE_DATA]);
+        // A pool with a feature this server does not implement: refused, as an older server
+        // refuses one with inline-data.
+        let mut json: serde_json::Value = serde_json::from_slice(&fresh.get(probe::DESCRIPTOR).await.unwrap().unwrap()).unwrap();
+        json["features"]["incompatible"] = serde_json::json!([INLINE_DATA, "encryption"]);
+        fresh.put(probe::DESCRIPTOR, Bytes::from(serde_json::to_vec(&json).unwrap())).await.unwrap();
+        let e = Pool::open(fresh.clone(), 1 << 20).await.err().unwrap();
+        assert!(format!("{e:#}").contains("unsupported features"), "{e:#}");
+        assert!(enable_feature(&fresh, INLINE_DATA).await.is_err(), "nor changed");
+    }
+
+    /// One task drains a drive's queue at a time, so whatever else waits for the commit lock (a
+    /// fork, a hard delete, a checkpoint putting what it spilled into the state) waits for the
+    /// batch being written, not for a line of tasks that grows with every mutation. With a task
+    /// per mutation, under eight clients writing steadily, it waited 1.5 s, then 9, then 56.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn steady_commits_do_not_starve_the_commit_lock() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = held(b"one");
+        mem.set_hook(Some(Arc::new(|op, path| {
+            let slow = op == MemOp::PutNew && path.contains("/log/");
+            async move {
+                if slow {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Fault::None
+            }
+            .boxed()
+        })));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clients: Vec<_> = (0..8)
+            .map(|c| {
+                let (pool, d, one, stop) = (pool.clone(), d.clone(), one.clone(), stop.clone());
+                tokio::spawn(async move {
+                    let mut i = 0;
+                    while !stop.load(Ordering::SeqCst) {
+                        pool.commit(&d, put_plan(&format!("c{c}-{i}"), &one, Precondition::default(), &Arc::default())).await.unwrap();
+                        i += 1;
+                    }
+                    i
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for _ in 0..5 {
+            let started = Instant::now();
+            drop(tokio::time::timeout(Duration::from_secs(5), d.commit_lock.lock()).await.expect("the commit lock is not starved"));
+            assert!(started.elapsed() < Duration::from_millis(500), "waited {:?}", started.elapsed());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // A checkpoint that spills puts what it spilled into the state meanwhile.
+        tokio::time::timeout(Duration::from_secs(5), checkpoint_now(&pool, &d)).await.expect("the checkpoint's swap is not starved");
+        assert_eq!(pool.metrics.checkpoint_swap.get_sample_count(), 1);
+        stop.store(true, Ordering::SeqCst);
+        let mut done = 0;
+        for c in clients {
+            done += c.await.unwrap();
+        }
+        assert!(done > 100, "only {done} commits");
     }
 
     // -----------------------------------------------------------------------------------------

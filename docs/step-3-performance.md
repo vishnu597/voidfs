@@ -265,9 +265,36 @@ per-byte time.
 
 ### Item 3. Fewer sequential round trips per write
 
-**Status (29 September 2026): changes 2 and 3 done; change 1 is
-[RFC 0003](../rfcs/0003-small-content-in-descriptors.md), accepted, not yet implemented.** Measured in
-[bench/results/write-round-trips](../bench/results/write-round-trips/README.md):
+**Status (29 September 2026): done.** Change 1, small files held in the log, implements
+[RFC 0003](../rfcs/0003-small-content-in-descriptors.md), measured in
+[bench/results/small-content](../bench/results/small-content/README.md):
+- **One at a time, a small write takes one round trip.** At 12 ms, put and overwrite 4 KiB take
+  14.9 ms where `main` takes 29.0 (1.04× the bare bucket, from 2.03×). The server writes only its
+  share of a log entry: 0.25 bucket requests per put 4 KiB (from 1.30), 0.06 and 0.03 per fan-out
+  put (from 1.08 and 1.04).
+- **Eight to 64 at once, still two round trips.** At 12 ms, relative to the bare bucket: put
+  4 KiB 2.37× to 2.12× (SpaceFS 2.01×), overwrite 2.57× to 2.16× (SpaceFS 3.05×), the fan-out
+  puts at 32 and 64 3.05× to 2.24× and 2.28× (SpaceFS 2.23× and 2.41×). Group commit, not the
+  write: while a log entry is in flight, the requests the last one answered wait for it and then
+  for their own, and two at once already take two round trips. A diagnostic build that holds an
+  entry until those requests are back (at most 2 ms) took the four rows to 1.1–1.4× and rename
+  64 MiB from 26 ms to 13; it is not in this change.
+- **On loopback**, where round trips cost little: put 4 KiB 1.98× to 1.15×, overwrite 1.72× to
+  0.91×, the fan-out puts 1.70× and 1.84× to 0.65× and 0.57×.
+- **Over the 49 rows**, relative to the bare bucket: at 12 ms the geometric mean of the p50 ratios
+  against `main` is 0.957 (writes 0.883), and 24–26 rows are at or ahead of SpaceFS's ratio (`main`
+  22–23 in the same session); on loopback 0.938 (writes 0.756), 34–35 rows (`main` 34–36), and 31–32
+  rows faster than the bare bucket (`main` 28).
+- **Checkpoints store the small files as shards** in the background. Over 20,000 puts of 4 KiB
+  at 12 ms, one comes every ~2,870 puts (16 MiB of log) and takes 1.25 s, uploading ~2,870 shards
+  32 at a time; foreground writes did better than `main`'s: p99 34.5–34.8 ms (48.5–49.1), p99.9
+  41–43 (51–52), slowest 44–46 (57–64).
+- **Found on the way:** every mutation started a task to drain the drive's queue, each of which
+  wrote a batch when its turn at the commit lock came, so the line of them grew under steady
+  writes. Anything else that needed the lock (a fork, a hard delete, a checkpoint's swap) waited
+  1.5 s, then 9, then 56 as it went on. One task drains a drive's queue now.
+
+Changes 2 and 3, measured in [bench/results/write-round-trips](../bench/results/write-round-trips/README.md):
 - **Measured first.** Put 64 MiB on loopback, one at a time, took 300 ms: about 150 ms of CPU in
   the request's own task and 150 ms waiting for seven batches of four shard uploads. The largest
   CPU cost was neither FastCDC nor SHA-256 but the upload checksum SDKs send (CRC32): the `crc`
@@ -296,9 +323,9 @@ What was built:
   takes with `try_lock` while it holds the commit lock and hands to the task. So there is one
   checkpoint at a time per drive; if one is still being written when the next is due, the next
   commit tries again; a failure still waits a whole interval.
-  - Forks and hard deletes take the commit lock and then the checkpoint lock, so they wait for
-    one being written: a fork starts from it, and nothing of a deleted drive is written after it
-    has gone.
+  - Forks and hard deletes take the checkpoint lock and then the commit lock (the commit lock
+    first until change 1, whose checkpoints take it at their end), so they wait for one being
+    written: a fork starts from it, and nothing of a deleted drive is written after it has gone.
   - The rows are copied, encoded and hashed on a blocking thread.
   - The index is written within 12 hours of when its state was the drive's, as §12.4 option 1
     requires of anything that references content through a root. Before, the state was the
@@ -318,11 +345,36 @@ What was built:
   shard of about 2 MiB. Each byte is now copied out about 1.4–1.8 times, and the buffer stays at
   32 MiB with the default chunking and body frames of 16–64 KiB.
 
+What change 1 built:
+- **Data extents** (`Extent::Data` in `voidfs-core`, format §5): up to 4,096 bytes in a
+  descriptor, parsed and checked wherever descriptors are (never in manifest pages or part
+  records), with the ETag of the shard extent holding the same bytes. `Extent` is no longer
+  `Copy`; its bytes are a `Bytes`, so a clone is a reference count. Edits treat a data extent as a
+  shard whose bytes are in hand.
+- **The writer**, only in a pool that lists `inline-data`: a put reads up to 4,097 bytes before it
+  cuts anything, and a body of at most 4,096 is held in one data extent, checked against its
+  signature and checksums before the commit, with no shard. An edit whose result is at most
+  4,096 bytes is held the same way; a larger result, and any result in a pool without the
+  feature, keeps no data extents. Copies keep the descriptor; multipart parts never hold one.
+- **Turning it on:** `--new-pool-feature inline-data` for a pool the server creates, and
+  `voidfs-server pool enable inline-data` for an existing one, once every server that writes it
+  is upgraded. Servers read the flag when they start, as the RFC requires.
+- **Spilling** (`Pool::write_checkpoint`): each distinct small content goes to a shard through
+  the garbage-collection guard, which now keeps 32 uploads in flight, not all of them at once;
+  rows list shard extents. Once the index is written, the drive's state takes the spilled
+  descriptors in place of those it still holds (`DriveState::with_spilled`), under the commit
+  lock for 14 ms on average for ~2,870 rows, so the state holds no more bytes in data extents
+  than its log since the last checkpoint: without that, memory grew about 5 KB a small file
+  more. A fork's first checkpoint spills too, and only the fork's state takes the result: only a
+  drive's own checkpoints vouch for its content.
+
 What was left for later:
-- Change 1, small files inside their metadata: [RFC 0003](../rfcs/0003-small-content-in-descriptors.md),
-  accepted on 29 September, specifies a `d` extent with up to 4 KiB of content, an `inline-data`
-  feature flag, and checkpoints that store those bytes as shards ("spilling") so that neither
-  checkpoints nor memory grow with them. Its spec text, conformance cases and code come next.
+- A short hold before a log entry that follows another, until the requests the last one
+  answered are back, would take small writes, fan-out puts and renames from two round trips to
+  one at 8 to 64 at once (the diagnostic above). It changes every write's timing, so it needs its
+  own measurements, and a way to behave on loopback, where a hold would cost more than an entry.
+- A drive's state takes about 26 KB of memory per small file, on `main` too (100,000 files:
+  2.6–2.8 GB with a 16 MiB shard cache). Not investigated.
 - Multipart uploads of 8 and 16 MiB parts gain little from the window: their time at 12 ms is
   completion's chain of round trips (item 5).
 - Put 1 MiB and the fan-out puts of 4 KiB, 8 to 64 at once at 12 ms, are 1.5–3.5% slower in p50.
