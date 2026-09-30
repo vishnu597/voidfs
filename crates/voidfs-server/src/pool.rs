@@ -1405,6 +1405,7 @@ mod tests {
             match e {
                 Extent::Shard { s, .. } => out.extend_from_slice(&pool.shard(&s).await.unwrap()),
                 Extent::Zero { z } => out.resize(out.len() + z as usize, 0),
+                Extent::Data { d } => out.extend_from_slice(&d),
             }
         }
         Some(out)
@@ -1644,7 +1645,7 @@ mod tests {
         assert_eq!(versions, expected);
         // Transactions of about 80 KB: a file of 1,000 extents, all of one shard.
         let e = voidfs_core::content::from_bytes(&Bytes::from_static(b"x"), pool.params);
-        let big = pool.describe(vec![e.extents[0]; 1000]).await.unwrap();
+        let big = pool.describe(vec![e.extents[0].clone(); 1000]).await.unwrap();
         let plans = (0..30).map(|i| put_plan(&format!("big{i}"), &big, Precondition::default(), &runs)).collect();
         let answers = batch(&pool, &d, plans).await;
         let seqs: HashSet<u64> = answers.iter().map(|a| version(a).seq).collect();
@@ -1656,7 +1657,7 @@ mod tests {
             assert!(c.txns.len() > 1 && size <= BATCH_BYTES, "seq {}: {} transactions, {size} bytes", c.seq, c.txns.len());
         }
         // A transaction larger than the cap commits, alone.
-        let huge = ContentDescriptor::Inline { extents: vec![e.extents[0]; 20_000] };
+        let huge = ContentDescriptor::Inline { extents: vec![e.extents[0].clone(); 20_000] };
         let answers = batch(&pool, &d, vec![put_plan("huge", &huge, Precondition::default(), &runs), put_plan("small", &one, Precondition::default(), &runs)]).await;
         let first = version(&answers[0]);
         assert_eq!(version(&answers[1]), VersionId::new(first.seq + 1, 0));
@@ -1945,7 +1946,7 @@ mod tests {
         // Commits of about 80 KB: a file of 1,000 extents, all of one shard.
         let e = voidfs_core::content::from_bytes(&Bytes::from_static(b"x"), pool.params);
         pool.write_shards(&e.new_shards).await.unwrap();
-        let big = pool.describe(vec![e.extents[0]; 1000]).await.unwrap();
+        let big = pool.describe(vec![e.extents[0].clone(); 1000]).await.unwrap();
         let (mut logged, mut last) = (0, 0);
         while checkpoints(&store, &d).await.is_empty() {
             let v = version(&pool.commit(&d, put_plan("big", &big, Precondition::default(), &Arc::default())).await);

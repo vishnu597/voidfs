@@ -9,6 +9,7 @@ use std::ops::Bound;
 
 use imbl::{HashMap as IMap, OrdMap, Vector};
 
+use crate::chunk::Shard;
 use crate::ids::{ObjectId, Timestamp, VersionId};
 use crate::model::{Commit, ContentDescriptor, EntryRow, HistoryRow, Kind, ObjectRecord, Op, RemovedRow, Txn};
 use crate::model::{Change, CreateChange, MoveChange, RemoveChange, SetChange};
@@ -532,6 +533,46 @@ pub struct Rows {
     pub removed: Vec<RemovedRow>,
 }
 
+/// What [`Rows::spill`] replaced: each descriptor with data extents, with the equivalent that
+/// replaced it, and the shards that equivalent references.
+#[derive(Clone, Debug, Default)]
+pub struct Spilled {
+    pub shards: Vec<Shard>,
+    /// An object's current content.
+    pub objects: Vec<(ObjectId, ContentDescriptor, ContentDescriptor)>,
+    /// A version's content.
+    pub versions: Vec<(VersionId, ContentDescriptor, ContentDescriptor)>,
+}
+
+impl Rows {
+    /// Replaces every descriptor that has data extents with its equivalent in shards, as a
+    /// checkpoint lists it (format §8.2).
+    pub fn spill(&mut self) -> Spilled {
+        let mut out = Spilled::default();
+        let mut seen = std::collections::HashSet::new();
+        let mut spill = |c: &mut Option<ContentDescriptor>, shards: &mut Vec<Shard>| {
+            let from = c.as_ref().filter(|c| c.has_data())?.clone();
+            let ContentDescriptor::Inline { extents } = &from else { return None };
+            let s = crate::content::spill(extents);
+            shards.extend(s.new_shards.into_iter().filter(|s| seen.insert(s.hash)));
+            let to = ContentDescriptor::Inline { extents: s.extents };
+            *c = Some(to.clone());
+            Some((from, to))
+        };
+        for r in &mut self.objects {
+            if let Some((from, to)) = spill(&mut r.content, &mut out.shards) {
+                out.objects.push((r.oid.clone(), from, to));
+            }
+        }
+        for r in &mut self.history {
+            if let Some((from, to)) = spill(&mut r.content, &mut out.shards) {
+                out.versions.push((r.version, from, to));
+            }
+        }
+        out
+    }
+}
+
 impl DriveState {
     /// Exports the state as checkpoint rows.
     pub fn rows(&self) -> Rows {
@@ -580,6 +621,30 @@ impl DriveState {
             s.removed.insert((r.key.clone(), r.oid.clone()), r);
         }
         Ok(s)
+    }
+
+    /// This state with the equivalents [`Rows::spill`] made in place of the descriptors they
+    /// replace, wherever those are still the same: once a checkpoint references the shards, the
+    /// state need not hold their bytes. Its position is unchanged.
+    pub fn with_spilled(&self, s: &Spilled) -> DriveState {
+        let mut next = self.clone();
+        for (oid, from, to) in &s.objects {
+            if let Some(r) = next.objects.get_mut(oid)
+                && r.content.as_ref() == Some(from)
+            {
+                r.content = Some(to.clone());
+            }
+        }
+        for (v, from, to) in &s.versions {
+            let Some(rows) = next.versions.get(v).and_then(|oid| next.history.get_mut(oid)) else { continue };
+            if let Ok(i) = rows.binary_search_by(|r| r.version.cmp(v))
+                && let Some(r) = rows.get_mut(i)
+                && r.content.as_ref() == Some(from)
+            {
+                r.content = Some(to.clone());
+            }
+        }
+        next
     }
 
     /// Total size of the files currently in the namespace.
@@ -796,6 +861,73 @@ mod tests {
         assert_eq!(back.version(&VersionId::new(1, 0)).unwrap().oid, b);
         assert_eq!(back.live_bytes(), 1);
         assert_eq!(s.subtree(&ObjectId::root()).len(), 3);
+    }
+
+    fn data(b: &'static [u8]) -> ContentDescriptor {
+        ContentDescriptor::Inline { extents: vec![Extent::Data { d: bytes::Bytes::from_static(b) }] }
+    }
+
+    fn set_to(oid: &ObjectId, c: ContentDescriptor) -> Change {
+        let mut s = SetChange::new(oid.clone());
+        s.content = Some(c);
+        Change::Set(s)
+    }
+
+    /// Rows as a checkpoint lists them: rows equal after this are the same bytes with the same
+    /// ETags, whether held in data extents or in shards.
+    fn spilled(rows: &Rows) -> Rows {
+        let mut r = rows.clone();
+        r.spill();
+        r
+    }
+
+    /// Spilled rows hold no data extents and load as an equivalent state; the state in memory
+    /// takes the equivalents only where it still has what was spilled.
+    #[test]
+    fn spilled_rows_are_equivalent_and_swap_in_where_unchanged() {
+        let root = ObjectId::root();
+        let [a, b] = [(); 2].map(|_| ObjectId::generate());
+        let s = DriveState::empty()
+            .apply(&commit(1, vec![
+                txn(&a, Op::Put, vec![create(&a, &root, "a", Kind::File), set_to(&a, data(b"one"))]),
+                txn(&b, Op::Put, vec![create(&b, &root, "b", Kind::File), set_to(&b, data(b"same"))]),
+            ]))
+            .unwrap()
+            .apply(&commit(2, vec![txn(&a, Op::Write, vec![set_to(&a, data(b"two"))])]))
+            .unwrap();
+        let mut rows = s.rows();
+        let spill = rows.spill();
+        assert!(rows.objects.iter().all(|r| r.content.as_ref().is_none_or(|c| !c.has_data())));
+        assert!(rows.history.iter().all(|r| r.content.as_ref().is_none_or(|c| !c.has_data())));
+        assert_eq!((spill.objects.len(), spill.versions.len()), (2, 3));
+        let mut hashes: Vec<_> = spill.shards.iter().map(|s| s.hash).collect();
+        hashes.sort();
+        let mut expected: Vec<_> = [&b"one"[..], b"two", b"same"].iter().map(|b| crate::ids::ShardHash::of(b)).collect();
+        expected.sort();
+        assert_eq!(hashes, expected, "each distinct content once");
+        let loaded = DriveState::from_rows(s.seq(), s.time(), rows.clone()).unwrap();
+        assert_ne!(loaded.rows(), s.rows());
+        assert_eq!(spilled(&loaded.rows()), spilled(&s.rows()), "equivalent");
+        assert_eq!(loaded.rows(), rows);
+        for oid in [&a, &b] {
+            assert_eq!(loaded.record(oid).unwrap().etag, s.record(oid).unwrap().etag);
+        }
+        // Meanwhile `b` changed and `a` was renamed: `b` keeps its new content, and the rename's
+        // version, made after the spill, keeps what it copied.
+        let later = s
+            .apply(&commit(3, vec![
+                txn(&b, Op::Write, vec![set_to(&b, data(b"new"))]),
+                txn(&a, Op::Rename, vec![Change::Move(MoveChange { oid: a.clone(), parent: root.clone(), name: "a2".into() })]),
+            ]))
+            .unwrap();
+        let swapped = later.with_spilled(&spill);
+        assert_eq!(swapped.seq(), later.seq());
+        assert_eq!(swapped.record(&b).unwrap().content, Some(data(b"new")));
+        assert_eq!(swapped.record(&a).unwrap().content, rows.objects.iter().find(|r| r.oid == a).unwrap().content);
+        assert_eq!(swapped.version(&VersionId::new(1, 1)).unwrap().content, rows.history.iter().find(|r| r.oid == b).unwrap().content);
+        assert_eq!(swapped.version(&VersionId::new(3, 1)).unwrap().content, Some(data(b"two")));
+        assert_eq!(spilled(&swapped.rows()), spilled(&later.rows()));
+        assert_eq!(swapped.key_of(&a).as_deref(), Some("a2"));
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub fn describe(extents: Vec<Extent>) -> (ContentDescriptor, Vec<Page>) {
     if extents.len() <= MAX_FANOUT {
         return (ContentDescriptor::Inline { extents }, Vec::new());
     }
+    debug_assert_eq!(crate::model::data_len(&extents), 0, "a manifest page holds no data extents (format §5.1)");
     let size = extents.iter().map(Extent::len).sum();
     let mut pages = Vec::new();
     let mut level: Vec<PageRef> = group(extents, Extent::shard)

@@ -12,7 +12,7 @@ use http::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use voidfs_core::chunk::{Shard, StreamChunker};
-use voidfs_core::content::{self, EditError, Edited};
+use voidfs_core::content::{self, EditError, Edited, Source};
 use voidfs_core::ids::{ObjectId, ShardHash, Timestamp, VersionId};
 use voidfs_core::model::{Attrs, ContentDescriptor, Extent, HistoryRow, Kind, ObjectRecord, Op};
 use voidfs_core::names::Key;
@@ -276,12 +276,13 @@ async fn get(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> 
         .map(move |piece| {
             let pool = pool.clone();
             async move {
-                match piece.shard {
-                    Some(h) => {
+                match piece.source {
+                    Source::Shard(h) => {
                         let bytes = pool.shard(&h).await.map_err(std::io::Error::other)?;
                         Ok::<_, std::io::Error>(vec![bytes.slice(piece.offset as usize..(piece.offset + piece.len) as usize)])
                     }
-                    None => {
+                    Source::Data(b) => Ok(vec![b]),
+                    Source::Zeros => {
                         const ZEROS: usize = 1 << 20;
                         let mut left = piece.len as usize;
                         let mut out = Vec::new();
@@ -956,7 +957,7 @@ async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) 
         if i + 1 < wanted.len() && p.size < MIN_PART {
             return Err(S3Error::new(400, "EntityTooSmall", format!("part {n} is smaller than 5 MiB")));
         }
-        extents.extend(p.extents.iter().copied());
+        extents.extend(p.extents.iter().cloned());
     }
     let desc = app.pool.describe(content::normalize(extents)).await?;
     let pre = ctx.precondition();

@@ -5,6 +5,11 @@
 //! An edit re-chunks only the shards it touches and reuses every other shard, which is what
 //! makes a 4 KiB change to a large file cost about one shard. Callers supply the bytes of the
 //! shards an edit needs through a [`ShardSource`]; [`needed_shards`] says which those are.
+//!
+//! Data extents (format §5) are treated as shards whose bytes are in hand: an edit that touches
+//! one, or leaves a short region beside it, re-chunks its bytes into shards, and one it does not
+//! touch is kept. Whether a result is held in data extents is the writer's choice ([`inline`],
+//! [`spill`]).
 
 use std::collections::VecDeque;
 
@@ -12,7 +17,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::chunk::{self, Params, Shard};
 use crate::ids::ShardHash;
-use crate::model::Extent;
+use crate::model::{Extent, MAX_DATA_BYTES};
 
 /// Supplies shard bytes during an edit.
 pub trait ShardSource {
@@ -51,13 +56,64 @@ pub fn normalize(extents: impl IntoIterator<Item = Extent>) -> Vec<Extent> {
         if e.is_empty() {
             continue;
         }
-        if let (Some(Extent::Zero { z }), Extent::Zero { z: more }) = (out.last_mut(), e) {
+        if let (Some(Extent::Zero { z }), Extent::Zero { z: more }) = (out.last_mut(), &e) {
             *z += more;
             continue;
         }
         out.push(e);
     }
     out
+}
+
+/// Content held in its descriptor: one data extent, or none for the empty file (format §5).
+/// `data` is at most [`MAX_DATA_BYTES`], and is copied, so that it does not keep a larger buffer
+/// it may be a slice of alive.
+pub fn inline(data: &[u8]) -> Vec<Extent> {
+    assert!(data.len() <= MAX_DATA_BYTES, "{} bytes cannot be held in a descriptor", data.len());
+    if data.is_empty() { Vec::new() } else { vec![Extent::Data { d: Bytes::copy_from_slice(data) }] }
+}
+
+/// Replaces each data extent with the shard extent of the same bytes (format §8.2), and returns
+/// those shards, which the result references and which may not be stored yet.
+pub fn spill(extents: &[Extent]) -> Edited {
+    let mut new_shards = Vec::new();
+    let extents = extents
+        .iter()
+        .map(|e| match e {
+            Extent::Data { d } => {
+                let s = Shard::new(d.clone());
+                let e = Extent::Shard { s: s.hash, n: s.bytes.len() as u64 };
+                new_shards.push(s);
+                e
+            }
+            e => e.clone(),
+        })
+        .collect();
+    Edited { extents, new_shards: dedup(new_shards) }
+}
+
+/// The bytes of content, with its shards' bytes from `src`. For small content only: it is all
+/// in memory at once.
+pub fn materialize(extents: &[Extent], src: &mut impl ShardSource) -> Result<Bytes, EditError> {
+    let mut out = BytesMut::with_capacity(size(extents) as usize);
+    for e in extents {
+        match e {
+            Extent::Shard { s, .. } => out.extend_from_slice(&src.shard(s).ok_or(EditError::MissingShard(*s))?),
+            Extent::Zero { z } => out.resize(out.len() + *z as usize, 0),
+            Extent::Data { d } => out.extend_from_slice(d),
+        }
+    }
+    Ok(out.freeze())
+}
+
+/// The bytes of an extent that holds some: a shard's from `src`, if it has them, or a data
+/// extent's own.
+fn bytes_of(e: &Extent, src: &mut impl ShardSource) -> Option<Bytes> {
+    match e {
+        Extent::Shard { s, .. } => src.shard(s),
+        Extent::Data { d } => Some(d.clone()),
+        Extent::Zero { .. } => None,
+    }
 }
 
 /// The content of a whole new object.
@@ -73,11 +129,19 @@ pub fn from_shards(shards: Vec<Shard>) -> Edited {
     Edited { extents: normalize(extents), new_shards: dedup(shards) }
 }
 
+/// Where a piece of a read comes from.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Source {
+    Shard(ShardHash),
+    Zeros,
+    /// Bytes held in the descriptor, already cut to the piece.
+    Data(Bytes),
+}
+
 /// One piece of a read: `len` bytes at `offset` within an extent.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ReadPiece {
-    /// The shard to read from, or `None` for zeros.
-    pub shard: Option<ShardHash>,
+    pub source: Source,
     pub offset: u64,
     pub len: u64,
 }
@@ -103,7 +167,13 @@ pub fn read_plan(extents: &[Extent], start: u64, len: u64) -> Result<Vec<ReadPie
         }
         let from = start.max(e_start);
         let to = end.min(e_end);
-        out.push(ReadPiece { shard: e.shard(), offset: from - e_start, len: to - from });
+        let (offset, len) = (from - e_start, to - from);
+        let source = match e {
+            Extent::Shard { s, .. } => Source::Shard(*s),
+            Extent::Zero { .. } => Source::Zeros,
+            Extent::Data { d } => Source::Data(d.slice(offset as usize..(offset + len) as usize)),
+        };
+        out.push(ReadPiece { source, offset, len });
     }
     Ok(out)
 }
@@ -169,32 +239,32 @@ pub fn splice(
         let (e_start, e_end) = (pos, pos + e.len());
         pos = e_end;
         if e_end <= start {
-            before.push(*e);
+            before.push(e.clone());
             continue;
         }
         if e_start >= end {
-            after.push_back(*e);
+            after.push_back(e.clone());
             continue;
         }
         // `e` overlaps the edited range: keep what lies outside it.
         let keep_left = start.saturating_sub(e_start).min(e.len());
         let keep_right = e_end.saturating_sub(end.max(e_start));
-        match *e {
+        let bytes = match e {
             Extent::Zero { .. } => {
                 if keep_left > 0 {
                     before.push(Extent::Zero { z: keep_left });
                 }
                 back_zero += keep_right;
+                continue;
             }
-            Extent::Shard { s, .. } => {
-                let bytes = src.shard(&s).ok_or(EditError::MissingShard(s))?;
-                if keep_left > 0 {
-                    front.extend_from_slice(&bytes[..keep_left as usize]);
-                }
-                if keep_right > 0 {
-                    back = bytes.slice(bytes.len() - keep_right as usize..);
-                }
-            }
+            Extent::Shard { s, .. } => src.shard(s).ok_or(EditError::MissingShard(*s))?,
+            Extent::Data { d } => d.clone(),
+        };
+        if keep_left > 0 {
+            front.extend_from_slice(&bytes[..keep_left as usize]);
+        }
+        if keep_right > 0 {
+            back = bytes.slice(bytes.len() - keep_right as usize..);
         }
     }
     if back_zero > 0 {
@@ -206,10 +276,10 @@ pub fn splice(
     region.extend_from_slice(&back);
 
     // A short region would become a tiny shard: absorb the previous shard, whose start is a
-    // chunk boundary, so the region is re-chunked from a boundary.
+    // chunk boundary, so the region is re-chunked from a boundary. A data extent is absorbed
+    // likewise, so that a new shard is not left beside it.
     if !region.is_empty() && region.len() < p.min
-        && let Some(Extent::Shard { s, .. }) = before.last().copied()
-            && let Some(bytes) = src.shard(&s) {
+        && let Some(bytes) = before.last().and_then(|e| bytes_of(e, src)) {
                 before.pop();
                 let mut joined = BytesMut::from(&bytes[..]);
                 joined.extend_from_slice(&region);
@@ -221,11 +291,10 @@ pub fn splice(
     // Likewise absorb following shards while the last new shard is shorter than the minimum.
     for _ in 0..MAX_PULLS {
         let short = new_shards.last().is_some_and(|s| s.bytes.len() < p.min);
-        let Some(Extent::Shard { s, .. }) = after.front().copied() else { break };
         if !short {
             break;
         }
-        let Some(bytes) = src.shard(&s) else { break };
+        let Some(bytes) = after.front().and_then(|e| bytes_of(e, src)) else { break };
         after.pop_front();
         let mut joined = BytesMut::from(&region[..]);
         joined.extend_from_slice(&bytes);
@@ -308,19 +377,63 @@ mod tests {
 
     use super::*;
     use crate::chunk::tests::{SMALL, random_bytes};
+    use crate::model::ContentDescriptor;
 
     /// An in-memory shard store and the object's expected bytes, kept side by side.
     struct Model {
         store: HashMap<ShardHash, Bytes>,
         extents: Vec<Extent>,
         bytes: Vec<u8>,
+        /// The most bytes data extents held at the start; edits never add any.
+        data: usize,
+    }
+
+    /// A run of content to start from: bytes cut into shards, a data extent, or zeros.
+    #[derive(Debug, Clone)]
+    enum Piece {
+        Shards(Vec<u8>),
+        Data(Vec<u8>),
+        Zeros(u64),
+    }
+
+    fn piece() -> impl Strategy<Value = Piece> {
+        prop_oneof![
+            (0u64..1000, 1usize..3000).prop_map(|(seed, len)| Piece::Shards(random_bytes(seed, len))),
+            prop::collection::vec(any::<u8>(), 1..600).prop_map(Piece::Data),
+            (1u64..2000).prop_map(Piece::Zeros),
+        ]
     }
 
     impl Model {
         fn new(data: Vec<u8>) -> Self {
-            let mut m = Model { store: HashMap::new(), extents: Vec::new(), bytes: data.clone() };
-            let e = from_bytes(&Bytes::from(data), SMALL);
-            m.absorb(e);
+            Model::of(vec![Piece::Shards(data)])
+        }
+
+        fn of(pieces: Vec<Piece>) -> Self {
+            let mut m = Model { store: HashMap::new(), extents: Vec::new(), bytes: Vec::new(), data: 0 };
+            let mut extents = Vec::new();
+            for p in pieces {
+                match p {
+                    Piece::Shards(b) => {
+                        let e = from_bytes(&Bytes::from(b.clone()), SMALL);
+                        for s in e.new_shards {
+                            m.store.insert(s.hash, s.bytes);
+                        }
+                        extents.extend(e.extents);
+                        m.bytes.extend(b);
+                    }
+                    Piece::Data(b) => {
+                        m.bytes.extend(&b);
+                        extents.push(Extent::Data { d: Bytes::from(b) });
+                    }
+                    Piece::Zeros(z) => {
+                        m.bytes.resize(m.bytes.len() + z as usize, 0);
+                        extents.push(Extent::Zero { z });
+                    }
+                }
+            }
+            m.extents = normalize(extents);
+            m.data = crate::model::data_len(&m.extents);
             m
         }
 
@@ -347,6 +460,7 @@ mod tests {
                         out.extend_from_slice(b);
                     }
                     Extent::Zero { z } => out.resize(out.len() + *z as usize, 0),
+                    Extent::Data { d } => out.extend_from_slice(d),
                 }
             }
             out
@@ -354,12 +468,55 @@ mod tests {
 
         fn check(&self) {
             assert_eq!(self.materialize(), self.bytes);
+            assert_eq!(materialize(&self.extents, &mut |h: &ShardHash| self.store.get(h).cloned()).unwrap(), self.bytes);
             assert_eq!(size(&self.extents), self.bytes.len() as u64);
             assert_eq!(normalize(self.extents.clone()), self.extents, "extents are normalized");
             for e in &self.extents {
                 if let Extent::Shard { n, .. } = e {
                     assert!(*n >= 1 && *n <= SMALL.max as u64);
                 }
+            }
+            assert!(crate::model::data_len(&self.extents) <= self.data, "an edit adds no data extents");
+            // Spilled, the content is the same bytes with the same ETag, and no data extents.
+            let spilled = spill(&self.extents);
+            let mut store = self.store.clone();
+            store.extend(spilled.new_shards.iter().map(|s| (s.hash, s.bytes.clone())));
+            assert_eq!(crate::model::data_len(&spilled.extents), 0);
+            assert_eq!(materialize(&spilled.extents, &mut |h: &ShardHash| store.get(h).cloned()).unwrap(), self.bytes);
+            let desc = |extents: &[Extent]| ContentDescriptor::Inline { extents: extents.to_vec() };
+            assert_eq!(desc(&spilled.extents).etag(), desc(&self.extents).etag());
+        }
+
+        /// Applies `ops` one after another, checking the content after each.
+        fn run(mut self, ops: Vec<Op>) {
+            self.check();
+            for op in ops {
+                let size = self.bytes.len() as u64;
+                match op {
+                    Op::Write(o, d) => {
+                        let mut src = self.narrow_source(o.min(size), o + d.len() as u64);
+                        let e = write_at(&self.extents, o, &d, SMALL, &mut |h: &ShardHash| src.remove(h)).unwrap();
+                        self.absorb(e);
+                        let o = o as usize;
+                        if o > self.bytes.len() { self.bytes.resize(o, 0); }
+                        let end = (o + d.len()).min(self.bytes.len());
+                        self.bytes.splice(o..end, d);
+                    }
+                    Op::Splice(o, r, d) => {
+                        let (o, r) = (o.min(size), r.min(size - o.min(size)));
+                        let mut src = self.narrow_source(o, o + r);
+                        let e = splice(&self.extents, o, r, &d, SMALL, &mut |h: &ShardHash| src.remove(h)).unwrap();
+                        self.absorb(e);
+                        self.bytes.splice(o as usize..(o + r) as usize, d);
+                    }
+                    Op::Resize(n) => {
+                        let mut src = self.narrow_source(n.min(size), size);
+                        let e = set_size(&self.extents, n, SMALL, &mut |h: &ShardHash| src.remove(h)).unwrap();
+                        self.absorb(e);
+                        self.bytes.resize(n as usize, 0);
+                    }
+                }
+                self.check();
             }
         }
     }
@@ -382,37 +539,55 @@ mod tests {
     proptest! {
         #[test]
         fn edits_match_a_byte_buffer(seed in 0u64..1000, len in 0usize..10_000, ops in prop::collection::vec(op(), 1..12)) {
-            let mut m = Model::new(random_bytes(seed, len));
-            m.check();
-            for op in ops {
-                let size = m.bytes.len() as u64;
-                match op {
-                    Op::Write(o, d) => {
-                        let mut src = m.narrow_source(o.min(size), o + d.len() as u64);
-                        let e = write_at(&m.extents, o, &d, SMALL, &mut |h: &ShardHash| src.remove(h)).unwrap();
-                        m.absorb(e);
-                        let o = o as usize;
-                        if o > m.bytes.len() { m.bytes.resize(o, 0); }
-                        let end = (o + d.len()).min(m.bytes.len());
-                        m.bytes.splice(o..end, d);
-                    }
-                    Op::Splice(o, r, d) => {
-                        let (o, r) = (o.min(size), r.min(size - o.min(size)));
-                        let mut src = m.narrow_source(o, o + r);
-                        let e = splice(&m.extents, o, r, &d, SMALL, &mut |h: &ShardHash| src.remove(h)).unwrap();
-                        m.absorb(e);
-                        m.bytes.splice(o as usize..(o + r) as usize, d);
-                    }
-                    Op::Resize(n) => {
-                        let mut src = m.narrow_source(n.min(size), size);
-                        let e = set_size(&m.extents, n, SMALL, &mut |h: &ShardHash| src.remove(h)).unwrap();
-                        m.absorb(e);
-                        m.bytes.resize(n as usize, 0);
-                    }
-                }
-                m.check();
-            }
+            Model::new(random_bytes(seed, len)).run(ops);
         }
+
+        /// Content with data extents among its shards and zeros: an edit reads a data extent's
+        /// bytes from the extent itself, and never adds one.
+        #[test]
+        fn edits_with_data_extents_match_a_byte_buffer(pieces in prop::collection::vec(piece(), 0..6), ops in prop::collection::vec(op(), 1..12)) {
+            Model::of(pieces).run(ops);
+        }
+    }
+
+    /// An edit that touches a data extent, or leaves a short region beside it, re-chunks its bytes
+    /// into shards; one far from the edit is kept.
+    #[test]
+    fn edits_rechunk_the_data_extents_they_touch() {
+        let data = |m: &Model| m.extents.iter().filter(|e| matches!(e, Extent::Data { .. })).count();
+        let mut m = Model::of(vec![Piece::Data(b"hello world".to_vec())]);
+        let e = write_at(&m.extents, 6, b"WORLD", SMALL, &mut |_: &ShardHash| None).unwrap();
+        m.absorb(e);
+        m.bytes[6..].copy_from_slice(b"WORLD");
+        m.check();
+        assert_eq!(data(&m), 0);
+        // Appending to it absorbs it too, rather than leave a short shard beside it.
+        let mut m = Model::of(vec![Piece::Data(b"hello".to_vec())]);
+        let e = write_at(&m.extents, 5, b" world", SMALL, &mut |_: &ShardHash| None).unwrap();
+        m.absorb(e);
+        m.bytes.extend_from_slice(b" world");
+        m.check();
+        assert_eq!((data(&m), m.extents.len()), (0, 1));
+        let mut m = Model::of(vec![Piece::Data(vec![7; 100]), Piece::Shards(random_bytes(1, 5000))]);
+        let mut src = m.narrow_source(4000, 4004);
+        let e = write_at(&m.extents, 4000, b"four", SMALL, &mut |h: &ShardHash| src.remove(h)).unwrap();
+        m.absorb(e);
+        m.bytes[4000..4004].copy_from_slice(b"four");
+        m.check();
+        assert_eq!(data(&m), 1, "untouched");
+    }
+
+    #[test]
+    fn small_content_is_one_data_extent_and_spills_to_one_shard() {
+        assert!(inline(b"").is_empty());
+        let big = vec![1u8; 1 << 20];
+        let one = inline(&Bytes::from(big).slice(..MAX_DATA_BYTES));
+        let [Extent::Data { d }] = &one[..] else { panic!("{one:?}") };
+        assert_eq!(d.len(), MAX_DATA_BYTES);
+        let spilled = spill(&one);
+        assert_eq!(spilled.extents, [Extent::Shard { s: ShardHash::of(d), n: MAX_DATA_BYTES as u64 }]);
+        assert_eq!(spilled.new_shards.len(), 1);
+        assert_eq!(spill(&spilled.extents), Edited { extents: spilled.extents.clone(), new_shards: Vec::new() });
     }
 
     #[test]
@@ -453,15 +628,22 @@ mod tests {
 
     #[test]
     fn read_plans_cover_exactly_the_range() {
-        let m = Model::new(random_bytes(4, 5000));
-        let plan = read_plan(&m.extents, 1000, 2500).unwrap();
-        let mut got = Vec::new();
-        for p in plan {
-            let b = &m.store[&p.shard.unwrap()];
-            got.extend_from_slice(&b[p.offset as usize..(p.offset + p.len) as usize]);
+        let m = Model::of(vec![Piece::Shards(random_bytes(4, 5000)), Piece::Data(random_bytes(5, 3000)), Piece::Zeros(500), Piece::Data(vec![9; 10])]);
+        for (start, len) in [(1000, 2500), (0, 8510), (4990, 3100), (8000, 510), (8505, 2)] {
+            let mut got = Vec::new();
+            for p in read_plan(&m.extents, start, len).unwrap() {
+                match p.source {
+                    Source::Shard(h) => got.extend_from_slice(&m.store[&h][p.offset as usize..(p.offset + p.len) as usize]),
+                    Source::Zeros => got.resize(got.len() + p.len as usize, 0),
+                    Source::Data(b) => {
+                        assert_eq!(b.len() as u64, p.len);
+                        got.extend_from_slice(&b);
+                    }
+                }
+            }
+            assert_eq!(got, &m.bytes[start as usize..(start + len) as usize], "{start}+{len}");
         }
-        assert_eq!(got, &m.bytes[1000..3500]);
-        assert!(read_plan(&m.extents, 4000, 1001).is_err());
+        assert!(read_plan(&m.extents, 8000, 511).is_err());
     }
 
     #[test]

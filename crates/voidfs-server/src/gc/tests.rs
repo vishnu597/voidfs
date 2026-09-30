@@ -67,6 +67,7 @@ impl Sim {
             match e {
                 Extent::Shard { s, .. } => out.extend_from_slice(&self.store.get(&format!("shards/{}", s.object_path())).await.ok()??),
                 Extent::Zero { z } => out.resize(out.len() + z as usize, 0),
+                Extent::Data { d } => out.extend_from_slice(&d),
             }
         }
         Some(out)
