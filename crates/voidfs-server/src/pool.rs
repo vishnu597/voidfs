@@ -304,6 +304,9 @@ pub struct Drive {
     checkpoint: Arc<tokio::sync::Mutex<Option<Checkpointed>>>,
     /// Mutations waiting for the next commit, in the order they arrived.
     queue: std::sync::Mutex<VecDeque<Waiting>>,
+    /// Whether a task is draining `queue`: there is at most one. Set and cleared only while
+    /// `queue` is locked.
+    draining: std::sync::atomic::AtomicBool,
     feed: RwLock<VecDeque<FeedBatch>>,
     /// The oldest seq the feed can still report changes after.
     feed_floor: RwLock<u64>,
@@ -346,6 +349,7 @@ impl Drive {
             commit_lock: tokio::sync::Mutex::new(cadence),
             checkpoint: Arc::new(tokio::sync::Mutex::new(last)),
             queue: std::sync::Mutex::new(VecDeque::new()),
+            draining: std::sync::atomic::AtomicBool::new(false),
             feed: RwLock::new(VecDeque::new()),
             feed_floor: RwLock::new(floor),
             notify,
@@ -1086,20 +1090,24 @@ impl Pool {
     {
         let plans: Vec<P> = plans.into_iter().collect();
         let since = self.clock.mono();
-        let answers: Vec<_> = {
+        let (answers, start): (Vec<_>, bool) = {
             let mut q = d.queue.lock().unwrap();
-            plans
+            let answers = plans
                 .into_iter()
                 .map(|plan| {
                     let (reply, answer) = tokio::sync::oneshot::channel();
                     q.push_back(Waiting { plan: Box::new(plan), reply, since });
                     answer
                 })
-                .collect()
+                .collect();
+            (answers, !d.draining.swap(true, std::sync::atomic::Ordering::Relaxed))
         };
         // A task of its own, so that a request that goes away cannot stop a commit that others
-        // are waiting on.
-        tokio::spawn(self.clone().drain(d.clone()));
+        // are waiting on; and only one, so that what else waits for the commit lock waits for one
+        // batch, not for a task per mutation queued ahead of it.
+        if start {
+            tokio::spawn(self.clone().drain(d.clone()));
+        }
         let mut out = Vec::with_capacity(answers.len());
         for answer in answers {
             out.push(answer.await.unwrap_or_else(|_| Err(CommitError::Other(anyhow!("the commit was abandoned")))));
@@ -1107,21 +1115,34 @@ impl Pool {
         out
     }
 
-    /// Commits what is waiting on `d`, a batch at a time, until nothing is. Every mutation starts
-    /// one of these, and whichever holds the commit lock takes everything waiting, so a batch is
-    /// what queued up while the one before it was being written.
+    /// Commits what is waiting on `d`, a batch at a time, until nothing is. A mutation starts one
+    /// of these unless one is running, and it takes everything waiting each time it holds the
+    /// commit lock, so a batch is what queued up while the one before it was being written.
     async fn drain(self: Arc<Self>, d: Arc<Drive>) {
+        use std::sync::atomic::Ordering;
+        /// Lets the next mutation start another task if this one panics.
+        struct Unwinding<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Unwinding<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+        let _unwinding = Unwinding(&d.draining);
         loop {
             // Taken for each batch, so that forks and deletions of the drive get their turn.
             let mut cadence = d.commit_lock.lock().await;
             let batch: Vec<Waiting> = {
                 let mut q = d.queue.lock().unwrap();
+                if q.is_empty() {
+                    // Under the queue's lock, so that a mutation queued after this starts a task.
+                    d.draining.store(false, Ordering::Relaxed);
+                    return;
+                }
                 let n = q.len().min(BATCH_TXNS);
                 q.drain(..n).collect()
             };
-            if batch.is_empty() {
-                return;
-            }
             let rest = self.commit_batch(&d, &mut cadence, batch).await;
             let mut q = d.queue.lock().unwrap();
             for w in rest.into_iter().rev() {
@@ -2170,6 +2191,54 @@ mod tests {
         ticks(&pool, &d, &tick, 1).await;
         settle(&d).await;
         assert_eq!(checkpoints(&pool.store, &d).await, [2 * CHECKPOINT_EVERY]);
+    }
+
+    /// One task drains a drive's queue at a time, so whatever else waits for the commit lock (a
+    /// fork, or a hard delete) waits for the batch being written, not for a line of tasks that grows with every mutation. With a task
+    /// per mutation, under eight clients writing steadily, it waited 1.5 s, then 9, then 56.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn steady_commits_do_not_starve_the_commit_lock() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = content(&pool, b"one").await;
+        mem.set_hook(Some(Arc::new(|op, path| {
+            let slow = op == MemOp::PutNew && path.contains("/log/");
+            async move {
+                if slow {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Fault::None
+            }
+            .boxed()
+        })));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clients: Vec<_> = (0..8)
+            .map(|c| {
+                let (pool, d, one, stop) = (pool.clone(), d.clone(), one.clone(), stop.clone());
+                tokio::spawn(async move {
+                    let mut i = 0;
+                    while !stop.load(Ordering::SeqCst) {
+                        pool.commit(&d, put_plan(&format!("c{c}-{i}"), &one, Precondition::default(), &Arc::default())).await.unwrap();
+                        i += 1;
+                    }
+                    i
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for _ in 0..5 {
+            let started = Instant::now();
+            drop(tokio::time::timeout(Duration::from_secs(5), d.commit_lock.lock()).await.expect("the commit lock is not starved"));
+            assert!(started.elapsed() < Duration::from_millis(500), "waited {:?}", started.elapsed());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stop.store(true, Ordering::SeqCst);
+        let mut done = 0;
+        for c in clients {
+            done += c.await.unwrap();
+        }
+        assert!(done > 100, "only {done} commits");
     }
 
     // -----------------------------------------------------------------------------------------
