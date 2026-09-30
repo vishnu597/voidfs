@@ -81,11 +81,51 @@ What was built, in `Pool::commit` ([pool.rs](../crates/voidfs-server/src/pool.rs
   entries: 200 keys at 12 ms went from 2.6 s to 16 ms.
 
 What was left for later:
-- Rename at 8 at once takes two round trips: after an entry lands, the first new request starts
-  the next alone. A short hold before an entry, while the previous one had company, might bring
-  it to one; not tried.
+- Rename at 8 at once took two round trips: after an entry landed, the requests it had answered
+  waited for the next entry and then their own. **Done** with the hold below (30 September 2026).
 - Planning the next batch while an entry is in flight saves only CPU, a small part of a round
   trip here, so it was not done.
+
+**Follow-up (30 September 2026): a hold before each entry.** Measured in
+[bench/results/group-commit-hold](../bench/results/group-commit-hold/README.md), relative to the
+bare bucket in the same run:
+- **At 12 ms, eight to 64 at once, a small write takes one round trip instead of two.** Put
+  4 KiB 2.18× to 1.20×, overwrite 4 KiB 2.19× to 1.15×, the fan-out puts of 4 KiB at 32 and 64
+  2.46× and 2.48× to 1.39× and 1.47× (focused runs, the median of four). Rename 64 MiB and the
+  folder move take 13.9 and 13.8 ms, from 27.3 and 27.0. Put 4 KiB takes 14.0–14.3 ms at 2, 4 and
+  8 at once, from 26.5–27.1, and 13.5 ms alone either way.
+- **Over the 49 rows at 12 ms**, the geometric mean of the p50 ratios against `main` is 0.932
+  (writes 0.830, metadata 0.747, edits 0.990, reads 1.002). 25–26 rows are at or ahead of
+  SpaceFS's ratio (`main` 22 in the same session), and the geometric mean speed-up over the bare
+  bucket is 2.9× (`main` 2.7×, SpaceFS 2.8×).
+- **Nothing else moved that the focused runs confirm, but list 200 keys:** 1.0 to 1.1 ms at
+  12 ms (+18% relative to bare in every pair, +11% with holding off and on in one binary), still
+  31–38× faster than the bare bucket. Not explained: listing the drive's state takes the same
+  30 µs however its puts were batched. Edits in 1 MiB files moved −3% to +6%, not the same way in
+  each pair.
+- **On loopback nothing is held**, since a log entry takes about 0.3 ms: over the 49 rows the
+  geometric mean is 0.975 relative to bare, 33–35 rows are at or ahead of SpaceFS's ratio (`main`
+  31–35), and the rows that looked slower moved both ways in a second focused set. Put 4 KiB was
+  2–4% slower than `main`'s in every pair, but not with holding off and on in one binary.
+
+What was built, in `Pool::drain` ([pool.rs](../crates/voidfs-server/src/pool.rs)):
+- **The hold.** After an entry lands, the next waits until as many mutations have queued since as
+  the entry answered, or a whole batch is waiting, for at most a quarter of the entry's write time
+  and 2 ms. A client alone never waits: the entry after its last waits for its next write. The
+  timer is set a tick early, since tokio's fire up to 1 ms late.
+- **Not after an entry written in under 4 ms** (loopback, a bucket on the same machine): the
+  bound would be under a timer tick. A spin of `yield_now` in its place caught nothing on
+  loopback (log entries per put unchanged) and kept a worker busy.
+- **Only while it pays.** The drive keeps a decayed tally of how many mutations queued within
+  each entry's bound against how many it answered, held or not, and holds while that is at least
+  a half. Edits, which upload a shard before they commit, and requests that arrive at their own
+  pace, do not come back in time, so their entries are not held. In exploratory runs, holding
+  every time made seven of the eight edits in 1 MiB files 8–19% slower, and deciding from the
+  last entry alone −3% to +9%.
+- **Not under the commit lock**, so forks, hard deletes and a checkpoint's swap get it between
+  entries as before. The tally is on the drive, not in `Cadence` (which a checkpoint resets), since
+  the draining task ends whenever the queue empties.
+- `voidfs_commit_hold_seconds` reports each hold.
 
 **Problem.** A drive commits one mutation per bucket round trip. `Pool::commit`
 ([pool.rs:619](../crates/voidfs-server/src/pool.rs#L619)) takes the drive's `commit_lock`
@@ -278,7 +318,7 @@ per-byte time.
   write: while a log entry is in flight, the requests the last one answered wait for it and then
   for their own, and two at once already take two round trips. A diagnostic build that holds an
   entry until those requests are back (at most 2 ms) took the four rows to 1.1–1.4× and rename
-  64 MiB from 26 ms to 13; it is not in this change.
+  64 MiB from 26 ms to 13; it is not in this change, but in item 1's follow-up.
 - **On loopback**, where round trips cost little: put 4 KiB 1.98× to 1.15×, overwrite 1.72× to
   0.91×, the fan-out puts 1.70× and 1.84× to 0.65× and 0.57×.
 - **Over the 49 rows**, relative to the bare bucket: at 12 ms the geometric mean of the p50 ratios
@@ -371,8 +411,11 @@ What change 1 built:
 What was left for later:
 - A short hold before a log entry that follows another, until the requests the last one
   answered are back, would take small writes, fan-out puts and renames from two round trips to
-  one at 8 to 64 at once (the diagnostic above). It changes every write's timing, so it needs its
-  own measurements, and a way to behave on loopback, where a hold would cost more than an entry.
+  one at 8 to 64 at once (the diagnostic above). **Done** (30 September 2026, item 1's
+  follow-up, [results](../bench/results/group-commit-hold/README.md)): at 12 ms, put and overwrite
+  4 KiB take 1.20× and 1.15× the bare bucket's time eight at once, the fan-out puts 1.39× and
+  1.47×, all ahead of SpaceFS's ratios, and put 4 KiB takes one round trip from 2 to 8 at once.
+  On loopback, where a hold would cost more than an entry, entries are not held.
 - A drive's state takes about 26 KB of memory per small file, on `main` too (100,000 files:
   2.6–2.8 GB with a 16 MiB shard cache). Not investigated.
 - Multipart uploads of 8 and 16 MiB parts gain little from the window: their time at 12 ms is

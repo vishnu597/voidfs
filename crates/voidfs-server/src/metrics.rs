@@ -16,6 +16,8 @@ use prometheus::{Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterV
 const LATENCY: &[f64] = &[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 /// Upper bounds of the transactions-per-log-entry histogram: a batch holds at most 256.
 const BATCH: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+/// Upper bounds of the hold histogram, in seconds: a hold takes at most 2 ms.
+const HOLD: &[f64] = &[0.0001, 0.00025, 0.0005, 0.001, 0.0015, 0.002];
 
 fn counters(r: &Registry, name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
     let v = IntCounterVec::new(Opts::new(name, help), labels).expect("a valid counter");
@@ -261,6 +263,8 @@ pub struct PoolMetrics {
     pub batch: Histogram,
     /// How long each log entry took to write.
     pub log_write: Histogram,
+    /// How long log entries were held for the requests the entry before answered.
+    pub hold: Histogram,
     pub commits_written: IntCounter,
     /// Log entries another server wrote first, so that the batch was planned again.
     pub commits_lost: IntCounter,
@@ -309,6 +313,7 @@ impl PoolMetrics {
         let (shards, pages) = (cache("shard", cache_bytes), cache("page", page_cache_bytes));
         let batch = histogram(&r, "voidfs_commit_transactions", "Transactions in each log entry written (group commit).", BATCH);
         let log_write = histogram(&r, "voidfs_commit_log_write_seconds", "Time to write each log entry, whether or not it was written.", LATENCY);
+        let hold = histogram(&r, "voidfs_commit_hold_seconds", "Time a log entry was held after the one before it, for the requests that one answered to come back.", HOLD);
         let commits = counters(&r, "voidfs_commits_total", "Log entries: written, lost to another server's entry (then planned again), or failed.", &["outcome"]);
         let checkpoints = counters(&r, "voidfs_checkpoints_total", "Checkpoints written, and attempts that failed.", &["outcome"]);
         let checkpoint_write = histogram(&r, "voidfs_checkpoint_write_seconds", "Time to write each checkpoint, in the background, whether or not it was written.", LATENCY);
@@ -323,6 +328,7 @@ impl PoolMetrics {
             pages,
             batch,
             log_write,
+            hold,
             commits_written: commits.with_label_values(&["written"]),
             commits_lost: commits.with_label_values(&["lost_race"]),
             commits_failed: commits.with_label_values(&["failed"]),

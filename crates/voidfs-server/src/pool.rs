@@ -62,6 +62,14 @@ const BATCH_ATTEMPTS: u32 = 8;
 /// collection before it was queued, and must be committed within 12 hours of that check (format
 /// §12.4), of which a request body may take 6.
 const QUEUE_MAX: Duration = Duration::from_secs(3600);
+/// The longest a log entry is held after the one before it, for the requests that one answered to
+/// come back (see [`Pool::drain`])...
+const HOLD_MAX: Duration = Duration::from_millis(2);
+/// ...and the share of that entry's write time it may take, at most.
+const HOLD_SHARE: u32 = 4;
+/// How coarse tokio's timers are. A hold shorter than this would take a tick all the same, so
+/// an entry written in less than four is not held.
+const TIMER_TICK: Duration = Duration::from_millis(1);
 
 fn log_path(id: &DriveId, seq: u64) -> String {
     format!("drives/{id}/log/{seq:020}.json")
@@ -290,6 +298,49 @@ struct Waiting {
     reply: tokio::sync::oneshot::Sender<Committed>,
     /// When it was queued, on the monotonic clock.
     since: Duration,
+    /// When it was queued, for holding log entries, which tokio's timers time.
+    queued: Instant,
+}
+
+/// A log entry just written. The requests it answered may send their next ones at once, and the
+/// next entry waits for them a little (see [`Pool::drain`]).
+#[derive(Clone, Copy)]
+struct Landed {
+    /// When its mutations were answered.
+    at: Instant,
+    /// How long the next entry may wait for them.
+    bound: Duration,
+    /// How many mutations it answered.
+    answered: usize,
+}
+
+impl Landed {
+    /// Whether `w` was queued while the next entry could wait for it.
+    fn caught(&self, w: &Waiting) -> bool {
+        w.queued > self.at && w.queued <= self.at + self.bound
+    }
+}
+
+/// How many mutations queued within the bound of each recent log entry, against how many it
+/// answered: each entry's are added once the sums so far have lost an eighth, so that the last
+/// eight or so entries count most.
+#[derive(Default)]
+struct Returns {
+    caught: f64,
+    answered: f64,
+}
+
+impl Returns {
+    fn add(&mut self, caught: usize, answered: usize) {
+        self.caught = self.caught * 0.875 + caught as f64;
+        self.answered = self.answered * 0.875 + answered as f64;
+    }
+
+    /// Whether holding pays: at least half as many came back as were answered, or nothing is
+    /// known yet.
+    fn pay(&self) -> bool {
+        2.0 * self.caught >= self.answered
+    }
 }
 
 pub struct Drive {
@@ -309,6 +360,12 @@ pub struct Drive {
     /// Whether a task is draining `queue`: there is at most one. Set and cleared only while
     /// `queue` is locked.
     draining: std::sync::atomic::AtomicBool,
+    /// Told whenever a mutation is queued, for the draining task holding the next entry.
+    queued: tokio::sync::Notify,
+    /// Whether the requests log entries answered came back in time lately, which decides whether
+    /// the draining task holds the next entry (see [`Pool::drain`]). Kept here, not in the task,
+    /// because the task ends whenever the queue empties. Only that task takes it.
+    returns: std::sync::Mutex<Returns>,
     feed: RwLock<VecDeque<FeedBatch>>,
     /// The oldest seq the feed can still report changes after.
     feed_floor: RwLock<u64>,
@@ -352,6 +409,8 @@ impl Drive {
             checkpoint: Arc::new(tokio::sync::Mutex::new(last)),
             queue: std::sync::Mutex::new(VecDeque::new()),
             draining: std::sync::atomic::AtomicBool::new(false),
+            queued: tokio::sync::Notify::new(),
+            returns: std::sync::Mutex::new(Returns::default()),
             feed: RwLock::new(VecDeque::new()),
             feed_floor: RwLock::new(floor),
             notify,
@@ -1147,19 +1206,20 @@ impl Pool {
         P: FnMut(&DriveState) -> Result<Txn, CommitError> + Send + 'static,
     {
         let plans: Vec<P> = plans.into_iter().collect();
-        let since = self.clock.mono();
+        let (since, queued) = (self.clock.mono(), Instant::now());
         let (answers, start): (Vec<_>, bool) = {
             let mut q = d.queue.lock().unwrap();
             let answers = plans
                 .into_iter()
                 .map(|plan| {
                     let (reply, answer) = tokio::sync::oneshot::channel();
-                    q.push_back(Waiting { plan: Box::new(plan), reply, since });
+                    q.push_back(Waiting { plan: Box::new(plan), reply, since, queued });
                     answer
                 })
                 .collect();
             (answers, !d.draining.swap(true, std::sync::atomic::Ordering::Relaxed))
         };
+        d.queued.notify_waiters();
         // A task of its own, so that a request that goes away cannot stop a commit that others
         // are waiting on; and only one, so that what else waits for the commit lock waits for one
         // batch, not for a task per mutation queued ahead of it.
@@ -1176,6 +1236,24 @@ impl Pool {
     /// Commits what is waiting on `d`, a batch at a time, until nothing is. A mutation starts one
     /// of these unless one is running, and it takes everything waiting each time it holds the
     /// commit lock, so a batch is what queued up while the one before it was being written.
+    ///
+    /// Taken as soon as an entry lands, the next batch would miss the requests that entry has
+    /// just answered: their clients send the next ones at once, which then wait for that batch
+    /// and then their own. Clients writing together split into two groups that take turns, and
+    /// each write takes two round trips. So after an entry lands, the next one waits until as
+    /// many mutations have queued since as it answered, up to a quarter of its write time and at
+    /// most [`HOLD_MAX`]. That is what those clients take to come back from nearby; one alone
+    /// never waits, since its own next request is what the entry waits for. An entry written in
+    /// less than 4 ms is not held: a timer takes a tick, 1 ms, to wait at all, and a client
+    /// takes longer than a quarter of such an entry to come back.
+    ///
+    /// Answered clients that do not come back, as when requests arrive at their own pace or do
+    /// more between writes, would cost what is waiting the bound each time. So an entry waits
+    /// only while, over the last several entries, at least half as many mutations queued within
+    /// their bounds as they answered, whether they were held or not ([`Returns`]). One entry
+    /// alone would not do: when each answers one or two, a single request that happens to
+    /// arrive in time would turn holding on. The commit lock is not held meanwhile, so forks,
+    /// hard deletes and a checkpoint's swap get it between entries as before.
     async fn drain(self: Arc<Self>, d: Arc<Drive>) {
         use std::sync::atomic::Ordering;
         /// Lets the next mutation start another task if this one panics.
@@ -1188,6 +1266,9 @@ impl Pool {
             }
         }
         let _unwinding = Unwinding(&d.draining);
+        // The entry written last, and how many mutations have been seen that queued within its
+        // bound.
+        let (mut last, mut caught): (Option<Landed>, usize) = (None, 0);
         loop {
             // Taken for each batch, so that forks and deletions of the drive get their turn.
             let mut cadence = d.commit_lock.lock().await;
@@ -1201,22 +1282,70 @@ impl Pool {
                 let n = q.len().min(BATCH_TXNS);
                 q.drain(..n).collect()
             };
-            let rest = self.commit_batch(&d, &mut cadence, batch).await;
-            let mut q = d.queue.lock().unwrap();
-            for w in rest.into_iter().rev() {
-                q.push_front(w);
+            if let Some(l) = &last {
+                caught += batch.iter().filter(|w| l.caught(w)).count();
+            }
+            let (rest, landed) = self.commit_batch(&d, &mut cadence, batch).await;
+            let landed = landed.filter(|l| l.bound >= TIMER_TICK);
+            drop(cadence);
+            {
+                let mut q = d.queue.lock().unwrap();
+                // Before what did not fit is put back: the batch counted it already.
+                if let Some(l) = &last {
+                    caught += q.iter().filter(|w| l.caught(w)).count();
+                }
+                for w in rest.into_iter().rev() {
+                    q.push_front(w);
+                }
+            }
+            let pay = {
+                let mut r = d.returns.lock().unwrap();
+                if let Some(l) = &last {
+                    r.add(caught, l.answered);
+                }
+                r.pay()
+            };
+            (last, caught) = (landed, 0);
+            if let Some(l) = &landed
+                && pay
+            {
+                let started = Instant::now();
+                Self::hold(&d, l).await;
+                self.metrics.hold.observe(started.elapsed().as_secs_f64());
+            }
+        }
+    }
+
+    /// Waits until as many mutations have queued on `d` since `landed` as it answered, or a
+    /// whole batch is waiting, or until its bound, which is a tick or more.
+    async fn hold(d: &Drive, landed: &Landed) {
+        // A timer fires up to a tick late: set so that it fires by the bound.
+        let timer = tokio::time::sleep_until((landed.at + landed.bound - TIMER_TICK).into());
+        tokio::pin!(timer);
+        loop {
+            // Made before looking, so that it hears of a mutation queued after the look.
+            let queued = d.queued.notified();
+            {
+                let q = d.queue.lock().unwrap();
+                if q.len() >= BATCH_TXNS || q.iter().filter(|w| w.queued > landed.at).count() >= landed.answered {
+                    return;
+                }
+            }
+            tokio::select! {
+                _ = queued => {}
+                _ = &mut timer => return,
             }
         }
     }
 
     /// Plans `batch` in order, each transaction against the state the ones before it leave,
     /// writes those that plan as one commit, and answers each mutation. Returns the mutations that
-    /// did not fit, to wait for the next commit.
+    /// did not fit, to wait for the next commit, and the commit if it was written.
     ///
     /// A mutation is answered only once the commit is written, unless its plan failed against
     /// the drive's state as installed, before any transaction of the batch: a failure may rest
     /// on an earlier transaction that is never written.
-    async fn commit_batch(self: &Arc<Self>, d: &Arc<Drive>, cadence: &mut Cadence, batch: Vec<Waiting>) -> Vec<Waiting> {
+    async fn commit_batch(self: &Arc<Self>, d: &Arc<Drive>, cadence: &mut Cadence, batch: Vec<Waiting>) -> (Vec<Waiting>, Option<Landed>) {
         let now = self.clock.mono();
         let (mut batch, late): (Vec<Waiting>, Vec<Waiting>) = batch.into_iter().partition(|w| now.saturating_sub(w.since) <= QUEUE_MAX);
         for w in late {
@@ -1275,19 +1404,20 @@ impl Pool {
                 }
             }
             if txns.is_empty() {
-                return rest;
+                return (rest, None);
             }
             let n = txns.len();
             let commit = Commit { format: 1, seq, time, authority: self.authority.clone(), txns };
-            let written = match serde_json::to_vec(&commit) {
+            let (written, took) = match serde_json::to_vec(&commit) {
                 Ok(bytes) => {
                     let len = bytes.len();
                     let started = Instant::now();
                     let created = self.create(&log_path(&d.id, seq), Bytes::from(bytes)).await;
-                    self.metrics.log_write.observe(started.elapsed().as_secs_f64());
-                    created.map(|created| created.then_some(len))
+                    let took = started.elapsed();
+                    self.metrics.log_write.observe(took.as_secs_f64());
+                    (created.map(|created| created.then_some(len)), took)
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => (Err(e.into()), Duration::ZERO),
             };
             match written {
                 Ok(Some(len)) => {
@@ -1305,10 +1435,11 @@ impl Pool {
                         let (pool, d, seen) = (self.clone(), d.clone(), self.clock.mono());
                         tokio::spawn(async move { pool.checkpoint(&d, state, seen, &mut last).await });
                     }
+                    let landed = Landed { at: Instant::now(), bound: (took / HOLD_SHARE).min(HOLD_MAX), answered: held.len() };
                     for (w, answer) in held {
                         let _ = w.reply.send(answer);
                     }
-                    return rest;
+                    return (rest, Some(landed));
                 }
                 // Another authority wrote this sequence number: catch up, and plan everything
                 // again against what it wrote (format §7.2).
@@ -1325,7 +1456,7 @@ impl Pool {
                     for (w, _) in held {
                         let _ = w.reply.send(Err(failed.as_ref().map_or(CommitError::Retry, |e| CommitError::Other(anyhow!("{e}")))));
                     }
-                    return rest;
+                    return (rest, None);
                 }
                 // Whether it was written is not known, so none of it may be reported as done.
                 Err(e) => {
@@ -1333,7 +1464,7 @@ impl Pool {
                     for (w, _) in held {
                         let _ = w.reply.send(Err(CommitError::Other(anyhow!("writing log entry {seq}: {e:#}"))));
                     }
-                    return rest;
+                    return (rest, None);
                 }
             }
         }
@@ -2586,6 +2717,166 @@ mod tests {
             done += c.await.unwrap();
         }
         assert!(done > 100, "only {done} commits");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Holding a log entry for the requests the one before it answered
+
+    /// Log entries written through [`slow_log`].
+    #[derive(Default)]
+    struct LogWrites {
+        begun: AtomicUsize,
+        /// When each began and ended.
+        done: std::sync::Mutex<Vec<(Instant, Instant)>>,
+    }
+
+    /// Makes each log entry written to `mem` take `delay`.
+    fn slow_log(mem: &MemStore, delay: Duration) -> Arc<LogWrites> {
+        let writes = Arc::new(LogWrites::default());
+        let w = writes.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if !(op == MemOp::PutNew && path.contains("/log/")) {
+                return futures::future::ready(Fault::None).boxed();
+            }
+            let w = w.clone();
+            async move {
+                let began = Instant::now();
+                w.begun.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                w.done.lock().unwrap().push((began, Instant::now()));
+                Fault::None
+            }
+            .boxed()
+        })));
+        writes
+    }
+
+    /// What a client takes to send its next request once answered: `t`, which a timer would
+    /// stretch to a millisecond.
+    async fn think(t: Duration) {
+        let started = Instant::now();
+        while started.elapsed() < t {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Clients that write again as soon as they are answered share log entries: each entry waits
+    /// for the requests the one before it answered. Otherwise they split into two groups that take
+    /// turns, each write takes two entries, and the ten rounds here take twenty. A drive that had
+    /// stopped holding, because the clients of its last entry did not come back, starts again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clients_writing_together_share_log_entries() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let one = held(b"one");
+        let writes = slow_log(&mem, Duration::from_millis(20));
+        let (clients, rounds) = (8, 10);
+        for (i, stopped) in [false, true].into_iter().enumerate() {
+            let d = pool.create_drive(&format!("d{i}"), None).await.unwrap();
+            if stopped {
+                d.returns.lock().unwrap().add(0, clients);
+                assert!(!d.returns.lock().unwrap().pay());
+            }
+            let before = writes.begun.load(Ordering::SeqCst);
+            let tasks: Vec<_> = (0..clients)
+                .map(|c| {
+                    let (pool, d, one) = (pool.clone(), d.clone(), one.clone());
+                    tokio::spawn(async move {
+                        for r in 0..rounds {
+                            pool.commit(&d, put_plan(&format!("c{c}-{r}"), &one, Precondition::default(), &Arc::default())).await.unwrap();
+                            think(Duration::from_micros(300)).await;
+                        }
+                    })
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+            let entries = writes.begun.load(Ordering::SeqCst) - before;
+            assert!(entries <= rounds + rounds / 2, "stopped at first: {stopped}. {entries} log entries for {rounds} rounds of {clients} writes");
+        }
+        assert!(pool.metrics.hold.get_sample_count() >= 2 * rounds as u64 - 4);
+    }
+
+    /// An entry written in less than 4 ms is not held: a timer would take a tick, more than a
+    /// quarter of the entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quick_entries_are_not_held() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = held(b"one");
+        let writes = slow_log(&mem, Duration::from_millis(1));
+        let tasks: Vec<_> = (0..4)
+            .map(|c| {
+                let (pool, d, one) = (pool.clone(), d.clone(), one.clone());
+                tokio::spawn(async move {
+                    for r in 0..10 {
+                        pool.commit(&d, put_plan(&format!("c{c}-{r}"), &one, Precondition::default(), &Arc::default())).await.unwrap();
+                        think(Duration::from_micros(300)).await;
+                    }
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert!(writes.begun.load(Ordering::SeqCst) > 0);
+        assert_eq!(pool.metrics.hold.get_sample_count(), 0);
+    }
+
+    /// A client writing alone never waits for a hold: the entry after its last one waits for its
+    /// next write, which comes, and for nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_alone_never_waits() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = held(b"one");
+        let writes = slow_log(&mem, Duration::from_millis(20));
+        let mut waited = Duration::ZERO;
+        for i in 0..20 {
+            let sent = Instant::now();
+            pool.commit(&d, put_plan(&format!("k{i}"), &one, Precondition::default(), &Arc::default())).await.unwrap();
+            waited += writes.done.lock().unwrap().last().unwrap().0 - sent;
+            think(Duration::from_micros(300)).await;
+        }
+        // Held for more, each write would wait a millisecond at least.
+        assert!(waited < Duration::from_millis(10), "waited {waited:?} in all before its entry was written");
+    }
+
+    /// When the clients an entry answered do not come back, the next entry waits at most the
+    /// bound, and then entries stop waiting: requests that arrive at their own pace do not pay
+    /// for it each time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hold_is_bounded_when_nobody_comes_back() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = inline_pool(&mem).await;
+        let d = pool.create_drive("d", None).await.unwrap();
+        let one = held(b"one");
+        let writes = slow_log(&mem, Duration::from_millis(100));
+        // One put an entry, each queued while the entry before it is written, after that entry's
+        // bound; no client writes again.
+        let puts = async {
+            let mut tasks = Vec::new();
+            for i in 0..7 {
+                if i > 0 {
+                    reached(&writes.begun, i).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let (pool, d, one) = (pool.clone(), d.clone(), one.clone());
+                tasks.push(tokio::spawn(async move { pool.commit(&d, put_plan(&format!("k{i}"), &one, Precondition::default(), &Arc::default())).await.unwrap() }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), puts).await.expect("the hold is bounded");
+        let done = writes.done.lock().unwrap().clone();
+        assert_eq!(done.len(), 7);
+        let gaps: Vec<Duration> = done.windows(2).map(|w| w[1].0 - w[0].1).collect();
+        assert!((HOLD_MAX - TIMER_TICK..HOLD_MAX + Duration::from_millis(10)).contains(&gaps[0]), "the first entry waits, at most the bound: {gaps:?}");
+        assert!(gaps[1..].iter().sum::<Duration>() < Duration::from_millis(3), "the next ones do not: {gaps:?}");
     }
 
     // -----------------------------------------------------------------------------------------

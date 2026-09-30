@@ -35,16 +35,17 @@ billing or plans), this page says so.
   benchmark scenarios; [`bench/`](../bench/README.md) runs all of them against voidfs and the bare
   bucket underneath it.
   - In the closest local emulation (the bucket 12 ms away), voidfs is at least as far ahead of
-    the bare bucket as SpaceFS on 24–26 of the 49 rows (§6), 22–23 for `main` in the same
-    session, up from 16–19 with group commit alone and 7 before it.
+    the bare bucket as SpaceFS on 25–26 of the 49 rows (§6), 22 for `main` in the same session,
+    up from 16–19 with group commit alone and 7 before it. Its geometric mean speed-up over the
+    bare bucket there, 2.9×, is above SpaceFS's 2.8×.
   - Group commit removed the cause that held back 35 rows: a drive committed one mutation per
     bucket round trip. The shard cache now keeps what was written and read last, which put the
     fan-out gets far ahead. Large puts now upload while they read the body, and checkpoints no
     longer hold up commits: put 64 MiB takes 1.3× the bare bucket's time eight at once and 0.9×
-    alone, from 2.2× and 2.5×. Small files are now held in the log (RFC 0003): alone, a small
-    write takes one round trip instead of two. Eight or more at once still take two, because of
-    how group commit schedules its log entries; a hold before an entry, tried in a diagnostic
-    build, takes them to one. Then patch, and large reads that only the real run can judge.
+    alone, from 2.2× and 2.5×. Small files are now held in the log (RFC 0003), and each log entry
+    waits briefly for the requests the one before it answered: a small write or a rename takes
+    one round trip instead of two, alone or 64 at once. Then patch, and large reads that only the
+    real run can judge.
 - **SpaceFS's Mac app is now understood** (§5). It is a native FSKit module with its core in Rust,
   running in a separate daemon, which is the architecture the FSKit spike chose for voidfs. It
   also shows that the FSKit entitlement can ship with Developer ID.
@@ -54,9 +55,9 @@ billing or plans), this page says so.
   - Step 2 is done: garbage collection, content-defined checkpoint segments, the bucket
     capability probe, runs on AWS S3, MinIO and rclone, virtual-host addressing, and the
     Compose file with health checks and metrics.
-  - Step 3 has its first three items done: group commit, the shard cache's admission, and fewer
-    round trips per write (checkpoints in the background, pipelined ingest, and small files held
-    in the log, RFC 0003).
+  - Step 3 has its first three items done: group commit (with a hold, so that concurrent writes
+    share one round trip), the shard cache's admission, and fewer round trips per write
+    (checkpoints in the background, pipelined ingest, and small files held in the log, RFC 0003).
   - Steps 4–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -186,23 +187,24 @@ All 49 scenarios ran on one Mac, against a local S3 server (versitygw), once ove
 once with the bucket 12 ms away; 23 of them also ran against Cloudflare R2. **These are not comparable with SpaceFS's cloud figures**; the
 real run in their setup is still to do (§8).
 
-| Scenarios | Rows | Loopback | Bucket 12 ms away | 12 ms, group commit (28 Sep) | 12 ms, shard cache (28 Sep) | 12 ms, write round trips (29 Sep) | 12 ms, small files in the log (29 Sep) | SpaceFS |
-|---|--:|---|---|---|---|---|---|---|
-| Small, ranged and cached reads, `head`, fan-out gets | 7 | 1.1× slower to 4.6× faster | 1.1× slower to 48× faster | 1.1× slower to 51× faster | 12–48× faster | 12–46× faster | 11–48× faster | 2.6–34× faster |
-| Large gets and streams | 4 | 1.1–1.7× slower | 1.1–3.0× faster | 1.1× slower to 3.1× faster | 2.3–3.1× faster | 2.3–2.7× faster | 2.3–2.8× faster | 12–17× faster |
-| Edits inside 32 and 64 MiB files | 16 | parity to 24× faster | 1.1× slower to 3.3× faster | 1.1× slower to 8.2× faster | 1.5–8.3× faster | 1.5–7.8× faster | 1.4–9.7× faster | 1.4–15× faster |
-| Rename and folder move | 2 | 44–138× faster | 1.5–4.8× faster | 5.8–18× faster | 5.2–18× faster | 5.0–18× faster | 5.7–20× faster | 7.9–18× faster |
-| Listing | 1 | 31× faster | 34× faster | 37× faster | 36× faster | 31× faster | 33× faster | 9.1× faster |
-| Edits inside 1 MiB files | 8 | 1.6–4.7× slower | 3.4–3.6× slower | 1.3–1.7× slower | 1.3–1.7× slower | 1.3–1.7× slower | 1.3–1.6× slower | 2.1× slower to parity |
-| Whole-object puts and overwrites, fan-out puts | 9 | 1.7–4.5× slower | 2.1–70× slower | 2.1–3.1× slower | 2.2–3.0× slower | 1.3–3.1× slower | 1.3–2.8× slower | 1.1–3.1× slower |
-| Multipart uploads | 2 | parity to 1.2× faster | 1.6–1.9× slower | 1.6–1.9× slower | 1.5–1.8× slower | 1.2–1.7× slower | 1.2–1.8× slower | 1.8–2.4× slower |
-| **All 49**: faster in / geometric mean | | 26 / 2.1× | 27 / 1.0× | 24–26 / 2.0× | 30 / 2.6× | 30 / 2.6× | 30 / 2.8× | 31 / 2.8× |
+| Scenarios | Rows | Loopback | Bucket 12 ms away | 12 ms, group commit (28 Sep) | 12 ms, shard cache (28 Sep) | 12 ms, write round trips (29 Sep) | 12 ms, small files in the log (29 Sep) | 12 ms, group-commit hold (30 Sep) | SpaceFS |
+|---|--:|---|---|---|---|---|---|---|---|
+| Small, ranged and cached reads, `head`, fan-out gets | 7 | 1.1× slower to 4.6× faster | 1.1× slower to 48× faster | 1.1× slower to 51× faster | 12–48× faster | 12–46× faster | 11–48× faster | 13–51× faster | 2.6–34× faster |
+| Large gets and streams | 4 | 1.1–1.7× slower | 1.1–3.0× faster | 1.1× slower to 3.1× faster | 2.3–3.1× faster | 2.3–2.7× faster | 2.3–2.8× faster | 2.3–2.7× faster | 12–17× faster |
+| Edits inside 32 and 64 MiB files | 16 | parity to 24× faster | 1.1× slower to 3.3× faster | 1.1× slower to 8.2× faster | 1.5–8.3× faster | 1.5–7.8× faster | 1.4–9.7× faster | 1.3–9.1× faster | 1.4–15× faster |
+| Rename and folder move | 2 | 44–138× faster | 1.5–4.8× faster | 5.8–18× faster | 5.2–18× faster | 5.0–18× faster | 5.7–20× faster | 11–31× faster | 7.9–18× faster |
+| Listing | 1 | 31× faster | 34× faster | 37× faster | 36× faster | 31× faster | 33× faster | 35× faster | 9.1× faster |
+| Edits inside 1 MiB files | 8 | 1.6–4.7× slower | 3.4–3.6× slower | 1.3–1.7× slower | 1.3–1.7× slower | 1.3–1.7× slower | 1.3–1.6× slower | 1.3–1.5× slower | 2.1× slower to parity |
+| Whole-object puts and overwrites, fan-out puts | 9 | 1.7–4.5× slower | 2.1–70× slower | 2.1–3.1× slower | 2.2–3.0× slower | 1.3–3.1× slower | 1.3–2.8× slower | 1.1–2.9× slower | 1.1–3.1× slower |
+| Multipart uploads | 2 | parity to 1.2× faster | 1.6–1.9× slower | 1.6–1.9× slower | 1.5–1.8× slower | 1.2–1.7× slower | 1.2–1.8× slower | 1.4–1.5× slower | 1.8–2.4× slower |
+| **All 49**: faster in / geometric mean | | 26 / 2.1× | 27 / 1.0× | 24–26 / 2.0× | 30 / 2.6× | 30 / 2.6× | 30 / 2.8× | 30 / 2.9× | 31 / 2.8× |
 
-The group-commit, shard-cache, write-round-trip and small-file columns are the median of each row
-over two runs ([bench/results/group-commit](../bench/results/group-commit/README.md),
+The group-commit, shard-cache, write-round-trip, small-file and hold columns are the median of
+each row over two runs ([bench/results/group-commit](../bench/results/group-commit/README.md),
 [bench/results/shard-cache](../bench/results/shard-cache/README.md),
 [bench/results/write-round-trips](../bench/results/write-round-trips/README.md),
-[bench/results/small-content](../bench/results/small-content/README.md)).
+[bench/results/small-content](../bench/results/small-content/README.md),
+[bench/results/group-commit-hold](../bench/results/group-commit-hold/README.md)).
 
 What the runs show:
 - **The prediction held for metadata:** listing, `head` and small warm reads are far ahead of
@@ -234,8 +236,9 @@ What the runs show:
 - **A small write took two round trips one after the other**: its shard, then the log entry. Small
   files are now held in the log itself (step 3, item 3, [RFC 0003](../rfcs/0003-small-content-in-descriptors.md)):
   alone, put and overwrite 4 KiB at 12 ms take 14.9 ms instead of 29 (1.04× the bare bucket), and
-  checkpoints store the files as shards in the background. Eight or more at once still take two
-  round trips, now for group commit's reason (below).
+  checkpoints store the files as shards in the background. Eight or more at once still took two
+  round trips, for group commit's reason, until each log entry waited for the requests the one
+  before it answered (30 September, below): now one.
 - Also found: patch re-chunks once per edit, and multipart completion is a chain of round trips. Details and code references are
   in [bench/README.md](../bench/README.md#findings-where-voidfs-is-far-from-parity-and-why).
 - The FSKit spike's mount numbers (loopback: 2.3–2.5 GB/s sequential, 1,000 files listed in
@@ -248,6 +251,8 @@ Scored on the local runs, which are not SpaceFS's setup:
 
 | Run | Rows at or ahead of SpaceFS | Edits (24) | Writes (11) | Reads (10) | Metadata (4) |
 |---|--:|--:|--:|--:|--:|
+| Bucket 12 ms away, 30 September, with the group-commit hold (two runs) | 25–26 | 9–10 | 6 | 6 | 4 |
+| Bucket 12 ms away, 30 September, `main` in the same session as the hold (two runs) | 22 | 9–10 | 3–5 | 6 | 2–3 |
 | Bucket 12 ms away, 29 September, with small files in the log (two runs) | 24–26 | 11 | 4–6 | 6 | 3 |
 | Bucket 12 ms away, 29 September, `main` in the same session as small files (two runs) | 22–23 | 10–11 | 3 | 6 | 3 |
 | Bucket 12 ms away, 29 September, with fewer round trips per write (two runs) | 20–23 | 9–11 | 3 | 6 | 2–3 |
@@ -259,11 +264,28 @@ Scored on the local runs, which are not SpaceFS's setup:
 | Bucket 12 ms away, 28 September, with checkpoints and the capability probe | 7 | 0 | 2 | 3 | 2 |
 | Bucket 12 ms away, 28 September, with garbage collection | 7 | 0 | 2 | 3 | 2 |
 | Bucket 12 ms away, 27 September | 6 | 0 | 1 | 3 | 2 |
+| Loopback, 30 September, with the group-commit hold (four runs) | 33–35 | 19–21 | 8–10 | 2 | 3 |
+| Loopback, 30 September, `main` in the same session as the hold (four runs) | 31–35 | 19–21 | 7–10 | 1–2 | 3 |
 | Loopback, 29 September, with small files in the log (four runs) | 34–35 | 20–21 | 9–10 | 2 | 3 |
 | Loopback, 29 September, `main` in the same session as small files (four runs) | 34–36 | 20–21 | 8–10 | 2 | 3 |
 | Loopback, 29 September, with fewer round trips per write (four runs) | 34–35 | 20–21 | 8–10 | 2 | 3 |
 | Loopback, 29 September, `main` in the same session (four runs) | 31–32 | 19–20 | 7 | 2 | 3 |
 | Loopback, 27 September | 20 | 13 | 4 | 0 | 3 |
+
+With a hold before each log entry (30 September,
+[bench/results/group-commit-hold](../bench/results/group-commit-hold/README.md)):
+- At 12 ms, eight to 64 at once, a small write takes one round trip instead of two. Relative to the
+  bare bucket, in focused runs: put 4 KiB 2.18× to 1.20× (SpaceFS 2.01×), overwrite 4 KiB 2.19× to
+  1.15× (3.05×), the fan-out puts of 4 KiB at 32 and 64 2.46× and 2.48× to 1.39× and 1.47× (2.23×
+  and 2.41×). Rename 64 MiB and the folder move take 14 ms, from 27: rename at 0.116× crossed
+  SpaceFS's 0.126×. All six are ahead of SpaceFS's ratio in every run.
+- Over the 49 rows the geometric mean ratio against `main` is 0.932 (writes 0.830, metadata
+  0.747), and the geometric mean speed-up over the bare bucket is 2.9×, above SpaceFS's 2.8×.
+- An entry is held only while the clients it answered come back within 2 ms, which edits (they
+  upload a shard first) do not; edits in 1 MiB files moved −3% to +6%, not the same way in each
+  pair. On loopback, where an entry takes 0.3 ms, nothing is held.
+- List 200 keys is 0.1 ms slower (1.1 ms, still 31–38× faster than the bare bucket), for a reason
+  not found.
 
 With small files held in the log (29 September,
 [bench/results/small-content](../bench/results/small-content/README.md)):
@@ -323,22 +345,21 @@ What holds back the 27–28 rows voidfs does not yet win at 12 ms
   cached, take 34–44 ms where SpaceFS's ratio needs 17–41. Step 3, item 3. Puts of 32 and 64 MiB,
   which took twice the bare bucket's time taking in the body, now take 1.3× eight at once and
   0.9–1.05× alone (29 September). Files of up to 4 KiB now need no shard
-  ([RFC 0003](../rfcs/0003-small-content-in-descriptors.md), implemented), but at 8 at once and
-  more they still take two round trips: see the next point.
-- **Group commit alternates two groups of requests** (small writes and fan-out puts at 12 ms,
-  rename): while a log entry is in flight, the requests the last one answered queue behind it,
-  and each waits for that entry and then its own. Holding an entry until those requests are back
-  (at most 2 ms) took small writes to 1.1–1.4× the bare bucket and rename to one round trip in a
-  diagnostic build (29 September); not yet in `main`.
+  ([RFC 0003](../rfcs/0003-small-content-in-descriptors.md), implemented), and since the next
+  point they take one round trip at 8 at once and more too.
+- **Group commit alternated two groups of requests** (small writes and fan-out puts at 12 ms,
+  rename): while a log entry was in flight, the requests the last one answered queued behind it,
+  and each waited for that entry and then its own. **Fixed** (30 September): an entry now waits
+  until those requests are back, at most 2 ms, and small writes take 1.15–1.47× the bare bucket's
+  time.
 - **Patch rewrites a shard once per edit (patch in 1 MiB, and in 64 MiB in one run).** Item 4.
 - **Large reads can't be judged locally (get 32 and 64 MiB, and streams of 64 and 256 MiB):**
   the emulated bucket adds latency but no bandwidth limit. The bare bucket's 64 MiB get takes
   110–130 ms here, against S3's 779 ms in SpaceFS's run. Get 32 MiB now takes the same time per
   byte as get 64 MiB. Edits inside 32 and 64 MiB files are understated the same way. Only the
   real run can judge these rows.
-- **Rename at 8 at once takes two round trips** (24–26 ms, where SpaceFS's ratio needs 15–17):
-  after a log entry lands, the first new request starts the next alone and the rest wait for it.
-  A short hold before an entry might bring this to one round trip; not tried.
+- **Rename at 8 at once took two round trips** (24–26 ms, where SpaceFS's ratio needs 15–17), for
+  the same reason. **Fixed** by the same hold: 13.9 ms (30 September).
 
 Garbage collection left four small-write rows 3.5–7% slower, for a reason not found. With group
 commit they take 30–38 ms instead of 106–851, and what is left of that difference can't be told
@@ -446,15 +467,19 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      Small files are held in the log ([RFC 0003](../rfcs/0003-small-content-in-descriptors.md),
      implemented): alone, a small write takes one round trip (1.04× the bare bucket at 12 ms, from
      2.02×), and fan-out put 1,000 × 4 KiB at 64 crossed SpaceFS's ratio.
+   - A hold in group commit, so that concurrent writes share one round trip. **Done**: a log entry
+     waits, at most 2 ms, for the requests the one before it answered; put and overwrite 4 KiB, the
+     fan-out puts of 4 KiB and rename 64 MiB went from two round trips to one at 12 ms, all ahead
+     of SpaceFS's ratio.
    - Patch that rewrites each touched shard once, and a multipart completion without a chain
      of round trips.
    - Parallel and coalesced shard fetch for cold and large reads, once the harness can measure
      cold reads.
    - **Done when:** every one of the 49 rows is at least as fast as SpaceFS's.
-   - **Status (2026-09-29):** group commit, the shard cache's admission, and fewer round trips
-     per write (pipelined ingest, background checkpoints, small files in the log) are done; 24–26
-     of the 49 rows are there in the local 12 ms runs, and 34–35 on loopback. Next: items 4–7,
-     and a hold in group commit so that concurrent small writes share one round trip.
+   - **Status (2026-09-30):** group commit (with its hold), the shard cache's admission, and fewer
+     round trips per write (pipelined ingest, background checkpoints, small files in the log) are
+     done; 25–26 of the 49 rows are there in the local 12 ms runs, and 33–35 on loopback. Next:
+     items 4–7.
 4. **Client core, CLI and Rust SDK.**
    - `crates/client`: cache, journal, upload queue, change-feed client.
    - Direct uploads (§4.11), and short-lived storage credentials: R2, AWS STS, and presigned URLs
