@@ -481,6 +481,46 @@ bucket); large puts within 1.1–1.2× of the bare bucket, as SpaceFS's are.
 
 ### Item 4. Patch: rewrite each touched shard once
 
+**Status (30 September 2026): done.** Measured in
+[bench/results/patch-once](../bench/results/patch-once/README.md):
+- **Patch in 1 MiB takes what one edit takes.** On loopback, 5.1 ms where `main` takes 18.2
+  (1.33× the bare bucket, from 4.46×; write at 4 KiB in the same file: 5.0 ms). At 12 ms, 1.34×
+  from 1.71× (SpaceFS 1.45×), ahead of SpaceFS's ratio in all four focused runs.
+- **Patch in 32 MiB** at 12 ms: 0.69× from 0.81× (SpaceFS 0.70×), at or ahead in all four
+  focused runs. On loopback, where it uploads 12 shards to a local disk, it moved within the
+  spread.
+- **Patch in 64 MiB** did not move in the focused runs (0.51×, SpaceFS 0.47×): its edits, 4 MiB
+  apart, rarely share a shard. Its CPU is now each touched shard chunked and hashed once, about
+  29 ms a patch.
+- The profile of `main` found 98% of the server's CPU in this scenario in `apply_edits`: SHA-256
+  and FastCDC in equal parts. The requests to the bucket did not change: `main` already fetched a
+  patch's shards in one go, and uploaded only those the result keeps.
+- Over the 49 rows, relative to the bare bucket, the geometric mean against `main` is 0.987 at
+  12 ms and 0.967 on loopback. The rows that looked slower in the full runs do not patch. Run
+  focused again, and in one diagnostic binary switched between the old patch and the new, they
+  moved as much with no change at all.
+
+What was built, in `content::apply_edits` ([content.rs](../crates/voidfs-core/src/content.rs)):
+- **Groups.** Each edit's range is widened to the whole shards and data extents it touches (in a
+  zero run, only its own bytes). Edits whose widened ranges share a byte are one group; ranges
+  that only meet at a boundary stay apart, as they would edit by edit.
+- **Once per group.** A group's bytes are read once, every edit in it is applied in order (later
+  ones win), and they are chunked once. The new shards are hashed once, at the end.
+- **The edges as `splice` has them.** A group shorter than the minimum absorbs the extent before
+  it; while its last shard is short it pulls in up to two following extents, or the next group
+  whole, which may then pull in two of its own. A pull re-cuts only from the short shard's start.
+- **The same fetch.** Every shard this reads is one `needed_shards` names for an edit's range,
+  which `run_edit` fetches in one go before it (a property test reads only from those).
+- **The same bytes and size.** The extents, and so the ETag, are those edit by edit gives when no
+  edit's neighbourhood overlaps another's, and were in every in-file patch tried (565 in process).
+  Pages written beside each other into a zero run can come out with other boundaries, since edit
+  by edit they depend on the order the pages come in: 1–5% of such patches tried, each with one
+  shard fewer.
+
+Left for later:
+- Hashing a patch's new shards in parallel, and off the async workers: in 64 MiB, about 16 shards
+  of about 2 MiB are chunked and hashed one after another on the request's task.
+
 **Problem.** `content::apply_edits` ([content.rs:273](../crates/voidfs-core/src/content.rs#L273))
 applies a patch's edits one at a time as full `write_at`s (line 283). Each one re-chunks and
 re-hashes the shard it lands in. Sixteen edits inside one 1 MiB file hash about 16 MiB instead
