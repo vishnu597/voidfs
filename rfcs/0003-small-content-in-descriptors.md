@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| Status | Accepted (2026-09-29), not yet implemented |
+| Status | Implemented (accepted 2026-09-29) |
 | Author(s) | voidfs maintainers |
 | Created | 2026-09-29 |
 | Affects | format |
-| Implemented by | (links, once implemented) |
+| Implemented by | [`spec/format.md`](../spec/format.md) §3.1, §5, §7.7, §8.2, §11, §12 (draft 1, revision 5), three conformance cases, and voidfs-server ([bench/results/small-content](../bench/results/small-content/README.md)) |
 
 ## Summary
 
@@ -198,7 +198,9 @@ Accepted as proposed (29 September 2026), which settles them so:
    that costs a checkpoint of a drive with many fresh small files, and a later RFC may relax it.
 2. One format-wide maximum, 4,096 bytes; no `inline_max` in `voidfs.json`. Writers may use less.
 3. How an operator turns the flag on is not part of the format; the implementation's pull request
-   decides it, within what [The feature flag](#the-feature-flag) requires.
+   decides it, within what [The feature flag](#the-feature-flag) requires. It chose both:
+   `--new-pool-feature inline-data` for a pool the server creates, and `voidfs-server pool enable
+   inline-data` for an existing one, once every server that writes it is upgraded.
 4. `d` extents may appear beside `s` and `z` extents, as the design says; the first writer uses
    them only for whole files of at most 4 KiB.
 
