@@ -295,6 +295,10 @@ turns these into work items is [docs/step-3-performance.md](../docs/step-3-perfo
    which re-chunks and re-hashes the shard every time. Sixteen edits in a 1 MiB file took 20–27 ms
    on loopback, against about 7 ms for one edit, and 4.7–6.5× the bare bucket's download, change
    and upload. Direction: group the edits by shard and rewrite each shard once.
+   - **Fixed** (30 September 2026, [results](results/patch-once/README.md)): the edits that share
+     a shard are applied to it together, and it is chunked and hashed once. Patch in 1 MiB takes
+     5.1 ms on loopback, what one edit takes (from 18.2), and 1.34× the bare bucket's time at
+     12 ms (from 1.71×; SpaceFS 1.45×); patch in 32 MiB 0.69× (from 0.81×; SpaceFS 0.70×).
 5. **Completing a multipart upload is a chain of round trips.** `complete_upload` reads the
    upload record, lists the parts, reads each part's record one after another, commits, and
    deletes the upload's records before it answers: about twenty sequential round trips for

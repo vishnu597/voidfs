@@ -1,0 +1,4297 @@
+{
+  "harness": "voidfs-bench 0.0.0",
+  "run_id": "20260930T190634Z",
+  "started": "2026-09-30T19:06:34Z",
+  "finished": "2026-09-30T19:09:02Z",
+  "settings": {
+    "rounds": 2,
+    "warmups": 3,
+    "connections": 64,
+    "ops_scale": 1.0,
+    "checksums": "SdkDefault",
+    "like_spacefs": false
+  },
+  "environment": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpus": 15,
+    "labels": {
+      "bucket": "versitygw 1.8.0 on local disk, 127.0.0.1:7070",
+      "commit": "10feda4",
+      "distance to the bucket": "emulated with `voidfs-bench delay --one-way-ms 4` between the bucket and both voidfs-server and the harness's bare target (timer granularity adds about 2 ms each way; the bare head row shows the real round trip). The harness reaches voidfs-server over loopback, as SpaceFS's reached its layer on the client host",
+      "pool features": "inline-data",
+      "setup": "one machine over loopback: harness, voidfs-server and the S3 server (15 CPUs, Darwin arm64)",
+      "voidfs server": "voidfs-server release build, s3: store in that bucket, 512 MiB shard cache"
+    }
+  },
+  "targets": {
+    "bare": "http://127.0.0.1:7071, bucket bench, prefix voidfs-bench/bare/",
+    "voidfs": "http://127.0.0.1:9000 (drives vfbench-*)"
+  },
+  "spacefs": {
+    "source": "https://docs.spacefs.com/benchmarks/",
+    "run": "20260920T055107Z (build s3sdk@fff9779)"
+  },
+  "scenarios": [
+    {
+      "id": "range-64k-of-64m",
+      "name": "range 64 KiB of 64 MiB",
+      "family": "reads",
+      "concurrency": 8,
+      "ops": 200,
+      "spacefs": {
+        "layer": 1.3,
+        "bare": 44.1
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 12.818541750000001,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 12.620667000000001,
+              "p90_ms": 13.8620795,
+              "p99_ms": 14.49707209,
+              "mean_ms": 12.638719414999994,
+              "min_ms": 9.915416,
+              "max_ms": 14.555416999999998,
+              "wall_ms": 318.285541,
+              "mib_per_s": 39.27291186626665
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.0164165,
+              "p90_ms": 14.9527122,
+              "p99_ms": 15.864184579999998,
+              "mean_ms": 13.185274980000004,
+              "min_ms": 9.919791,
+              "max_ms": 15.977000000000002,
+              "wall_ms": 333.046541,
+              "mib_per_s": 37.53229192072588
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 406,
+          "bytes_up": 67108864,
+          "bytes_down": 26411008
+        },
+        "voidfs": {
+          "p50_ms": 0.31846875,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 0.2315,
+              "p90_ms": 0.32105029999999996,
+              "p99_ms": 0.50434592,
+              "mean_ms": 0.24694214999999997,
+              "min_ms": 0.15704200000000001,
+              "max_ms": 0.511292,
+              "wall_ms": 6.313917,
+              "mib_per_s": 1979.7536141194128
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 0.4054375,
+              "p90_ms": 0.5569672999999999,
+              "p99_ms": 0.7386462499999996,
+              "mean_ms": 0.420385,
+              "min_ms": 0.248541,
+              "max_ms": 0.803916,
+              "wall_ms": 10.717166,
+              "mib_per_s": 1166.3531198453024
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 406,
+          "bytes_up": 67108864,
+          "bytes_down": 26411008,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "get-4k",
+      "name": "get 4 KiB",
+      "family": "reads",
+      "concurrency": 8,
+      "ops": 200,
+      "spacefs": {
+        "layer": 1.1,
+        "bare": 25.5,
+        "layer_cold": 27.5
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 13.510104000000002,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.7180415,
+              "p90_ms": 14.7377753,
+              "p99_ms": 15.687478009999998,
+              "mean_ms": 13.430812085,
+              "min_ms": 10.406417,
+              "max_ms": 15.849459,
+              "wall_ms": 337.011666,
+              "mib_per_s": 2.318169009615234
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.302166500000002,
+              "p90_ms": 15.563804499999998,
+              "p99_ms": 16.19934033,
+              "mean_ms": 13.626147074999999,
+              "min_ms": 11.454917,
+              "max_ms": 16.346834,
+              "wall_ms": 345.18187500000005,
+              "mib_per_s": 2.263299601116078
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 406,
+          "bytes_up": 4096,
+          "bytes_down": 1650688
+        },
+        "voidfs": {
+          "p50_ms": 0.40912525,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 0.4085,
+              "p90_ms": 0.6496836999999999,
+              "p99_ms": 1.1867232499999947,
+              "mean_ms": 0.4380760650000001,
+              "min_ms": 0.133083,
+              "max_ms": 1.907333,
+              "wall_ms": 11.380708,
+              "mib_per_s": 68.64687153031252
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 0.4097505,
+              "p90_ms": 0.6822547,
+              "p99_ms": 1.43854333,
+              "mean_ms": 0.4531545849999999,
+              "min_ms": 0.155291,
+              "max_ms": 1.543833,
+              "wall_ms": 11.595292,
+              "mib_per_s": 67.37648349002336
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 406,
+          "bytes_up": 4096,
+          "bytes_down": 1650688,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "move-dir-200x64k",
+      "name": "move dir 200 × 64 KiB",
+      "family": "metadata",
+      "concurrency": 8,
+      "ops": 16,
+      "spacefs": {
+        "layer": 99.0,
+        "bare": 1774.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 459.051302,
+          "rounds": [
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 438.1730625,
+              "p90_ms": 506.06733299999996,
+              "p99_ms": 506.14067859999994,
+              "mean_ms": 458.9111041875,
+              "min_ms": 401.741542,
+              "max_ms": 506.15266599999995,
+              "wall_ms": 944.848125
+            },
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 479.9295415,
+              "p90_ms": 483.0524795,
+              "p99_ms": 483.875775,
+              "mean_ms": 473.5326015,
+              "min_ms": 452.13175,
+              "max_ms": 483.927375,
+              "wall_ms": 965.73875
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 8682,
+          "bytes_up": 104857600,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 15.661083,
+          "rounds": [
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 16.4440205,
+              "p90_ms": 27.488375,
+              "p99_ms": 27.539937499999997,
+              "mean_ms": 20.907622250000003,
+              "min_ms": 13.641250000000001,
+              "max_ms": 27.548,
+              "wall_ms": 43.925625000000004
+            },
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 14.878145499999999,
+              "p90_ms": 27.2046875,
+              "p99_ms": 27.228533,
+              "mean_ms": 19.162817625,
+              "min_ms": 13.481375,
+              "max_ms": 27.231082999999998,
+              "wall_ms": 42.096416
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 1645,
+          "bytes_up": 104857600,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 6
+          }
+        }
+      }
+    },
+    {
+      "id": "get-64m",
+      "name": "get 64 MiB",
+      "family": "reads",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 47.2,
+        "bare": 779.0,
+        "layer_cold": 299.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 120.46663525,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 105.664354,
+              "p90_ms": 112.24848719999999,
+              "p99_ms": 116.70152771000001,
+              "mean_ms": 101.80125390625,
+              "min_ms": 52.128417000000006,
+              "max_ms": 116.8545,
+              "wall_ms": 420.971,
+              "mib_per_s": 4864.943190861129
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 135.2689165,
+              "p90_ms": 142.5760122,
+              "p99_ms": 143.13587977,
+              "mean_ms": 135.90248040625005,
+              "min_ms": 130.304459,
+              "max_ms": 143.28633299999998,
+              "wall_ms": 543.9238330000001,
+              "mib_per_s": 3765.2330634315117
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 70,
+          "bytes_up": 67108864,
+          "bytes_down": 4496293888
+        },
+        "voidfs": {
+          "p50_ms": 51.12135425,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 47.858000000000004,
+              "p90_ms": 54.3434458,
+              "p99_ms": 56.29533675,
+              "mean_ms": 45.212661437499996,
+              "min_ms": 13.409083,
+              "max_ms": 56.662957999999996,
+              "wall_ms": 189.16,
+              "mib_per_s": 10826.813279763164
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 54.3847085,
+              "p90_ms": 60.3423836,
+              "p99_ms": 61.192506,
+              "mean_ms": 50.1964270625,
+              "min_ms": 8.458208,
+              "max_ms": 61.246291,
+              "wall_ms": 210.716917,
+              "mib_per_s": 9719.200665791821
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 70,
+          "bytes_up": 67108864,
+          "bytes_down": 4496293888,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "stream-get-256m",
+      "name": "stream get 256 MiB",
+      "family": "reads",
+      "concurrency": 8,
+      "ops": 16,
+      "spacefs": {
+        "layer": 178.0,
+        "bare": 2772.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 546.9926042500001,
+          "rounds": [
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 540.6399585,
+              "p90_ms": 586.9381874999999,
+              "p99_ms": 587.5889893,
+              "mean_ms": 540.5903437499999,
+              "min_ms": 493.53045899999995,
+              "max_ms": 587.672458,
+              "wall_ms": 1081.36075,
+              "mib_per_s": 3787.820114610226
+            },
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 553.3452500000001,
+              "p90_ms": 558.742021,
+              "p99_ms": 558.9641706,
+              "mean_ms": 553.4169141250001,
+              "min_ms": 548.0020420000001,
+              "max_ms": 558.9700829999999,
+              "wall_ms": 1107.1717919999999,
+              "mib_per_s": 3699.516217443517
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 38,
+          "bytes_up": 268435456,
+          "bytes_down": 9395240960
+        },
+        "voidfs": {
+          "p50_ms": 197.40672925,
+          "rounds": [
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 201.079042,
+              "p90_ms": 204.0408335,
+              "p99_ms": 204.48875805,
+              "mean_ms": 201.93379687499998,
+              "min_ms": 199.849083,
+              "max_ms": 204.548583,
+              "wall_ms": 405.271542,
+              "mib_per_s": 10106.80389692894
+            },
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 193.7344165,
+              "p90_ms": 196.12629199999998,
+              "p99_ms": 196.2330063,
+              "mean_ms": 193.70028112499998,
+              "min_ms": 191.19204100000002,
+              "max_ms": 196.25175000000002,
+              "wall_ms": 387.74154100000004,
+              "mib_per_s": 10563.737868881064
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 38,
+          "bytes_up": 268435456,
+          "bytes_down": 9395240960,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "stream-get-64m",
+      "name": "stream get 64 MiB",
+      "family": "reads",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 45.1,
+        "bare": 697.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 133.13386450000002,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 132.3172915,
+              "p90_ms": 135.52374580000003,
+              "p99_ms": 136.16078852,
+              "mean_ms": 132.566102875,
+              "min_ms": 129.593458,
+              "max_ms": 136.256333,
+              "wall_ms": 530.511125,
+              "mib_per_s": 3860.4279976221046
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 133.9504375,
+              "p90_ms": 137.8047794,
+              "p99_ms": 137.97208808,
+              "mean_ms": 134.4464869375,
+              "min_ms": 131.939542,
+              "max_ms": 138.014041,
+              "wall_ms": 538.226542,
+              "mib_per_s": 3805.089196065697
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 70,
+          "bytes_up": 67108864,
+          "bytes_down": 4496293888
+        },
+        "voidfs": {
+          "p50_ms": 48.675312250000005,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 47.9513125,
+              "p90_ms": 53.6895542,
+              "p99_ms": 54.17742148,
+              "mean_ms": 44.77807425000001,
+              "min_ms": 6.9298329999999995,
+              "max_ms": 54.216417,
+              "wall_ms": 187.566291,
+              "mib_per_s": 10918.806300861384
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 49.399312,
+              "p90_ms": 53.9422756,
+              "p99_ms": 54.124438250000004,
+              "mean_ms": 44.39807684374999,
+              "min_ms": 6.18825,
+              "max_ms": 54.193917,
+              "wall_ms": 189.158875,
+              "mib_per_s": 10826.877670952526
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 70,
+          "bytes_up": 67108864,
+          "bytes_down": 4496293888,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "append-4k-64m",
+      "name": "append 4 KiB to 64 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 111.0,
+        "bare": 1668.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 293.27814575,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 292.32635400000004,
+              "p90_ms": 436.4373878,
+              "p99_ms": 453.14431875,
+              "mean_ms": 309.21038690625,
+              "min_ms": 199.267375,
+              "max_ms": 458.421875,
+              "wall_ms": 1353.385708
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 294.2299375,
+              "p90_ms": 368.0905328,
+              "p99_ms": 382.14576476999997,
+              "mean_ms": 278.75556121875,
+              "min_ms": 181.10795900000002,
+              "max_ms": 382.421458,
+              "wall_ms": 1223.029666
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 5034455040,
+          "bytes_down": 4564455424
+        },
+        "voidfs": {
+          "p50_ms": 39.464886,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 39.0741465,
+              "p90_ms": 42.042758299999996,
+              "p99_ms": 47.21861727000001,
+              "mean_ms": 37.317287656249995,
+              "min_ms": 30.119667,
+              "max_ms": 49.504583,
+              "wall_ms": 174.574125
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 39.8556255,
+              "p90_ms": 48.78046670000002,
+              "p99_ms": 49.78022623,
+              "mean_ms": 38.22893493750001,
+              "min_ms": 26.275875,
+              "max_ms": 49.781208,
+              "wall_ms": 164.43379199999998
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 537145344,
+          "bytes_down": 67145728,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 65,
+            "put_new": 25
+          }
+        }
+      }
+    },
+    {
+      "id": "head",
+      "name": "head",
+      "family": "metadata",
+      "concurrency": 8,
+      "ops": 200,
+      "spacefs": {
+        "layer": 0.9,
+        "bare": 12.1
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 13.09040625,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.1624375,
+              "p90_ms": 15.6117791,
+              "p99_ms": 16.65548199,
+              "mean_ms": 13.362499774999998,
+              "min_ms": 10.583083,
+              "max_ms": 16.736833,
+              "wall_ms": 334.29275
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.018374999999999,
+              "p90_ms": 14.4667872,
+              "p99_ms": 16.72164875,
+              "mean_ms": 13.060977485000002,
+              "min_ms": 10.441374999999999,
+              "max_ms": 16.895709,
+              "wall_ms": 328.766917
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 406,
+          "bytes_up": 4096,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 0.26863549999999997,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 0.2081875,
+              "p90_ms": 0.2824839,
+              "p99_ms": 0.3834271699999993,
+              "mean_ms": 0.21931417000000003,
+              "min_ms": 0.144791,
+              "max_ms": 0.47391700000000003,
+              "wall_ms": 5.684167
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 0.3290835,
+              "p90_ms": 0.5059412999999999,
+              "p99_ms": 0.8459583299999998,
+              "mean_ms": 0.35116980499999995,
+              "min_ms": 0.11745799999999999,
+              "max_ms": 1.093791,
+              "wall_ms": 9.0615
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 406,
+          "bytes_up": 4096,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "truncate-4k-end-64m",
+      "name": "truncate 4 KiB, end of 64 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 131.0,
+        "bare": 1677.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 277.95346900000004,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 264.35510450000004,
+              "p90_ms": 437.3725952,
+              "p99_ms": 443.24400499999996,
+              "mean_ms": 298.3159739375,
+              "min_ms": 187.5415,
+              "max_ms": 443.98087499999997,
+              "wall_ms": 1249.22775
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 291.5518335,
+              "p90_ms": 416.8331667,
+              "p99_ms": 416.94363323,
+              "mean_ms": 309.3108814062499,
+              "min_ms": 182.448833,
+              "max_ms": 416.94725,
+              "wall_ms": 1289.2905830000002
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 5031874560,
+          "bytes_down": 4562350080
+        },
+        "voidfs": {
+          "p50_ms": 37.606771,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 37.505604500000004,
+              "p90_ms": 44.2463792,
+              "p99_ms": 62.60301427000002,
+              "mean_ms": 38.64381134374999,
+              "min_ms": 26.245874999999998,
+              "max_ms": 66.38225,
+              "wall_ms": 165.875583
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 37.7079375,
+              "p90_ms": 46.75806190000001,
+              "p99_ms": 51.93338723000001,
+              "mean_ms": 38.910379,
+              "min_ms": 25.772,
+              "max_ms": 53.287209000000004,
+              "wall_ms": 177.23775
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 536870912,
+          "bytes_down": 67072000,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 2,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 25
+          }
+        }
+      }
+    },
+    {
+      "id": "get-32m",
+      "name": "get 32 MiB",
+      "family": "reads",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 30.3,
+        "bare": 356.0,
+        "layer_cold": 179.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 66.27635425,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 64.477125,
+              "p90_ms": 68.2909962,
+              "p99_ms": 68.55852721000001,
+              "mean_ms": 64.16021359374999,
+              "min_ms": 57.324042,
+              "max_ms": 68.611292,
+              "wall_ms": 257.77116700000005,
+              "mib_per_s": 3972.515669295162
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 68.0755835,
+              "p90_ms": 70.8517038,
+              "p99_ms": 71.01630198,
+              "mean_ms": 68.53946356249999,
+              "min_ms": 67.036125,
+              "max_ms": 71.0205,
+              "wall_ms": 274.55879100000004,
+              "mib_per_s": 3729.620152647015
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 70,
+          "bytes_up": 33554432,
+          "bytes_down": 2248146944
+        },
+        "voidfs": {
+          "p50_ms": 26.5033335,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 26.238417,
+              "p90_ms": 29.300433,
+              "p99_ms": 29.41613348,
+              "mean_ms": 23.705587187500004,
+              "min_ms": 4.329333,
+              "max_ms": 29.421959,
+              "wall_ms": 101.36475,
+              "mib_per_s": 10102.131164926663
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 26.768250000000002,
+              "p90_ms": 29.7532833,
+              "p99_ms": 30.48339148,
+              "mean_ms": 25.525985624999997,
+              "min_ms": 4.224708,
+              "max_ms": 30.720167,
+              "wall_ms": 105.133792,
+              "mib_per_s": 9739.970189603739
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 70,
+          "bytes_up": 33554432,
+          "bytes_down": 2248146944,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "delete-4k-middle-64m",
+      "name": "delete 4 KiB, middle of 64 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 152.0,
+        "bare": 1718.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 252.24051049999997,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 257.93177099999997,
+              "p90_ms": 377.333167,
+              "p99_ms": 551.8416577300001,
+              "mean_ms": 295.28070184375,
+              "min_ms": 193.286625,
+              "max_ms": 552.530917,
+              "wall_ms": 1251.3114999999998
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 246.54925,
+              "p90_ms": 412.9585500000003,
+              "p99_ms": 425.25486229,
+              "mean_ms": 266.88846093750004,
+              "min_ms": 183.46158400000002,
+              "max_ms": 425.25875,
+              "wall_ms": 1129.536292
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 5031874560,
+          "bytes_down": 4562350080
+        },
+        "voidfs": {
+          "p50_ms": 37.372947749999994,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 35.180145499999995,
+              "p90_ms": 47.12997080000001,
+              "p99_ms": 48.96860296,
+              "mean_ms": 37.41383596875001,
+              "min_ms": 23.769583,
+              "max_ms": 48.970333999999994,
+              "wall_ms": 172.34854199999998
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 39.56575,
+              "p90_ms": 43.86231250000001,
+              "p99_ms": 49.523282290000004,
+              "mean_ms": 38.51561984375,
+              "min_ms": 28.227625,
+              "max_ms": 49.5405,
+              "wall_ms": 173.625875
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 536870912,
+          "bytes_down": 67072000,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 27
+          }
+        }
+      }
+    },
+    {
+      "id": "insert-4k-middle-64m",
+      "name": "insert 4 KiB, middle of 64 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 152.0,
+        "bare": 1667.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 301.47979150000003,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 292.278458,
+              "p90_ms": 355.0384125,
+              "p99_ms": 369.68557825,
+              "mean_ms": 280.8212330624999,
+              "min_ms": 194.75637500000002,
+              "max_ms": 369.698792,
+              "wall_ms": 1199.546834
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 310.681125,
+              "p90_ms": 424.13343360000005,
+              "p99_ms": 439.64265596,
+              "mean_ms": 306.3351926875,
+              "min_ms": 181.483542,
+              "max_ms": 442.349292,
+              "wall_ms": 1332.884167
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 5034455040,
+          "bytes_down": 4564455424
+        },
+        "voidfs": {
+          "p50_ms": 43.387927250000004,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 41.162062500000005,
+              "p90_ms": 43.935771100000004,
+              "p99_ms": 47.12085581000001,
+              "mean_ms": 39.16379815625001,
+              "min_ms": 28.953875,
+              "max_ms": 48.539958,
+              "wall_ms": 177.515334
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 45.613792000000004,
+              "p90_ms": 53.2948622,
+              "p99_ms": 53.33310802,
+              "mean_ms": 42.82727606249999,
+              "min_ms": 33.200583,
+              "max_ms": 53.33325,
+              "wall_ms": 182.65475
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 537145344,
+          "bytes_down": 67145728,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 24
+          }
+        }
+      }
+    },
+    {
+      "id": "list-200",
+      "name": "list 200 keys",
+      "family": "metadata",
+      "concurrency": 8,
+      "ops": 200,
+      "spacefs": {
+        "layer": 3.0,
+        "bare": 27.2
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 40.90418700000001,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 35.361145500000006,
+              "p90_ms": 47.579245199999995,
+              "p99_ms": 53.46557207999999,
+              "mean_ms": 37.39121267000001,
+              "min_ms": 16.050167000000002,
+              "max_ms": 55.452583,
+              "wall_ms": 941.982
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 46.4472285,
+              "p90_ms": 49.1027372,
+              "p99_ms": 50.70157334,
+              "mean_ms": 45.143138289999996,
+              "min_ms": 17.641750000000002,
+              "max_ms": 51.314291999999995,
+              "wall_ms": 1145.0689169999998
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 605,
+          "bytes_up": 819200,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 1.12916675,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 1.2426249999999999,
+              "p90_ms": 1.7520084,
+              "p99_ms": 2.5656908299999994,
+              "mean_ms": 1.2946208050000003,
+              "min_ms": 0.6693330000000001,
+              "max_ms": 2.716291,
+              "wall_ms": 32.717125
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 1.0157085000000001,
+              "p90_ms": 1.4017711,
+              "p99_ms": 1.6408900799999981,
+              "mean_ms": 1.0378504050000004,
+              "min_ms": 0.5615,
+              "max_ms": 1.911375,
+              "wall_ms": 26.461499999999997
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 605,
+          "bytes_up": 819200,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "append-4k-32m",
+      "name": "append 4 KiB to 32 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 109.0,
+        "bare": 874.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 127.32024999999999,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 129.88074999999998,
+              "p90_ms": 238.8972036,
+              "p99_ms": 238.99398200000002,
+              "mean_ms": 145.96527603124997,
+              "min_ms": 99.57875,
+              "max_ms": 239.021417,
+              "wall_ms": 617.190084
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 124.75975,
+              "p90_ms": 243.0990414,
+              "p99_ms": 244.03207706,
+              "mean_ms": 142.79154946875002,
+              "min_ms": 98.5925,
+              "max_ms": 244.351958,
+              "wall_ms": 616.214375
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 2517872640,
+          "bytes_down": 2282754048
+        },
+        "voidfs": {
+          "p50_ms": 36.6895,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 36.5483545,
+              "p90_ms": 40.508937499999995,
+              "p99_ms": 50.28634171,
+              "mean_ms": 36.83467325,
+              "min_ms": 22.895709,
+              "max_ms": 50.522084,
+              "wall_ms": 149.126958
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 36.8306455,
+              "p90_ms": 37.774932699999994,
+              "p99_ms": 45.26339573000001,
+              "mean_ms": 36.795436156250005,
+              "min_ms": 24.922375,
+              "max_ms": 47.5645,
+              "wall_ms": 162.628583
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 268709888,
+          "bytes_down": 33591296,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 22
+          }
+        }
+      }
+    },
+    {
+      "id": "rename-64m",
+      "name": "rename 64 MiB",
+      "family": "metadata",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 108.0,
+        "bare": 858.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 125.20301049999999,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 120.6945835,
+              "p90_ms": 132.2232334,
+              "p99_ms": 132.64257975,
+              "mean_ms": 121.72755856250001,
+              "min_ms": 112.414625,
+              "max_ms": 132.665791,
+              "wall_ms": 489.278375
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 129.7114375,
+              "p90_ms": 146.4297331,
+              "p99_ms": 146.51727648000002,
+              "mean_ms": 129.33735025000004,
+              "min_ms": 115.50975,
+              "max_ms": 146.53054200000003,
+              "wall_ms": 526.648709
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 152,
+          "bytes_up": 536870912,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 13.699874999999999,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 13.6844375,
+              "p90_ms": 26.7134003,
+              "p99_ms": 26.79748602,
+              "mean_ms": 16.763441468750003,
+              "min_ms": 12.892833,
+              "max_ms": 26.799333,
+              "wall_ms": 67.166084
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 13.7153125,
+              "p90_ms": 27.0558587,
+              "p99_ms": 27.13559875,
+              "mean_ms": 16.67887503125,
+              "min_ms": 12.784333,
+              "max_ms": 27.143,
+              "wall_ms": 68.744875
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 85,
+          "bytes_up": 536870912,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 10
+          }
+        }
+      }
+    },
+    {
+      "id": "delete-4k-start-64m",
+      "name": "delete 4 KiB, start of 64 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 244.0,
+        "bare": 1685.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 281.438542,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 254.755292,
+              "p90_ms": 449.7388581000003,
+              "p99_ms": 466.86480271,
+              "mean_ms": 281.2781601875,
+              "min_ms": 201.656666,
+              "max_ms": 466.88525,
+              "wall_ms": 1189.022
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 308.121792,
+              "p90_ms": 453.80909650000007,
+              "p99_ms": 457.76910126999996,
+              "mean_ms": 325.42096234375,
+              "min_ms": 186.541042,
+              "max_ms": 458.136167,
+              "wall_ms": 1334.693209
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 5031874560,
+          "bytes_down": 4562350080
+        },
+        "voidfs": {
+          "p50_ms": 38.04207275,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 37.281104,
+              "p90_ms": 49.274250300000006,
+              "p99_ms": 51.72160529,
+              "mean_ms": 38.61900659375,
+              "min_ms": 25.545709,
+              "max_ms": 52.609458,
+              "wall_ms": 173.937917
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 38.803041500000006,
+              "p90_ms": 40.2058036,
+              "p99_ms": 40.3613025,
+              "mean_ms": 35.30674225,
+              "min_ms": 23.275084,
+              "max_ms": 40.362,
+              "wall_ms": 156.918125
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 536870912,
+          "bytes_down": 67072000,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 3,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 24
+          }
+        }
+      }
+    },
+    {
+      "id": "insert-4k-start-64m",
+      "name": "insert 4 KiB, start of 64 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 248.0,
+        "bare": 1690.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 295.81096875000003,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 316.16341650000004,
+              "p90_ms": 411.2618036000001,
+              "p99_ms": 418.97448102000004,
+              "mean_ms": 298.8651093125,
+              "min_ms": 185.963917,
+              "max_ms": 419.343833,
+              "wall_ms": 1319.823333
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 275.458521,
+              "p90_ms": 386.6218872000001,
+              "p99_ms": 395.64407648,
+              "mean_ms": 283.95563015625004,
+              "min_ms": 183.67575,
+              "max_ms": 396.34166700000003,
+              "wall_ms": 1224.145792
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 5034455040,
+          "bytes_down": 4564455424
+        },
+        "voidfs": {
+          "p50_ms": 38.194937249999995,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 38.6080415,
+              "p90_ms": 46.8589872,
+              "p99_ms": 50.00730925,
+              "mean_ms": 38.44492031249999,
+              "min_ms": 29.569333,
+              "max_ms": 50.013083,
+              "wall_ms": 179.86687500000002
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 37.781833,
+              "p90_ms": 44.399591100000016,
+              "p99_ms": 51.08957625000001,
+              "mean_ms": 36.89161059375,
+              "min_ms": 22.074208000000002,
+              "max_ms": 51.731625,
+              "wall_ms": 165.683833
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 537145344,
+          "bytes_down": 67145728,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 25
+          }
+        }
+      }
+    },
+    {
+      "id": "write-at-4k-64m",
+      "name": "write at 4 KiB in 64 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 267.0,
+        "bare": 1667.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 280.0682605,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 283.4641045,
+              "p90_ms": 485.893858,
+              "p99_ms": 491.16497373,
+              "mean_ms": 304.24011721875,
+              "min_ms": 178.368583,
+              "max_ms": 493.488708,
+              "wall_ms": 1290.4465
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 276.6724165,
+              "p90_ms": 424.3468289,
+              "p99_ms": 425.55343802,
+              "mean_ms": 300.24046221875,
+              "min_ms": 182.270083,
+              "max_ms": 426.071125,
+              "wall_ms": 1256.140375
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 5033164800,
+          "bytes_down": 4563402752
+        },
+        "voidfs": {
+          "p50_ms": 38.72283325,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 40.118395500000005,
+              "p90_ms": 45.6418994,
+              "p99_ms": 47.83987773,
+              "mean_ms": 38.498307062500004,
+              "min_ms": 25.8825,
+              "max_ms": 47.851167,
+              "wall_ms": 175.963666
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 37.327270999999996,
+              "p90_ms": 46.9641791,
+              "p99_ms": 47.01104619,
+              "mean_ms": 37.574303406249996,
+              "min_ms": 24.162166999999997,
+              "max_ms": 47.019959,
+              "wall_ms": 159.80391699999998
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 537145344,
+          "bytes_down": 67108864,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 25
+          }
+        }
+      }
+    },
+    {
+      "id": "fanout-get-200x256k-c32",
+      "name": "fanout get 200 × 256 KiB, 32 at once",
+      "family": "reads",
+      "concurrency": 32,
+      "ops": 200,
+      "spacefs": {
+        "layer": 5.2,
+        "bare": 32.1
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 13.56654175,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 12.270146,
+              "p90_ms": 15.157208299999999,
+              "p99_ms": 16.260853419999997,
+              "mean_ms": 12.837351479999997,
+              "min_ms": 10.026459,
+              "max_ms": 16.290875,
+              "wall_ms": 87.00562500000001,
+              "mib_per_s": 574.6754879354064
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 14.862937500000001,
+              "p90_ms": 15.730066399999998,
+              "p99_ms": 16.02757333,
+              "mean_ms": 14.580426859999998,
+              "min_ms": 11.946625000000001,
+              "max_ms": 16.482375,
+              "wall_ms": 98.7435,
+              "mib_per_s": 506.36244411024524
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 605,
+          "bytes_up": 52428800,
+          "bytes_down": 105644032
+        },
+        "voidfs": {
+          "p50_ms": 1.07190625,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 1.034417,
+              "p90_ms": 2.7486333,
+              "p99_ms": 3.1165154099999994,
+              "mean_ms": 1.2777568649999997,
+              "min_ms": 0.572041,
+              "max_ms": 3.240584,
+              "wall_ms": 8.986625,
+              "mib_per_s": 5563.824016246366
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 1.1093955,
+              "p90_ms": 1.2475630999999998,
+              "p99_ms": 1.36049425,
+              "mean_ms": 1.09033584,
+              "min_ms": 0.43029100000000003,
+              "max_ms": 1.365417,
+              "wall_ms": 7.359125000000001,
+              "mib_per_s": 6794.2860054694
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 605,
+          "bytes_up": 52428800,
+          "bytes_down": 105644032,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "truncate-4k-end-32m",
+      "name": "truncate 4 KiB, end of 32 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 146.0,
+        "bare": 860.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 148.24723975,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 147.37879199999998,
+              "p90_ms": 175.652017,
+              "p99_ms": 199.84495927000003,
+              "mean_ms": 144.82528915625,
+              "min_ms": 98.313583,
+              "max_ms": 210.65824999999998,
+              "wall_ms": 599.9336669999999
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 149.1156875,
+              "p90_ms": 166.3767327,
+              "p99_ms": 168.31617500000002,
+              "mean_ms": 151.13748053125,
+              "min_ms": 99.224542,
+              "max_ms": 168.56650000000002,
+              "wall_ms": 625.031208
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 2515292160,
+          "bytes_down": 2280648704
+        },
+        "voidfs": {
+          "p50_ms": 38.2211875,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 38.4767705,
+              "p90_ms": 43.0104414,
+              "p99_ms": 46.24831921,
+              "mean_ms": 37.54979046875,
+              "min_ms": 23.194916,
+              "max_ms": 46.262334,
+              "wall_ms": 164.479667
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 37.9656045,
+              "p90_ms": 38.481125000000006,
+              "p99_ms": 38.57655206,
+              "mean_ms": 36.24073831250001,
+              "min_ms": 24.707707999999997,
+              "max_ms": 38.610458,
+              "wall_ms": 149.928208
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 268435456,
+          "bytes_down": 33517568,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 23
+          }
+        }
+      }
+    },
+    {
+      "id": "fanout-get-1000x4k-c32",
+      "name": "fanout get 1000 × 4 KiB, 32 at once",
+      "family": "reads",
+      "concurrency": 32,
+      "ops": 1000,
+      "spacefs": {
+        "layer": 4.9,
+        "bare": 26.1
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 12.959875,
+          "rounds": [
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 12.8383745,
+              "p90_ms": 14.2658664,
+              "p99_ms": 16.10119825,
+              "mean_ms": 12.83082408599998,
+              "min_ms": 9.172958999999999,
+              "max_ms": 16.721084,
+              "wall_ms": 401.90325,
+              "mib_per_s": 9.719378979891305
+            },
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 13.0813755,
+              "p90_ms": 14.774799400000001,
+              "p99_ms": 15.668437500000001,
+              "mean_ms": 13.115187826999993,
+              "min_ms": 9.3495,
+              "max_ms": 16.745791,
+              "wall_ms": 413.415958,
+              "mib_per_s": 9.448716055610026
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 3005,
+          "bytes_up": 4096000,
+          "bytes_down": 8204288
+        },
+        "voidfs": {
+          "p50_ms": 0.47229175,
+          "rounds": [
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 0.47162499999999996,
+              "p90_ms": 0.6965291,
+              "p99_ms": 1.319844249999999,
+              "mean_ms": 0.5099470069999996,
+              "min_ms": 0.20925,
+              "max_ms": 2.543708,
+              "wall_ms": 16.3525,
+              "mib_per_s": 238.87784742394132
+            },
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 0.4729585,
+              "p90_ms": 0.709542,
+              "p99_ms": 1.06280699,
+              "mean_ms": 0.502730149,
+              "min_ms": 0.198625,
+              "max_ms": 1.311083,
+              "wall_ms": 16.097334,
+              "mib_per_s": 242.6644064166153
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 3005,
+          "bytes_up": 4096000,
+          "bytes_down": 8204288,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "write-at-4k-32m",
+      "name": "write at 4 KiB in 32 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 172.0,
+        "bare": 873.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 140.87185424999998,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 139.29368749999998,
+              "p90_ms": 174.6541503,
+              "p99_ms": 176.30448848,
+              "mean_ms": 137.3641758125,
+              "min_ms": 99.695666,
+              "max_ms": 176.338834,
+              "wall_ms": 589.602666
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 142.450021,
+              "p90_ms": 165.847183,
+              "p99_ms": 168.14682221,
+              "mean_ms": 140.46185287499998,
+              "min_ms": 100.679833,
+              "max_ms": 168.15091700000002,
+              "wall_ms": 615.760792
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 2516582400,
+          "bytes_down": 2281701376
+        },
+        "voidfs": {
+          "p50_ms": 37.9655415,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 39.564750000000004,
+              "p90_ms": 51.3417917,
+              "p99_ms": 54.62106875,
+              "mean_ms": 41.97550265625,
+              "min_ms": 24.796292,
+              "max_ms": 54.628625,
+              "wall_ms": 192.79325
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 36.366333,
+              "p90_ms": 45.859408699999996,
+              "p99_ms": 50.65616421000001,
+              "mean_ms": 37.249412781249994,
+              "min_ms": 25.10175,
+              "max_ms": 51.453084000000004,
+              "wall_ms": 175.848792
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 268709888,
+          "bytes_down": 33554432,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 28
+          }
+        }
+      }
+    },
+    {
+      "id": "delete-4k-middle-32m",
+      "name": "delete 4 KiB, middle of 32 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 179.0,
+        "bare": 861.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 152.74739575,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 161.2729165,
+              "p90_ms": 177.6873128,
+              "p99_ms": 179.97192448,
+              "mean_ms": 153.63171234374997,
+              "min_ms": 98.58033400000001,
+              "max_ms": 180.37300000000002,
+              "wall_ms": 653.074292
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 144.221875,
+              "p90_ms": 196.35022120000002,
+              "p99_ms": 198.69072102,
+              "mean_ms": 151.47529549999996,
+              "min_ms": 98.814,
+              "max_ms": 198.710083,
+              "wall_ms": 631.801792
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 2515292160,
+          "bytes_down": 2280648704
+        },
+        "voidfs": {
+          "p50_ms": 42.019083249999994,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 43.787979,
+              "p90_ms": 50.434096200000006,
+              "p99_ms": 53.23193477,
+              "mean_ms": 43.003558625,
+              "min_ms": 31.454333000000002,
+              "max_ms": 53.792208,
+              "wall_ms": 205.09725
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 40.250187499999996,
+              "p90_ms": 45.7521961,
+              "p99_ms": 46.16247104,
+              "mean_ms": 37.71397665625,
+              "min_ms": 26.929209,
+              "max_ms": 46.302875,
+              "wall_ms": 164.957625
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 268435456,
+          "bytes_down": 33517568,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 65,
+            "put_new": 28
+          }
+        }
+      }
+    },
+    {
+      "id": "delete-4k-start-32m",
+      "name": "delete 4 KiB, start of 32 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 186.0,
+        "bare": 859.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 155.62497925,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 152.4442295,
+              "p90_ms": 208.0268250000001,
+              "p99_ms": 214.16703575,
+              "mean_ms": 153.62614456249997,
+              "min_ms": 102.179625,
+              "max_ms": 214.196292,
+              "wall_ms": 684.716958
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 158.80572899999999,
+              "p90_ms": 170.44883779999998,
+              "p99_ms": 207.07440581,
+              "mean_ms": 152.30187375,
+              "min_ms": 104.03729100000001,
+              "max_ms": 207.736333,
+              "wall_ms": 679.897291
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 2515292160,
+          "bytes_down": 2280648704
+        },
+        "voidfs": {
+          "p50_ms": 36.708042,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 35.8230005,
+              "p90_ms": 40.062992200000004,
+              "p99_ms": 40.22623777,
+              "mean_ms": 35.867918031250014,
+              "min_ms": 26.143708,
+              "max_ms": 40.244166,
+              "wall_ms": 149.01187499999997
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 37.5930835,
+              "p90_ms": 49.33340870000001,
+              "p99_ms": 49.51310375,
+              "mean_ms": 37.37412109375,
+              "min_ms": 24.859958000000002,
+              "max_ms": 49.544375,
+              "wall_ms": 167.63358300000002
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 268435456,
+          "bytes_down": 33521664,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 23
+          }
+        }
+      }
+    },
+    {
+      "id": "get-1m",
+      "name": "get 1 MiB",
+      "family": "reads",
+      "concurrency": 8,
+      "ops": 200,
+      "spacefs": {
+        "layer": 8.3,
+        "bare": 37.5,
+        "layer_cold": 44.1
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 13.803698,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.980125,
+              "p90_ms": 15.048208599999999,
+              "p99_ms": 15.783573159999998,
+              "mean_ms": 13.847297694999991,
+              "min_ms": 10.781374999999999,
+              "max_ms": 16.161291000000002,
+              "wall_ms": 347.182875,
+              "mib_per_s": 576.0652797174976
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.627271,
+              "p90_ms": 15.5394167,
+              "p99_ms": 15.82263291,
+              "mean_ms": 13.668485204999994,
+              "min_ms": 10.759208,
+              "max_ms": 15.865,
+              "wall_ms": 346.63575000000003,
+              "mib_per_s": 576.9745330653286
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 406,
+          "bytes_up": 1048576,
+          "bytes_down": 422576128
+        },
+        "voidfs": {
+          "p50_ms": 1.19387475,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 1.3608954999999998,
+              "p90_ms": 1.73065,
+              "p99_ms": 3.397480919999998,
+              "mean_ms": 1.2966120650000013,
+              "min_ms": 0.356458,
+              "max_ms": 3.755958,
+              "wall_ms": 32.720082999999995,
+              "mib_per_s": 6112.453932344854
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 1.0268540000000002,
+              "p90_ms": 1.5488288999999997,
+              "p99_ms": 1.92042309,
+              "mean_ms": 1.0672220899999993,
+              "min_ms": 0.504125,
+              "max_ms": 1.9789999999999999,
+              "wall_ms": 27.282,
+              "mib_per_s": 7330.840847445202
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 406,
+          "bytes_up": 1048576,
+          "bytes_down": 422576128,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "insert-4k-middle-32m",
+      "name": "insert 4 KiB, middle of 32 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 234.0,
+        "bare": 883.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 153.623021,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 162.6219585,
+              "p90_ms": 190.49327559999998,
+              "p99_ms": 191.00255294,
+              "mean_ms": 158.08613156250001,
+              "min_ms": 100.718917,
+              "max_ms": 191.008792,
+              "wall_ms": 666.271917
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 144.6240835,
+              "p90_ms": 219.2525589,
+              "p99_ms": 219.60066558,
+              "mean_ms": 158.80068109374997,
+              "min_ms": 101.135959,
+              "max_ms": 219.623166,
+              "wall_ms": 675.5401250000001
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 2517872640,
+          "bytes_down": 2282754048
+        },
+        "voidfs": {
+          "p50_ms": 40.463218749999996,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 38.237792,
+              "p90_ms": 47.3546372,
+              "p99_ms": 49.460635960000005,
+              "mean_ms": 39.22546099999999,
+              "min_ms": 28.378542,
+              "max_ms": 50.390042,
+              "wall_ms": 172.219583
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 42.6886455,
+              "p90_ms": 52.85227530000002,
+              "p99_ms": 56.32218475,
+              "mean_ms": 41.4408840625,
+              "min_ms": 31.045166,
+              "max_ms": 56.331291,
+              "wall_ms": 187.085791
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 268709888,
+          "bytes_down": 33587200,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 25
+          }
+        }
+      }
+    },
+    {
+      "id": "insert-4k-start-32m",
+      "name": "insert 4 KiB, start of 32 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 251.0,
+        "bare": 890.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 144.29303099999998,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 139.4815415,
+              "p90_ms": 177.96452920000002,
+              "p99_ms": 181.28048919,
+              "mean_ms": 145.26172009375,
+              "min_ms": 100.62191700000001,
+              "max_ms": 181.791292,
+              "wall_ms": 604.826334
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 149.1045205,
+              "p90_ms": 189.18836249999998,
+              "p99_ms": 191.486142,
+              "mean_ms": 149.989830625,
+              "min_ms": 100.98124999999999,
+              "max_ms": 191.88216699999998,
+              "wall_ms": 624.866542
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 2517872640,
+          "bytes_down": 2282754048
+        },
+        "voidfs": {
+          "p50_ms": 37.6267605,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 38.5144585,
+              "p90_ms": 47.1683045,
+              "p99_ms": 48.37247848,
+              "mean_ms": 37.92674100000001,
+              "min_ms": 23.78575,
+              "max_ms": 48.773709,
+              "wall_ms": 177.374583
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 36.739062499999996,
+              "p90_ms": 41.4197167,
+              "p99_ms": 46.86322079000001,
+              "mean_ms": 36.635690062500004,
+              "min_ms": 25.364375000000003,
+              "max_ms": 47.842291,
+              "wall_ms": 171.41825
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 268709888,
+          "bytes_down": 33587200,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 64,
+            "put_new": 25
+          }
+        }
+      }
+    },
+    {
+      "id": "fanout-get-1000x4k-c64",
+      "name": "fanout get 1000 × 4 KiB, 64 at once",
+      "family": "reads",
+      "concurrency": 64,
+      "ops": 1000,
+      "spacefs": {
+        "layer": 10.6,
+        "bare": 28.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 12.292822999999999,
+          "rounds": [
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 12.275020999999999,
+              "p90_ms": 14.287128800000001,
+              "p99_ms": 17.45809893,
+              "mean_ms": 12.479165136000008,
+              "min_ms": 9.310458,
+              "max_ms": 18.491792,
+              "wall_ms": 200.743542,
+              "mib_per_s": 19.458907425275978
+            },
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 12.310625,
+              "p90_ms": 14.0815705,
+              "p99_ms": 16.430498999999998,
+              "mean_ms": 12.466951957999992,
+              "min_ms": 9.23475,
+              "max_ms": 17.200875,
+              "wall_ms": 198.84225,
+              "mib_per_s": 19.644969819039968
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 3005,
+          "bytes_up": 4096000,
+          "bytes_down": 8204288
+        },
+        "voidfs": {
+          "p50_ms": 0.9699060000000002,
+          "rounds": [
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 1.1099165000000002,
+              "p90_ms": 1.9483712000000002,
+              "p99_ms": 3.1862101700000003,
+              "mean_ms": 1.203982748999998,
+              "min_ms": 0.243,
+              "max_ms": 4.774291,
+              "wall_ms": 19.888875,
+              "mib_per_s": 196.40376843838578
+            },
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 0.8298955,
+              "p90_ms": 1.2038036,
+              "p99_ms": 1.6901238299999997,
+              "mean_ms": 0.8591405269999991,
+              "min_ms": 0.217667,
+              "max_ms": 4.2932500000000005,
+              "wall_ms": 13.999875,
+              "mib_per_s": 279.0203483959678
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 3005,
+          "bytes_up": 4096000,
+          "bytes_down": 8204288,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "patch-16x4k-64m",
+      "name": "patch 16 × 4 KiB in 64 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 785.0,
+        "bare": 1662.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 282.31656225,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 279.587229,
+              "p90_ms": 303.7922702,
+              "p99_ms": 465.75000602000006,
+              "mean_ms": 281.0559321875,
+              "min_ms": 183.886542,
+              "max_ms": 475.941708,
+              "wall_ms": 1324.495333
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 285.04589550000003,
+              "p90_ms": 329.3344164,
+              "p99_ms": 409.7170930000001,
+              "mean_ms": 286.16981759375,
+              "min_ms": 179.318958,
+              "max_ms": 440.99733299999997,
+              "wall_ms": 1288.3466669999998
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 5033164800,
+          "bytes_down": 4563402752
+        },
+        "voidfs": {
+          "p50_ms": 122.25825000000002,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 109.91677100000001,
+              "p90_ms": 247.31007980000015,
+              "p99_ms": 407.9639905800001,
+              "mean_ms": 149.20308078125,
+              "min_ms": 69.0645,
+              "max_ms": 420.368666,
+              "wall_ms": 652.963125
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 134.59972900000002,
+              "p90_ms": 167.2822369,
+              "p99_ms": 192.45671875,
+              "mean_ms": 132.17565887499998,
+              "min_ms": 83.269958,
+              "max_ms": 192.50225,
+              "wall_ms": 580.8254579999999
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 541279780,
+          "bytes_down": 67108864,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 317,
+            "head": 0,
+            "list": 0,
+            "put": 992,
+            "put_new": 46
+          }
+        }
+      }
+    },
+    {
+      "id": "patch-16x4k-32m",
+      "name": "patch 16 × 4 KiB in 32 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 627.0,
+        "bare": 899.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 144.65865624999998,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 150.2133955,
+              "p90_ms": 158.57078330000002,
+              "p99_ms": 181.17984502000004,
+              "mean_ms": 140.51064459375002,
+              "min_ms": 102.076875,
+              "max_ms": 189.841542,
+              "wall_ms": 665.900292
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 139.103917,
+              "p90_ms": 169.7005163,
+              "p99_ms": 201.91878527000006,
+              "mean_ms": 142.44011584375002,
+              "min_ms": 99.81791700000001,
+              "max_ms": 214.34841600000001,
+              "wall_ms": 681.999
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 153,
+          "bytes_up": 2516582400,
+          "bytes_down": 2281701376
+        },
+        "voidfs": {
+          "p50_ms": 100.48657275,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 99.0625835,
+              "p90_ms": 129.09788809999998,
+              "p99_ms": 144.43932148000002,
+              "mean_ms": 104.49919796875002,
+              "min_ms": 81.429333,
+              "max_ms": 151.111542,
+              "wall_ms": 428.20216700000003
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 101.910562,
+              "p90_ms": 123.5289372,
+              "p99_ms": 124.03821948000001,
+              "mean_ms": 99.89157790625,
+              "min_ms": 65.399625,
+              "max_ms": 124.111625,
+              "wall_ms": 433.648667
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 86,
+          "bytes_up": 272844324,
+          "bytes_down": 33554432,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 763,
+            "put_new": 32
+          }
+        }
+      }
+    },
+    {
+      "id": "append-4k-1m",
+      "name": "append 4 KiB to 1 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 64,
+      "spacefs": {
+        "layer": 106.0,
+        "bare": 108.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 28.04,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 28.592875,
+              "p90_ms": 31.353029200000005,
+              "p99_ms": 33.20685363,
+              "mean_ms": 28.789628859374993,
+              "min_ms": 23.644833000000002,
+              "max_ms": 33.212208,
+              "wall_ms": 236.426375
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 27.487125000000002,
+              "p90_ms": 31.157958999999998,
+              "p99_ms": 31.788377209999997,
+              "mean_ms": 27.565509828125005,
+              "min_ms": 23.176041,
+              "max_ms": 32.460167,
+              "wall_ms": 227.639667
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 281,
+          "bytes_up": 150417408,
+          "bytes_down": 142610432
+        },
+        "voidfs": {
+          "p50_ms": 38.071396,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 38.256792000000004,
+              "p90_ms": 42.355653800000006,
+              "p99_ms": 43.99614233,
+              "mean_ms": 36.91059185937501,
+              "min_ms": 26.011667,
+              "max_ms": 44.019584,
+              "wall_ms": 305.29125
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 37.885999999999996,
+              "p90_ms": 42.586774999999996,
+              "p99_ms": 43.72270499999999,
+              "mean_ms": 37.37503449999999,
+              "min_ms": 25.89,
+              "max_ms": 45.555375000000005,
+              "wall_ms": 304.203667
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 150,
+          "bytes_up": 8925184,
+          "bytes_down": 1118208,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 128,
+            "put_new": 46
+          }
+        }
+      }
+    },
+    {
+      "id": "put-64m",
+      "name": "put 64 MiB",
+      "family": "writes",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 1109.0,
+        "bare": 978.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 164.62115625,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 166.81987500000002,
+              "p90_ms": 176.33890839999998,
+              "p99_ms": 179.77559552,
+              "mean_ms": 166.95557171875004,
+              "min_ms": 155.327333,
+              "max_ms": 179.86137499999998,
+              "wall_ms": 702.1699580000001,
+              "mib_per_s": 2916.6727751118055
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 162.4224375,
+              "p90_ms": 174.7245164,
+              "p99_ms": 179.54636127,
+              "mean_ms": 163.43990487500002,
+              "min_ms": 151.705083,
+              "max_ms": 180.263417,
+              "wall_ms": 678.576083,
+              "mib_per_s": 3018.0845616393467
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 69,
+          "bytes_up": 4496293888,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 206.06210425,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 206.18325,
+              "p90_ms": 462.6606961,
+              "p99_ms": 477.34824498,
+              "mean_ms": 268.06643484375,
+              "min_ms": 179.346709,
+              "max_ms": 477.52108300000003,
+              "wall_ms": 1123.836708,
+              "mib_per_s": 1822.3288004577262
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 205.94095850000002,
+              "p90_ms": 222.7327798,
+              "p99_ms": 235.05652052000002,
+              "mean_ms": 207.71158331250004,
+              "min_ms": 183.762917,
+              "max_ms": 238.512,
+              "wall_ms": 852.79375,
+              "mib_per_s": 2401.518538333565
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 69,
+          "bytes_up": 4496293888,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 1796,
+            "put_new": 38
+          }
+        }
+      }
+    },
+    {
+      "id": "put-32m",
+      "name": "put 32 MiB",
+      "family": "writes",
+      "concurrency": 8,
+      "ops": 32,
+      "spacefs": {
+        "layer": 630.0,
+        "bare": 523.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 88.827573,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 85.710625,
+              "p90_ms": 98.3040247,
+              "p99_ms": 99.05778704,
+              "mean_ms": 88.77751296875002,
+              "min_ms": 79.989458,
+              "max_ms": 99.088916,
+              "wall_ms": 385.252791,
+              "mib_per_s": 2657.99502020999
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 91.94452100000001,
+              "p90_ms": 101.2131417,
+              "p99_ms": 101.75071052,
+              "mean_ms": 92.45113681250001,
+              "min_ms": 80.202917,
+              "max_ms": 101.777125,
+              "wall_ms": 393.282958,
+              "mib_per_s": 2603.7232968533563
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 69,
+          "bytes_up": 2248146944,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 108.71147925,
+          "rounds": [
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 108.968146,
+              "p90_ms": 140.46875359999999,
+              "p99_ms": 141.49791756,
+              "mean_ms": 112.10316009374999,
+              "min_ms": 87.80983400000001,
+              "max_ms": 141.568791,
+              "wall_ms": 479.924458,
+              "mib_per_s": 2133.669128402704
+            },
+            {
+              "ops": 32,
+              "errors": 0,
+              "p50_ms": 108.4548125,
+              "p90_ms": 126.16865419999998,
+              "p99_ms": 133.20453677,
+              "mean_ms": 108.58598840625,
+              "min_ms": 84.907042,
+              "max_ms": 134.803,
+              "wall_ms": 482.032208,
+              "mib_per_s": 2124.3393760941385
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 69,
+          "bytes_up": 2248146944,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 924,
+            "put_new": 42
+          }
+        }
+      }
+    },
+    {
+      "id": "delete-4k-middle-1m",
+      "name": "delete 4 KiB, middle of 1 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 64,
+      "spacefs": {
+        "layer": 139.0,
+        "bare": 102.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 27.4220835,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 27.744083500000002,
+              "p90_ms": 32.895737600000004,
+              "p99_ms": 33.61422092,
+              "mean_ms": 28.2386133125,
+              "min_ms": 22.694375,
+              "max_ms": 33.619208,
+              "wall_ms": 230.881833
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 27.1000835,
+              "p90_ms": 32.1000208,
+              "p99_ms": 32.59414375,
+              "mean_ms": 27.715454468749996,
+              "min_ms": 22.291083999999998,
+              "max_ms": 32.656749999999995,
+              "wall_ms": 229.270333
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 281,
+          "bytes_up": 141086720,
+          "bytes_down": 134213632
+        },
+        "voidfs": {
+          "p50_ms": 36.14466675,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 36.1988335,
+              "p90_ms": 44.6264376,
+              "p99_ms": 45.729301209999996,
+              "mean_ms": 37.009285140625,
+              "min_ms": 26.080417,
+              "max_ms": 46.048291,
+              "wall_ms": 308.89629099999996
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 36.0905,
+              "p90_ms": 43.0597663,
+              "p99_ms": 43.23774854,
+              "mean_ms": 37.703444671875,
+              "min_ms": 27.215959,
+              "max_ms": 43.250375,
+              "wall_ms": 306.461834
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 150,
+          "bytes_up": 8388608,
+          "bytes_down": 978944,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 128,
+            "put_new": 46
+          }
+        }
+      }
+    },
+    {
+      "id": "insert-4k-middle-1m",
+      "name": "insert 4 KiB, middle of 1 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 64,
+      "spacefs": {
+        "layer": 136.0,
+        "bare": 94.8
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 27.880291500000002,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 27.057666500000003,
+              "p90_ms": 32.016491800000004,
+              "p99_ms": 32.51596821,
+              "mean_ms": 27.74606046875,
+              "min_ms": 22.087666,
+              "max_ms": 32.551458,
+              "wall_ms": 230.787
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 28.7029165,
+              "p90_ms": 33.5658374,
+              "p99_ms": 34.156065330000004,
+              "mean_ms": 28.92977406250001,
+              "min_ms": 23.267666,
+              "max_ms": 34.207542000000004,
+              "wall_ms": 237.03954099999999
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 281,
+          "bytes_up": 150417408,
+          "bytes_down": 142610432
+        },
+        "voidfs": {
+          "p50_ms": 37.55246875,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 38.035041500000005,
+              "p90_ms": 42.3753213,
+              "p99_ms": 45.3989175,
+              "mean_ms": 37.42170246875,
+              "min_ms": 26.095291,
+              "max_ms": 45.413250000000005,
+              "wall_ms": 312.878208
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 37.069896,
+              "p90_ms": 43.03720440000001,
+              "p99_ms": 43.88327142,
+              "mean_ms": 36.78883389062501,
+              "min_ms": 26.349083999999998,
+              "max_ms": 43.912041,
+              "wall_ms": 299.210875
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 150,
+          "bytes_up": 8925184,
+          "bytes_down": 1118208,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 128,
+            "put_new": 46
+          }
+        }
+      }
+    },
+    {
+      "id": "patch-16x4k-1m",
+      "name": "patch 16 × 4 KiB in 1 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 64,
+      "spacefs": {
+        "layer": 154.0,
+        "bare": 106.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 27.544927,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 28.085687,
+              "p90_ms": 33.4566038,
+              "p99_ms": 33.83350654,
+              "mean_ms": 28.60957034375,
+              "min_ms": 23.97575,
+              "max_ms": 33.855583,
+              "wall_ms": 237.213333
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 27.004167000000002,
+              "p90_ms": 31.085258200000002,
+              "p99_ms": 31.57636746,
+              "mean_ms": 27.546299499999996,
+              "min_ms": 23.638541999999998,
+              "max_ms": 31.577916,
+              "wall_ms": 222.764208
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 281,
+          "bytes_up": 145752064,
+          "bytes_down": 138412032
+        },
+        "voidfs": {
+          "p50_ms": 35.8192915,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 36.5431875,
+              "p90_ms": 38.1340833,
+              "p99_ms": 39.75508012,
+              "mean_ms": 35.362219406250006,
+              "min_ms": 26.367542,
+              "max_ms": 39.760042000000006,
+              "wall_ms": 287.95183299999997
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 35.095395499999995,
+              "p90_ms": 39.2794083,
+              "p99_ms": 42.5014775,
+              "mean_ms": 36.017442703125006,
+              "min_ms": 26.172959,
+              "max_ms": 42.531875,
+              "wall_ms": 293.278708
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 150,
+          "bytes_up": 17008932,
+          "bytes_down": 1048576,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 147,
+            "put_new": 46
+          }
+        }
+      }
+    },
+    {
+      "id": "delete-4k-start-1m",
+      "name": "delete 4 KiB, start of 1 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 64,
+      "spacefs": {
+        "layer": 155.0,
+        "bare": 106.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 28.83736475,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 28.854813,
+              "p90_ms": 33.368833200000005,
+              "p99_ms": 34.28678129,
+              "mean_ms": 28.842380249999998,
+              "min_ms": 22.415166,
+              "max_ms": 34.347209,
+              "wall_ms": 234.053333
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 28.8199165,
+              "p90_ms": 31.7052293,
+              "p99_ms": 31.906250540000002,
+              "mean_ms": 28.852721281250002,
+              "min_ms": 25.003458,
+              "max_ms": 31.947542000000002,
+              "wall_ms": 231.85649999999998
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 281,
+          "bytes_up": 141086720,
+          "bytes_down": 134213632
+        },
+        "voidfs": {
+          "p50_ms": 39.6063125,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 39.459917,
+              "p90_ms": 43.340983800000004,
+              "p99_ms": 45.111875500000004,
+              "mean_ms": 38.94929628125,
+              "min_ms": 26.774709,
+              "max_ms": 45.118333,
+              "wall_ms": 316.621417
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 39.752708,
+              "p90_ms": 43.4620956,
+              "p99_ms": 44.55033646,
+              "mean_ms": 38.480933000000014,
+              "min_ms": 23.959292,
+              "max_ms": 44.928625,
+              "wall_ms": 318.956792
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 150,
+          "bytes_up": 8388608,
+          "bytes_down": 978944,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 128,
+            "put_new": 46
+          }
+        }
+      }
+    },
+    {
+      "id": "write-at-4k-1m",
+      "name": "write at 4 KiB in 1 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 64,
+      "spacefs": {
+        "layer": 157.0,
+        "bare": 101.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 28.92297925,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 28.815604,
+              "p90_ms": 32.123412300000005,
+              "p99_ms": 32.5118525,
+              "mean_ms": 28.665356796875006,
+              "min_ms": 23.856167000000003,
+              "max_ms": 32.550125,
+              "wall_ms": 234.374208
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 29.0303545,
+              "p90_ms": 32.30370900000001,
+              "p99_ms": 33.22611342,
+              "mean_ms": 28.549841140625002,
+              "min_ms": 22.554583,
+              "max_ms": 33.240708,
+              "wall_ms": 235.159208
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 281,
+          "bytes_up": 145752064,
+          "bytes_down": 138412032
+        },
+        "voidfs": {
+          "p50_ms": 36.41257325,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 36.6575005,
+              "p90_ms": 42.67377960000001,
+              "p99_ms": 43.992144880000005,
+              "mean_ms": 36.754055359375,
+              "min_ms": 25.959916999999997,
+              "max_ms": 44.006083000000004,
+              "wall_ms": 298.96633299999996
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 36.167646000000005,
+              "p90_ms": 42.0489749,
+              "p99_ms": 42.54194621,
+              "mean_ms": 36.93508726562499,
+              "min_ms": 27.310000000000002,
+              "max_ms": 42.567041,
+              "wall_ms": 300.42675
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 150,
+          "bytes_up": 8925184,
+          "bytes_down": 1048576,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 128,
+            "put_new": 46
+          }
+        }
+      }
+    },
+    {
+      "id": "insert-4k-start-1m",
+      "name": "insert 4 KiB, start of 1 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 64,
+      "spacefs": {
+        "layer": 178.0,
+        "bare": 105.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 26.695260500000003,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 26.951708500000002,
+              "p90_ms": 32.1563457,
+              "p99_ms": 34.040658,
+              "mean_ms": 27.79868099999999,
+              "min_ms": 23.057792,
+              "max_ms": 34.102083,
+              "wall_ms": 226.897
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 26.4388125,
+              "p90_ms": 30.3012876,
+              "p99_ms": 36.81031908,
+              "mean_ms": 27.049634765624994,
+              "min_ms": 23.095375,
+              "max_ms": 36.816042,
+              "wall_ms": 229.214791
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 281,
+          "bytes_up": 150417408,
+          "bytes_down": 142610432
+        },
+        "voidfs": {
+          "p50_ms": 39.7238855,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 38.006354,
+              "p90_ms": 41.8659583,
+              "p99_ms": 43.01839717,
+              "mean_ms": 36.710087328125006,
+              "min_ms": 24.301167,
+              "max_ms": 43.038582999999996,
+              "wall_ms": 312.867791
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 41.441417,
+              "p90_ms": 44.58947920000001,
+              "p99_ms": 46.74931371,
+              "mean_ms": 39.26901171875001,
+              "min_ms": 24.460459,
+              "max_ms": 46.795041000000005,
+              "wall_ms": 327.907917
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 150,
+          "bytes_up": 8925184,
+          "bytes_down": 1118208,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 128,
+            "put_new": 47
+          }
+        }
+      }
+    },
+    {
+      "id": "put-1m",
+      "name": "put 1 MiB",
+      "family": "writes",
+      "concurrency": 8,
+      "ops": 200,
+      "spacefs": {
+        "layer": 126.0,
+        "bare": 72.8
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 13.59166675,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.9460835,
+              "p90_ms": 15.828363099999999,
+              "p99_ms": 17.282505750000002,
+              "mean_ms": 14.131810814999996,
+              "min_ms": 11.759916,
+              "max_ms": 17.303417000000003,
+              "wall_ms": 367.034041,
+              "mib_per_s": 544.9085851957802
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.23725,
+              "p90_ms": 15.056491699999999,
+              "p99_ms": 17.05231226,
+              "mean_ms": 13.555367469999998,
+              "min_ms": 11.679292,
+              "max_ms": 17.807459,
+              "wall_ms": 350.18445799999995,
+              "mib_per_s": 571.1275741426538
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 405,
+          "bytes_up": 422576128,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 33.550979,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 33.4123125,
+              "p90_ms": 36.6044744,
+              "p99_ms": 44.30814467,
+              "mean_ms": 34.07801519999999,
+              "min_ms": 29.756500000000003,
+              "max_ms": 44.509916,
+              "wall_ms": 861.5131670000001,
+              "mib_per_s": 232.14967299507333
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 33.6896455,
+              "p90_ms": 36.6981834,
+              "p99_ms": 41.32415508,
+              "mean_ms": 33.92359691500002,
+              "min_ms": 26.496125,
+              "max_ms": 41.452374999999996,
+              "wall_ms": 857.554208,
+              "mib_per_s": 233.22140820280364
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 405,
+          "bytes_up": 422576128,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 465,
+            "put_new": 148
+          }
+        }
+      }
+    },
+    {
+      "id": "multipart-256m-x16m",
+      "name": "multipart put 256 MiB × 16 MiB",
+      "family": "writes",
+      "concurrency": 8,
+      "ops": 16,
+      "spacefs": {
+        "layer": 3209.0,
+        "bare": 1790.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 695.05425,
+          "rounds": [
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 727.147458,
+              "p90_ms": 1198.4193125000002,
+              "p99_ms": 4802.417131249998,
+              "mean_ms": 1029.3370364999998,
+              "min_ms": 301.097208,
+              "max_ms": 5437.13825,
+              "wall_ms": 5457.116333,
+              "mib_per_s": 750.5795643810769
+            },
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 662.961042,
+              "p90_ms": 5438.059854,
+              "p99_ms": 5448.46715625,
+              "mean_ms": 1820.7369271875,
+              "min_ms": 397.169083,
+              "max_ms": 5450.280375,
+              "wall_ms": 5467.528042,
+              "mib_per_s": 749.1502500829789
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 632,
+          "bytes_up": 9395240960,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 1143.8314375,
+          "rounds": [
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 1177.914229,
+              "p90_ms": 1558.4318954999999,
+              "p99_ms": 1582.0082731499997,
+              "mean_ms": 1180.6063125,
+              "min_ms": 787.6932909999999,
+              "max_ms": 1582.8217919999997,
+              "wall_ms": 2420.805209,
+              "mib_per_s": 1691.9990029648022
+            },
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 1109.748646,
+              "p90_ms": 1192.979792,
+              "p99_ms": 1196.90479825,
+              "mean_ms": 1127.0504870625,
+              "min_ms": 1075.9202500000001,
+              "max_ms": 1197.1889170000002,
+              "wall_ms": 2317.938542,
+              "mib_per_s": 1767.0874036486857
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 632,
+          "bytes_up": 9395240960,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 32,
+            "get": 1057,
+            "head": 0,
+            "list": 32,
+            "put": 4408,
+            "put_new": 22
+          }
+        }
+      }
+    },
+    {
+      "id": "overwrite-1m",
+      "name": "overwrite 1 MiB",
+      "family": "writes",
+      "concurrency": 8,
+      "ops": 200,
+      "spacefs": {
+        "layer": 125.0,
+        "bare": 65.3
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 14.09221875,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 14.043333,
+              "p90_ms": 16.2692545,
+              "p99_ms": 18.20009825,
+              "mean_ms": 14.393432045000006,
+              "min_ms": 11.935584,
+              "max_ms": 18.364874999999998,
+              "wall_ms": 370.669458,
+              "mib_per_s": 539.5642820941563
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 14.1411045,
+              "p90_ms": 16.208692199999998,
+              "p99_ms": 28.52024066,
+              "mean_ms": 14.518572284999996,
+              "min_ms": 11.663540999999999,
+              "max_ms": 28.569875000000003,
+              "wall_ms": 369.80025,
+              "mib_per_s": 540.832517014253
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 421,
+          "bytes_up": 430964736,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 33.537823,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 33.837646,
+              "p90_ms": 36.47683369999999,
+              "p99_ms": 43.234860499999996,
+              "mean_ms": 34.26915437499999,
+              "min_ms": 27.363666,
+              "max_ms": 43.380958,
+              "wall_ms": 864.7961250000001,
+              "mib_per_s": 231.26838131935432
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 33.238,
+              "p90_ms": 39.4516747,
+              "p99_ms": 42.70528816,
+              "mean_ms": 34.16131102,
+              "min_ms": 25.858084,
+              "max_ms": 43.105709,
+              "wall_ms": 869.895208,
+              "mib_per_s": 229.9127505942072
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 421,
+          "bytes_up": 430964736,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 471,
+            "put_new": 150
+          }
+        }
+      }
+    },
+    {
+      "id": "put-4k",
+      "name": "put 4 KiB",
+      "family": "writes",
+      "concurrency": 8,
+      "ops": 200,
+      "spacefs": {
+        "layer": 60.6,
+        "bare": 30.1
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 13.747145750000001,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.376437500000002,
+              "p90_ms": 15.0142587,
+              "p99_ms": 15.49767167,
+              "mean_ms": 13.293095190000006,
+              "min_ms": 10.523,
+              "max_ms": 15.594040999999999,
+              "wall_ms": 332.77099999999996,
+              "mib_per_s": 2.347710587761554
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 14.117854,
+              "p90_ms": 15.2476,
+              "p99_ms": 15.93457775,
+              "mean_ms": 13.778878579999999,
+              "min_ms": 10.460291999999999,
+              "max_ms": 16.062666999999998,
+              "wall_ms": 346.243,
+              "mib_per_s": 2.256363305539751
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 405,
+          "bytes_up": 1650688,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 16.72139575,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 17.426812499999997,
+              "p90_ms": 33.6658711,
+              "p99_ms": 35.73666959,
+              "mean_ms": 22.44717727999999,
+              "min_ms": 13.292666,
+              "max_ms": 36.227584,
+              "wall_ms": 565.521167,
+              "mib_per_s": 1.3814690688668776
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 16.015979,
+              "p90_ms": 33.5677205,
+              "p99_ms": 36.05884408,
+              "mean_ms": 19.833102900000007,
+              "min_ms": 12.374958,
+              "max_ms": 36.422999999999995,
+              "wall_ms": 508.312083,
+              "mib_per_s": 1.536949496437605
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 405,
+          "bytes_up": 1650688,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 67
+          }
+        }
+      }
+    },
+    {
+      "id": "truncate-4k-end-1m",
+      "name": "truncate 4 KiB, end of 1 MiB",
+      "family": "edits",
+      "concurrency": 8,
+      "ops": 64,
+      "spacefs": {
+        "layer": 174.0,
+        "bare": 82.3
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 28.03277075,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 28.7856665,
+              "p90_ms": 33.247796300000005,
+              "p99_ms": 33.841943750000006,
+              "mean_ms": 29.238436171875,
+              "min_ms": 25.635,
+              "max_ms": 33.890375,
+              "wall_ms": 235.571209
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 27.279875,
+              "p90_ms": 33.35047110000001,
+              "p99_ms": 34.28238979,
+              "mean_ms": 28.075477874999997,
+              "min_ms": 24.154249999999998,
+              "max_ms": 34.291000000000004,
+              "wall_ms": 227.764583
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 281,
+          "bytes_up": 141086720,
+          "bytes_down": 134213632
+        },
+        "voidfs": {
+          "p50_ms": 36.25603125,
+          "rounds": [
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 34.6106875,
+              "p90_ms": 40.076729400000005,
+              "p99_ms": 41.41791333,
+              "mean_ms": 35.25154228125,
+              "min_ms": 28.338625,
+              "max_ms": 41.420249999999996,
+              "wall_ms": 286.907334
+            },
+            {
+              "ops": 64,
+              "errors": 0,
+              "p50_ms": 37.901375,
+              "p90_ms": 44.04996250000001,
+              "p99_ms": 45.574834,
+              "mean_ms": 38.569339218749995,
+              "min_ms": 26.643083,
+              "max_ms": 45.897709,
+              "wall_ms": 313.406917
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 150,
+          "bytes_up": 8388608,
+          "bytes_down": 978944,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 128,
+            "put_new": 46
+          }
+        }
+      }
+    },
+    {
+      "id": "fanout-put-1000x4k-c32",
+      "name": "fanout put 1000 × 4 KiB, 32 at once",
+      "family": "writes",
+      "concurrency": 32,
+      "ops": 1000,
+      "spacefs": {
+        "layer": 60.3,
+        "bare": 27.1
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 12.239854000000001,
+          "rounds": [
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 12.251875,
+              "p90_ms": 14.18715,
+              "p99_ms": 16.846894909999993,
+              "mean_ms": 12.46051104100002,
+              "min_ms": 9.209,
+              "max_ms": 18.98675,
+              "wall_ms": 397.59450000000004,
+              "mib_per_s": 9.824708339778342
+            },
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 12.227833,
+              "p90_ms": 14.0036795,
+              "p99_ms": 15.885591330000002,
+              "mean_ms": 12.361194503000002,
+              "min_ms": 9.259792,
+              "max_ms": 16.46425,
+              "wall_ms": 393.5005,
+              "mib_per_s": 9.926925124618649
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 2009,
+          "bytes_up": 8204288,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 17.128323,
+          "rounds": [
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 17.414604,
+              "p90_ms": 33.5435208,
+              "p99_ms": 35.795737329999994,
+              "mean_ms": 22.773002813999987,
+              "min_ms": 14.302292,
+              "max_ms": 36.495332999999995,
+              "wall_ms": 734.368375,
+              "mib_per_s": 5.319196922116915
+            },
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 16.842042000000003,
+              "p90_ms": 32.85,
+              "p99_ms": 34.233283920000005,
+              "mean_ms": 20.400679788,
+              "min_ms": 13.850625,
+              "max_ms": 34.486999999999995,
+              "wall_ms": 656.751792,
+              "mib_per_s": 5.947833028524116
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 2005,
+          "bytes_up": 8204288,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 85
+          }
+        }
+      }
+    },
+    {
+      "id": "fanout-put-1000x4k-c64",
+      "name": "fanout put 1000 × 4 KiB, 64 at once",
+      "family": "writes",
+      "concurrency": 64,
+      "ops": 1000,
+      "spacefs": {
+        "layer": 67.1,
+        "bare": 27.8
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 12.4127185,
+          "rounds": [
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 12.6126665,
+              "p90_ms": 17.231683,
+              "p99_ms": 27.48857309,
+              "mean_ms": 13.627674070999994,
+              "min_ms": 9.418667000000001,
+              "max_ms": 28.124917,
+              "wall_ms": 219.672541,
+              "mib_per_s": 17.782149658841522
+            },
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 12.212770500000001,
+              "p90_ms": 14.8928539,
+              "p99_ms": 18.935972169999996,
+              "mean_ms": 12.675672812000002,
+              "min_ms": 9.179,
+              "max_ms": 19.389375,
+              "wall_ms": 205.679417,
+              "mib_per_s": 18.991934423851465
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 2009,
+          "bytes_up": 8204288,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 18.199385499999998,
+          "rounds": [
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 18.274375,
+              "p90_ms": 33.8092078,
+              "p99_ms": 35.18048417,
+              "mean_ms": 22.635980264000004,
+              "min_ms": 13.627792,
+              "max_ms": 35.708125,
+              "wall_ms": 380.21812500000004,
+              "mib_per_s": 10.27370801957429
+            },
+            {
+              "ops": 1000,
+              "errors": 0,
+              "p50_ms": 18.124396,
+              "p90_ms": 33.924792,
+              "p99_ms": 36.321387,
+              "mean_ms": 23.402229170000002,
+              "min_ms": 12.928917,
+              "max_ms": 36.677208,
+              "wall_ms": 385.283292,
+              "mib_per_s": 10.138643645102576
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 2005,
+          "bytes_up": 8204288,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 46
+          }
+        }
+      }
+    },
+    {
+      "id": "multipart-64m-x8m",
+      "name": "multipart put 64 MiB × 8 MiB",
+      "family": "writes",
+      "concurrency": 8,
+      "ops": 16,
+      "spacefs": {
+        "layer": 1613.0,
+        "bare": 660.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 256.23378075,
+          "rounds": [
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 323.309916,
+              "p90_ms": 495.0616665,
+              "p99_ms": 792.0469794499998,
+              "mean_ms": 339.37996093749996,
+              "min_ms": 106.889792,
+              "max_ms": 843.8472919999999,
+              "wall_ms": 848.710625,
+              "mib_per_s": 1206.5360911441398
+            },
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 189.1576455,
+              "p90_ms": 521.5249375000001,
+              "p99_ms": 537.8189669,
+              "mean_ms": 293.89058324999996,
+              "min_ms": 95.125625,
+              "max_ms": 539.987792,
+              "wall_ms": 651.183541,
+              "mib_per_s": 1572.5213177646947
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 352,
+          "bytes_up": 2348810240,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 410.37991650000004,
+          "rounds": [
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 430.812583,
+              "p90_ms": 452.08356249999997,
+              "p99_ms": 452.13994549999995,
+              "mean_ms": 433.9471456875,
+              "min_ms": 417.134,
+              "max_ms": 452.14770799999997,
+              "wall_ms": 892.546125,
+              "mib_per_s": 1147.279643390979
+            },
+            {
+              "ops": 16,
+              "errors": 0,
+              "p50_ms": 389.94725,
+              "p90_ms": 422.12799999999993,
+              "p99_ms": 428.81657939999997,
+              "mean_ms": 396.0656379375,
+              "min_ms": 359.84575,
+              "max_ms": 429.126417,
+              "wall_ms": 824.776834,
+              "mib_per_s": 1241.547965203882
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 352,
+          "bytes_up": 2348810240,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 32,
+            "get": 544,
+            "head": 0,
+            "list": 32,
+            "put": 1347,
+            "put_new": 15
+          }
+        }
+      }
+    },
+    {
+      "id": "fanout-put-200x256k-c32",
+      "name": "fanout put 200 × 256 KiB, 32 at once",
+      "family": "writes",
+      "concurrency": 32,
+      "ops": 200,
+      "spacefs": {
+        "layer": 134.0,
+        "bare": 48.0
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 13.2201875,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 13.892021,
+              "p90_ms": 16.871333000000003,
+              "p99_ms": 17.69434258,
+              "mean_ms": 13.715776879999995,
+              "min_ms": 9.965333,
+              "max_ms": 17.952333,
+              "wall_ms": 91.781167,
+              "mib_per_s": 544.7740711337872
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 12.548354,
+              "p90_ms": 16.767537499999992,
+              "p99_ms": 18.84510958,
+              "mean_ms": 13.095316240000002,
+              "min_ms": 9.726584,
+              "max_ms": 19.089125,
+              "wall_ms": 87.044625,
+              "mib_per_s": 574.4180068556789
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 405,
+          "bytes_up": 105644032,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 39.37691675,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 40.089271,
+              "p90_ms": 47.9315919,
+              "p99_ms": 48.9113665,
+              "mean_ms": 39.52726354,
+              "min_ms": 25.328916,
+              "max_ms": 49.148833,
+              "wall_ms": 257.942875,
+              "mib_per_s": 193.84136894651576
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 38.6645625,
+              "p90_ms": 43.1242,
+              "p99_ms": 46.560654670000005,
+              "mean_ms": 35.33783079500002,
+              "min_ms": 25.267875,
+              "max_ms": 46.893416,
+              "wall_ms": 240.25608300000002,
+              "mib_per_s": 208.1112760004499
+            }
+          ],
+          "warmup_errors": 0,
+          "requests": 405,
+          "bytes_up": 105644032,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 400,
+            "put_new": 33
+          }
+        }
+      }
+    },
+    {
+      "id": "overwrite-4k",
+      "name": "overwrite 4 KiB",
+      "family": "writes",
+      "concurrency": 8,
+      "ops": 200,
+      "spacefs": {
+        "layer": 84.6,
+        "bare": 27.7
+      },
+      "results": {
+        "bare": {
+          "p50_ms": 13.783416500000001,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 12.781812500000001,
+              "p90_ms": 15.503024700000001,
+              "p99_ms": 16.987658089999996,
+              "mean_ms": 13.336544155000002,
+              "min_ms": 10.68125,
+              "max_ms": 17.130083,
+              "wall_ms": 334.537417,
+              "mib_per_s": 2.3353142587335753
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 14.7850205,
+              "p90_ms": 16.285096099999997,
+              "p99_ms": 17.54931217,
+              "mean_ms": 14.524653919999999,
+              "min_ms": 10.588583999999999,
+              "max_ms": 17.718,
+              "wall_ms": 364.189208,
+              "mib_per_s": 2.1451761415181747
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 421,
+          "bytes_up": 1683456,
+          "bytes_down": 0
+        },
+        "voidfs": {
+          "p50_ms": 15.988968999999999,
+          "rounds": [
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 16.2570005,
+              "p90_ms": 30.4214205,
+              "p99_ms": 35.31324075,
+              "mean_ms": 18.8556784,
+              "min_ms": 13.813167,
+              "max_ms": 35.445375,
+              "wall_ms": 484.44708399999996,
+              "mib_per_s": 1.6126632315532734
+            },
+            {
+              "ops": 200,
+              "errors": 0,
+              "p50_ms": 15.720937499999998,
+              "p90_ms": 31.906883299999997,
+              "p99_ms": 34.831219669999996,
+              "mean_ms": 18.395043065000003,
+              "min_ms": 13.50925,
+              "max_ms": 35.053208000000005,
+              "wall_ms": 469.628708,
+              "mib_per_s": 1.6635482173291671
+            }
+          ],
+          "warmup_errors": 0,
+          "verified": true,
+          "requests": 421,
+          "bytes_up": 1683456,
+          "bytes_down": 0,
+          "bucket_requests": {
+            "delete": 0,
+            "delete_prefix": 0,
+            "get": 0,
+            "head": 0,
+            "list": 0,
+            "put": 0,
+            "put_new": 61
+          }
+        }
+      }
+    }
+  ]
+}
