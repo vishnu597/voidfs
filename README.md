@@ -110,6 +110,27 @@ For a bucket without conditional writes, create the pool with `--commit-guard ex
 one server, and one garbage collector, may then write it
 ([§7.3](spec/format.md#73-external-guard)).
 
+### Small files in the log
+
+A file of up to 4 KiB can be held in the log itself, so that writing it takes one request to the
+bucket instead of two, one after the other: its shard, then the log entry. This is the pool's
+`inline-data` feature ([RFC 0003](rfcs/0003-small-content-in-descriptors.md),
+[format §5](spec/format.md#5-content-and-manifests)). Servers and readers older than it refuse a
+pool that has it, so it is off until you turn it on:
+
+- **A new pool:** start the server that creates it with `--new-pool-feature inline-data` (or
+  `VOIDFS_NEW_POOL_FEATURES=inline-data`). The option changes nothing in a pool that exists.
+- **An existing pool:** once every server that writes it runs this version or later, add the
+  feature, then restart them, since servers read the pool's `voidfs.json` when they start:
+
+  ```bash
+  cargo run --release -p voidfs-server -- pool enable inline-data --store s3:<bucket>/<prefix> --s3-endpoint <url>
+  ```
+
+A feature cannot be removed again. Checkpoints store small files as shards, in the background, so
+only a drive's log since its last checkpoint holds them, and the server keeps no more of them in
+memory than that: about 12 MB of small files a drive.
+
 ### Garbage collection
 
 Content that nothing references any more, such as the content of hard-deleted drives, is
@@ -157,6 +178,8 @@ or a private network, and never publish it. No label names a drive or a key.
 | `voidfs_commit_log_write_seconds` | | Time to write each log entry (histogram) |
 | `voidfs_commits_total`, `voidfs_checkpoints_total` | `outcome` | Log entries written, lost to another server's, or failed; checkpoints written or failed |
 | `voidfs_checkpoint_write_seconds` | | Time to write each checkpoint, in the background after the commit that made it due (histogram) |
+| `voidfs_checkpoint_spilled_shards_total` | | Shards checkpoints stored for small files held in the log (`inline-data`) |
+| `voidfs_checkpoint_swap_seconds` | | Time each such checkpoint then held its drive's commits, to take those shards into memory in place of the files' bytes (histogram) |
 | `voidfs_gc_phase` | `phase` | The garbage-collection run in `gc/pending.json`: `none`, `marking`, `waiting` or `deleting` |
 | `voidfs_gc_steps_total`, `voidfs_gc_last_step`, `voidfs_gc_last_step_timestamp_seconds` | `outcome` | Steps of `--gc-interval` collection, and the last one |
 | `voidfs_gc_deleted_objects_total`, `voidfs_gc_deleted_bytes_total` | | What collection deleted |

@@ -85,11 +85,14 @@ gets=$(metric 'voidfs_s3_requests_total{op="get",status="2xx"}')
 puts=$(metric 'voidfs_s3_requests_total{op="put",status="2xx"}')
 bucket_gets=$(metric 'voidfs_bucket_requests_total{op="get"}')
 commits=$(metric 'voidfs_commits_total{outcome="written"}')
-s3 PUT "/$drive/counted.txt" --data-binary 'counted by the metrics'
+# Over 4 KiB, so that it is stored in a shard even where small files are held in the log
+# (inline-data): the reads then show in the shard cache.
+printf 'counted by the metrics %.0s' $(seq 1 200) > "$out/counted"
+s3 PUT "/$drive/counted.txt" --data-binary @"$out/counted"
 check "put an object" '[ "$status" = 200 ]'
 for i in 1 2; do
     s3 GET "/$drive/counted.txt"
-    check "get it ($i)" '[ "$status" = 200 ] && [ "$(cat "$out/body")" = "counted by the metrics" ]'
+    check "get it ($i)" '[ "$status" = 200 ] && cmp -s "$out/body" "$out/counted"'
 done
 # Read into variables first: bash 3.2 brace-expands `{a,b}` in a command substitution under eval.
 scrape

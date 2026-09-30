@@ -14,7 +14,8 @@ use voidfs_core::chunk::{Params, Shard};
 use voidfs_core::ids::{DriveId, ObjectId, ShardHash, Timestamp, VersionId};
 use voidfs_core::manifest::{self, Page};
 use voidfs_core::model::{
-    Chunking, Commit, CommitGuard, ContentDescriptor, DriveDescriptor, Extent, Features, ForkOf, KNOWN_INCOMPATIBLE_FEATURES, Kind, Op, PoolDescriptor, Txn,
+    Chunking, Commit, CommitGuard, ContentDescriptor, DriveDescriptor, Extent, Features, ForkOf, INLINE_DATA, KNOWN_INCOMPATIBLE_FEATURES, Kind, Op, PoolDescriptor,
+    Txn,
 };
 use voidfs_core::ops::OpError;
 use voidfs_core::state::{DriveState, Rows, Spilled};
@@ -402,6 +403,9 @@ pub struct Pool {
     pub clock: Clock,
     /// Which shards and pages a commit may reference without uploading them (format §12.4).
     pub guard: Guard,
+    /// Whether the pool lists `inline-data`, so that content may be held in data extents
+    /// (format §3.1, §5). Read when the pool opens, as the rest of `voidfs.json` is.
+    pub inline_data: bool,
     shards: moka::sync::Cache<ShardHash, Bytes>,
     pages: moka::sync::Cache<ShardHash, Bytes>,
     drives: RwLock<HashMap<DriveId, Arc<Drive>>>,
@@ -522,6 +526,7 @@ impl Pool {
         };
         let pool = Arc::new(Pool {
             store,
+            inline_data: desc.has(INLINE_DATA),
             desc,
             params,
             clock,
@@ -1370,6 +1375,36 @@ impl Pool {
         }
         Ok(state)
     }
+}
+
+/// Adds `feature` to the incompatible features of the pool in `store` (format §3.1), unless it
+/// already lists it; returns whether it added it. Readers that do not implement the feature refuse
+/// the pool from then on, and servers use it once they have read `voidfs.json` again, when they
+/// next start. Members of `voidfs.json` this server does not know are kept.
+pub async fn enable_feature(store: &crate::store::Store, feature: &str) -> anyhow::Result<bool> {
+    if !KNOWN_INCOMPATIBLE_FEATURES.contains(&feature) {
+        bail!("this server does not implement the feature {feature:?}; it knows {KNOWN_INCOMPATIBLE_FEATURES:?}");
+    }
+    let Some(bytes) = store.get(probe::DESCRIPTOR).await? else {
+        bail!("there is no pool here yet (no {}). A server creates one when it starts; --new-pool-feature {feature} creates it with the feature", probe::DESCRIPTOR);
+    };
+    let desc: PoolDescriptor = serde_json::from_slice(&bytes).context("reading voidfs.json")?;
+    desc.check_readable().map_err(|e| anyhow!(e))?;
+    if desc.has(feature) {
+        return Ok(false);
+    }
+    let mut json: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let features = json.as_object_mut().and_then(|o| o.get_mut("features")).and_then(|f| f.as_object_mut()).ok_or_else(|| anyhow!("voidfs.json has no features object"))?;
+    let listed = features.entry("incompatible").or_insert_with(|| serde_json::json!([]));
+    listed.as_array_mut().ok_or_else(|| anyhow!("features.incompatible in voidfs.json is not a list"))?.push(feature.into());
+    store.put(probe::DESCRIPTOR, Bytes::from(serde_json::to_vec_pretty(&json)?)).await?;
+    // Another change made at the same moment would have been lost: check this one stuck.
+    let again = store.get(probe::DESCRIPTOR).await?.ok_or_else(|| anyhow!("voidfs.json vanished"))?;
+    let again: PoolDescriptor = serde_json::from_slice(&again).context("reading voidfs.json again")?;
+    if !again.has(feature) || again.pool_id != desc.pool_id {
+        bail!("voidfs.json changed while {feature} was being added; try again");
+    }
+    Ok(true)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2251,7 +2286,9 @@ mod tests {
 
     /// A pool that lists `inline-data`.
     async fn inline_pool(mem: &Arc<MemStore>) -> Arc<Pool> {
-        Pool::open_creating(Store::mem(mem.clone()), 1 << 20, Clock::System, CommitGuard::CreateIfAbsent, &[voidfs_core::model::INLINE_DATA.into()]).await.unwrap()
+        let pool = Pool::open_creating(Store::mem(mem.clone()), 1 << 20, Clock::System, CommitGuard::CreateIfAbsent, &[INLINE_DATA.into()]).await.unwrap();
+        assert!(pool.inline_data);
+        pool
     }
 
     /// Content held in its descriptor.
@@ -2457,6 +2494,46 @@ mod tests {
         h.release.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(10), checkpointing).await.expect("no deadlock").unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(10), deleting).await.expect("no deadlock").unwrap());
+    }
+
+    /// A new pool lists the features a server is started with; an existing one keeps its own,
+    /// and has one added only by [`enable_feature`], which keeps what it does not know of
+    /// `voidfs.json`. A pool listing a feature this server does not implement is refused.
+    #[tokio::test]
+    async fn features_are_added_to_new_pools_or_enabled() {
+        let store = Store::memory().unwrap();
+        assert!(format!("{:#}", enable_feature(&store, INLINE_DATA).await.unwrap_err()).contains("no pool here yet"));
+        let open = |features: Vec<String>| {
+            let store = store.clone();
+            async move { Pool::open_creating(store, 1 << 20, Clock::System, CommitGuard::CreateIfAbsent, &features).await }
+        };
+        assert!(open(vec!["shard-zstd".into()]).await.is_err(), "not implemented");
+        assert!(store.get(probe::DESCRIPTOR).await.unwrap().is_none());
+        assert!(!open(vec![]).await.unwrap().inline_data);
+        assert!(!open(vec![INLINE_DATA.into()]).await.unwrap().inline_data, "not a new pool");
+        let mut json: serde_json::Value = serde_json::from_slice(&store.get(probe::DESCRIPTOR).await.unwrap().unwrap()).unwrap();
+        json["future_member"] = serde_json::json!({ "kept": true });
+        store.put(probe::DESCRIPTOR, Bytes::from(serde_json::to_vec(&json).unwrap())).await.unwrap();
+        assert!(enable_feature(&store, "shard-zstd").await.is_err());
+        assert!(enable_feature(&store, INLINE_DATA).await.unwrap());
+        assert!(!enable_feature(&store, INLINE_DATA).await.unwrap(), "already");
+        let json: serde_json::Value = serde_json::from_slice(&store.get(probe::DESCRIPTOR).await.unwrap().unwrap()).unwrap();
+        assert_eq!(json["features"]["incompatible"], serde_json::json!([INLINE_DATA]));
+        assert_eq!(json["future_member"], serde_json::json!({ "kept": true }));
+        assert!(open(vec![]).await.unwrap().inline_data);
+        let fresh = Store::memory().unwrap();
+        let pool = Pool::open_creating(fresh.clone(), 1 << 20, Clock::System, CommitGuard::CreateIfAbsent, &[INLINE_DATA.into()]).await.unwrap();
+        assert!(pool.inline_data);
+        let desc: PoolDescriptor = serde_json::from_slice(&fresh.get(probe::DESCRIPTOR).await.unwrap().unwrap()).unwrap();
+        assert_eq!(desc.features.incompatible, [INLINE_DATA]);
+        // A pool with a feature this server does not implement: refused, as an older server
+        // refuses one with inline-data.
+        let mut json: serde_json::Value = serde_json::from_slice(&fresh.get(probe::DESCRIPTOR).await.unwrap().unwrap()).unwrap();
+        json["features"]["incompatible"] = serde_json::json!([INLINE_DATA, "encryption"]);
+        fresh.put(probe::DESCRIPTOR, Bytes::from(serde_json::to_vec(&json).unwrap())).await.unwrap();
+        let e = Pool::open(fresh.clone(), 1 << 20).await.err().unwrap();
+        assert!(format!("{e:#}").contains("unsupported features"), "{e:#}");
+        assert!(enable_feature(&fresh, INLINE_DATA).await.is_err(), "nor changed");
     }
 
     /// One task drains a drive's queue at a time, so whatever else waits for the commit lock (a

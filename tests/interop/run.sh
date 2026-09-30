@@ -13,6 +13,8 @@
 #
 #   VOIDFS_SERVER_BIN, VOIDFS_CONFORMANCE_BIN   binaries (default: target/debug)
 #   S3_PORT, VOIDFS_PORT, ADMIN_PORT            loopback ports (default 7070, 9000 and 9001)
+#   VOIDFS_INTEROP_FEATURES   features the pool is created with (default inline-data; empty for
+#                             none)
 
 set -euo pipefail
 
@@ -24,6 +26,7 @@ s3_port="${S3_PORT:-7070}"
 voidfs_port="${VOIDFS_PORT:-9000}"
 admin_port="${ADMIN_PORT:-$((voidfs_port + 1))}"
 require_all="${VOIDFS_INTEROP_REQUIRE_ALL:-0}"
+features="${VOIDFS_INTEROP_FEATURES-inline-data}"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/voidfs-interop.XXXXXX")"
 pids=()
@@ -97,6 +100,19 @@ case "$store" in
         ;;
 esac
 
+feature_args=()
+for f in ${features//,/ }; do
+    feature_args+=(--new-pool-feature "$f")
+done
+if [[ "$store" != memory && -n "$features" ]]; then
+    # There is no pool yet to add a feature to.
+    if "$server" "${store_args[@]}" pool enable "${features%%,*}" > "$work/enable.log" 2>&1; then
+        echo "pool enable succeeded without a pool" >&2
+        exit 1
+    fi
+    grep -q "no pool here yet" "$work/enable.log" || { cat "$work/enable.log" >&2; exit 1; }
+fi
+
 export VOIDFS_ACCESS_KEY_ID="VF$(random 'A-Z2-7' 18)"
 export VOIDFS_SECRET_ACCESS_KEY="$(random 'A-Za-z0-9' 40)"
 export VOIDFS_READ_ACCESS_KEY_ID="VR$(random 'A-Z2-7' 18)"
@@ -108,7 +124,7 @@ if "$server" "${store_args[@]}" --listen "127.0.0.1:$voidfs_port" --admin-listen
 fi
 grep -q "would share the S3 port" "$work/same-port.log" || { cat "$work/same-port.log" >&2; exit 1; }
 # Names under localhost reach the loopback address without DNS (curl and these checks see to it).
-RUST_LOG=warn "$server" "${store_args[@]}" --listen "127.0.0.1:$voidfs_port" --virtual-host-domain s3.localhost \
+RUST_LOG=warn "$server" "${store_args[@]}" ${feature_args[@]+"${feature_args[@]}"} --listen "127.0.0.1:$voidfs_port" --virtual-host-domain s3.localhost \
     --admin-listen "127.0.0.1:$admin_port" \
     --key "$VOIDFS_READ_ACCESS_KEY_ID:$VOIDFS_READ_SECRET_ACCESS_KEY:read" > "$work/voidfs.log" 2>&1 &
 server_pid=$!
@@ -154,3 +170,8 @@ if [[ "$status" != 0 ]]; then
     exit 1
 fi
 echo "stopped, with status 0"
+if [[ "$store" != memory && -n "$features" ]]; then
+    echo "== the pool lists ${features%%,*} ($store)"
+    "$server" "${store_args[@]}" pool enable "${features%%,*}" | tee "$work/enable.log"
+    grep -q "already lists" "$work/enable.log"
+fi
