@@ -6,7 +6,7 @@
 | Author(s) | voidfs maintainers |
 | Created | 2026-09-29 |
 | Affects | format |
-| Implemented by | [`spec/format.md`](../spec/format.md) §3.1, §5, §7.7, §8.2, §11, §12 (draft 1, revision 5), three conformance cases, and voidfs-server ([bench/results/small-content](../bench/results/small-content/README.md)) |
+| Implemented by | [`spec/format.md`](../spec/format.md) §3.1, §5, §7.7, §8.2, §11, §12 (draft 1, revision 5), three conformance cases, and voidfs-server ([#14](https://github.com/vishnu597/voidfs/pull/14), [bench/results/small-content](../bench/results/small-content/README.md)) |
 
 ## Summary
 
