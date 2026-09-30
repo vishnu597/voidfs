@@ -260,7 +260,9 @@ turns these into work items is [docs/step-3-performance.md](../docs/step-3-perfo
      written share the next one (`Commit.txns`). At 12 ms, renames at 1, 2, 4 and 8 at once now
      take 13.9, 20.7, 26.1 and 26.3 ms, and fan-out puts 37 and 38 ms at 32 and 64 at once. A
      small write's p50 is now two or three round trips at any concurrency, and finding 2 is what
-     is left.
+     is left. Since 30 September a log entry also waits, at most 2 ms, for the requests the one
+     before it answered, so small writes and renames 2 to 64 at once take one round trip, not two
+     ([results](results/group-commit-hold/README.md)).
 2. **Every write takes two or more bucket round trips, one after another.** A 4 KiB put at
    concurrency 1 took 27.3 ms where a rename took 12.8: shards first, then the log entry. The
    format requires that order (a commit may only reference stored shards, format §7.4), where
