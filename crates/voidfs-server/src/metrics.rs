@@ -240,10 +240,13 @@ impl BucketMetrics {
 // The pool: caches, commits, garbage collection, drives
 
 /// A shard or page cache's series. Hits, misses and evictions are counted as they happen; the
-/// gauges are set when the metrics are gathered.
+/// gauges are set when the metrics are gathered. Every read is a hit, a miss or coalesced, and
+/// every miss is one request to the bucket.
 pub struct CacheMetrics {
     pub hits: IntCounter,
     pub misses: IntCounter,
+    /// Reads that missed while another read was fetching the same object, and waited for it.
+    pub coalesced: IntCounter,
     pub evictions: IntCounter,
     pub bytes: IntGauge,
     pub entries: IntGauge,
@@ -296,6 +299,12 @@ impl PoolMetrics {
         let r = Registry::new();
         let hits = counters(&r, "voidfs_cache_hits_total", "Reads of a shard or page found in memory.", &["cache"]);
         let misses = counters(&r, "voidfs_cache_misses_total", "Reads of a shard or page that went to the bucket.", &["cache"]);
+        let coalesced = counters(
+            &r,
+            "voidfs_cache_coalesced_total",
+            "Reads of a shard or page that waited for a fetch another read had started, rather than go to the bucket again: neither hits nor misses.",
+            &["cache"],
+        );
         let evictions = counters(&r, "voidfs_cache_evictions_total", "Entries evicted to make room.", &["cache"]);
         let bytes = gauges(&r, "voidfs_cache_bytes", "Bytes held by the cache.", &["cache"]);
         let entries = gauges(&r, "voidfs_cache_entries", "Entries held by the cache.", &["cache"]);
@@ -304,6 +313,7 @@ impl PoolMetrics {
             let c = CacheMetrics {
                 hits: hits.with_label_values(&[name]),
                 misses: misses.with_label_values(&[name]),
+                coalesced: coalesced.with_label_values(&[name]),
                 evictions: evictions.with_label_values(&[name]),
                 bytes: bytes.with_label_values(&[name]),
                 entries: entries.with_label_values(&[name]),

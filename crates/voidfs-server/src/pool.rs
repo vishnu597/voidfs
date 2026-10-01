@@ -7,7 +7,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
-use futures::StreamExt;
+use futures::future::{BoxFuture, Shared};
+use futures::{FutureExt, StreamExt};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use voidfs_core::chunk::{Params, Shard};
@@ -461,12 +462,15 @@ pub struct Pool {
     pub params: Params,
     pub clock: Clock,
     /// Which shards and pages a commit may reference without uploading them (format §12.4).
-    pub guard: Guard,
+    pub guard: Arc<Guard>,
     /// Whether the pool lists `inline-data`, so that content may be held in data extents
     /// (format §3.1, §5). Read when the pool opens, as the rest of `voidfs.json` is.
     pub inline_data: bool,
     shards: moka::sync::Cache<ShardHash, Bytes>,
     pages: moka::sync::Cache<ShardHash, Bytes>,
+    /// Shards and pages being fetched from the bucket, which reads that miss meanwhile wait for.
+    shard_fetches: Fetches,
+    page_fetches: Fetches,
     drives: RwLock<HashMap<DriveId, Arc<Drive>>>,
     aliases: RwLock<HashMap<String, DriveId>>,
     deleted: RwLock<HashMap<String, DriveId>>,
@@ -490,6 +494,24 @@ pub struct Dropped {
 /// alive, and a shard cut by the chunker is a slice of a buffer of up to about 32 MiB.
 fn cached(b: &Bytes) -> Bytes {
     Bytes::copy_from_slice(b)
+}
+
+/// A fetch of a shard or page, which every read waiting for it shares.
+type Fetch = Shared<BoxFuture<'static, Result<Bytes, Arc<anyhow::Error>>>>;
+/// The fetches in flight, by hash. Never held across an await. A fetch's task is started with
+/// this held, and is what takes the fetch out again.
+type Fetches = Arc<std::sync::Mutex<HashMap<ShardHash, Fetch>>>;
+
+/// Takes a fetch out of [`Fetches`] when its task ends, however it ends.
+struct Leaving {
+    fetches: Fetches,
+    h: ShardHash,
+}
+
+impl Drop for Leaving {
+    fn drop(&mut self) {
+        self.fetches.lock().unwrap().remove(&self.h);
+    }
 }
 
 impl Pool {
@@ -598,9 +620,11 @@ impl Pool {
             desc,
             params,
             clock,
-            guard: Guard::new(REUSE_CAPACITY),
+            guard: Arc::new(Guard::new(REUSE_CAPACITY)),
             shards: cache(cache_bytes, metrics.shards.evictions.clone()),
             pages: cache(page_bytes, metrics.pages.evictions.clone()),
+            shard_fetches: Fetches::default(),
+            page_fetches: Fetches::default(),
             drives: RwLock::new(HashMap::new()),
             aliases: RwLock::new(HashMap::new()),
             registry: std::sync::Mutex::new(()),
@@ -898,33 +922,71 @@ impl Pool {
     // -----------------------------------------------------------------------------------------
     // Shards and pages
 
+    /// A shard, from the cache or else from the bucket, checked against its hash.
     pub async fn shard(&self, h: &ShardHash) -> anyhow::Result<Bytes> {
-        if let Some(b) = self.shards.get(h) {
-            self.metrics.shards.hits.inc();
-            return Ok(b);
-        }
-        self.metrics.shards.misses.inc();
-        let generation = self.guard.generation();
-        let b = self.store.get(&guard::Kind::Shard.path(h)).await?.ok_or_else(|| anyhow!("shard {h} is missing"))?;
-        if ShardHash::of(&b) != *h {
-            bail!("shard {h} is corrupt");
-        }
-        self.guard.confirmed(*h, generation);
-        self.shards.insert(*h, cached(&b));
-        Ok(b)
+        self.read(guard::Kind::Shard, h).await
     }
 
+    /// A manifest page or checkpoint segment, from the cache or else from the bucket.
     pub async fn page(&self, h: &ShardHash) -> anyhow::Result<Bytes> {
-        if let Some(b) = self.pages.get(h) {
-            self.metrics.pages.hits.inc();
-            return Ok(b);
-        }
-        self.metrics.pages.misses.inc();
+        self.read(guard::Kind::Page, h).await
+    }
+
+    /// Reads a shard or page. Reads that miss it while it is being fetched wait for that fetch,
+    /// so that the bucket is asked once however many miss it at once; they count as coalesced,
+    /// not as misses. The fetch runs on a task of its own: a reader that goes away (a client
+    /// that disconnects) leaves it to the others, and if all go it still fills the cache. A
+    /// failure reaches every reader waiting, and is not kept: the next read fetches again.
+    async fn read(&self, kind: guard::Kind, h: &ShardHash) -> anyhow::Result<Bytes> {
+        let (cache, series, fetches) = match kind {
+            guard::Kind::Shard => (&self.shards, &self.metrics.shards, &self.shard_fetches),
+            guard::Kind::Page => (&self.pages, &self.metrics.pages, &self.page_fetches),
+        };
+        let fetch = loop {
+            if let Some(b) = cache.get(h) {
+                series.hits.inc();
+                return Ok(b);
+            }
+            let mut inflight = fetches.lock().unwrap();
+            if let Some(f) = inflight.get(h) {
+                series.coalesced.inc();
+                break f.clone();
+            }
+            // A fetch puts what it read in the cache before it leaves the map, so one that ended
+            // since the miss above has left it there.
+            if cache.contains_key(h) {
+                continue;
+            }
+            series.misses.inc();
+            let f = self.fetch_one(kind, *h, cache.clone(), fetches.clone());
+            inflight.insert(*h, f.clone());
+            break f;
+        };
+        fetch.await.map_err(|e| anyhow!("{e:#}"))
+    }
+
+    /// Starts fetching a shard or page for [`Pool::read`]. A shard must match its hash. What it
+    /// read is recorded as checked (format §12.4, option 2) under the view the fetch started in,
+    /// whenever its readers came.
+    fn fetch_one(&self, kind: guard::Kind, h: ShardHash, cache: moka::sync::Cache<ShardHash, Bytes>, fetches: Fetches) -> Fetch {
+        let (store, guard) = (self.store.clone(), self.guard.clone());
         let generation = self.guard.generation();
-        let b = self.store.get(&guard::Kind::Page.path(h)).await?.ok_or_else(|| anyhow!("page {h} is missing"))?;
-        self.guard.confirmed(*h, generation);
-        self.pages.insert(*h, cached(&b));
-        Ok(b)
+        let task = tokio::spawn(async move {
+            let _leaving = Leaving { fetches, h };
+            let what = match kind {
+                guard::Kind::Shard => "shard",
+                guard::Kind::Page => "page",
+            };
+            let b = store.get(&kind.path(&h)).await?.ok_or_else(|| anyhow!("{what} {h} is missing"))?;
+            if matches!(kind, guard::Kind::Shard) && ShardHash::of(&b) != h {
+                bail!("shard {h} is corrupt");
+            }
+            guard.confirmed(h, generation);
+            let b = cached(&b);
+            cache.insert(h, b.clone());
+            Ok(b)
+        });
+        async move { task.await.unwrap_or_else(|e| Err(anyhow!("fetching {h}: {e}"))).map_err(Arc::new) }.boxed().shared()
     }
 
     /// Stores shards so that a commit may reference them (format §7.4, §12.4). Shards already
@@ -2975,6 +3037,232 @@ mod tests {
             assert_eq!(series.misses.get(), 2, "{kind:?}: a miss for each fetch");
             assert_eq!(series.hits.get(), 16 * 20 + 1 + 2 + 1, "{kind:?}: a hit for every other read");
         }
+    }
+
+    /// Requests to a [`MemStore`] held back by [`gate`] until it opens, which says how they end.
+    struct Gate {
+        open: tokio::sync::watch::Sender<Option<Fault>>,
+        /// Requests held so far.
+        held: Arc<AtomicUsize>,
+    }
+
+    impl Gate {
+        fn open(&self, fault: Fault) {
+            self.open.send_replace(Some(fault));
+        }
+    }
+
+    /// Holds the requests to `mem` that `which` picks until the gate opens.
+    fn gate(mem: &MemStore, which: impl Fn(MemOp, &str) -> bool + Send + Sync + 'static) -> Gate {
+        let (open, opened) = tokio::sync::watch::channel(None);
+        let held = Arc::new(AtomicUsize::new(0));
+        let h = held.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if !which(op, path) {
+                return futures::future::ready(Fault::None).boxed();
+            }
+            h.fetch_add(1, Ordering::SeqCst);
+            let mut opened = opened.clone();
+            async move { opened.wait_for(Option::is_some).await.map(|f| f.unwrap()).unwrap_or(Fault::None) }.boxed()
+        })));
+        Gate { open, held }
+    }
+
+    fn object_gets(op: MemOp, path: &str) -> bool {
+        op == MemOp::Get && (path.starts_with("shards/") || path.starts_with("pages/"))
+    }
+
+    /// Waits until `done` says so, and fails the test after five seconds rather than hang.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        waited.await.unwrap_or_else(|_| panic!("waited five seconds for {what}"));
+    }
+
+    /// `n` reads of `h` at once, each on a task of its own.
+    fn readers(pool: &Arc<Pool>, kind: guard::Kind, h: ShardHash, n: usize) -> Vec<tokio::task::JoinHandle<anyhow::Result<Bytes>>> {
+        (0..n)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    match kind {
+                        guard::Kind::Shard => pool.shard(&h).await,
+                        guard::Kind::Page => pool.page(&h).await,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn cache_of(pool: &Pool, kind: guard::Kind) -> (&moka::sync::Cache<ShardHash, Bytes>, &crate::metrics::CacheMetrics) {
+        match kind {
+            guard::Kind::Shard => (&pool.shards, &pool.metrics.shards),
+            guard::Kind::Page => (&pool.pages, &pool.metrics.pages),
+        }
+    }
+
+    /// However many reads miss a shard or page at once, the bucket is asked for it once, and
+    /// every read gets its bytes. The reads that waited count as coalesced, not as misses.
+    #[tokio::test]
+    async fn reads_that_miss_together_share_one_fetch() {
+        use crate::metrics::{encode, sample};
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        for kind in [guard::Kind::Shard, guard::Kind::Page] {
+            let (cache, series) = cache_of(&pool, kind);
+            let [(h, b)] = &blobs(&format!("{kind:?}"), 1, 64 << 10)[..] else { unreachable!() };
+            pool.store.put(&kind.path(h), b.clone()).await.unwrap();
+            let gets = gate(&mem, object_gets);
+            let reads = readers(&pool, kind, *h, 8);
+            until("eight reads", || series.misses.get() + series.coalesced.get() == 8).await;
+            gets.open(Fault::None);
+            for r in reads {
+                assert_eq!(&r.await.unwrap().unwrap(), b, "{kind:?}");
+            }
+            assert_eq!(gets.held.load(Ordering::SeqCst), 1, "{kind:?}: one request to the bucket");
+            assert_eq!((series.hits.get(), series.misses.get(), series.coalesced.get()), (0, 1, 7), "{kind:?}");
+            assert!(cache.contains_key(h), "{kind:?}");
+            assert_eq!(&read_as(&pool, kind, h).await, b);
+            assert_eq!(gets.held.load(Ordering::SeqCst), 1, "{kind:?}: then from memory");
+            assert_eq!(series.hits.get(), 1);
+        }
+        let text = encode(pool.gather_metrics());
+        assert_eq!(sample(&text, r#"voidfs_cache_coalesced_total{cache="shard"}"#), Some(7.0));
+        assert_eq!(sample(&text, r#"voidfs_cache_coalesced_total{cache="page"}"#), Some(7.0));
+    }
+
+    /// A failed fetch fails every read waiting for it, and is not kept: the next read asks the
+    /// bucket again.
+    #[tokio::test]
+    async fn a_failed_fetch_reaches_every_reader_and_the_next_read_tries_again() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        for kind in [guard::Kind::Shard, guard::Kind::Page] {
+            let (cache, series) = cache_of(&pool, kind);
+            let [(h, b)] = &blobs(&format!("{kind:?}"), 1, 64 << 10)[..] else { unreachable!() };
+            pool.store.put(&kind.path(h), b.clone()).await.unwrap();
+            let gets = gate(&mem, object_gets);
+            let reads = readers(&pool, kind, *h, 8);
+            until("eight reads", || series.misses.get() + series.coalesced.get() == 8).await;
+            gets.open(Fault::Fail);
+            for r in reads {
+                let e = r.await.unwrap().unwrap_err();
+                assert!(format!("{e:#}").contains("injected failure"), "{kind:?}: {e:#}");
+            }
+            assert_eq!(gets.held.load(Ordering::SeqCst), 1, "{kind:?}: one request to the bucket");
+            assert!(!cache.contains_key(h), "{kind:?}: nothing kept");
+            let gets = count(&mem, object_gets);
+            assert_eq!(&read_as(&pool, kind, h).await, b, "{kind:?}");
+            assert_eq!(gets.load(Ordering::SeqCst), 1, "{kind:?}: the next read asks again");
+            assert_eq!((series.misses.get(), series.coalesced.get()), (2, 7), "{kind:?}");
+        }
+    }
+
+    /// The read that started a fetch can go away, as when its client disconnects, without
+    /// failing or cancelling the reads waiting for the same fetch. With every reader gone, the
+    /// fetch still ends and fills the cache.
+    #[tokio::test]
+    async fn a_reader_that_goes_away_leaves_the_fetch_to_the_others() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        let [(h, b), (lone, lone_b)] = &blobs("shard", 2, 64 << 10)[..] else { unreachable!() };
+        for (h, b) in [(h, b), (lone, lone_b)] {
+            pool.store.put(&guard::Kind::Shard.path(h), b.clone()).await.unwrap();
+        }
+        let series = &pool.metrics.shards;
+        let gets = gate(&mem, object_gets);
+        let first = readers(&pool, guard::Kind::Shard, *h, 1).pop().unwrap();
+        until("the first read's fetch", || gets.held.load(Ordering::SeqCst) == 1).await;
+        let others = readers(&pool, guard::Kind::Shard, *h, 7);
+        until("seven more reads", || series.coalesced.get() == 7).await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        gets.open(Fault::None);
+        for r in others {
+            assert_eq!(&r.await.unwrap().unwrap(), b);
+        }
+        assert_eq!(gets.held.load(Ordering::SeqCst), 1);
+
+        let gets = gate(&mem, object_gets);
+        let reads = readers(&pool, guard::Kind::Shard, *lone, 3);
+        until("three reads", || gets.held.load(Ordering::SeqCst) == 1 && series.coalesced.get() == 9).await;
+        for r in reads {
+            r.abort();
+            assert!(r.await.unwrap_err().is_cancelled());
+        }
+        gets.open(Fault::None);
+        until("the fetch to fill the cache", || pool.shards.contains_key(lone)).await;
+        assert_eq!(&pool.shard(lone).await.unwrap(), lone_b);
+        assert_eq!(gets.held.load(Ordering::SeqCst), 1, "fetched once, by no reader in the end");
+    }
+
+    /// A shard whose bytes do not match its hash is refused to every read waiting for it. It is
+    /// neither cached nor taken as stored: the next read asks the bucket again, and a write of
+    /// the shard uploads it.
+    #[tokio::test]
+    async fn a_corrupt_shard_is_refused_to_every_reader() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        let [(h, b)] = &blobs("shard", 1, 64 << 10)[..] else { unreachable!() };
+        let mut bad = b.to_vec();
+        bad[100] ^= 1;
+        pool.store.put(&guard::Kind::Shard.path(h), Bytes::from(bad)).await.unwrap();
+        let gets = gate(&mem, object_gets);
+        let reads = readers(&pool, guard::Kind::Shard, *h, 8);
+        until("eight reads", || pool.metrics.shards.misses.get() + pool.metrics.shards.coalesced.get() == 8).await;
+        gets.open(Fault::None);
+        for r in reads {
+            let e = r.await.unwrap().unwrap_err();
+            assert!(format!("{e:#}").contains(&format!("shard {h} is corrupt")), "{e:#}");
+        }
+        assert_eq!(gets.held.load(Ordering::SeqCst), 1);
+        assert!(!pool.shards.contains_key(h));
+        let gets = count(&mem, object_gets);
+        assert!(pool.shard(h).await.is_err());
+        assert_eq!(gets.load(Ordering::SeqCst), 1, "asked again, and refused again");
+        let puts = count(&mem, |op, path| op == MemOp::Put && path.starts_with("shards/"));
+        write_as(&pool, guard::Kind::Shard, &[(*h, b.clone())]).await;
+        assert_eq!(puts.load(Ordering::SeqCst), 1, "not taken as stored: uploaded");
+        assert_eq!(&pool.shard(h).await.unwrap(), b);
+    }
+
+    /// A fetch records what it read as checked under the view of garbage collection it started
+    /// in (format §12.4, option 2), whoever waited for it: if the view changed while it was in
+    /// flight, a write of the shard still uploads it.
+    #[tokio::test]
+    async fn a_fetch_is_checked_under_the_view_it_started_in() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        let [(steady, steady_b), (moved, moved_b)] = &blobs("shard", 2, 64 << 10)[..] else { unreachable!() };
+        for (h, b) in [(steady, steady_b), (moved, moved_b)] {
+            pool.store.put(&guard::Kind::Shard.path(h), b.clone()).await.unwrap();
+        }
+        let puts = |mem: &MemStore| count(mem, |op, path| op == MemOp::Put && path.starts_with("shards/"));
+        // The view stays: what was read is not uploaded again.
+        assert_eq!(&pool.shard(steady).await.unwrap(), steady_b);
+        let n = puts(&mem);
+        write_as(&pool, guard::Kind::Shard, &[(*steady, steady_b.clone())]).await;
+        assert_eq!(n.load(Ordering::SeqCst), 0, "read under an unchanged view: not uploaded");
+
+        // A run starts while the fetch is in flight, and a second read joins it after.
+        let gets = gate(&mem, object_gets);
+        let first = readers(&pool, guard::Kind::Shard, *moved, 1);
+        until("the fetch", || gets.held.load(Ordering::SeqCst) == 1).await;
+        let run = crate::gc::PendingRecord { format: 1, run: "r-1".into(), phase: crate::gc::Phase::Marking, t1: None, grace: 0, candidates: vec![] };
+        pool.store.put(crate::gc::PENDING, Bytes::from(serde_json::to_vec(&run).unwrap())).await.unwrap();
+        pool.guard.refresh(&pool.store, &pool.clock).await.unwrap();
+        let second = readers(&pool, guard::Kind::Shard, *moved, 1);
+        until("the second read", || pool.metrics.shards.coalesced.get() == 1).await;
+        gets.open(Fault::None);
+        for r in first.into_iter().chain(second) {
+            assert_eq!(&r.await.unwrap().unwrap(), moved_b);
+        }
+        let n = puts(&mem);
+        write_as(&pool, guard::Kind::Shard, &[(*moved, moved_b.clone())]).await;
+        assert_eq!(n.load(Ordering::SeqCst), 1, "read across a change of view: uploaded");
     }
 
     /// Reading a manifest tree doesn't rely on the page cache keeping the pages it fetched.
