@@ -589,7 +589,12 @@ impl Refs {
             return Ok(None);
         }
         let path = format!("pages/{}", h.object_path());
-        Ok(Some(store.get(&path).await?.ok_or_else(|| anyhow!("{path} is referenced but missing"))?))
+        let b = store.get(&path).await?.ok_or_else(|| anyhow!("{path} is referenced but missing"))?;
+        // A page that parses but is not what was written would hide what it references.
+        if ShardHash::of(&b) != h {
+            bail!("{path} is corrupt: its bytes do not match its name");
+        }
+        Ok(Some(b))
     }
 
     async fn segment(&mut self, store: &Store, h: ShardHash) -> anyhow::Result<()> {

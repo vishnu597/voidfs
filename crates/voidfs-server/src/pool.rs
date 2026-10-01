@@ -927,7 +927,8 @@ impl Pool {
         self.read(guard::Kind::Shard, h).await
     }
 
-    /// A manifest page or checkpoint segment, from the cache or else from the bucket.
+    /// A manifest page or checkpoint segment, from the cache or else from the bucket, checked
+    /// against its hash.
     pub async fn page(&self, h: &ShardHash) -> anyhow::Result<Bytes> {
         self.read(guard::Kind::Page, h).await
     }
@@ -965,9 +966,10 @@ impl Pool {
         fetch.await.map_err(|e| anyhow!("{e:#}"))
     }
 
-    /// Starts fetching a shard or page for [`Pool::read`]. A shard must match its hash. What it
-    /// read is recorded as checked (format §12.4, option 2) under the view the fetch started in,
-    /// whenever its readers came.
+    /// Starts fetching a shard or page for [`Pool::read`]. What it reads must match its hash,
+    /// pages too: a checkpoint segment that parses but does not would load a drive in a state it
+    /// never had. What it read is recorded as checked (format §12.4, option 2) under the view the
+    /// fetch started in, whenever its readers came.
     fn fetch_one(&self, kind: guard::Kind, h: ShardHash, cache: moka::sync::Cache<ShardHash, Bytes>, fetches: Fetches) -> Fetch {
         let (store, guard) = (self.store.clone(), self.guard.clone());
         let generation = self.guard.generation();
@@ -978,8 +980,8 @@ impl Pool {
                 guard::Kind::Page => "page",
             };
             let b = store.get(&kind.path(&h)).await?.ok_or_else(|| anyhow!("{what} {h} is missing"))?;
-            if matches!(kind, guard::Kind::Shard) && ShardHash::of(&b) != h {
-                bail!("shard {h} is corrupt");
+            if ShardHash::of(&b) != h {
+                bail!("{what} {h} is corrupt");
             }
             guard.confirmed(h, generation);
             let b = cached(&b);
@@ -2989,11 +2991,14 @@ mod tests {
     }
 
     async fn read_as(pool: &Pool, kind: guard::Kind, h: &ShardHash) -> Bytes {
+        read_result(pool, kind, h).await.unwrap()
+    }
+
+    async fn read_result(pool: &Pool, kind: guard::Kind, h: &ShardHash) -> anyhow::Result<Bytes> {
         match kind {
             guard::Kind::Shard => pool.shard(h).await,
             guard::Kind::Page => pool.page(h).await,
         }
-        .unwrap()
     }
 
     /// A cache full of objects read many times still takes in new ones, written or read, and
@@ -3199,34 +3204,58 @@ mod tests {
         assert_eq!(gets.held.load(Ordering::SeqCst), 1, "fetched once, by no reader in the end");
     }
 
-    /// A shard whose bytes do not match its hash is refused to every read waiting for it. It is
-    /// neither cached nor taken as stored: the next read asks the bucket again, and a write of
-    /// the shard uploads it.
+    /// A shard or page whose bytes do not match its hash is refused to every read waiting for it.
+    /// It is neither cached nor taken as stored: the next read asks the bucket again, and a write
+    /// of it uploads it.
     #[tokio::test]
-    async fn a_corrupt_shard_is_refused_to_every_reader() {
+    async fn a_corrupt_shard_or_page_is_refused_to_every_reader() {
         let mem = Arc::new(MemStore::new(Clock::System));
         let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
-        let [(h, b)] = &blobs("shard", 1, 64 << 10)[..] else { unreachable!() };
-        let mut bad = b.to_vec();
-        bad[100] ^= 1;
-        pool.store.put(&guard::Kind::Shard.path(h), Bytes::from(bad)).await.unwrap();
-        let gets = gate(&mem, object_gets);
-        let reads = readers(&pool, guard::Kind::Shard, *h, 8);
-        until("eight reads", || pool.metrics.shards.misses.get() + pool.metrics.shards.coalesced.get() == 8).await;
-        gets.open(Fault::None);
-        for r in reads {
-            let e = r.await.unwrap().unwrap_err();
-            assert!(format!("{e:#}").contains(&format!("shard {h} is corrupt")), "{e:#}");
+        for (kind, what) in [(guard::Kind::Shard, "shard"), (guard::Kind::Page, "page")] {
+            let (cache, series) = cache_of(&pool, kind);
+            let [(h, b)] = &blobs(what, 1, 64 << 10)[..] else { unreachable!() };
+            let mut bad = b.to_vec();
+            bad[100] ^= 1;
+            pool.store.put(&kind.path(h), Bytes::from(bad)).await.unwrap();
+            let gets = gate(&mem, object_gets);
+            let reads = readers(&pool, kind, *h, 8);
+            until("eight reads", || series.misses.get() + series.coalesced.get() == 8).await;
+            gets.open(Fault::None);
+            for r in reads {
+                let e = r.await.unwrap().unwrap_err();
+                assert!(format!("{e:#}").contains(&format!("{what} {h} is corrupt")), "{e:#}");
+            }
+            assert_eq!(gets.held.load(Ordering::SeqCst), 1, "{what}");
+            assert!(!cache.contains_key(h), "{what}");
+            let gets = count(&mem, object_gets);
+            assert!(read_result(&pool, kind, h).await.is_err(), "{what}");
+            assert_eq!(gets.load(Ordering::SeqCst), 1, "{what}: asked again, and refused again");
+            let dir = format!("{what}s/");
+            let puts = count(&mem, move |op, path| op == MemOp::Put && path.starts_with(&dir));
+            write_as(&pool, kind, &[(*h, b.clone())]).await;
+            assert_eq!(puts.load(Ordering::SeqCst), 1, "{what}: not taken as stored, so uploaded");
+            assert_eq!(&read_as(&pool, kind, h).await, b);
         }
-        assert_eq!(gets.held.load(Ordering::SeqCst), 1);
-        assert!(!pool.shards.contains_key(h));
-        let gets = count(&mem, object_gets);
-        assert!(pool.shard(h).await.is_err());
-        assert_eq!(gets.load(Ordering::SeqCst), 1, "asked again, and refused again");
-        let puts = count(&mem, |op, path| op == MemOp::Put && path.starts_with("shards/"));
-        write_as(&pool, guard::Kind::Shard, &[(*h, b.clone())]).await;
-        assert_eq!(puts.load(Ordering::SeqCst), 1, "not taken as stored: uploaded");
-        assert_eq!(&pool.shard(h).await.unwrap(), b);
+    }
+
+    /// A checkpoint segment that still parses, but is not what was written, is refused: the drive
+    /// is not loaded in a state it never had.
+    #[tokio::test]
+    async fn a_checkpoint_with_a_corrupt_segment_is_not_loaded() {
+        let (mem, pool, d, _) = big_drive(300, Clock::System).await;
+        let index = format!("drives/{}/checkpoints/{:020}.json", d.id, checkpoints(&pool.store, &d).await[0]);
+        let idx: CheckpointIndex = serde_json::from_slice(&pool.store.get(&index).await.unwrap().unwrap()).unwrap();
+        let seg = idx.tables.entries[0].page;
+        let path = guard::Kind::Page.path(&seg);
+        let text = String::from_utf8(mem.peek(&path).unwrap().to_vec()).unwrap();
+        let changed = text.replacen("\"f000000\"", "\"f000001\"", 1);
+        assert_ne!(changed, text);
+        serde_json::from_str::<Segment<serde_json::Value>>(&changed).expect("the segment still parses");
+        pool.store.put(&path, Bytes::from(changed)).await.unwrap();
+        let fresh = Pool::open(pool.store.clone(), 64 << 20).await.unwrap();
+        assert!(fresh.drive("big").is_none(), "the drive is not served from a corrupt checkpoint");
+        let Err(e) = fresh.load_checkpoint(&index).await else { panic!("a corrupt segment loaded") };
+        assert!(format!("{e:#}").contains(&format!("page {seg} is corrupt")), "{e:#}");
     }
 
     /// A fetch records what it read as checked under the view of garbage collection it started
