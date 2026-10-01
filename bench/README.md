@@ -304,6 +304,11 @@ turns these into work items is [docs/step-3-performance.md](../docs/step-3-perfo
    deletes the upload's records before it answers: about twenty sequential round trips for
    16 parts. On par on loopback, 1.6–1.9× slower at 12 ms. Direction: read the
    part records concurrently (or keep them in one record), and clean up after answering.
+   - **Fixed** (30 September 2026, [results](results/multipart-complete/README.md)): completion
+     reads the upload's record and the listed parts' together and answers once it commits, 32 ms
+     at 12 ms where it took 157 ms for 8 parts and 258 ms for 16; the records are deleted after.
+     Each part looks its upload up while its body is read. Multipart put 64 MiB × 8 MiB takes
+     254 ms instead of 343, and 256 MiB × 16 MiB 1,008 instead of 1,147 (focused, 12 ms).
 6. **Edits in 1 MiB files cost more than rewriting the file**, on loopback too: a shard read
    (usually from the cache), re-chunking, a shard write and a log write, against one GET and one
    PUT. SpaceFS is also
