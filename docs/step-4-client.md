@@ -150,6 +150,24 @@ client) and decisions only the user can make (§5).
 
 **Checklist:** A1 (the Rust half; TypeScript waits for step 7).
 
+**Status (1 October 2026): done**, as designed below. What was built:
+- `crates/voidfs-sdk`: `Client` and `Config` (or `Config::from_env`), the `aws-sdk-s3` client
+  underneath as `client.s3()`, and a call for every protocol request but direct upload: the drive
+  calls of §5, `put_object`, `get_object`, `get_object_stream`, `head_object`, `read_range`,
+  `delete_object`, `list_objects`, the edits of §4.1–§4.3, `rename`, `list_versions`,
+  `restore_version`, `restore_as_of`, `attributes`, `set_attributes`, `list_folder` (and a page at
+  a time), `list_deleted`, `changes` and `watch_changes`.
+- `Error`, with `status()`, `code()`, `current_version_id()` and `request_id()`, for the SDK's
+  own requests and the AWS client's alike; `Transport` errors say whether the request may have
+  reached the server.
+- The retry rule, in `retry.rs`, as below.
+- `voidfs_sdk::sign`, the signing code the conformance runner had, which the runner now uses.
+- `voidfs-server` as a library too, with `voidfs_server::test_server::TestServer`: a server over a
+  memory pool in the test's own process.
+
+What it showed about the server, for later: the event stream ignores `Last-Event-ID` (the client
+resumes with `since`, which works), and `x-voidfs-display-name` is ignored (PARITY §3).
+
 **Design.** A crate `voidfs-sdk` (`crates/voidfs-sdk`):
 - `Client::new(Config { endpoint, access_key_id, secret_access_key, .. })` or
   `Config::from_env()` (`VOIDFS_ENDPOINT`, `VOIDFS_ACCESS_KEY_ID`, `VOIDFS_SECRET_ACCESS_KEY`, the
@@ -357,4 +375,8 @@ for first); a cold read through the bucket against one through the API.
 
 ## 6. Status
 
-- Items 1–6: not started (1 October). First: the Rust SDK.
+- Item 1, the Rust SDK: **done** (1 October). Its 35 tests (14 unit, 11 against a server in the
+  same process, 10 through the fault proxy) each failed with the code it guards broken, 37 breaks
+  in all, each run alone with a timeout. The conformance suite passes through the moved signing
+  code on memory, local disk and versitygw, both addressing styles.
+- Items 2–6: not started. Next: the CLI (item 2).
