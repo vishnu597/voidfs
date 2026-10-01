@@ -39,6 +39,11 @@ pub struct Settings {
     pub checksums: String,
     /// The run reproduces SpaceFS's published setup, so its ratios can be set against theirs.
     pub like_spacefs: bool,
+    /// Every measured operation started with voidfs's caches empty (`--cold`): the rounds ran
+    /// in waves, and the caches were dropped before each. Set against SpaceFS's cache-cleared
+    /// figures, where they give one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cold: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,6 +101,10 @@ pub struct TargetResult {
     /// `gc/pending.json` once a minute; the other target's rounds in between send it none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket_requests: Option<BTreeMap<String, u64>>,
+    /// The time those requests took, added up, by operation: over a round's wall-clock time,
+    /// how many were in flight on average.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_seconds: Option<BTreeMap<String, f64>>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -117,6 +126,13 @@ pub struct RoundStats {
     pub first_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub samples_ms: Option<Vec<f64>>,
+    /// With `--cold`: the waves of one operation per worker the round ran in...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waves: Option<usize>,
+    /// ...and how many of them started with voidfs's caches dropped: all of voidfs's, none of
+    /// the bare bucket's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drops: Option<usize>,
 }
 
 /// The `q` quantile of sorted values, interpolating linearly between neighbours.
@@ -176,6 +192,12 @@ impl ScenarioResult {
         let b = self.results.get("bare")?.p50_ms?;
         (v > 0.0).then(|| b / v)
     }
+
+    /// SpaceFS's speed-up for the same: with its cache cleared in a cold run, where they give
+    /// that.
+    pub fn theirs(&self, cold: bool) -> Option<f64> {
+        if cold { self.spacefs.layer_cold.map(|c| self.spacefs.bare / c) } else { Some(self.spacefs.speedup()) }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -217,7 +239,8 @@ fn geomean(xs: &[f64]) -> Option<f64> {
 pub fn markdown(run: &RunFile) -> String {
     let mut out = String::new();
     let like = run.settings.like_spacefs;
-    let _ = writeln!(out, "# voidfs against a bare bucket\n");
+    let cold = run.settings.cold;
+    let _ = writeln!(out, "# voidfs against a bare bucket{}\n", if cold { ", cold" } else { "" });
     if !like {
         let _ = writeln!(
             out,
@@ -254,32 +277,56 @@ pub fn markdown(run: &RunFile) -> String {
     if s.ops_scale != 1.0 {
         let _ = writeln!(out, "| Operations | scaled by {} from the harness defaults |", s.ops_scale);
     }
+    if cold {
+        let _ = writeln!(
+            out,
+            "| Cold | Each round ran in waves of one operation per worker, each wave once the one before had ended; voidfs-server's shard and page caches were dropped before each of its waves. The bare bucket's own caches were not |"
+        );
+    }
     let _ = writeln!(out, "| Figure | Median of each round's p50, in milliseconds |");
-    let _ = writeln!(out, "| SpaceFS column | Their published run {}, [{}]({}) |\n", SPACEFS_RUN, SPACEFS_SOURCE, SPACEFS_SOURCE);
+    let _ = writeln!(
+        out,
+        "| SpaceFS column | Their published run {}, [{}]({}){} |\n",
+        SPACEFS_RUN,
+        SPACEFS_SOURCE,
+        SPACEFS_SOURCE,
+        if cold { ", with their cache cleared: given for four rows" } else { "" }
+    );
 
     let mut rows: Vec<&ScenarioResult> = run.scenarios.iter().collect();
     rows.sort_by(|a, b| b.speedup().unwrap_or(-1.0).total_cmp(&a.speedup().unwrap_or(-1.0)));
-    let measured: Vec<(f64, f64)> = rows.iter().filter_map(|r| r.speedup().map(|x| (x, r.spacefs.speedup()))).collect();
+    let measured: Vec<(f64, Option<f64>)> = rows.iter().filter_map(|r| r.speedup().map(|x| (x, r.theirs(cold)))).collect();
     if !measured.is_empty() {
         let faster = measured.iter().filter(|(x, _)| *x >= 1.0).count();
         let ours = geomean(&measured.iter().map(|m| m.0).collect::<Vec<_>>()).unwrap();
-        let theirs = geomean(&measured.iter().map(|m| m.1).collect::<Vec<_>>()).unwrap();
-        let _ = writeln!(
+        let _ = write!(
             out,
             "voidfs is faster in **{faster} of {}** scenarios and slower in the other **{}**. \
-             Geometric mean speed-up over the bare bucket: **{}** (SpaceFS's, same rows: {}).\n",
+             Geometric mean speed-up over the bare bucket: **{}**",
             measured.len(),
             measured.len() - faster,
-            factor(ours),
-            factor(theirs)
+            factor(ours)
         );
-        if like {
-            let level = measured.iter().filter(|(x, t)| x >= t).count();
-            let _ = writeln!(out, "voidfs's speed-up matches or beats SpaceFS's in **{level} of {}** rows.\n", measured.len());
+        let both: Vec<(f64, f64)> = measured.iter().filter_map(|(x, t)| Some((*x, (*t)?))).collect();
+        match geomean(&both.iter().map(|m| m.1).collect::<Vec<_>>()) {
+            Some(theirs) if both.len() == measured.len() => {
+                let _ = writeln!(out, " (SpaceFS's, same rows: {}).\n", factor(theirs));
+            }
+            Some(theirs) => {
+                let ours = geomean(&both.iter().map(|m| m.0).collect::<Vec<_>>()).unwrap();
+                let _ = writeln!(out, "; over the {} rows SpaceFS gives a figure for, {} (SpaceFS's: {}).\n", both.len(), factor(ours), factor(theirs));
+            }
+            None => {
+                let _ = writeln!(out, ".\n");
+            }
+        }
+        if like && !both.is_empty() {
+            let level = both.iter().filter(|(x, t)| x >= t).count();
+            let _ = writeln!(out, "voidfs's speed-up matches or beats SpaceFS's in **{level} of {}** rows.\n", both.len());
         }
     }
 
-    let _ = write!(out, "| Scenario | Bucket alone (ms) | voidfs (ms) | Result | SpaceFS result |");
+    let _ = write!(out, "| Scenario | Bucket alone (ms) | voidfs (ms) | Result | SpaceFS result{} |", if cold { ", cache cleared" } else { "" });
     let _ = writeln!(out, "{}", if like { " voidfs vs SpaceFS |" } else { "" });
     let _ = writeln!(out, "|---|--:|--:|---|---|{}", if like { "---|" } else { "" });
     let mut notes: Vec<String> = Vec::new();
@@ -304,12 +351,13 @@ pub fn markdown(run: &RunFile) -> String {
             }
         }
         let ours = r.speedup().map(result).unwrap_or_else(|| "–".into());
-        let _ = write!(out, "| {name} | {} | {} | {ours} | {} |", cell("bare"), cell("voidfs"), result(r.spacefs.speedup()));
+        let theirs = r.theirs(cold);
+        let _ = write!(out, "| {name} | {} | {} | {ours} | {} |", cell("bare"), cell("voidfs"), theirs.map(result).unwrap_or_else(|| "–".into()));
         if like {
-            let gap = match r.speedup() {
-                Some(x) if x >= r.spacefs.speedup() => "level or ahead".to_string(),
-                Some(x) => format!("{} short", factor(r.spacefs.speedup() / x)),
-                None => "–".into(),
+            let gap = match (r.speedup(), theirs) {
+                (Some(x), Some(t)) if x >= t => "level or ahead".to_string(),
+                (Some(x), Some(t)) => format!("{} short", factor(t / x)),
+                _ => "–".into(),
             };
             let _ = write!(out, " {gap} |");
         }
@@ -367,6 +415,56 @@ mod tests {
         assert_eq!(result(44.1 / 1.3), "34× faster");
         assert_eq!(result(27.7 / 84.6), "3.1× slower");
         assert_eq!(result(108.0 / 106.0), "1.0× faster");
+    }
+
+    /// A run of `ids` where voidfs took `voidfs` ms and the bare bucket `bare`.
+    fn run_of(ids: &[&str], voidfs: f64, bare: f64, cold: bool) -> RunFile {
+        let result = |p50: f64| TargetResult { p50_ms: Some(p50), rounds: vec![RoundStats { ops: 1, p50_ms: Some(p50), ..Default::default() }], ..Default::default() };
+        let scenarios = ids
+            .iter()
+            .map(|id| {
+                let s = crate::scenarios::ALL.iter().find(|s| s.id == *id).unwrap();
+                let results = [("voidfs".to_owned(), result(voidfs)), ("bare".to_owned(), result(bare))].into_iter().collect();
+                ScenarioResult { id: s.id.into(), name: s.name.into(), family: "reads".into(), concurrency: 8, ops: 32, spacefs: s.spacefs, results }
+            })
+            .collect();
+        RunFile {
+            harness: "test".into(),
+            run_id: "r".into(),
+            started: "now".into(),
+            finished: None,
+            settings: Settings { rounds: 2, warmups: 3, concurrency: None, connections: 64, ops_scale: 1.0, checksums: "SdkDefault".into(), like_spacefs: true, cold },
+            environment: Environment { os: "macos".into(), arch: "aarch64".into(), cpus: 1, labels: BTreeMap::new() },
+            targets: BTreeMap::new(),
+            spacefs: SpacefsRef { source: SPACEFS_SOURCE.into(), run: SPACEFS_RUN.into() },
+            scenarios,
+        }
+    }
+
+    /// A cold run is set against SpaceFS's cache-cleared figures, and only where they give one.
+    #[test]
+    fn cold_runs_compare_with_spacefss_cold_figures() {
+        let warm = markdown(&run_of(&["get-64m"], 300.0, 779.0, false));
+        assert!(warm.contains("| get 64 MiB | 779 | 300 | 2.6× faster | 17× faster | 6.4× short |"), "{warm}");
+        let cold = markdown(&run_of(&["get-64m", "stream-get-64m"], 290.0, 779.0, true));
+        assert!(cold.contains("SpaceFS result, cache cleared"), "{cold}");
+        assert!(cold.contains("| get 64 MiB | 779 | 290 | 2.7× faster | 2.6× faster | level or ahead |"), "779 / 299: {cold}");
+        assert!(cold.contains("| stream get 64 MiB | 779 | 290 | 2.7× faster | – | – |"), "no cold figure: {cold}");
+        assert!(cold.contains("over the 1 rows SpaceFS gives a figure for"), "{cold}");
+        assert!(cold.contains("matches or beats SpaceFS's in **1 of 1** rows"), "{cold}");
+    }
+
+    /// Files written before `--cold` and the bandwidth cap still read, as warm runs.
+    #[test]
+    fn older_result_files_still_read() {
+        let mut v = serde_json::to_value(run_of(&["get-4k"], 1.0, 12.0, false)).unwrap();
+        let round = &mut v["scenarios"][0]["results"]["voidfs"]["rounds"][0];
+        assert!(round.get("waves").is_none() && round.get("drops").is_none());
+        assert!(v["settings"].get("cold").is_none(), "left out of warm runs, as before");
+        let old: RunFile = serde_json::from_value(v).unwrap();
+        assert!(!old.settings.cold);
+        let cold: RunFile = serde_json::from_str(&serde_json::to_string(&run_of(&["get-4k"], 1.0, 12.0, true)).unwrap()).unwrap();
+        assert!(cold.settings.cold);
     }
 
     #[test]

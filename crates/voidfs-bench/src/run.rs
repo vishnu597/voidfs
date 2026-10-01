@@ -41,6 +41,8 @@ pub struct Settings {
     /// Short lowercase tag naming this run's drives and prefixes.
     pub tag: String,
     pub metrics: Option<MetricsSource>,
+    /// Measure every operation with voidfs's caches empty (`--cold`).
+    pub cold: Option<Cold>,
 }
 
 /// voidfs-server's metrics, read before and after each scenario's measured rounds.
@@ -54,21 +56,67 @@ impl MetricsSource {
         MetricsSource { url, http: reqwest::Client::new() }
     }
 
-    /// voidfs's requests to the bucket so far, by operation.
-    async fn bucket_requests(&self) -> anyhow::Result<BTreeMap<String, u64>> {
-        let text = self.http.get(&self.url).send().await?.error_for_status()?.text().await?;
-        Ok(bucket_requests(&text))
+    async fn scrape(&self) -> anyhow::Result<String> {
+        Ok(self.http.get(&self.url).send().await?.error_for_status()?.text().await?)
+    }
+
+    /// voidfs's requests to the bucket so far, by operation, and the seconds they took.
+    async fn bucket_requests(&self) -> anyhow::Result<(BTreeMap<String, u64>, BTreeMap<String, f64>)> {
+        let text = self.scrape().await?;
+        Ok((by_op(&text, "voidfs_bucket_requests_total").into_iter().map(|(op, n)| (op, n as u64)).collect(), by_op(&text, "voidfs_bucket_request_duration_seconds_sum")))
     }
 }
 
-/// The `voidfs_bucket_requests_total` series of a scrape, by operation.
-fn bucket_requests(text: &str) -> BTreeMap<String, u64> {
+/// A series of a scrape, by its `op` label.
+fn by_op(text: &str, series: &str) -> BTreeMap<String, f64> {
+    let prefix = format!("{series}{{op=\"");
     text.lines()
         .filter_map(|l| {
-            let (op, value) = l.strip_prefix("voidfs_bucket_requests_total{op=\"")?.split_once("\"} ")?;
-            Some((op.to_owned(), value.parse::<f64>().ok()? as u64))
+            let (op, value) = l.strip_prefix(prefix.as_str())?.split_once("\"} ")?;
+            Some((op.to_owned(), value.parse::<f64>().ok()?))
         })
         .collect()
+}
+
+/// A series of a scrape that has no labels.
+fn sample(text: &str, series: &str) -> Option<f64> {
+    text.lines().find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+}
+
+/// How long a drop of voidfs's caches may take to show in its metrics.
+const DROP_WAIT: Duration = Duration::from_secs(5);
+
+/// Drops voidfs-server's shard and page caches: SIGUSR1 to its process, which must be on this
+/// machine, confirmed by its metrics.
+pub struct Cold {
+    pid: u32,
+    metrics: MetricsSource,
+}
+
+impl Cold {
+    pub fn new(pid: u32, metrics: MetricsSource) -> Cold {
+        Cold { pid, metrics }
+    }
+
+    async fn drops(&self) -> anyhow::Result<f64> {
+        sample(&self.metrics.scrape().await?, "voidfs_cache_drops_total").context("voidfs-server's metrics have no voidfs_cache_drops_total: it cannot drop its caches")
+    }
+
+    /// Drops the caches, and waits until the server's metrics count the drop.
+    pub async fn drop_caches(&self) -> anyhow::Result<()> {
+        let before = self.drops().await?;
+        let pid = self.pid.to_string();
+        let status = tokio::task::spawn_blocking(move || std::process::Command::new("kill").args(["-USR1", &pid]).status()).await?.context("running kill")?;
+        ensure!(status.success(), "kill -USR1 {} failed: {status}", self.pid);
+        let deadline = Instant::now() + DROP_WAIT;
+        loop {
+            if self.drops().await? > before {
+                return Ok(());
+            }
+            ensure!(Instant::now() < deadline, "voidfs-server (pid {}) did not drop its caches within {} s", self.pid, DROP_WAIT.as_secs());
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
 }
 
 /// What every worker of a scenario reads.
@@ -155,7 +203,7 @@ pub async fn scenario(targets: &[Arc<Target>], index: usize, s: &'static Scenari
 
     for (i, t) in targets.iter().enumerate() {
         if let Some(st) = states[i].as_mut() {
-            let (_, errors, _) = measure(t, st, s, index, Phase::Warmup, set.warmups, set).await;
+            let (_, errors, _, _) = measure(t, st, s, index, Phase::Warmup, set.warmups, set, Start::Steady).await;
             results[i].warmup_errors = errors.len();
             if let Some(e) = errors.first() {
                 log(&format!("  {:6} warm-up error: {e}", t.name()));
@@ -176,8 +224,10 @@ pub async fn scenario(targets: &[Arc<Target>], index: usize, s: &'static Scenari
         }
         for i in order {
             let Some(st) = states[i].as_mut() else { continue };
-            let (lat, errors, wall) = measure(&targets[i], st, s, index, Phase::Round(round), ops, set).await;
-            let stats = RoundStats::new(lat, &errors, wall, s.bytes_per_op(), set.samples);
+            let start = Start::of(set.cold.as_ref(), targets[i].flavor);
+            let (lat, errors, wall, waves) = measure(&targets[i], st, s, index, Phase::Round(round), ops, set, start).await;
+            let mut stats = RoundStats::new(lat, &errors, wall, s.bytes_per_op(), set.samples);
+            (stats.waves, stats.drops) = waves;
             log(&format!(
                 "  {:6} round {}: p50 {} ms, p90 {} ms, {} ops, {} errors{}",
                 targets[i].name(),
@@ -193,7 +243,10 @@ pub async fn scenario(targets: &[Arc<Target>], index: usize, s: &'static Scenari
     }
     if let (Some(m), Some(i), Some(before)) = (&set.metrics, voidfs, scraped) {
         match m.bucket_requests().await {
-            Ok(after) => results[i].bucket_requests = Some(after.into_iter().map(|(op, n)| (op.clone(), n.saturating_sub(before.get(&op).copied().unwrap_or(0)))).collect()),
+            Ok((after, seconds)) => {
+                results[i].bucket_requests = Some(after.into_iter().map(|(op, n)| (op.clone(), n.saturating_sub(before.0.get(&op).copied().unwrap_or(0)))).collect());
+                results[i].bucket_seconds = Some(seconds.into_iter().map(|(op, x)| (op.clone(), (x - before.1.get(&op).copied().unwrap_or(0.0)).max(0.0))).collect());
+            }
             Err(e) => log(&format!("  reading voidfs's metrics failed: {e:#}")),
         }
     }
@@ -234,43 +287,142 @@ pub async fn scenario(targets: &[Arc<Target>], index: usize, s: &'static Scenari
     }
 }
 
-/// Runs `ops` operations, one worker per slot. Returns the latencies in milliseconds,
-/// the errors, and the wall-clock time.
-async fn measure(t: &Arc<Target>, st: &mut State, s: &'static Scenario, index: usize, phase: Phase, ops: usize, set: &Settings) -> (Vec<f64>, Vec<String>, Duration) {
-    let next = Arc::new(AtomicUsize::new(0));
-    let started = Instant::now();
-    let slots = std::mem::take(&mut st.slots);
-    let tasks: Vec<_> = slots
-        .into_iter()
-        .enumerate()
-        .map(|(w, mut slot)| {
-            let (t, place, shared, next) = (t.clone(), st.place.clone(), st.shared.clone(), next.clone());
-            let nonce = set.nonce;
-            tokio::spawn(async move {
-                let (mut lat, mut errors) = (Vec::new(), Vec::new());
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= ops {
-                        break;
-                    }
-                    let seed = data::seed(&[nonce, index as u64, phase.code(), i as u64, w as u64]);
-                    match op(&t, &place, s, &shared, &mut slot, phase, i, seed).await {
-                        Ok(d) => lat.push(d.as_secs_f64() * 1000.0),
-                        Err(e) => errors.push(format!("{e:#}")),
-                    }
-                }
-                (slot, lat, errors)
-            })
-        })
-        .collect();
-    let (mut lat, mut errors) = (Vec::new(), Vec::new());
-    for task in tasks {
-        let (slot, l, e) = task.await.expect("a worker panicked");
-        st.slots.push(slot);
-        lat.extend(l);
-        errors.extend(e);
+/// How a round's operations start.
+#[derive(Clone, Copy)]
+enum Start<'a> {
+    /// Each worker starts its next operation as soon as its last one ends.
+    Steady,
+    /// In waves of one operation per worker: a wave starts once the one before has ended, after
+    /// dropping voidfs's caches if given (`--cold`).
+    Waves(Option<&'a Cold>),
+}
+
+impl<'a> Start<'a> {
+    /// A target's rounds: with `--cold`, every target's run in waves, and voidfs's caches are
+    /// dropped before each of its own.
+    fn of(cold: Option<&'a Cold>, flavor: Flavor) -> Start<'a> {
+        match cold {
+            Some(c) => Start::Waves((flavor == Flavor::Voidfs).then_some(c)),
+            None => Start::Steady,
+        }
     }
-    (lat, errors, started.elapsed())
+}
+
+/// Runs `ops` operations, one worker per slot. Returns the latencies in milliseconds, the
+/// errors, the wall-clock time, and in waves, how many ran and how many began with a drop.
+#[allow(clippy::too_many_arguments)]
+async fn measure(t: &Arc<Target>, st: &mut State, s: &'static Scenario, index: usize, phase: Phase, ops: usize, set: &Settings, start: Start<'_>) -> (Vec<f64>, Vec<String>, Duration, (Option<usize>, Option<usize>)) {
+    let started = Instant::now();
+    let (t, place, shared, nonce) = (t.clone(), st.place.clone(), st.shared.clone(), set.nonce);
+    let run = move |(w, mut slot): (usize, Slot), i: usize| {
+        let (t, place, shared) = (t.clone(), place.clone(), shared.clone());
+        async move {
+            let seed = data::seed(&[nonce, index as u64, phase.code(), i as u64, w as u64]);
+            let r = op(&t, &place, s, &shared, &mut slot, phase, i, seed).await;
+            ((w, slot), r)
+        }
+    };
+    let workers: Vec<(usize, Slot)> = std::mem::take(&mut st.slots).into_iter().enumerate().collect();
+    let done = match start {
+        Start::Steady => schedule(workers, ops, false, async || Ok(()), run).await,
+        Start::Waves(cold) => {
+            schedule(
+                workers,
+                ops,
+                true,
+                async || match cold {
+                    Some(c) => c.drop_caches().await,
+                    None => Ok(()),
+                },
+                run,
+            )
+            .await
+        }
+    };
+    st.slots = done.workers.into_iter().map(|(_, slot)| slot).collect();
+    let (mut lat, mut errors) = (Vec::new(), Vec::new());
+    for r in done.results {
+        match r {
+            Ok(d) => lat.push(d.as_secs_f64() * 1000.0),
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+    }
+    if let Some(e) = done.failed {
+        errors.push(format!("dropping voidfs's caches: {e:#}"));
+    }
+    let waves = match start {
+        Start::Steady => (None, None),
+        Start::Waves(cold) => (Some(done.waves), Some(if cold.is_some() { done.waves } else { 0 })),
+    };
+    (lat, errors, started.elapsed(), waves)
+}
+
+/// What [`schedule`] ran.
+struct Scheduled<W, R> {
+    /// The workers, in the order given.
+    workers: Vec<W>,
+    /// Each operation's result, in no particular order.
+    results: Vec<R>,
+    /// Why the operations stopped short, if they did: `before_wave` failed.
+    failed: Option<anyhow::Error>,
+    /// Waves started, each after `before_wave`.
+    waves: usize,
+}
+
+/// Runs operations `0..ops` on `workers`, each running one at a time. Without `waves`, a worker
+/// starts its next operation as soon as its last ends. With `waves`, each worker runs one per
+/// wave, and a wave starts after `before_wave`, once the wave before has ended; if
+/// `before_wave` fails, nothing more runs.
+async fn schedule<W, R, F, Fut>(mut workers: Vec<W>, ops: usize, waves: bool, mut before_wave: impl AsyncFnMut() -> anyhow::Result<()>, op: F) -> Scheduled<W, R>
+where
+    W: Send + 'static,
+    R: Send + 'static,
+    F: Fn(W, usize) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = (W, R)> + Send + 'static,
+{
+    let width = workers.len();
+    assert!(width > 0, "no workers");
+    let (mut results, mut started, mut from) = (Vec::with_capacity(ops), 0, 0);
+    while from < ops {
+        if waves {
+            if let Err(e) = before_wave().await {
+                return Scheduled { workers, results, failed: Some(e), waves: started };
+            }
+            started += 1;
+        }
+        let to = if waves { (from + width).min(ops) } else { ops };
+        let next = Arc::new(AtomicUsize::new(from));
+        let tasks: Vec<_> = workers
+            .into_iter()
+            .map(|mut w| {
+                let (next, op) = (next.clone(), op.clone());
+                tokio::spawn(async move {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= to {
+                            break;
+                        }
+                        let (back, r) = op(w, i).await;
+                        w = back;
+                        out.push(r);
+                        if waves {
+                            break;
+                        }
+                    }
+                    (w, out)
+                })
+            })
+            .collect();
+        workers = Vec::with_capacity(width);
+        for task in tasks {
+            let (w, out) = task.await.expect("a worker panicked");
+            workers.push(w);
+            results.extend(out);
+        }
+        from = to;
+    }
+    Scheduled { workers, results, failed: None, waves: started }
 }
 
 /// Applies an edit to a downloaded object, off the async threads when the object is large.
@@ -507,8 +659,146 @@ mod tests {
     fn bucket_requests_are_read_from_a_scrape() {
         let text = "# HELP voidfs_bucket_requests_total Requests to the bucket.\n# TYPE voidfs_bucket_requests_total counter\n\
                     voidfs_bucket_requests_total{op=\"get\"} 12\nvoidfs_bucket_requests_total{op=\"put_new\"} 3\n\
-                    voidfs_bucket_request_errors_total{op=\"get\"} 1\n";
-        let got = bucket_requests(text);
-        assert_eq!(got.into_iter().collect::<Vec<_>>(), [("get".to_owned(), 12), ("put_new".to_owned(), 3)]);
+                    voidfs_bucket_request_errors_total{op=\"get\"} 1\nvoidfs_bucket_request_duration_seconds_sum{op=\"get\"} 0.25\n\
+                    voidfs_cache_drops_total 2\n";
+        let got = by_op(text, "voidfs_bucket_requests_total");
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), [("get".to_owned(), 12.0), ("put_new".to_owned(), 3.0)]);
+        assert_eq!(by_op(text, "voidfs_bucket_request_duration_seconds_sum").get("get"), Some(&0.25));
+        assert_eq!(sample(text, "voidfs_cache_drops_total"), Some(2.0));
+        assert_eq!(sample(text, "voidfs_cache_drops"), None);
+    }
+
+    /// Which operation ran, on which worker, after how many drops.
+    type Ran = (usize, usize, usize);
+
+    /// Operation `i` on worker `w`: records what [`Ran`], and takes 1–4 ms, except the first of
+    /// each eight, which takes no time at all.
+    fn timed(in_flight: &Arc<AtomicUsize>, drops: &Arc<AtomicUsize>) -> impl Fn(usize, usize) -> futures::future::BoxFuture<'static, (usize, Ran)> + Clone + Send + 'static {
+        let (in_flight, drops) = (in_flight.clone(), drops.clone());
+        move |w, i| {
+            let (in_flight, drops) = (in_flight.clone(), drops.clone());
+            Box::pin(async move {
+                let seen = drops.load(Ordering::SeqCst);
+                in_flight.fetch_add(1, Ordering::SeqCst);
+                if i % 8 != 0 {
+                    tokio::time::sleep(Duration::from_millis(1 + (i % 4) as u64)).await;
+                }
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                (w, (i, w, seen))
+            })
+        }
+    }
+
+    /// `--cold`: each wave starts after a drop, once the wave before has ended, and runs one
+    /// operation per worker. Every operation runs once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waves_start_after_a_drop_once_the_one_before_has_ended() {
+        let (in_flight, drops) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let drop = async || {
+            assert_eq!(in_flight.load(Ordering::SeqCst), 0, "a drop while a wave runs");
+            drops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let done = schedule((0..8).collect(), 20, true, drop, timed(&in_flight, &drops)).await;
+        assert!(done.failed.is_none());
+        assert_eq!((done.waves, drops.load(Ordering::SeqCst)), (3, 3));
+        assert_eq!(done.workers, (0..8).collect::<Vec<_>>(), "the workers come back in order");
+        let mut ran = done.results;
+        ran.sort();
+        assert_eq!(ran.iter().map(|r| r.0).collect::<Vec<_>>(), (0..20).collect::<Vec<_>>(), "each operation once");
+        for (i, _, seen) in &ran {
+            assert_eq!(*seen, i / 8 + 1, "operation {i} started after its own wave's drop");
+        }
+        for wave in ran.chunks(8) {
+            let mut workers: Vec<usize> = wave.iter().map(|r| r.1).collect();
+            workers.sort();
+            workers.dedup();
+            assert_eq!(workers.len(), wave.len(), "one operation per worker in a wave: {wave:?}");
+        }
+    }
+
+    /// Without `--cold`, workers take operations as they come, and nothing is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn steady_rounds_drop_nothing() {
+        let (in_flight, drops) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let calls = AtomicUsize::new(0);
+        let done = schedule((0..8).collect(), 20, false, async || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }, timed(&in_flight, &drops)).await;
+        assert_eq!((done.waves, calls.load(Ordering::SeqCst), done.results.len()), (0, 0, 20));
+        assert!(done.results.iter().filter(|r| r.1 == 0).count() > 1, "worker 0 finishes its first at once, and takes another");
+    }
+
+    /// A drop that fails stops the round there.
+    #[tokio::test]
+    async fn a_failed_drop_stops_the_round() {
+        let (in_flight, drops) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let calls = AtomicUsize::new(0);
+        let drop = async || if calls.fetch_add(1, Ordering::SeqCst) == 1 { Err(anyhow::anyhow!("no")) } else { Ok(()) };
+        let done = schedule((0..8).collect(), 20, true, drop, timed(&in_flight, &drops)).await;
+        assert_eq!((done.waves, done.results.len(), done.workers.len()), (1, 8, 8));
+        assert_eq!(done.failed.map(|e| e.to_string()), Some("no".into()));
+    }
+
+    /// `--cold` runs every target's rounds in waves, and drops only voidfs's caches.
+    #[test]
+    fn cold_rounds_run_in_waves_and_drop_voidfss_caches() {
+        let cold = Cold::new(1, MetricsSource::new("http://127.0.0.1:9/metrics".into()));
+        assert!(matches!(Start::of(Some(&cold), Flavor::Voidfs), Start::Waves(Some(c)) if std::ptr::eq(c, &cold)));
+        assert!(matches!(Start::of(Some(&cold), Flavor::Bare), Start::Waves(None)));
+        assert!(matches!(Start::of(None, Flavor::Voidfs), Start::Steady));
+        assert!(matches!(Start::of(None, Flavor::Bare), Start::Steady));
+    }
+
+    /// A stand-in for voidfs-server's metrics: `voidfs_cache_drops_total` goes up 50 ms after
+    /// each SIGUSR1 to this process, or the series is left out.
+    async fn fake_server(with_drops: bool) -> (String, Arc<AtomicUsize>) {
+        let mut usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let counted = drops.clone();
+        tokio::spawn(async move {
+            while usr1.recv().await.is_some() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/metrics", listener.local_addr().unwrap());
+        let served = drops.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.ends_with(b"\r\n\r\n") {
+                    let n = s.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let body = if with_drops { format!("voidfs_uptime_seconds 1\nvoidfs_cache_drops_total {}\n", served.load(Ordering::SeqCst)) } else { "voidfs_uptime_seconds 1\n".into() };
+                let resp = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        (url, drops)
+    }
+
+    /// A drop signals the server and returns once its metrics count it. One the server cannot
+    /// confirm is refused before anything is sent: SIGUSR1 stops a server that does not handle it.
+    #[tokio::test]
+    async fn a_drop_waits_for_the_server_to_count_it() {
+        let (url, drops) = fake_server(true).await;
+        let cold = Cold::new(std::process::id(), MetricsSource::new(url));
+        cold.drop_caches().await.unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "returned before the drop");
+        cold.drop_caches().await.unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        let (url, drops) = fake_server(false).await;
+        let err = Cold::new(std::process::id(), MetricsSource::new(url)).drop_caches().await.unwrap_err();
+        assert!(format!("{err:#}").contains("cannot drop its caches"), "{err:#}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "no signal sent");
     }
 }

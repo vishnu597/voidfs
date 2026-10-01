@@ -20,6 +20,12 @@
 #                 target reach it through `voidfs-bench delay`, which adds this many ms each way.
 #                 The harness reaches voidfs-server directly, as SpaceFS's harness reached its
 #                 layer on the client host.
+#   BENCH_BANDWIDTH  also cap the bandwidth through that relay, for both: `s3`, fitted to the
+#                 bare bucket in SpaceFS's run, or DOWN/UP/TOTAL in MB/s (per connection down
+#                 and up, and in all each way; - for no limit). Off by default
+#   BENCH_COLD=1  measure cold reads: the harness's --cold, which drops voidfs-server's caches
+#                 (SIGUSR1) before each wave of operations, and confirms each drop from its
+#                 metrics (its admin listener on VOIDFS_PORT + 1)
 #   BENCH_SERVER_BIN  a voidfs-server binary to use instead of this checkout's release build,
 #                 for comparing server changes
 #   BENCH_POOL_FEATURES  features of the on-bucket format the pool is created with, for example
@@ -110,18 +116,30 @@ curl -sS -f -o /dev/null --aws-sigv4 "aws:amz:us-east-1:s3" --user "$s3_key:$s3_
 
 bucket_port="$s3_port"
 distance="none (loopback)"
-if [[ -n "${BENCH_ONE_WAY_MS:-}" ]]; then
+if [[ -n "${BENCH_ONE_WAY_MS:-}" || -n "${BENCH_BANDWIDTH:-}" ]]; then
     bucket_port=$((s3_port + 1))
+    relay_args=(--one-way-ms "${BENCH_ONE_WAY_MS:-0}")
+    [[ -n "${BENCH_BANDWIDTH:-}" ]] && relay_args+=(--bandwidth "$BENCH_BANDWIDTH")
     "$root/target/release/voidfs-bench" delay --listen "127.0.0.1:$bucket_port" \
-        --upstream "127.0.0.1:$s3_port" --one-way-ms "$BENCH_ONE_WAY_MS" > "$work/logs/delay.log" 2>&1 &
+        --upstream "127.0.0.1:$s3_port" "${relay_args[@]}" > "$work/logs/delay.log" 2>&1 &
     pids+=($!)
     wait_for "http://127.0.0.1:$bucket_port/"
-    distance="emulated with \`voidfs-bench delay --one-way-ms $BENCH_ONE_WAY_MS\` between the bucket and both voidfs-server and the harness's bare target (timer granularity adds about 2 ms each way; the bare head row shows the real round trip). The harness reaches voidfs-server over loopback, as SpaceFS's reached its layer on the client host"
+    distance="emulated with \`voidfs-bench delay ${relay_args[*]}\` between the bucket and both voidfs-server and the harness's bare target (timer granularity adds about 2 ms each way; the bare head row shows the real round trip). The harness reaches voidfs-server over loopback, as SpaceFS's reached its layer on the client host"
+fi
+labels=()
+if [[ -n "${BENCH_BANDWIDTH:-}" ]]; then
+    # The relay describes the cap once it listens.
+    for _ in $(seq 1 20); do
+        rate="$(sed -n 's/.*ms each way, //p' "$work/logs/delay.log")"
+        [[ -n "$rate" ]] && break
+        sleep 0.05
+    done
+    labels+=(--label "bandwidth to the bucket=capped by that relay (--bandwidth $BENCH_BANDWIDTH): ${rate:-see its log}")
 fi
 
 admin_args=()
 bench_args=()
-if [[ "${BENCH_BUCKET_REQUESTS:-0}" == 1 ]]; then
+if [[ "${BENCH_BUCKET_REQUESTS:-0}" == 1 || "${BENCH_COLD:-0}" == 1 ]]; then
     admin_port=$((voidfs_port + 1))
     admin_args=(--admin-listen "127.0.0.1:$admin_port")
     bench_args=(--voidfs-metrics "http://127.0.0.1:$admin_port/metrics")
@@ -135,6 +153,7 @@ VOIDFS_NEW_POOL_FEATURES="${BENCH_POOL_FEATURES:-}" RUST_LOG=warn "${BENCH_SERVE
     ${admin_args[@]+"${admin_args[@]}"} \
     > "$work/logs/voidfs.log" 2>&1 &
 pids+=($!)
+[[ "${BENCH_COLD:-0}" == 1 ]] && bench_args+=(--cold --voidfs-pid "$!")
 wait_for "http://127.0.0.1:$voidfs_port/"
 
 # The features the pool was created with, from its descriptor in the bucket's directory.
@@ -157,6 +176,7 @@ VOIDFS_S3_ACCESS_KEY_ID="$s3_key" VOIDFS_S3_SECRET_ACCESS_KEY="$s3_secret" \
     --label "setup=one machine over loopback: harness, voidfs-server and the S3 server ($cpus CPUs, $(uname -sm))" \
     --label "bucket=$s3_version on local disk, 127.0.0.1:$s3_port" \
     --label "distance to the bucket=$distance" \
+    ${labels[@]+"${labels[@]}"} \
     --label "voidfs server=voidfs-server release build, s3: store in that bucket, 512 MiB shard cache" \
     --label "pool features=$pool_features" \
     --label "commit=$commit" \

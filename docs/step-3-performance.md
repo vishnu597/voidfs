@@ -604,40 +604,98 @@ it gone eventually, and it stays a GC root until then.
 
 ### Item 6. The read path for cold and large reads
 
-**Problem.** These are observations, not yet measured, because the harness cannot yet measure
-cold reads (item 7):
-- A GET streams at most 8 shards at a time (object.rs:298). A cold 64 MiB read is four waves of
-  2 MiB shard fetches.
-- `Pool::shard` (pool.rs:436) fetches on every miss. Eight readers of the same cold object make
-  eight fetches of each shard; nothing coalesces them.
+**Problem.** Measured cold since 1 October (item 7.1), with the bucket 12 ms away and capped as
+S3 was in SpaceFS's run (item 7.4):
+- A GET streams at most 8 shards at a time (`.buffered(8)` in object.rs). A cold 64 MiB read is
+  about 25 shard fetches of 2–3 MiB, 8 in flight.
+- `Pool::shard` fetches on every miss. Eight readers of the same cold object make eight fetches
+  of each shard; nothing coalesces them.
+- A cold range fetches the whole shard it falls in.
 - There is no read-ahead across requests, which the mount will need (checklist D6), and no disk
   tier (S5).
 
-**Evidence.** SpaceFS's cache-cleared figures are the target:
-- get 64 MiB cold: 299 ms against 769 bare;
-- get 32 MiB cold: 179 ms;
-- small cold reads at parity with the bucket.
+**Evidence** ([bench/results/cold-reads](../bench/results/cold-reads/README.md)), voidfs's time
+as a fraction of the bare bucket's, cold, two runs, against SpaceFS's cache-cleared figures:
 
-With a warm cache voidfs already reads 64 MiB in 45–55 ms, 8 at once, as SpaceFS's warm 47 ms.
+| Row | Capped (`s3`) | Capped, no total | No cap | SpaceFS |
+|---|--:|--:|--:|--:|
+| get 4 KiB (`inline-data`; without it) | 0.02 (0.96–0.98) | 0.02 | 0.02 | 1.08 |
+| get 1 MiB | 1.03–1.04 | 1.03–1.04 | 1.04–1.05 | 1.18 |
+| get 32 MiB | 0.72–0.74 | 0.32–0.39 | 1.16–1.18 | 0.50 |
+| get 64 MiB | 0.69–0.71 | 0.29–0.30 | 1.12–1.16 | 0.38 |
+| range 64 KiB of 64 MiB | 2.77–2.98 | 3.04–3.32 | 1.25–1.29 | – |
 
-**Changes, after item 7 measures cold reads:**
-- coalesce concurrent misses (moka's async cache has `try_get_with`, or a small in-flight map);
-- raise or adapt the per-request shard window;
+- **Small cold reads are ahead of SpaceFS's:** one shard GET, or none for a file in the log.
+- **Large cold reads are behind with the cap and ahead without its total.** Eight parallel shard
+  fetches beat S3's per-stream limit, but each of a wave's eight readers fetches every shard,
+  8 × 64 MiB = 537 MB, and at the cap's 1,000 MB/s total that takes the 506–517 ms measured. The
+  total is the cap's assumption for downloads (item 7.4).
+- **A cold range is about 3× the bare bucket's time:** about 2.5 MiB fetched for 64 KiB.
+- With a warm cache voidfs reads 64 MiB in 45–55 ms, 8 at once, as SpaceFS's warm 47 ms.
+
+**Changes, in this order:**
+- coalesce concurrent misses (moka's async cache has `try_get_with`, or a small in-flight map):
+  537 MB per wave of get 64 MiB becomes 67, and the estimate is about 0.15× the bare bucket's
+  time with the cap;
+- fetch only the bytes a range needs from its shard (a ranged GET of the shard object);
+- raise or adapt the per-request shard window, which bounds one read once reads are coalesced;
 - add read-ahead;
 - add the disk tier.
 
 ### Item 7. Measurement gaps to close first
 
-1. **Cold reads.** voidfs-server cannot drop its caches, so the harness only measures warm
-   reads. Add an operator-only way to drop them, for example on `SIGUSR1`. Something outside the
-   S3 surface avoids a protocol change. Then give the harness a `--cold` mode that drops caches
-   between setup and each round.
+**Status (1 October 2026): 7.1 and 7.4 done.** Measured in
+[bench/results/cold-reads](../bench/results/cold-reads/README.md):
+- **Cold reads** (7.1): `SIGUSR1` empties voidfs-server's shard and page caches, and the
+  harness's `--cold` (`BENCH_COLD=1`) drops them before every wave of operations, so that every
+  measured read starts cold. The four rows SpaceFS gives cold figures for: get 4 KiB and 1 MiB
+  ahead of SpaceFS's ratio, get 32 and 64 MiB behind with the cap (0.69–0.74× the bare bucket's
+  time, SpaceFS 0.38× and 0.50×) and ahead without its total (0.29–0.39×). Item 6 has the detail.
+- **A bandwidth cap** (7.4): `BENCH_BANDWIDTH=s3` caps the relay at 95 MB/s down and 68 MB/s up
+  per connection, and 1,000 MB/s in all each way, fitted to SpaceFS's bare bucket: within −7% to
+  +13% on the rows that move the most data. With it, warm, **46 of the 49 rows are at or ahead
+  of SpaceFS's ratio** in both runs, where 27–28 are without it. The three behind are warm large
+  reads (get 64 MiB, stream get 64 and 256 MiB: 0.79–0.91 of SpaceFS's ratio), which voidfs
+  serves from memory in 50–57 ms for 64 MiB, eight at once, against SpaceFS's 45–47.
+- The server's change costs nothing warm: over the 49 rows at 12 ms without the cap, the
+  geometric mean against `main` is 0.999, and the rows that looked slower were not when run
+  focused again.
+
+1. **Cold reads. Done.** voidfs-server could not drop its caches, so the harness only measured
+   warm reads.
+   - `SIGUSR1` calls `Pool::drop_caches`, which empties the shard cache and the page cache and
+     counts it in `voidfs_cache_drops_total`. It is outside the S3 surface and the
+     unauthenticated admin port: only someone who may signal the process can drop the caches.
+     Each drive's state (with `inline-data`, small files' bytes too), the guard's record of
+     stored shards and the connections to the bucket stay.
+   - `--cold` runs each round in waves of one operation per worker, and drops voidfs's caches
+     before each of its waves, confirmed from the server's metrics; the bare target runs the same
+     waves. A get row's eight readers share one object, so dropping once per round would have
+     left all but the first eight reads warm. SpaceFS does not say when it cleared its cache.
+   - Cold runs are scored against SpaceFS's cache-cleared figures (`Published::layer_cold`).
 2. **The real run** in SpaceFS's setup (`client-host`), for the numbers the done-criterion is
-   judged on. Everything above is local or on R2.
+   judged on. Everything above is local or on R2. A cold run there
+   (`BENCH_COLD=1 BENCH_TOPOLOGY=client-host bench/scripts/cloud-run.sh`) would also settle the
+   download total that 7.4 could only assume.
 3. **CI against MinIO** (step 1's remaining bullet). MinIO runs on Linux, and
    `BENCH_S3=minio bench/scripts/local.sh --ops-scale 0.1` works there. A small emulated-distance
    run in CI (`BENCH_ONE_WAY_MS=4`) would catch regressions in items 1 and 2, which loopback
    hides.
+4. **A bucket with S3's bandwidth. Done.** The relay that emulates the distance added no
+   bandwidth limit, so the bare bucket read 64 MiB in about 120 ms where S3 took 779 ms in
+   SpaceFS's run, and a 64 MiB edit's download and upload took about 290 ms where they took
+   1,690. The large reads and the edits in 32 and 64 MiB files could not be judged.
+   - `voidfs-bench delay --bandwidth` (`BENCH_BANDWIDTH` in `local.sh`, off by default) sends
+     each chunk once a link at the rate would have carried it, on top of the delay: a link per
+     connection each way, and one shared by all connections each way, for voidfs-server's
+     traffic and the bare target's alike.
+   - `s3` is 95 MB/s down and 68 MB/s up per connection, and 1,000 MB/s in all each way, fitted
+     to SpaceFS's bare-bucket figures for get and stream get, put 32 and 64 MiB, and the
+     multipart uploads; the edits in 32 and 64 MiB files, not used to fit it, land within −1% to
+     +5%. Not confirmed: the total for downloads, which no bare row of theirs reaches, and what
+     limited the multipart uploads.
+   - It does not emulate S3's time per request: small requests and server-side copies stay
+     faster here than on S3.
 
 ## 3. How to compare a change
 

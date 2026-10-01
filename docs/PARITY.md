@@ -1,8 +1,9 @@
 # voidfs and SpaceFS: parity status and plan
 
 *Stocktake of 2026-09-28, brought up to date the same day after content-defined checkpoints, the
-capability probe, group commit and the shard cache's admission, and on 2026-09-29 after
-virtual-host addressing and then health checks and metrics; the first was taken on 2026-09-27.*
+capability probe, group commit and the shard cache's admission, on 2026-09-29 after
+virtual-host addressing and then health checks and metrics, and on 2026-10-01 for cold reads and
+S3's bandwidth in the local benchmark; the first was taken on 2026-09-27.*
 
 Sources:
 - the voidfs code on `main` at `0ff3f2d` (garbage collection, content-defined checkpoints, the
@@ -49,6 +50,15 @@ billing or plans), this page says so.
     once, not once per edit: patch in 1 and 32 MiB crossed SpaceFS's ratio. Completing a
     multipart upload takes two round trips instead of a chain of them. Then patch in 64 MiB, and
     large reads that only the real run can judge.
+  - **With S3's bandwidth emulated as well** (1 October: the bucket 12 ms away and capped as S3
+    was in SpaceFS's run, a different setup from the figures above), 46 of the 49 rows are at or
+    ahead of SpaceFS's ratio in both runs, and the geometric mean speed-up is 5.9×. The three
+    behind are warm reads of 64 and 256 MiB, at 0.79–0.91 of SpaceFS's ratio.
+  - **Cold reads are now measured** (the server drops its caches on `SIGUSR1`). Small cold reads
+    are ahead of SpaceFS's cache-cleared figures. Large ones are behind with the cap (0.69–0.74×
+    the bare bucket's time, SpaceFS 0.38–0.50×), because eight readers of one cold object each
+    fetch every shard; without the cap's total for downloads, which is an assumption, they are
+    ahead (0.29–0.39×). Coalescing those fetches is next (§7, step 3).
 - **SpaceFS's Mac app is now understood** (§5). It is a native FSKit module with its core in Rust,
   running in a separate daemon, which is the architecture the FSKit spike chose for voidfs. It
   also shows that the FSKit entitlement can ship with Developer ID.
@@ -191,17 +201,17 @@ All 49 scenarios ran on one Mac, against a local S3 server (versitygw), once ove
 once with the bucket 12 ms away; 23 of them also ran against Cloudflare R2. **These are not comparable with SpaceFS's cloud figures**; the
 real run in their setup is still to do (§8).
 
-| Scenarios | Rows | Loopback | Bucket 12 ms away | 12 ms, group commit (28 Sep) | 12 ms, shard cache (28 Sep) | 12 ms, write round trips (29 Sep) | 12 ms, small files in the log (29 Sep) | 12 ms, group-commit hold (30 Sep) | 12 ms, patch once (30 Sep) | 12 ms, multipart completion (30 Sep) | SpaceFS |
-|---|--:|---|---|---|---|---|---|---|---|---|---|
-| Small, ranged and cached reads, `head`, fan-out gets | 7 | 1.1× slower to 4.6× faster | 1.1× slower to 48× faster | 1.1× slower to 51× faster | 12–48× faster | 12–46× faster | 11–48× faster | 13–51× faster | 11–55× faster | 12–55× faster | 2.6–34× faster |
-| Large gets and streams | 4 | 1.1–1.7× slower | 1.1–3.0× faster | 1.1× slower to 3.1× faster | 2.3–3.1× faster | 2.3–2.7× faster | 2.3–2.8× faster | 2.3–2.7× faster | 2.4–2.9× faster | 2.4–2.9× faster | 12–17× faster |
-| Edits inside 32 and 64 MiB files | 16 | parity to 24× faster | 1.1× slower to 3.3× faster | 1.1× slower to 8.2× faster | 1.5–8.3× faster | 1.5–7.8× faster | 1.4–9.7× faster | 1.3–9.1× faster | 1.5–8.0× faster | 1.6–7.9× faster | 1.4–15× faster |
-| Rename and folder move | 2 | 44–138× faster | 1.5–4.8× faster | 5.8–18× faster | 5.2–18× faster | 5.0–18× faster | 5.7–20× faster | 11–31× faster | 9.9–29× faster | 9.3–30× faster | 7.9–18× faster |
-| Listing | 1 | 31× faster | 34× faster | 37× faster | 36× faster | 31× faster | 33× faster | 35× faster | 37× faster | 39× faster | 9.1× faster |
-| Edits inside 1 MiB files | 8 | 1.6–4.7× slower | 3.4–3.6× slower | 1.3–1.7× slower | 1.3–1.7× slower | 1.3–1.7× slower | 1.3–1.6× slower | 1.3–1.5× slower | 1.3–1.4× slower | 1.3–1.4× slower | 2.1× slower to parity |
-| Whole-object puts and overwrites, fan-out puts | 9 | 1.7–4.5× slower | 2.1–70× slower | 2.1–3.1× slower | 2.2–3.0× slower | 1.3–3.1× slower | 1.3–2.8× slower | 1.1–2.9× slower | 1.1–2.9× slower | 1.1–2.9× slower | 1.1–3.1× slower |
-| Multipart uploads | 2 | parity to 1.2× faster | 1.6–1.9× slower | 1.6–1.9× slower | 1.5–1.8× slower | 1.2–1.7× slower | 1.2–1.8× slower | 1.4–1.5× slower | 1.4× slower to 1.3× faster | 1.0× slower to 1.0× faster | 1.8–2.4× slower |
-| **All 49**: faster in / geometric mean | | 26 / 2.1× | 27 / 1.0× | 24–26 / 2.0× | 30 / 2.6× | 30 / 2.6× | 30 / 2.8× | 30 / 2.9× | 31 / 2.9× | 31 / 3.0× | 31 / 2.8× |
+| Scenarios | Rows | Loopback | Bucket 12 ms away | 12 ms, group commit (28 Sep) | 12 ms, shard cache (28 Sep) | 12 ms, write round trips (29 Sep) | 12 ms, small files in the log (29 Sep) | 12 ms, group-commit hold (30 Sep) | 12 ms, patch once (30 Sep) | 12 ms, multipart completion (30 Sep) | **Another setup:** 12 ms and S3's bandwidth (1 Oct) | SpaceFS |
+|---|--:|---|---|---|---|---|---|---|---|---|---|---|
+| Small, ranged and cached reads, `head`, fan-out gets | 7 | 1.1× slower to 4.6× faster | 1.1× slower to 48× faster | 1.1× slower to 51× faster | 12–48× faster | 12–46× faster | 11–48× faster | 13–51× faster | 11–55× faster | 12–55× faster | 12–53× faster | 2.6–34× faster |
+| Large gets and streams | 4 | 1.1–1.7× slower | 1.1–3.0× faster | 1.1× slower to 3.1× faster | 2.3–3.1× faster | 2.3–2.7× faster | 2.3–2.8× faster | 2.3–2.7× faster | 2.4–2.9× faster | 2.4–2.9× faster | 12–14× faster | 12–17× faster |
+| Edits inside 32 and 64 MiB files | 16 | parity to 24× faster | 1.1× slower to 3.3× faster | 1.1× slower to 8.2× faster | 1.5–8.3× faster | 1.5–7.8× faster | 1.4–9.7× faster | 1.3–9.1× faster | 1.5–8.0× faster | 1.6–7.9× faster | 3.4–37× faster | 1.4–15× faster |
+| Rename and folder move | 2 | 44–138× faster | 1.5–4.8× faster | 5.8–18× faster | 5.2–18× faster | 5.0–18× faster | 5.7–20× faster | 11–31× faster | 9.9–29× faster | 9.3–30× faster | 9.5–28× faster | 7.9–18× faster |
+| Listing | 1 | 31× faster | 34× faster | 37× faster | 36× faster | 31× faster | 33× faster | 35× faster | 37× faster | 39× faster | 42× faster | 9.1× faster |
+| Edits inside 1 MiB files | 8 | 1.6–4.7× slower | 3.4–3.6× slower | 1.3–1.7× slower | 1.3–1.7× slower | 1.3–1.7× slower | 1.3–1.6× slower | 1.3–1.5× slower | 1.3–1.4× slower | 1.3–1.4× slower | 1.1–1.2× faster | 2.1× slower to parity |
+| Whole-object puts and overwrites, fan-out puts | 9 | 1.7–4.5× slower | 2.1–70× slower | 2.1–3.1× slower | 2.2–3.0× slower | 1.3–3.1× slower | 1.3–2.8× slower | 1.1–2.9× slower | 1.1–2.9× slower | 1.1–2.9× slower | 2.1× slower to 1.8× faster | 1.1–3.1× slower |
+| Multipart uploads | 2 | parity to 1.2× faster | 1.6–1.9× slower | 1.6–1.9× slower | 1.5–1.8× slower | 1.2–1.7× slower | 1.2–1.8× slower | 1.4–1.5× slower | 1.4× slower to 1.3× faster | 1.0× slower to 1.0× faster | 1.0× faster | 1.8–2.4× slower |
+| **All 49**: faster in / geometric mean | | 26 / 2.1× | 27 / 1.0× | 24–26 / 2.0× | 30 / 2.6× | 30 / 2.6× | 30 / 2.8× | 30 / 2.9× | 31 / 2.9× | 31 / 3.0× | 42 / 5.9× | 31 / 2.8× |
 
 The group-commit, shard-cache, write-round-trip, small-file, hold, patch and multipart columns are
 the median of each row over two runs ([bench/results/group-commit](../bench/results/group-commit/README.md),
@@ -210,7 +220,11 @@ the median of each row over two runs ([bench/results/group-commit](../bench/resu
 [bench/results/small-content](../bench/results/small-content/README.md),
 [bench/results/group-commit-hold](../bench/results/group-commit-hold/README.md),
 [bench/results/patch-once](../bench/results/patch-once/README.md),
-[bench/results/multipart-complete](../bench/results/multipart-complete/README.md)).
+[bench/results/multipart-complete](../bench/results/multipart-complete/README.md)). The column of
+1 October is **another setup**: the same relay, also capped at S3's bandwidth as their run's bare
+bucket shows it (`BENCH_BANDWIDTH=s3`), with this branch's server, median of two runs
+([bench/results/cold-reads](../bench/results/cold-reads/README.md)). Its rows are not comparable
+with the columns before it, only with SpaceFS's.
 
 What the runs show:
 - **The prediction held for metadata:** listing, `head` and small warm reads are far ahead of
@@ -261,6 +275,9 @@ Scored on the local runs, which are not SpaceFS's setup:
 
 | Run | Rows at or ahead of SpaceFS | Edits (24) | Writes (11) | Reads (10) | Metadata (4) |
 |---|--:|--:|--:|--:|--:|
+| **Another setup:** bucket 12 ms away and capped at S3's bandwidth (`BENCH_BANDWIDTH=s3`), 1 October, with the cache drop (two runs) | 46 | 24 | 11 | 7 | 4 |
+| Bucket 12 ms away, 1 October, with the cache drop (two runs) | 27–28 | 11–12 | 6–7 | 6 | 3–4 |
+| Bucket 12 ms away, 1 October, `main` in the same session as the cache drop (two runs) | 26–28 | 10–12 | 6 | 6 | 4 |
 | Bucket 12 ms away, 30 September, with multipart completion in two round trips (two runs) | 29 | 12–13 | 6–7 | 6 | 4 |
 | Bucket 12 ms away, 30 September, `main` in the same session as multipart completion (two runs) | 25–27 | 9–11 | 6 | 6 | 4 |
 | Bucket 12 ms away, 30 September, with each touched shard chunked once per patch (two runs) | 25–30 | 9–14 | 6 | 6 | 4 |
@@ -289,6 +306,39 @@ Scored on the local runs, which are not SpaceFS's setup:
 | Loopback, 29 September, with fewer round trips per write (four runs) | 34–35 | 20–21 | 8–10 | 2 | 3 |
 | Loopback, 29 September, `main` in the same session (four runs) | 31–32 | 19–20 | 7 | 2 | 3 |
 | Loopback, 27 September | 20 | 13 | 4 | 0 | 3 |
+
+With cold reads and S3's bandwidth (1 October,
+[bench/results/cold-reads](../bench/results/cold-reads/README.md)):
+- **The local bucket now can have S3's bandwidth** (`BENCH_BANDWIDTH=s3`): 95 MB/s down and
+  68 MB/s up per connection, 1,000 MB/s in all each way, fitted to SpaceFS's bare-bucket figures
+  for the rows that move the most data (within −7% to +13%; the edits in 32 and 64 MiB files,
+  not used to fit it, within −1% to +5%). Not confirmed: the total for downloads, which no bare
+  row of theirs reaches, and what limited their multipart uploads. S3's time per request is not
+  emulated, for either side.
+- **With it, 46 of the 49 rows are at or ahead of SpaceFS's ratio**, in both runs. The large
+  reads are 12–14× faster than the bare bucket, the edits in 32 and 64 MiB files 3.4–37×, the
+  edits in 1 MiB files 1.1–1.2×, and put 32 and 64 MiB 1.7–1.8× (voidfs uploads a body's shards
+  in parallel, the bare bucket's single PUT is held to one stream's rate). Behind: get 64 MiB
+  and stream get 64 and 256 MiB, warm, at 0.79–0.91 of SpaceFS's ratio: voidfs serves 64 MiB
+  from memory in 50–57 ms eight at once, SpaceFS in 45–47.
+- **Cold reads** (`BENCH_COLD=1`: voidfs-server's caches dropped with `SIGUSR1` before every wave
+  of reads), against SpaceFS's cache-cleared figures, as a fraction of the bare bucket's time:
+
+  | Row | voidfs, capped | Capped, no total | No cap | SpaceFS |
+  |---|--:|--:|--:|--:|
+  | get 4 KiB (in a pool without `inline-data`) | 0.02 (0.96–0.98) | 0.02 | 0.02 | 1.08 |
+  | get 1 MiB | 1.03–1.04 | 1.03–1.04 | 1.04–1.05 | 1.18 |
+  | get 32 MiB | 0.72–0.74 | 0.32–0.39 | 1.16–1.18 | 0.50 |
+  | get 64 MiB | 0.69–0.71 | 0.29–0.30 | 1.12–1.16 | 0.38 |
+
+  The small rows are ahead. The large rows are behind with the cap because each of the eight
+  readers of a cold object fetches every shard of it, 537 MB for a wave of 64 MiB reads, which
+  the 1,000 MB/s total holds to about 510 ms; without the total they are ahead. A cold 64 KiB
+  range takes about 3× the bare bucket's time: it fetches its whole shard. Coalescing concurrent
+  fetches comes first in step 3, item 6.
+- Warm and without the cap, the server's change costs nothing: over the 49 rows at 12 ms, the
+  geometric mean against `main` is 0.999, and the rows that looked slower moved −3.1% to +4.1%
+  in voidfs's own time when run focused again.
 
 With multipart completion in two round trips (30 September,
 [bench/results/multipart-complete](../bench/results/multipart-complete/README.md)):
@@ -442,7 +492,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      CI (GitHub Actions) runs them on every push to `main` at a tenth of the operations, with
      versitygw 12 ms away as in the local runs, and keeps the results; MinIO no longer publishes
      binaries, so the benchmark doesn't use it. The run in SpaceFS's setup and the Mac comparison
-     are still to do.
+     are still to do. Since 2026-10-01 the harness also measures cold reads (`BENCH_COLD=1`, in
+     the `client-host` topology too), and emulates S3's bandwidth locally (`BENCH_BANDWIDTH=s3`).
 2. **Finish the engine** (the Phase 1 exit criteria).
    - Garbage collection first. **Done** (E8): two phases per format §12 as amended by
      [RFC 0002](../rfcs/0002-gc-safe-against-writers.md), which closes a race in draft 1 that
@@ -536,14 +587,21 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      of 157–258; the staging records are deleted after. Multipart put 64 MiB × 8 MiB takes 254 ms
      at 12 ms instead of 343, and 256 MiB × 16 MiB 1,008 instead of 1,147. Racing or retried
      completions of one upload now commit once.
-   - Parallel and coalesced shard fetch for cold and large reads, once the harness can measure
-     cold reads.
+   - Cold reads, and S3's bandwidth, measurable locally. **Done**: `SIGUSR1` empties the
+     server's caches and the harness's `--cold` drops them before every wave of reads;
+     `BENCH_BANDWIDTH=s3` caps the emulated bucket as S3 was in SpaceFS's run. With the cap, 46
+     of the 49 rows are at or ahead of SpaceFS's ratio; cold, the small reads are ahead of their
+     cache-cleared figures and the large ones behind.
+   - Parallel and coalesced shard fetch for cold and large reads. Measured cold: eight readers of
+     one cold object each fetch every shard, and a cold range fetches its whole shard. Coalescing
+     first, then ranged shard reads, then the window.
    - **Done when:** every one of the 49 rows is at least as fast as SpaceFS's.
-   - **Status (2026-09-30):** group commit (with its hold), the shard cache's admission, fewer
+   - **Status (2026-10-01):** group commit (with its hold), the shard cache's admission, fewer
      round trips per write (pipelined ingest, background checkpoints, small files in the log),
-     patch chunking each touched shard once, and multipart completion in two round trips are done;
-     25–30 of the 49 rows are there in the local 12 ms runs, and 34–37 on loopback. Next:
-     items 6 and 7.
+     patch chunking each touched shard once, multipart completion in two round trips, and cold
+     reads and S3's bandwidth in the benchmark are done. 27–28 of the 49 rows are there in the
+     local 12 ms runs, 46 with S3's bandwidth emulated, and 34–37 on loopback. Next: item 6
+     (coalesced shard fetches), and the real run (item 7.2).
 4. **Client core, CLI and Rust SDK.**
    - `crates/client`: cache, journal, upload queue, change-feed client.
    - Direct uploads (§4.11), and short-lived storage credentials: R2, AWS STS, and presigned URLs

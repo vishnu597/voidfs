@@ -54,7 +54,8 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Relay TCP to an S3 server with a fixed delay each way, to emulate a distant bucket.
+    /// Relay TCP to an S3 server with a fixed delay each way, and optionally a bandwidth cap, to
+    /// emulate a distant bucket.
     Delay {
         #[arg(long, default_value = "127.0.0.1:7071")]
         listen: std::net::SocketAddr,
@@ -64,6 +65,11 @@ enum Command {
         /// Delay added in each direction; a round trip gains twice this.
         #[arg(long)]
         one_way_ms: f64,
+        /// The most it carries: `s3`, fitted to the bare bucket in SpaceFS's run, or
+        /// `DOWN/UP/TOTAL` in MB/s, down and up per connection and in all each way (`-` for no
+        /// limit). Unlimited if not given.
+        #[arg(long, value_parser = delay::Bandwidth::parse)]
+        bandwidth: Option<delay::Bandwidth>,
     },
     /// Render a results file as a Markdown table.
     Report {
@@ -97,6 +103,15 @@ struct RunArgs {
     /// rounds.
     #[arg(long, env = "VOIDFS_METRICS_URL")]
     voidfs_metrics: Option<String>,
+    /// Measure cold reads: run each round in waves of one operation per worker, and drop
+    /// voidfs-server's caches before each of its waves, so that every measured operation starts
+    /// with them empty. Needs `--voidfs-pid` and `--voidfs-metrics`: the server on this machine,
+    /// SIGUSR1 to drop, its metrics to confirm. The bare target runs the same waves.
+    #[arg(long, requires_all = ["voidfs_pid", "voidfs_metrics"])]
+    cold: bool,
+    /// voidfs-server's process id, for `--cold`.
+    #[arg(long, env = "VOIDFS_SERVER_PID")]
+    voidfs_pid: Option<u32>,
 
     #[command(flatten)]
     bucket: Bucket,
@@ -270,6 +285,10 @@ async fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         nonce,
         tag: tag.clone(),
         metrics: args.voidfs_metrics.clone().map(run::MetricsSource::new),
+        cold: match (args.cold, args.voidfs_pid, &args.voidfs_metrics) {
+            (true, Some(pid), Some(url)) => Some(run::Cold::new(pid, run::MetricsSource::new(url.clone()))),
+            _ => None,
+        },
     };
     let mut file = RunFile {
         harness: format!("voidfs-bench {}", env!("CARGO_PKG_VERSION")),
@@ -284,6 +303,7 @@ async fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             ops_scale: args.ops_scale,
             checksums: format!("{:?}", args.checksums),
             like_spacefs: args.like_spacefs,
+            cold: args.cold,
         },
         environment: Environment {
             os: std::env::consts::OS.into(),
@@ -381,8 +401,9 @@ async fn main() -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Delay { listen, upstream, one_way_ms } => {
-            delay::serve(listen, upstream, std::time::Duration::from_secs_f64(one_way_ms / 1000.0)).await?;
+        Command::Delay { listen, upstream, one_way_ms, bandwidth } => {
+            let link = delay::Link { delay: std::time::Duration::from_secs_f64(one_way_ms / 1000.0), bandwidth: bandwidth.unwrap_or_default() };
+            delay::serve(listen, upstream, link).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Report { file, like_spacefs } => {
