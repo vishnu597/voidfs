@@ -257,6 +257,11 @@ async fn main() -> anyhow::Result<()> {
         keys.insert(KeyInfo { id: id.into(), secret: secret.into(), scope: scope.parse().map_err(anyhow::Error::msg)?, drives: None });
     }
 
+    // Listening from here on, so that a SIGUSR1 sent while the pool opens does not stop the
+    // process, as it does by default.
+    #[cfg(unix)]
+    let usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()).map_err(|e| tracing::warn!("SIGUSR1 will not drop the caches: {e}")).ok();
+
     // Before the pool opens, which can take a while: liveness answers meanwhile, and readiness
     // says why not.
     let admin = admin::Admin::new();
@@ -282,6 +287,10 @@ async fn main() -> anyhow::Result<()> {
         probe::guard_name(pool.desc.commit_guard),
         pool.desc.features.incompatible
     );
+    #[cfg(unix)]
+    if let Some(usr1) = usr1 {
+        tokio::spawn(drop_caches_on(usr1, pool.clone()));
+    }
     if let Some(every) = args.gc_interval {
         tracing::info!("collecting garbage every {}s", every.as_secs());
         tokio::spawn(gc::run_periodically(pool.clone(), gc::Options::default(), every));
@@ -323,6 +332,16 @@ async fn shutdown_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Empties the shard and page caches whenever `signals` fires: SIGUSR1, which operators and the
+/// benchmark's `--cold` send to measure cold reads. It is not part of the S3 surface.
+#[cfg(unix)]
+async fn drop_caches_on(mut signals: tokio::signal::unix::Signal, pool: Arc<pool::Pool>) {
+    while signals.recv().await.is_some() {
+        let d = pool.drop_caches();
+        tracing::info!("SIGUSR1: dropped the caches: {} shards ({} MiB), {} pages ({} KiB)", d.shards, d.shard_bytes >> 20, d.pages, d.page_bytes >> 10);
+    }
 }
 
 /// Whether listening on both would take the same port: the same address, or the same port where
@@ -400,6 +419,31 @@ mod tests {
         assert!(!same_port(addr("127.0.0.1:9001"), addr("127.0.0.1:9000")));
         assert!(!same_port(addr("127.0.0.1:9000"), addr("127.0.0.2:9000")));
         assert!(!same_port(addr("127.0.0.1:0"), addr("127.0.0.1:0")));
+    }
+
+    /// SIGUSR1, sent here to this test process, empties the caches of the pool it serves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigusr1_drops_the_caches() {
+        use crate::metrics::{encode, sample};
+        let pool = pool::Pool::open(Store::memory().unwrap(), 1 << 20).await.unwrap();
+        let usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()).unwrap();
+        tokio::spawn(drop_caches_on(usr1, pool.clone()));
+        let data = bytes::Bytes::from_static(b"cached");
+        pool.write_shards(&[voidfs_core::chunk::Shard { hash: voidfs_core::ids::ShardHash::of(&data), bytes: data }]).await.unwrap();
+        let entries = |text: &str| sample(text, r#"voidfs_cache_entries{cache="shard"}"#);
+        assert_eq!(entries(&encode(pool.gather_metrics())), Some(1.0));
+        assert!(std::process::Command::new("kill").args(["-USR1", &std::process::id().to_string()]).status().unwrap().success());
+        let mut text = String::new();
+        for _ in 0..200 {
+            text = encode(pool.gather_metrics());
+            if sample(&text, "voidfs_cache_drops_total") == Some(1.0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(sample(&text, "voidfs_cache_drops_total"), Some(1.0), "dropped once");
+        assert_eq!(entries(&text), Some(0.0));
     }
 
     #[test]

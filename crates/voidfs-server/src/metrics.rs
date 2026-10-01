@@ -259,6 +259,8 @@ pub struct PoolMetrics {
     registry: Registry,
     pub shards: CacheMetrics,
     pub pages: CacheMetrics,
+    /// Times both caches were emptied (SIGUSR1).
+    pub cache_drops: IntCounter,
     /// Transactions in each log entry written.
     pub batch: Histogram,
     /// How long each log entry took to write.
@@ -326,6 +328,7 @@ impl PoolMetrics {
         PoolMetrics {
             shards,
             pages,
+            cache_drops: counter(&r, "voidfs_cache_drops_total", "Times the shard and page caches were emptied, on SIGUSR1."),
             batch,
             log_write,
             hold,

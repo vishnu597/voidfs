@@ -174,6 +174,7 @@ or a private network, and never publish it. No label names a drive or a key.
 | `voidfs_bucket_request_duration_seconds` | `op` | Their latency (histogram) |
 | `voidfs_cache_hits_total`, `voidfs_cache_misses_total`, `voidfs_cache_evictions_total` | `cache` (`shard`, `page`) | Reads served from memory, and from the bucket; entries evicted for room |
 | `voidfs_cache_bytes`, `voidfs_cache_entries`, `voidfs_cache_capacity_bytes` | `cache` | What each cache holds, and the most it may |
+| `voidfs_cache_drops_total` | | Times the caches were emptied on SIGUSR1 (below) |
 | `voidfs_commit_transactions` | | Transactions in each log entry written: group commit's batches (histogram) |
 | `voidfs_commit_log_write_seconds` | | Time to write each log entry (histogram) |
 | `voidfs_commits_total`, `voidfs_checkpoints_total` | `outcome` | Log entries written, lost to another server's, or failed; checkpoints written or failed |
@@ -190,6 +191,10 @@ The S3 port's `op` is one of `list_drives`, `drive`, `list`, `get`, `head`, `put
 `delete`, `multipart`, `extension` (the `x-voidfs-*` requests) and `other`. The bucket's is one of
 `get`, `head`, `put`, `put_new` (create-if-absent), `delete`, `delete_prefix` and `list`; a listing
 or a deletion by prefix may take several requests.
+
+`SIGUSR1` empties the shard and page caches, so that the next reads go to the bucket as after a
+restart; the benchmark's cold runs use it. Only someone who can signal the process can do it, and
+nothing on either port does. The drives' state, which the server serves from, stays in memory.
 
 ## Repository
 

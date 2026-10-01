@@ -477,6 +477,15 @@ pub struct Pool {
     pub metrics: PoolMetrics,
 }
 
+/// What [`Pool::drop_caches`] emptied the caches of.
+#[derive(Debug)]
+pub struct Dropped {
+    pub shards: u64,
+    pub shard_bytes: u64,
+    pub pages: u64,
+    pub page_bytes: u64,
+}
+
 /// What a cache keeps of `b`: a copy holding only these bytes. A slice keeps its whole buffer
 /// alive, and a shard cut by the chunker is a slice of a buffer of up to about 32 MiB.
 fn cached(b: &Bytes) -> Bytes {
@@ -943,6 +952,22 @@ impl Pool {
     pub fn forget(&self, h: &ShardHash) {
         self.shards.invalidate(h);
         self.pages.invalidate(h);
+    }
+
+    /// Empties the shard and page caches, so that reads go to the bucket as they would after a
+    /// restart: an operator sends SIGUSR1 for it, to measure cold reads. Nothing else is
+    /// dropped. The drives' states are what the server serves from, not caches, and the guard's
+    /// checks only spare writes their uploads. Reads in flight may put back what they fetch.
+    pub fn drop_caches(&self) -> Dropped {
+        let mut held = [(0, 0); 2];
+        for (cache, held) in [&self.shards, &self.pages].into_iter().zip(&mut held) {
+            cache.run_pending_tasks();
+            *held = (cache.entry_count(), cache.weighted_size());
+            cache.invalidate_all();
+            cache.run_pending_tasks();
+        }
+        self.metrics.cache_drops.inc();
+        Dropped { shards: held[0].0, shard_bytes: held[0].1, pages: held[1].0, page_bytes: held[1].1 }
     }
 
     /// The pool's metrics, with what they report as of now: the caches' sizes, the drives, and
@@ -2972,6 +2997,50 @@ mod tests {
             futures::future::ready(Fault::None).boxed()
         })));
         assert_eq!(pool.extents(&desc).await.unwrap(), extents);
+    }
+
+    /// Dropping the caches empties both, and only them: reads then fetch every shard and page
+    /// once, and return the same bytes. The drive's state stays, and so do the guard's checks.
+    #[tokio::test]
+    async fn dropping_the_caches_empties_them_and_reads_come_back_the_same() {
+        let mem = Arc::new(MemStore::new(Clock::System));
+        let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
+        let d = pool.create_drive("cold", None).await.unwrap();
+        // More extents than a descriptor holds, so that the file has manifest pages too.
+        let pieces = blobs("piece", 1_100, 16);
+        write_as(&pool, guard::Kind::Shard, &pieces).await;
+        let desc = pool.describe(pieces.iter().map(|(h, b)| Extent::Shard { s: *h, n: b.len() as u64 }).collect()).await.unwrap();
+        assert!(matches!(desc, ContentDescriptor::Tree { .. }));
+        pool.commit(&d, put_plan("big", &desc, Precondition::default(), &Arc::default())).await.unwrap();
+        put(&pool, &d, "small", b"hello").await;
+        let want: Vec<u8> = pieces.iter().flat_map(|(_, b)| b.to_vec()).collect();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            log.lock().unwrap().push((op, path.split('/').next().unwrap_or_default().to_owned()));
+            futures::future::ready(Fault::None).boxed()
+        })));
+        let requests = |op: MemOp, dir: &str| seen.lock().unwrap().iter().filter(|(o, d)| *o == op && (dir.is_empty() || d == dir)).count();
+        assert_eq!(read(&pool, &d, "big").await.unwrap(), want);
+        assert_eq!(requests(MemOp::Get, ""), 0, "warm: everything from memory");
+
+        let dropped = pool.drop_caches();
+        assert_eq!((dropped.shards, dropped.shard_bytes), (1_101, 1_100 * 16 + 5), "{dropped:?}");
+        assert!(dropped.pages > 0 && dropped.page_bytes > 0, "{dropped:?}");
+        for cache in [&pool.shards, &pool.pages] {
+            cache.run_pending_tasks();
+            assert_eq!((cache.entry_count(), cache.weighted_size()), (0, 0));
+        }
+        assert_eq!(pool.metrics.cache_drops.get(), 1);
+
+        assert_eq!(read(&pool, &d, "big").await.unwrap(), want);
+        assert_eq!(read(&pool, &d, "small").await.unwrap(), b"hello");
+        assert_eq!(read(&pool, &d, "big").await.unwrap(), want);
+        assert_eq!(requests(MemOp::Get, "shards"), 1_101, "cold: each shard fetched once");
+        assert_eq!(requests(MemOp::Get, "pages") as u64, dropped.pages, "and each page");
+        assert_eq!(seen.lock().unwrap().len(), 1_101 + dropped.pages as usize, "nothing else: the drive's state stays");
+        write_as(&pool, guard::Kind::Shard, &pieces[..1]).await;
+        assert_eq!(requests(MemOp::Put, "") + requests(MemOp::PutNew, ""), 0, "the guard's checks stay: a shard stored already is not uploaded again");
     }
 
     // -----------------------------------------------------------------------------------------
