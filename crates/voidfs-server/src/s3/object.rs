@@ -2090,28 +2090,34 @@ mod tests {
     async fn a_failed_deletion_of_the_records_is_tried_again() {
         let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
         let (app, d) = app_with(&mem, &[]).await;
-        let failures = Arc::new(AtomicUsize::new(1));
+        // Deletions under the upload left to fail.
+        let failures = Arc::new(std::sync::Mutex::new(1usize));
         let left = failures.clone();
         mem.set_hook(Some(Arc::new(move |op, path| {
-            let fail = op == MemOp::Delete && path.contains("/uploads/") && left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+            let fail = op == MemOp::Delete && path.contains("/uploads/") && {
+                let mut n = left.lock().unwrap();
+                let fail = *n > 0;
+                *n = n.saturating_sub(1);
+                fail
+            };
             futures::future::ready(if fail { Fault::Fail } else { Fault::None }).boxed()
         })));
         let id = create(&app, "mp", &[]).await;
         let etag = part(&app, "mp", &id, 1, b"one").await;
         complete(&app, "mp", &id, &[(1, &etag)]).await.unwrap();
-        until("the first deletion fails", || failures.load(Ordering::SeqCst) == 0).await;
+        until("the first deletion fails", || *failures.lock().unwrap() == 0).await;
         assert!(staged(&mem, &d, &id));
         no_upload(complete(&app, "mp", &id, &[(1, &etag)]).await);
         assert!(!uploads_listed(&app).await.contains(&id));
         until("the second deletion succeeds", || !staged(&mem, &d, &id)).await;
         until("and the claim goes", || app.uploads.claims.lock().unwrap().is_empty()).await;
 
-        failures.store(usize::MAX, Ordering::SeqCst);
+        *failures.lock().unwrap() = usize::MAX;
         let id = create(&app, "mp2", &[]).await;
         let etag = part(&app, "mp2", &id, 1, b"two").await;
         complete(&app, "mp2", &id, &[(1, &etag)]).await.unwrap();
-        until("the first deletion fails", || failures.load(Ordering::SeqCst) < usize::MAX).await;
-        failures.store(0, Ordering::SeqCst);
+        until("the first deletion fails", || *failures.lock().unwrap() < usize::MAX).await;
+        *failures.lock().unwrap() = 0;
         assert!(staged(&mem, &d, &id));
         app.uploads.finish(&app.pool).await;
         assert!(!staged(&mem, &d, &id));
