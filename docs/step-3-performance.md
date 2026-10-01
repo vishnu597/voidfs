@@ -540,6 +540,52 @@ single edit in the same file. That is 4.7–6.5× the bare bucket's download, ch
 
 ### Item 5. Multipart completion
 
+**Status (30 September 2026): done.** Measured in
+[bench/results/multipart-complete](../bench/results/multipart-complete/README.md):
+- **Completion answers in two round trips.** At 12 ms, 32 ms at the median, where it took 157 ms
+  for 8 parts and 258 ms for 16: one round trip reads the upload's record and every part's
+  together, one commits. The staging records are deleted after answering.
+- **The uploads' own times fell** in every focused pair at 12 ms: multipart put 64 MiB × 8 MiB
+  from 343 to 254 ms (−26%), 256 MiB × 16 MiB from 1,147 to 1,008 ms (−12%). Relative to the bare
+  bucket, whose multipart times varied 2× within the session, the full runs put them at 0.74× and
+  1.50× the bare bucket's time (64 MiB) and 1.50× and 0.80× (256 MiB), against `main`'s 1.45× and
+  1.70×, and 1.58× and 1.25×. Both builds are ahead of SpaceFS's 2.44× and 1.79× in every run.
+- In one binary switched between the two paths, multipart put 64 MiB took 23% less time, and
+  256 MiB only 2%: in those runs the local disk had slowed down, and eight uploads of 256 MiB at
+  once waited for it, not for completion's round trips.
+- On loopback, where the round trips cost little, nothing moved beyond the spread.
+- Over the 49 rows, relative to the bare bucket, the geometric mean against `main` is 0.967 at
+  12 ms and 1.015 on loopback. The rows that looked slower in the full runs do not run this code,
+  and run focused again were not.
+- **LIST per upload: 1 to 0.** GETs per upload are unchanged (17 and 33): each part still reads
+  `upload.json`, now while its body is read, and completion still reads each part's record, now all
+  at once.
+
+What was built, in [object.rs](../crates/voidfs-server/src/s3/object.rs):
+- Completion reads `upload.json` and the listed parts' records by name, together (at most 32 at
+  a time), and lists nothing. The errors keep their order: the upload's, the body's, then the
+  parts' as listed.
+- It commits, answers, and then deletes the staging prefix, retrying for about 40 seconds; at
+  shutdown, what is left is deleted once more.
+- A claim per upload, in the server's memory, says it is completed until its records are gone:
+  completions and aborts of one upload take turns, so racing or retried completions commit once,
+  and ListMultipartUploads, ListParts, UploadPart and aborts see the upload as gone. The completion
+  runs in a task of its own, so a client that goes away cannot leave it committed and still open.
+- UploadPart looks its upload up while it reads the part, and answers NoSuchUpload as soon as the
+  lookup does. A part whose upload is completed meanwhile is refused before its record is written.
+- The on-bucket format, and what GC counts as roots, are unchanged.
+
+Left for later:
+- The claim is per server: two servers completing one upload at once can still both commit, and
+  another server sees a completed upload open until its records are deleted. Closing that across
+  servers needs the upload's id in the commit, a format change.
+- A part whose record lands after its upload's staging prefix was deleted leaves an orphan record
+  (now only when it lands within one round trip of the completion). Records with no `upload.json`
+  are never aborted by GC, and stay roots.
+- The GETs per part and per record: keeping the part list in one record, or `upload.json` in
+  memory, would remove them, but the first changes the format and the second would miss aborts by
+  another server or by `voidfs-server gc`.
+
 **Problem.** `complete_upload` ([object.rs:870](../crates/voidfs-server/src/s3/object.rs#L870))
 makes a chain of round trips before it answers:
 - it reads the upload record;
