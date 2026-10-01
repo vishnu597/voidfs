@@ -90,37 +90,46 @@ billing or plans), this page says so.
 ## 3. Scorecard
 
 Every item of the plan's checklist (§3, 65 items, including the Finder integration item added on
-2026-09-27), scored against the code:
+2026-09-27), scored against the code on `main` at `939b57c` and the results in `bench/results/`
+(refreshed 2026-10-01; the previous scorecard was of 28 September):
 
 | Area | Done | Partly | Missing | State |
 |---|---|---|---|---|
-| Engine (E1–E13) | 8 | 1 | 4 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints and garbage collection work. Missing: the small-file path, direct uploads, encryption, retention policies |
-| Storage backends (B1–B8) | 1 | 1 | 6 | Local disk, R2 and versitygw (the local S3 server the benchmarks use) work. Not yet run on AWS S3 or MinIO. A capability probe checks the bucket at start. No short-lived storage credentials, no adopt or export |
-| Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed, on one node. Missing: a disk cache tier, several nodes, several regions, quotas |
+| Engine (E1–E13) | 9 | 1 | 3 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints, garbage collection, and small files held in the log (RFC 0003, the `inline-data` pool feature) work. Missing: direct uploads, encryption, retention policies |
+| Storage backends (B1–B8) | 2 | 0 | 6 | Local disk, AWS S3, Cloudflare R2, MinIO (built from source in CI) and versitygw work, and rclone works against the server. A capability probe checks the bucket at start. No other providers tried, no short-lived storage credentials, no stored bucket credentials, no adopt or export |
+| Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed (long poll and SSE), on one node. Missing: direct upload and storage credentials, a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
-| Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount (the spike). No agent, journal, CLI, Finder integration, Linux or Windows |
-| SDKs, agents, search (A1–A7) | 0 | 0 | 7 | Stock S3 SDKs and the AWS CLI work; nothing voidfs-specific |
-| Operations (O1–O6) | 1 | 2 | 3 | One binary, with a Compose file. Health checks and Prometheus metrics on a port of their own. A benchmark harness, not yet run in the cloud. No tracing, Helm chart or audit |
-| **Total** | **13** | **11** | **41** | Of the 28 P0 items: 13 done, 7 partly, 8 missing |
+| Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount and its menu-bar shell (the spike). No client core, journal, CLI, Finder integration, Linux or Windows |
+| SDKs, agents, search (A1–A7) | 0 | 0 | 7 | Stock S3 SDKs, boto3, rclone and curl work; nothing voidfs-specific |
+| Operations (O1–O6) | 1 | 2 | 3 | One binary, with a Compose file. Health checks and Prometheus metrics on a port of their own. A benchmark harness run locally, against R2 and AWS S3 for the small objects, and in CI, not yet in SpaceFS's setup. No tracing, Helm chart, fuzzing or audit |
+| **Total** | **15** | **10** | **40** | Of the 28 P0 items: 14 done, 6 partly, 8 missing |
 
-Earlier stocktakes counted 71 items and 6 more missing than the rows add up to; the checklist has
-65. The P0 counts were right.
+What moved since 28 September: E9 (small files held in the log, RFC 0003) is done, and B1 is done
+now that AWS S3 and MinIO have run the conformance suite and the clients.
 
 "Partly" means:
-- E1 has no compression.
-- B1 is not yet run on AWS S3 or MinIO.
-- S3 lacks direct upload and credentials; S5 is memory-only; S8 has no operations catalogue.
-- C3 keys can't be minted or revoked.
+- E1 has no compression (`shard-zstd` is a reserved pool feature that servers refuse).
+- S3 lacks direct upload (§4.11), storage credentials (§5.5, which answer `501`), copy-mode forks
+  (`x-voidfs-fork-mode: copy` answers `501`) and display names (`x-voidfs-display-name` is
+  ignored: a drive's display name is its alias). S5 is memory-only. S8 has the protocol header
+  and 38 conformance cases, but no operations catalogue.
+- C3 keys come from command-line flags: they can't be minted or revoked while the server runs, and
+  the drive allowlist exists in the code but no flag sets it.
 - D3 is read-only, D6 relies on the kernel's read-ahead only, and D11 is the spike's shell.
-- O4 has health checks and metrics, not tracing or structured logs. O5 has run locally and
-  against R2, not yet in SpaceFS's setup.
+- O4 has health checks and metrics, not tracing or structured logs. O5 has run locally, against R2
+  and AWS S3 (the 23 small-object scenarios) and in CI, not yet in SpaceFS's setup.
+
+Two items count as done with a gap that can't matter yet:
+- E7: a fork across pools answers `501` rather than copying, but a deployment has one pool.
+- B3: temporary credentials are reported as not probed (AWS needs a role to assume, R2 an API
+  token); B4 adds them.
 
 The 28 P0 items, which a credible v1 needs:
 
 | Status | Items |
 |---|---|
-| Done (13) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, E11 checkpoints, B3 capability probe, S1 S3 server, S2 S3 subset, S4 per-drive authority and change feed, O1 single binary and compose |
-| Partly (7) | E1 chunking, B1 backends, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount |
+| Done (14) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, E11 checkpoints, B1 backends, B3 capability probe, S1 S3 server, S2 S3 subset, S4 per-drive authority and change feed, O1 single binary and compose |
+| Partly (6) | E1 chunking, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount |
 | Missing (8) | B5 stored bucket credentials, C1 sign-in, C2 workspaces, C4 bucket connections, D1 client daemon, D5 desktop semantics, D9 CLI, A1 Rust and TypeScript SDKs |
 
 ## 4. Product by product
