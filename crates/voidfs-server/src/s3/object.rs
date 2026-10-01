@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::response::Response;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use http::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -903,6 +903,109 @@ struct PartRecord {
 }
 
 const MIN_PART: u64 = 5 * 1024 * 1024;
+/// Attempts at deleting a completed upload's staging records, the first at once and each
+/// retry four times as long after the one before: 0.5, 2, 8 and 32 seconds.
+const DELETE_TRIES: u32 = 5;
+
+/// The multipart uploads this server is completing or aborting, and those it completed whose
+/// staging records (format §11) are not deleted yet, by staging prefix.
+///
+/// A completion answers once it commits, and deletes the staging records after. Until they are
+/// gone the upload still looks open in the bucket, so this is what says it is not: a completion
+/// that comes after, as a retry or racing the first, waits for the first to finish and then
+/// finds no upload, as do an abort, UploadPart and ListParts, and ListMultipartUploads leaves it
+/// out. Another server, or this one after a restart, sees the upload open until the records
+/// are gone.
+#[derive(Default)]
+pub struct Uploads {
+    claims: std::sync::Mutex<HashMap<String, Arc<Claim>>>,
+}
+
+#[derive(Default)]
+struct Claim {
+    /// Held by a completion or an abort while it runs.
+    turn: Arc<tokio::sync::Mutex<()>>,
+    /// Completed: the upload is no more, whatever the bucket still holds.
+    done: std::sync::atomic::AtomicBool,
+}
+
+/// A request's hold on an upload's claim, which it sees completed even once the claim has left
+/// [`Uploads`]. Dropped, it leaves no trace of an upload not completed once no one else holds it.
+struct Hold<'a> {
+    uploads: &'a Uploads,
+    dir: String,
+    claim: Arc<Claim>,
+}
+
+/// A completion's or an abort's turn at an upload.
+struct Turn<'a> {
+    _held: tokio::sync::OwnedMutexGuard<()>,
+    hold: Hold<'a>,
+}
+
+impl Uploads {
+    fn hold(&self, dir: &str) -> Hold<'_> {
+        let claim = self.claims.lock().unwrap().entry(dir.to_owned()).or_default().clone();
+        Hold { uploads: self, dir: dir.to_owned(), claim }
+    }
+
+    async fn turn(&self, dir: &str) -> Turn<'_> {
+        let hold = self.hold(dir);
+        Turn { _held: hold.claim.turn.clone().lock_owned().await, hold }
+    }
+
+    /// Whether the upload under `dir` was completed here.
+    fn done(&self, dir: &str) -> bool {
+        self.claims.lock().unwrap().get(dir).is_some_and(|c| c.done.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Deletes the staging records of the uploads completed here that are still there, once: at
+    /// shutdown, so that a deletion in progress or waiting to retry does not leave one looking
+    /// open.
+    pub async fn finish(&self, pool: &Pool) {
+        let dirs: Vec<String> = self.claims.lock().unwrap().iter().filter(|(_, c)| c.done.load(std::sync::atomic::Ordering::Acquire)).map(|(dir, _)| dir.clone()).collect();
+        futures::future::join_all(dirs.iter().map(|dir| async move {
+            if let Err(e) = pool.store.delete_prefix(dir).await {
+                tracing::warn!("the staging records of a completed upload, {dir}, are left for the garbage collector: {e:#}");
+            }
+        }))
+        .await;
+    }
+}
+
+impl Hold<'_> {
+    fn done(&self) -> bool {
+        self.claim.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        let mut claims = self.uploads.claims.lock().unwrap();
+        // Clones are made only under the lock: two means the map's and this one.
+        if !self.done() && Arc::strong_count(&self.claim) == 2 {
+            claims.remove(&self.dir);
+        }
+    }
+}
+
+impl Turn<'_> {
+    fn complete(&self) {
+        self.hold.claim.done.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Runs `work` alongside `check`, and answers `check`'s error first: `work` is dropped as soon as
+/// `check` fails, and its own error waits until `check` has passed.
+async fn checked<T, U>(check: impl Future<Output = Result<T, S3Error>>, work: impl Future<Output = Result<U, S3Error>>) -> Result<(T, U), S3Error> {
+    match futures::future::select(std::pin::pin!(check), std::pin::pin!(work)).await {
+        futures::future::Either::Left((checked, work)) => {
+            let checked = checked?;
+            Ok((checked, work.await?))
+        }
+        futures::future::Either::Right((done, check)) => Ok((check.await?, done?)),
+    }
+}
 
 fn upload_dir(d: &Drive, id: &str) -> Result<String, S3Error> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
@@ -913,6 +1016,9 @@ fn upload_dir(d: &Drive, id: &str) -> Result<String, S3Error> {
 
 async fn load_upload(app: &App, d: &Drive, id: &str, key: &str) -> Result<(String, UploadRecord), S3Error> {
     let dir = upload_dir(d, id)?;
+    if app.uploads.done(&dir) {
+        return Err(S3Error::new(404, "NoSuchUpload", "no such upload"));
+    }
     let bytes = app.pool.store.get(&format!("{dir}upload.json")).await?.ok_or_else(|| S3Error::new(404, "NoSuchUpload", "no such upload"))?;
     let rec: UploadRecord = serde_json::from_slice(&bytes).map_err(anyhow::Error::from)?;
     if rec.key != key {
@@ -942,25 +1048,35 @@ async fn create_upload(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response,
 
 async fn upload_part(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result<Response, S3Error> {
     let n: u32 = ctx.query.get("partNumber").and_then(|p| p.parse().ok()).filter(|p| (1..=10_000).contains(p)).ok_or_else(|| S3Error::invalid("partNumber must be 1 to 10000"))?;
-    let (dir, _) = load_upload(app, d, ctx.query.get("uploadId").unwrap_or_default(), ctx.key()).await?;
-    let extents = if let Some(src) = ctx.header("x-amz-copy-source") {
-        if ctx.header("x-amz-copy-source-range").is_some() {
-            return Err(S3Error::not_implemented("UploadPartCopy with a range is not supported yet"));
+    let id = ctx.query.get("uploadId").unwrap_or_default();
+    // Held from the start, so that a completion while the part is read is seen at the end.
+    let hold = app.uploads.hold(&upload_dir(d, id)?);
+    // The upload is looked up while the part is read and its shards uploaded. If there is none,
+    // the part is dropped, and what it uploaded is left to the garbage collector.
+    let part = async {
+        if let Some(src) = ctx.header("x-amz-copy-source") {
+            if ctx.header("x-amz-copy-source-range").is_some() {
+                return Err(S3Error::not_implemented("UploadPartCopy with a range is not supported yet"));
+            }
+            let decoded = percent_encoding::percent_decode_str(src).decode_utf8_lossy().into_owned();
+            let (b, k) = decoded.trim_start_matches('/').split_once('/').ok_or_else(|| S3Error::invalid("bad x-amz-copy-source"))?;
+            let sd = ctx.drive_named(app, b)?;
+            let ss = sd.snapshot();
+            let oid = ss.lookup(&parse_key(k)?).ok_or_else(S3Error::no_key)?;
+            let r = ss.record(&oid).ok_or_else(S3Error::no_key)?;
+            let extents = app.pool.extents(r.content.as_ref().unwrap_or(&ContentDescriptor::empty())).await?;
+            // A part holds no data extents (format §11): a small source's bytes go to a shard.
+            let spilled = content::spill(&extents);
+            app.pool.write_shards(&spilled.new_shards).await?;
+            Ok(spilled.extents)
+        } else {
+            ingest(&app.pool, BodyReader::new(body, ctx, MAX_PUT)?, false).await
         }
-        let decoded = percent_encoding::percent_decode_str(src).decode_utf8_lossy().into_owned();
-        let (b, k) = decoded.trim_start_matches('/').split_once('/').ok_or_else(|| S3Error::invalid("bad x-amz-copy-source"))?;
-        let sd = ctx.drive_named(app, b)?;
-        let ss = sd.snapshot();
-        let oid = ss.lookup(&parse_key(k)?).ok_or_else(S3Error::no_key)?;
-        let r = ss.record(&oid).ok_or_else(S3Error::no_key)?;
-        let extents = app.pool.extents(r.content.as_ref().unwrap_or(&ContentDescriptor::empty())).await?;
-        // A part holds no data extents (format §11): a small source's bytes go to a shard.
-        let spilled = content::spill(&extents);
-        app.pool.write_shards(&spilled.new_shards).await?;
-        spilled.extents
-    } else {
-        ingest(&app.pool, BodyReader::new(body, ctx, MAX_PUT)?, false).await?
     };
+    let ((dir, _), extents) = checked(load_upload(app, d, id, ctx.key()), part).await?;
+    if hold.done() {
+        return Err(S3Error::new(404, "NoSuchUpload", "no such upload"));
+    }
     let size = content::size(&extents);
     let etag = ContentDescriptor::Inline { extents: extents.clone() }.etag();
     let rec = PartRecord { part: n, size, etag: etag.clone(), extents };
@@ -971,29 +1087,30 @@ async fn upload_part(app: &Arc<App>, ctx: &Ctx, d: &Drive, body: Body) -> Result
     Ok(empty(200).header("etag", etag).body(Body::empty()).unwrap())
 }
 
-async fn parts_of(app: &App, dir: &str) -> Result<Vec<PartRecord>, S3Error> {
-    let mut out = Vec::new();
-    for name in app.pool.store.list_files(dir, None).await? {
-        if name == "upload.json" {
-            continue;
-        }
-        if let Some(b) = app.pool.store.get(&format!("{dir}{name}")).await? {
-            let p = serde_json::from_slice::<PartRecord>(&b).map_err(anyhow::Error::from)?;
-            if voidfs_core::model::data_len(&p.extents) > 0 {
-                return Err(S3Error::internal(format!("{dir}{name} holds a data extent, which part records never do (format §11)")));
-            }
-            out.push(p);
-        }
+/// Staging records a request reads at once.
+const READ_RECORDS: usize = 32;
+
+/// A part record, or `None` if there is none at `path`.
+async fn read_part(app: &App, path: String) -> Result<Option<PartRecord>, S3Error> {
+    let Some(b) = app.pool.store.get(&path).await? else { return Ok(None) };
+    let p = serde_json::from_slice::<PartRecord>(&b).map_err(anyhow::Error::from)?;
+    if voidfs_core::model::data_len(&p.extents) > 0 {
+        return Err(S3Error::internal(format!("{path} holds a data extent, which part records never do (format §11)")));
     }
+    Ok(Some(p))
+}
+
+async fn parts_of(app: &App, dir: &str) -> Result<Vec<PartRecord>, S3Error> {
+    let reads: Vec<_> = app.pool.store.list_files(dir, None).await?.into_iter().filter(|name| name != "upload.json").map(|name| read_part(app, format!("{dir}{name}"))).collect();
+    let read: Vec<Option<PartRecord>> = futures::stream::iter(reads).buffered(READ_RECORDS).try_collect().await?;
+    let mut out: Vec<PartRecord> = read.into_iter().flatten().collect();
     out.sort_by_key(|p| p.part);
     Ok(out)
 }
 
-async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
-    let key = ctx.key().to_owned();
-    let (dir, rec) = load_upload(app, d, ctx.query.get("uploadId").unwrap_or_default(), &key).await?;
-    let body = BodyReader::new(body, ctx, MAX_SMALL_BODY)?.read_all().await?;
-    let text = std::str::from_utf8(&body).map_err(|_| S3Error::new(400, "MalformedXML", "not UTF-8"))?;
+/// The parts a CompleteMultipartUpload body lists: number and ETag, in ascending order.
+fn completed_parts(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
+    let text = std::str::from_utf8(body).map_err(|_| S3Error::new(400, "MalformedXML", "not UTF-8"))?;
     let doc = roxmltree::Document::parse(text).map_err(|e| S3Error::new(400, "MalformedXML", e.to_string()))?;
     let mut wanted = Vec::new();
     for p in doc.root_element().children().filter(|n| n.tag_name().name() == "Part") {
@@ -1007,26 +1124,65 @@ async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) 
     if wanted.windows(2).any(|w| w[0].0 >= w[1].0) {
         return Err(S3Error::new(400, "InvalidPartOrder", "parts must be listed in ascending order"));
     }
-    let have: HashMap<u32, PartRecord> = parts_of(app, &dir).await?.into_iter().map(|p| (p.part, p)).collect();
-    let mut extents = Vec::new();
-    for (i, (n, etag)) in wanted.iter().enumerate() {
-        let p = have.get(n).ok_or_else(|| S3Error::new(400, "InvalidPart", format!("part {n} was not uploaded")))?;
+    Ok(wanted)
+}
+
+/// The records of the parts a completion lists, read at once and checked in order.
+async fn completed_records(app: &App, dir: &str, wanted: &[(u32, String)]) -> Result<Vec<PartRecord>, S3Error> {
+    let reads: Vec<_> = wanted.iter().enumerate().map(|(i, (n, etag))| async move {
+        let p = read_part(app, format!("{dir}{n:05}.json")).await?.ok_or_else(|| S3Error::new(400, "InvalidPart", format!("part {n} was not uploaded")))?;
         if p.etag.trim_matches('"') != etag.trim_matches('"') {
             return Err(S3Error::new(400, "InvalidPart", format!("part {n} has a different ETag")));
         }
         if i + 1 < wanted.len() && p.size < MIN_PART {
             return Err(S3Error::new(400, "EntityTooSmall", format!("part {n} is smaller than 5 MiB")));
         }
-        extents.extend(p.extents.iter().cloned());
-    }
-    let desc = app.pool.describe(content::normalize(extents)).await?;
-    let pre = ctx.precondition();
-    let actor = ctx.actor();
-    let attrs = rec.attrs;
-    let (v, s) = commit(app, d, move |st| Ok(ops::put(st, &key, desc.clone(), attrs.clone(), Op::Put, &pre, &actor)?)).await?;
-    let _ = app.pool.store.delete_prefix(&dir).await;
+        Ok(p)
+    }).collect();
+    futures::stream::iter(reads).buffered(READ_RECORDS).try_collect().await
+}
+
+async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
+    let key = ctx.key().to_owned();
+    let id = ctx.query.get("uploadId").unwrap_or_default().to_owned();
+    let dir = upload_dir(d, &id)?;
+    let body = match BodyReader::new(body, ctx, MAX_SMALL_BODY) {
+        Ok(reader) => reader.read_all().await,
+        Err(e) => Err(e),
+    };
+    let (pre, actor) = (ctx.precondition(), ctx.actor());
+    // A task of its own, so that a client that goes away cannot leave the upload committed and
+    // still open. It answers once it commits, then deletes the staging records.
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    let (app2, d) = (app.clone(), d.clone());
+    tokio::spawn(async move {
+        let app = &app2;
+        let turn = app.uploads.turn(&dir).await;
+        let committed = async {
+            // The upload's record and those of the parts the body lists, read together. The
+            // upload's errors come first, then the body's, then the parts' in the order listed.
+            let ((_, rec), parts) = checked(load_upload(app, &d, &id, &key), async { completed_records(app, &dir, &completed_parts(&body?)?).await }).await?;
+            let extents: Vec<Extent> = parts.into_iter().flat_map(|p| p.extents).collect();
+            let desc = app.pool.describe(content::normalize(extents)).await?;
+            let attrs = rec.attrs;
+            let k = key.clone();
+            let (v, s) = commit(app, &d, move |st| Ok(ops::put(st, &k, desc.clone(), attrs.clone(), Op::Put, &pre, &actor)?)).await?;
+            let etag = s.lookup(&parse_key(&key)?).and_then(|o| s.record(&o).map(|r| r.etag.clone())).unwrap_or_default();
+            Ok::<_, S3Error>((v, etag))
+        }
+        .await;
+        let done = committed.is_ok();
+        if done {
+            turn.complete();
+        }
+        drop(turn);
+        let _ = reply.send(committed);
+        if done {
+            delete_staging(app, &dir).await;
+        }
+    });
+    let (v, etag) = answer.await.unwrap_or_else(|_| Err(S3Error::internal("the completion was abandoned")))?;
     let key = ctx.key();
-    let etag = s.lookup(&parse_key(key)?).and_then(|o| s.record(&o).map(|r| r.etag.clone())).unwrap_or_default();
     let mut resp = xml(
         200,
         format!(
@@ -1041,8 +1197,31 @@ async fn complete_upload(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) 
     Ok(resp)
 }
 
+/// Deletes a completed upload's staging records, retrying for a while. Once they are gone, the
+/// claim that said the upload is done goes too; if they cannot be, it stays, and the records stay
+/// GC roots until the collector aborts the upload (format §11).
+async fn delete_staging(app: &App, dir: &str) {
+    let mut wait = std::time::Duration::from_millis(500);
+    for attempt in 1..=DELETE_TRIES {
+        match app.pool.store.delete_prefix(dir).await {
+            Ok(()) => {
+                app.uploads.claims.lock().unwrap().remove(dir);
+                return;
+            }
+            Err(e) => tracing::warn!("deleting the staging records of a completed upload, {dir}, try {attempt} of {DELETE_TRIES}: {e:#}"),
+        }
+        if attempt < DELETE_TRIES {
+            tokio::time::sleep(wait).await;
+            wait *= 4;
+        }
+    }
+}
+
 async fn abort_upload(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> {
-    let (dir, _) = load_upload(app, d, ctx.query.get("uploadId").unwrap_or_default(), ctx.key()).await?;
+    let id = ctx.query.get("uploadId").unwrap_or_default();
+    // After a completion in progress: one that commits leaves no upload to abort.
+    let _turn = app.uploads.turn(&upload_dir(d, id)?).await;
+    let (dir, _) = load_upload(app, d, id, ctx.key()).await?;
     app.pool.store.delete_prefix(&dir).await?;
     Ok(empty(204).body(Body::empty()).unwrap())
 }
@@ -1068,6 +1247,9 @@ async fn list_parts(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3
 pub async fn list_uploads(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> {
     let mut out = String::new();
     for id in app.pool.store.list_dirs(&format!("drives/{}/uploads/", d.id)).await? {
+        if app.uploads.done(&format!("drives/{}/uploads/{id}/", d.id)) {
+            continue;
+        }
         if let Some(b) = app.pool.store.get(&format!("drives/{}/uploads/{id}/upload.json", d.id)).await?
             && let Ok(r) = serde_json::from_slice::<UploadRecord>(&b) {
                 out.push_str(&format!("<Upload><Key>{}</Key><UploadId>{id}</UploadId><Initiated>{}</Initiated></Upload>", xml_escape(&r.key), iso(r.created)));
@@ -1256,20 +1438,27 @@ mod tests {
         let store = Store::mem(mem.clone());
         let pool = Pool::open_creating(store, 1 << 20, crate::clock::Clock::System, CommitGuard::CreateIfAbsent, &features).await.unwrap();
         let d = pool.create_drive("d", None).await.unwrap();
-        (Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new() }), d)
+        (Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default() }), d)
     }
 
     /// Sends a request for `key` of drive `d` as the admin key, with `payload` as what its
     /// signature says of the body.
-    async fn send_as(app: &Arc<App>, method: Method, key: &str, query: &str, headers: &[(&str, &str)], body: &[u8], payload: Payload) -> Result<Response, S3Error> {
+    /// A request of drive `d` for `key` (the drive itself if `None`) as the admin key, with
+    /// `payload` as what its signature says of the body.
+    fn request(method: Method, key: Option<&str>, query: &str, headers: &[(&str, &str)], payload: Payload) -> Ctx {
         let key_info = KeyInfo { id: "k".into(), secret: "s".into(), scope: crate::sigv4::Scope::Admin, drives: None };
         let auth = Authenticated { key: key_info, payload, signing_key: [0; 32], scope: String::new(), amz_date: String::new(), seed_signature: String::new() };
         let mut map = http::HeaderMap::new();
         for (k, v) in headers {
             map.insert(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
         }
-        let ctx = Ctx { method, bucket: Some("d".into()), key: Some(key.into()), virtual_host: false, query: super::super::util::Query::parse(query), headers: map, auth };
-        dispatch(app, &ctx, Body::from(body.to_vec())).await
+        Ctx { method, bucket: Some("d".into()), key: key.map(str::to_owned), virtual_host: false, query: super::super::util::Query::parse(query), headers: map, auth }
+    }
+
+    /// Sends a request for `key` of drive `d` as the admin key, with `payload` as what its
+    /// signature says of the body.
+    async fn send_as(app: &Arc<App>, method: Method, key: &str, query: &str, headers: &[(&str, &str)], body: &[u8], payload: Payload) -> Result<Response, S3Error> {
+        dispatch(app, &request(method, Some(key), query, headers, payload), Body::from(body.to_vec())).await
     }
 
     async fn send(app: &Arc<App>, method: Method, key: &str, query: &str, headers: &[(&str, &str)], body: &[u8]) -> Response {
@@ -1488,5 +1677,453 @@ mod tests {
         tx.unbounded_send(Ok(Bytes::from(random_bytes(9, 10_000)))).unwrap();
         drop(tx);
         assert_eq!(ingest(&pool, reader, true).await.unwrap_err().code, "XAmzContentSHA256Mismatch");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Multipart uploads (format §11)
+
+    async fn text(r: Response) -> String {
+        String::from_utf8(axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap()
+    }
+
+    fn between<'a>(s: &'a str, open: &str, close: &str) -> &'a str {
+        s.split(open).nth(1).unwrap().split(close).next().unwrap()
+    }
+
+    async fn create(app: &Arc<App>, key: &str, headers: &[(&str, &str)]) -> String {
+        let r = send(app, Method::POST, key, "uploads", headers, b"").await;
+        between(&text(r).await, "<UploadId>", "</UploadId>").to_owned()
+    }
+
+    /// Uploads part `n`; returns its ETag.
+    async fn part(app: &Arc<App>, key: &str, id: &str, n: u32, data: &[u8]) -> String {
+        let r = send(app, Method::PUT, key, &format!("partNumber={n}&uploadId={id}"), &[], data).await;
+        r.headers()["etag"].to_str().unwrap().to_owned()
+    }
+
+    async fn complete(app: &Arc<App>, key: &str, id: &str, parts: &[(u32, &str)]) -> Result<Response, S3Error> {
+        let listed: String = parts.iter().map(|(n, etag)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>")).collect();
+        let body = format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>");
+        send_as(app, Method::POST, key, &format!("uploadId={id}"), &[], body.as_bytes(), Payload::Unsigned).await
+    }
+
+    /// Completes in a task of its own, as a request that others race.
+    fn completing(app: &Arc<App>, key: &str, id: &str, parts: &[(u32, &str)]) -> tokio::task::JoinHandle<Result<Response, S3Error>> {
+        let (app, key, id) = (app.clone(), key.to_owned(), id.to_owned());
+        let parts: Vec<(u32, String)> = parts.iter().map(|(n, e)| (*n, (*e).to_owned())).collect();
+        tokio::spawn(async move {
+            let parts: Vec<(u32, &str)> = parts.iter().map(|(n, e)| (*n, e.as_str())).collect();
+            complete(&app, &key, &id, &parts).await
+        })
+    }
+
+    fn no_upload(r: Result<Response, S3Error>) {
+        assert_eq!(r.err().map(|e| e.code), Some("NoSuchUpload"));
+    }
+
+    /// The ListMultipartUploads answer.
+    async fn uploads_listed(app: &Arc<App>) -> String {
+        let ctx = request(Method::GET, None, "uploads", &[], Payload::Unsigned);
+        let d = ctx.drive(app).unwrap();
+        text(list_uploads(app, &ctx, &d).await.unwrap()).await
+    }
+
+    fn versions_of(d: &Drive, key: &str) -> usize {
+        let s = d.snapshot();
+        s.lookup(&Key::parse(key).unwrap()).and_then(|o| s.history(&o).map(|h| h.len())).unwrap_or(0)
+    }
+
+    fn staged(mem: &MemStore, d: &Drive, id: &str) -> bool {
+        mem.peek(&format!("drives/{}/uploads/{id}/upload.json", d.id)).is_some()
+    }
+
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    /// Makes the requests to `mem` that `which` picks wait until the sender says `true`. Counts
+    /// them.
+    fn gate(mem: &MemStore, which: impl Fn(MemOp, &str) -> bool + Send + Sync + 'static) -> (tokio::sync::watch::Sender<bool>, Arc<AtomicUsize>) {
+        let (release, released) = tokio::sync::watch::channel(false);
+        let started = Arc::new(AtomicUsize::new(0));
+        let n = started.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if !which(op, path) {
+                return futures::future::ready(Fault::None).boxed();
+            }
+            n.fetch_add(1, Ordering::SeqCst);
+            let mut released = released.clone();
+            async move {
+                let _ = released.wait_for(|r| *r).await;
+                Fault::None
+            }
+            .boxed()
+        })));
+        (release, started)
+    }
+
+    /// A completed upload is its parts in the order listed: their bytes, the extents their
+    /// records hold and the ETag those give, with the attributes it was created with, as the
+    /// version its answer names.
+    #[tokio::test]
+    async fn a_completed_upload_is_its_parts_in_order() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let id = create(&app, "mp", &[("content-type", "text/plain"), ("x-amz-meta-colour", "blue")]).await;
+        let data = [random_bytes(1, MIN_PART as usize), random_bytes(2, MIN_PART as usize + 1), random_bytes(3, 1000)];
+        let mut etags = vec![String::new(); 3];
+        for i in [2, 0, 1] {
+            etags[i] = part(&app, "mp", &id, i as u32 + 1, &data[i]).await;
+        }
+        let records: Vec<PartRecord> = (1..=3).map(|n| serde_json::from_slice(&mem.peek(&format!("drives/{}/uploads/{id}/{n:05}.json", d.id)).unwrap()).unwrap()).collect();
+        let r = complete(&app, "mp", &id, &[(1, &etags[0]), (2, &etags[1]), (3, &etags[2])]).await.unwrap();
+        let version = r.headers()["x-amz-version-id"].to_str().unwrap().to_owned();
+        let etag = between(&text(r).await, "<ETag>", "</ETag>").replace("&quot;", "\"");
+        let extents = content::normalize(records.into_iter().flat_map(|p| p.extents).collect::<Vec<_>>());
+        assert_eq!(content_of(&d, "mp"), extents);
+        assert_eq!(etag, ContentDescriptor::Inline { extents }.etag());
+        assert_eq!(read_back(&app, "mp").await, data.concat());
+        let head = send(&app, Method::HEAD, "mp", "", &[], b"").await;
+        assert_eq!(head.headers()["etag"], etag.as_str());
+        assert_eq!(head.headers()["x-amz-version-id"], version.as_str());
+        assert_eq!(head.headers()["content-type"], "text/plain");
+        assert_eq!(head.headers()["x-amz-meta-colour"], "blue");
+        assert_eq!(versions_of(&d, "mp"), 1);
+        until("the staging records are deleted", || !staged(&mem, &d, &id)).await;
+    }
+
+    /// A completion reads the upload's record and those of the parts it lists all at once, and
+    /// lists nothing.
+    #[tokio::test]
+    async fn a_completion_reads_its_records_at_once() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let id = create(&app, "mp", &[]).await;
+        let one = part(&app, "mp", &id, 1, &random_bytes(1, MIN_PART as usize)).await;
+        let two = part(&app, "mp", &id, 2, &random_bytes(2, 10)).await;
+        let staging = format!("drives/{}/uploads/{id}/", d.id);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release, reads) = {
+            let (seen, staging) = (seen.clone(), staging.clone());
+            gate(&mem, move |op, path| {
+                if let Some(name) = path.strip_prefix(&staging) {
+                    seen.lock().unwrap().push((op, name.to_owned()));
+                }
+                op == MemOp::Get && path.starts_with(&staging)
+            })
+        };
+        let done = completing(&app, "mp", &id, &[(1, &one), (2, &two)]);
+        tokio::time::timeout(Duration::from_secs(10), reached(&reads, 3)).await.expect("the three records are read at once");
+        release.send(true).unwrap();
+        done.await.unwrap().unwrap();
+        let seen = seen.lock().unwrap().clone();
+        let mut gets: Vec<&str> = seen.iter().filter(|(op, _)| *op == MemOp::Get).map(|(_, name)| name.as_str()).collect();
+        gets.sort();
+        assert_eq!(gets, ["00001.json", "00002.json", "upload.json"]);
+        assert!(!seen.iter().any(|(op, _)| *op == MemOp::List), "{seen:?}");
+    }
+
+    /// Once a completion has answered, the upload is gone, whether or not its staging records
+    /// are yet: a retry finds no upload and commits nothing, and ListMultipartUploads, ListParts,
+    /// UploadPart and an abort do not see it either.
+    #[tokio::test]
+    async fn a_completed_upload_is_gone_before_its_records_are() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let id = create(&app, "mp", &[]).await;
+        let other = create(&app, "other", &[]).await;
+        let etag = part(&app, "mp", &id, 1, b"all of it").await;
+        let (release, deletes) = gate(&mem, |op, path| op == MemOp::Delete && path.contains("/uploads/"));
+        tokio::time::timeout(Duration::from_secs(10), complete(&app, "mp", &id, &[(1, &etag)])).await.expect("answered before the records are deleted").unwrap();
+        reached(&deletes, 1).await;
+        assert!(staged(&mem, &d, &id), "the deletion is held");
+        no_upload(complete(&app, "mp", &id, &[(1, &etag)]).await);
+        assert_eq!(versions_of(&d, "mp"), 1);
+        let listed = uploads_listed(&app).await;
+        assert!(!listed.contains(&id) && listed.contains(&other), "{listed}");
+        no_upload(send_as(&app, Method::GET, "mp", &format!("uploadId={id}"), &[], b"", Payload::Unsigned).await);
+        no_upload(send_as(&app, Method::PUT, "mp", &format!("partNumber=2&uploadId={id}"), &[], b"more", Payload::Unsigned).await);
+        no_upload(send_as(&app, Method::DELETE, "mp", &format!("uploadId={id}"), &[], b"", Payload::Unsigned).await);
+        assert!(mem.peek(&format!("drives/{}/uploads/{id}/00002.json", d.id)).is_none());
+        release.send(true).unwrap();
+        until("the staging records are deleted", || !staged(&mem, &d, &id)).await;
+        until("the claim goes with them", || app.uploads.claims.lock().unwrap().is_empty()).await;
+        no_upload(complete(&app, "mp", &id, &[(1, &etag)]).await);
+        assert_eq!(versions_of(&d, "mp"), 1);
+        assert_eq!(read_back(&app, "mp").await, b"all of it");
+    }
+
+    /// Two completions of one upload at once, as a client's retry of one still running would be:
+    /// the second waits for the first, then finds no upload. One version is committed.
+    #[tokio::test]
+    async fn racing_completions_commit_once() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let id = create(&app, "mp", &[]).await;
+        let etag = part(&app, "mp", &id, 1, b"once").await;
+        let (release, reads) = gate(&mem, |op, path| op == MemOp::Get && path.ends_with("/upload.json"));
+        let first = completing(&app, "mp", &id, &[(1, &etag)]);
+        reached(&reads, 1).await;
+        let second = completing(&app, "mp", &id, &[(1, &etag)]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "the second waits for the first");
+        release.send(true).unwrap();
+        first.await.unwrap().unwrap();
+        no_upload(second.await.unwrap());
+        assert_eq!(versions_of(&d, "mp"), 1);
+    }
+
+    /// A completion that fails leaves the upload open and no claim behind: the one waiting
+    /// behind it completes it.
+    #[tokio::test]
+    async fn a_completion_after_one_that_failed_completes() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let id = create(&app, "mp", &[]).await;
+        let etag = part(&app, "mp", &id, 1, b"at last").await;
+        assert_eq!(complete(&app, "mp", &id, &[(1, "\"wrong\"")]).await.err().map(|e| e.code), Some("InvalidPart"));
+        assert!(app.uploads.claims.lock().unwrap().is_empty());
+        let (release, reads) = gate(&mem, |op, path| op == MemOp::Get && path.ends_with("/upload.json"));
+        let failing = completing(&app, "mp", &id, &[(1, "\"wrong\"")]);
+        reached(&reads, 1).await;
+        let right = completing(&app, "mp", &id, &[(1, &etag)]);
+        release.send(true).unwrap();
+        assert_eq!(failing.await.unwrap().err().map(|e| e.code), Some("InvalidPart"));
+        right.await.unwrap().unwrap();
+        assert_eq!(read_back(&app, "mp").await, b"at last");
+        assert_eq!(versions_of(&d, "mp"), 1);
+        until("no claim is left", || app.uploads.claims.lock().unwrap().is_empty()).await;
+    }
+
+    /// An abort deletes the upload's records; after it, the upload cannot be listed, completed or
+    /// added to. One that comes while a completion runs waits for it, and finds no upload if it
+    /// committed.
+    #[tokio::test]
+    async fn an_abort_ends_an_upload_unless_a_completion_did() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let id = create(&app, "gone", &[]).await;
+        let etag = part(&app, "gone", &id, 1, b"never").await;
+        assert_eq!(send(&app, Method::DELETE, "gone", &format!("uploadId={id}"), &[], b"").await.status(), 204);
+        assert!(app.pool.store.list_files(&format!("drives/{}/uploads/{id}/", d.id), None).await.unwrap().is_empty());
+        assert!(!uploads_listed(&app).await.contains(&id));
+        no_upload(send_as(&app, Method::GET, "gone", &format!("uploadId={id}"), &[], b"", Payload::Unsigned).await);
+        no_upload(send_as(&app, Method::PUT, "gone", &format!("partNumber=2&uploadId={id}"), &[], b"more", Payload::Unsigned).await);
+        no_upload(complete(&app, "gone", &id, &[(1, &etag)]).await);
+        assert!(d.snapshot().lookup(&Key::parse("gone").unwrap()).is_none());
+        assert!(app.uploads.claims.lock().unwrap().is_empty());
+
+        let id = create(&app, "kept", &[]).await;
+        let etag = part(&app, "kept", &id, 1, b"kept").await;
+        let (release, commits) = gate(&mem, |op, _| op == MemOp::PutNew);
+        let completion = completing(&app, "kept", &id, &[(1, &etag)]);
+        reached(&commits, 1).await;
+        let abort = {
+            let (app, id) = (app.clone(), id.clone());
+            tokio::spawn(async move { send_as(&app, Method::DELETE, "kept", &format!("uploadId={id}"), &[], b"", Payload::Unsigned).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!abort.is_finished(), "the abort waits for the completion");
+        release.send(true).unwrap();
+        completion.await.unwrap().unwrap();
+        no_upload(abort.await.unwrap());
+        assert_eq!(read_back(&app, "kept").await, b"kept");
+    }
+
+    /// A deletion of a completed upload's records that fails is tried again, and until it
+    /// succeeds the upload stays gone here. At shutdown, what is left is deleted once more.
+    #[tokio::test]
+    async fn a_failed_deletion_of_the_records_is_tried_again() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let failures = Arc::new(AtomicUsize::new(1));
+        let left = failures.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            let fail = op == MemOp::Delete && path.contains("/uploads/") && left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+            futures::future::ready(if fail { Fault::Fail } else { Fault::None }).boxed()
+        })));
+        let id = create(&app, "mp", &[]).await;
+        let etag = part(&app, "mp", &id, 1, b"one").await;
+        complete(&app, "mp", &id, &[(1, &etag)]).await.unwrap();
+        until("the first deletion fails", || failures.load(Ordering::SeqCst) == 0).await;
+        assert!(staged(&mem, &d, &id));
+        no_upload(complete(&app, "mp", &id, &[(1, &etag)]).await);
+        assert!(!uploads_listed(&app).await.contains(&id));
+        until("the second deletion succeeds", || !staged(&mem, &d, &id)).await;
+        until("and the claim goes", || app.uploads.claims.lock().unwrap().is_empty()).await;
+
+        failures.store(usize::MAX, Ordering::SeqCst);
+        let id = create(&app, "mp2", &[]).await;
+        let etag = part(&app, "mp2", &id, 1, b"two").await;
+        complete(&app, "mp2", &id, &[(1, &etag)]).await.unwrap();
+        until("the first deletion fails", || failures.load(Ordering::SeqCst) < usize::MAX).await;
+        failures.store(0, Ordering::SeqCst);
+        assert!(staged(&mem, &d, &id));
+        app.uploads.finish(&app.pool).await;
+        assert!(!staged(&mem, &d, &id));
+        assert_eq!(versions_of(&d, "mp2"), 1);
+    }
+
+    /// UploadPart reads the part while it looks the upload up: the part's shards upload while
+    /// the lookup is held. With no such upload, it answers without waiting for the rest of the
+    /// body, and records nothing.
+    #[tokio::test]
+    async fn a_part_is_read_while_its_upload_is_looked_up() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let id = create(&app, "mp", &[]).await;
+        let shards = Arc::new(AtomicUsize::new(0));
+        let (release, released) = tokio::sync::watch::channel(false);
+        let uploaded = shards.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if shard_puts(op, path) {
+                uploaded.fetch_add(1, Ordering::SeqCst);
+            }
+            if op != MemOp::Get || !path.ends_with("/upload.json") {
+                return futures::future::ready(Fault::None).boxed();
+            }
+            let mut released = released.clone();
+            async move {
+                let _ = released.wait_for(|r| *r).await;
+                Fault::None
+            }
+            .boxed()
+        })));
+        let data = random_bytes(4, 3 << 20);
+        let uploading = {
+            let (app, id, data) = (app.clone(), id.clone(), data.clone());
+            tokio::spawn(async move { part(&app, "mp", &id, 1, &data).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), reached(&shards, 1)).await.expect("shards upload while the upload is looked up");
+        assert!(!uploading.is_finished());
+        release.send(true).unwrap();
+        let etag = uploading.await.unwrap();
+        complete(&app, "mp", &id, &[(1, &etag)]).await.unwrap();
+        assert_eq!(read_back(&app, "mp").await, data);
+
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Bytes, std::io::Error>>();
+        tx.unbounded_send(Ok(Bytes::from(random_bytes(5, 1 << 20)))).unwrap();
+        let ctx = request(Method::PUT, Some("mp"), "partNumber=1&uploadId=0123-abcd", &[], Payload::Unsigned);
+        let answered = tokio::time::timeout(Duration::from_secs(10), dispatch(&app, &ctx, Body::from_stream(rx))).await.expect("no waiting for the body");
+        no_upload(answered);
+        assert!(mem.peek(&format!("drives/{}/uploads/0123-abcd/00001.json", d.id)).is_none());
+        drop(tx);
+    }
+
+    /// A part whose upload is completed while it is read is refused, and not recorded.
+    #[tokio::test]
+    async fn a_part_read_while_its_upload_completes_is_refused() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let id = create(&app, "mp", &[]).await;
+        let etag = part(&app, "mp", &id, 1, b"first").await;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let (release, released) = tokio::sync::watch::channel(false);
+        let looked = lookups.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if op == MemOp::Get && path.ends_with("/upload.json") {
+                looked.fetch_add(1, Ordering::SeqCst);
+            }
+            if !shard_puts(op, path) {
+                return futures::future::ready(Fault::None).boxed();
+            }
+            let mut released = released.clone();
+            async move {
+                let _ = released.wait_for(|r| *r).await;
+                Fault::None
+            }
+            .boxed()
+        })));
+        let late = {
+            let (app, id) = (app.clone(), id.clone());
+            tokio::spawn(async move { send_as(&app, Method::PUT, "mp", &format!("partNumber=2&uploadId={id}"), &[], &random_bytes(6, 1 << 20), Payload::Unsigned).await })
+        };
+        reached(&lookups, 1).await;
+        complete(&app, "mp", &id, &[(1, &etag)]).await.unwrap();
+        release.send(true).unwrap();
+        no_upload(late.await.unwrap());
+        until("the staging records are deleted", || !staged(&mem, &d, &id)).await;
+        assert!(mem.peek(&format!("drives/{}/uploads/{id}/00002.json", d.id)).is_none());
+    }
+
+    /// A completion answers for the upload before the body, and for the body before the parts,
+    /// though it reads them together.
+    #[tokio::test]
+    async fn a_completion_answers_for_the_upload_first() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, _d) = app_with(&mem, &[]).await;
+        let id = create(&app, "mp", &[]).await;
+        let send_body = |id: String, body: &'static str| {
+            let app = app.clone();
+            async move { send_as(&app, Method::POST, "mp", &format!("uploadId={id}"), &[], body.as_bytes(), Payload::Unsigned).await.err().map(|e| e.code) }
+        };
+        let two = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>x</ETag></Part><Part><PartNumber>2</PartNumber><ETag>y</ETag></Part></CompleteMultipartUpload>";
+        assert_eq!(send_body("0123-abcd".into(), "<not xml").await, Some("NoSuchUpload"));
+        assert_eq!(send_body("0123-abcd".into(), two).await, Some("NoSuchUpload"));
+        assert_eq!(send_body(id.clone(), "<not xml").await, Some("MalformedXML"));
+        assert_eq!(send_body(id.clone(), two).await, Some("InvalidPart"));
+        let unordered = "<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>y</ETag></Part><Part><PartNumber>1</PartNumber><ETag>x</ETag></Part></CompleteMultipartUpload>";
+        assert_eq!(send_body(id.clone(), unordered).await, Some("InvalidPartOrder"));
+        let small = part(&app, "mp", &id, 1, b"small").await;
+        part(&app, "mp", &id, 2, b"last").await;
+        let body = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{small}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>wrong</ETag></Part></CompleteMultipartUpload>");
+        let r = send_as(&app, Method::POST, "mp", &format!("uploadId={id}"), &[], body.as_bytes(), Payload::Unsigned).await;
+        assert_eq!(r.err().map(|e| e.code), Some("EntityTooSmall"), "part 1's error before part 2's");
+    }
+
+    /// A completion whose client goes away once it is committing still commits once and ends
+    /// the upload: a retry finds none.
+    #[tokio::test]
+    async fn a_completion_whose_client_went_away_ends_the_upload() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, d) = app_with(&mem, &[]).await;
+        let id = create(&app, "mp", &[]).await;
+        let etag = part(&app, "mp", &id, 1, b"left").await;
+        let (release, commits) = gate(&mem, |op, _| op == MemOp::PutNew);
+        let gone = completing(&app, "mp", &id, &[(1, &etag)]);
+        reached(&commits, 1).await;
+        gone.abort();
+        assert!(gone.await.unwrap_err().is_cancelled());
+        release.send(true).unwrap();
+        until("the staging records are deleted", || !staged(&mem, &d, &id)).await;
+        no_upload(complete(&app, "mp", &id, &[(1, &etag)]).await);
+        assert_eq!(versions_of(&d, "mp"), 1);
+        assert_eq!(read_back(&app, "mp").await, b"left");
+    }
+
+    /// ListParts lists the parts uploaded, in order, each as last uploaded; ListMultipartUploads
+    /// lists the uploads open.
+    #[tokio::test]
+    async fn uploads_and_their_parts_are_listed() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, _d) = app_with(&mem, &[]).await;
+        let a = create(&app, "a", &[]).await;
+        let b = create(&app, "b", &[]).await;
+        let three = part(&app, "a", &a, 3, b"three").await;
+        let one = part(&app, "a", &a, 1, b"one").await;
+        part(&app, "a", &a, 2, b"two").await;
+        let two = part(&app, "a", &a, 2, b"two again").await;
+        let listed = text(send(&app, Method::GET, "a", &format!("uploadId={a}"), &[], b"").await).await;
+        let parts: Vec<(String, String, String)> = listed
+            .split("<Part>")
+            .skip(1)
+            .map(|p| (between(p, "<PartNumber>", "<").to_owned(), between(p, "<ETag>", "<").replace("&quot;", "\""), between(p, "<Size>", "<").to_owned()))
+            .collect();
+        let want = |n: &str, etag: &str, size: usize| (n.to_owned(), etag.to_owned(), size.to_string());
+        assert_eq!(parts, [want("1", &one, 3), want("2", &two, 9), want("3", &three, 5)]);
+        let open = uploads_listed(&app).await;
+        assert!(open.contains(&format!("<Key>a</Key><UploadId>{a}</UploadId>")) && open.contains(&format!("<Key>b</Key><UploadId>{b}</UploadId>")), "{open}");
+        let only = part(&app, "b", &b, 1, b"b").await;
+        complete(&app, "b", &b, &[(1, &only)]).await.unwrap();
+        let open = uploads_listed(&app).await;
+        assert!(open.contains(&a) && !open.contains(&b), "{open}");
+        send(&app, Method::DELETE, "a", &format!("uploadId={a}"), &[], b"").await;
+        assert!(!uploads_listed(&app).await.contains("<Upload>"));
     }
 }

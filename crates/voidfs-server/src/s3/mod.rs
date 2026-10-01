@@ -30,6 +30,9 @@ pub struct App {
     /// Domains for virtual-host addressing; empty for path-style only.
     pub domains: Domains,
     pub metrics: S3Metrics,
+    /// Multipart uploads being completed or aborted, and those completed until their staging
+    /// records are deleted.
+    pub uploads: object::Uploads,
 }
 
 pub fn router(app: Arc<App>) -> axum::Router {
