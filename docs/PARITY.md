@@ -3,18 +3,21 @@
 *Stocktake of 2026-09-28, brought up to date the same day after content-defined checkpoints, the
 capability probe, group commit and the shard cache's admission, on 2026-09-29 after
 virtual-host addressing and then health checks and metrics, and on 2026-10-01 for cold reads and
-S3's bandwidth in the local benchmark, and then coalesced shard fetches; the first was taken on
-2026-09-27.*
+S3's bandwidth in the local benchmark, then coalesced shard fetches, and then for the start of
+step 4 (the scorecard refreshed, SpaceFS 0.2.333 looked at again, the Rust SDK); the first was
+taken on 2026-09-27.*
 
 Sources:
-- the voidfs code on `main` at `0ff3f2d` (garbage collection, content-defined checkpoints, the
-  capability probe, group commit and the shard cache's admission merged), with virtual-host
-  addressing, and health checks and metrics, on top;
+- the voidfs code on `main` at `939b57c` (everything through coalesced shard fetches merged), with
+  step 4's Rust SDK on top;
 - the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
 - the benchmark results in [`bench/results/`](../bench/results/);
 - SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog, read again on 28
   September: no release since 22 September, and the same benchmark runs;
-- the SpaceFS macOS app 0.2.300, installed on the same Mac.
+- the SpaceFS macOS app 0.2.300, installed on the same Mac, which had updated itself to 0.2.333
+  by 1 October: its CLI's help, its read-only commands, and the app's settings looked at through
+  computer use ([step 4's plan, §1](step-4-client.md#1-what-spacefs-offers)); and SpaceFS's
+  `llms-full.txt`, read on 1 October.
 
 The goal is feature, functionality and performance parity with SpaceFS, as open source that people
 host themselves on their own bucket. Where voidfs differs on purpose (no hosted offering, so no
@@ -32,7 +35,8 @@ billing or plans), this page says so.
     ([RFC 0002](../rfcs/0002-gc-safe-against-writers.md));
   - 38 conformance cases passing on local disk (the first 35 on Cloudflare R2 too).
 - **Almost everything a person touches is missing:** a writable mount, a CLI, accounts and a web
-  app, SDKs, search and share links.
+  app, search and share links. The first SDK, for Rust, exists (step 4, item 1): the official
+  AWS SDK for S3 with a typed call for every extension, one error type and the retry rule.
 - **Performance is measured locally, not yet in SpaceFS's setup.** SpaceFS publishes 49
   benchmark scenarios; [`bench/`](../bench/README.md) runs all of them against voidfs and the bare
   bucket underneath it.
@@ -63,7 +67,9 @@ billing or plans), this page says so.
     0.71–0.76×. The small cold reads were ahead already.
 - **SpaceFS's Mac app is now understood** (§5). It is a native FSKit module with its core in Rust,
   running in a separate daemon, which is the architecture the FSKit spike chose for voidfs. It
-  also shows that the FSKit entitlement can ship with Developer ID.
+  also shows that the FSKit entitlement can ship with Developer ID. **Since 0.2.333** (observed 1
+  October) it mounts drives through a loopback SMB server by default, backed by a local journal,
+  with FSKit as the other choice, and offers pinned files for offline use: step 5 weighs both.
 - **The plan (§7):**
   - Step 1 has its harness, local results and CI. Still to do: the run in SpaceFS's setup
     (which waits on cloud accounts, §8), and the Mac comparison.
@@ -76,7 +82,9 @@ billing or plans), this page says so.
     patch chunking each touched shard once, multipart completion in two round trips, and
     coalesced shard fetches with shared read-ahead. Reading pieces of shards is deferred to the
     mount (step 5), as SpaceFS's S3 layer also reads whole shards for a range.
-  - Steps 4–10 have not started.
+  - Step 4 (client core, CLI and Rust SDK) has started: its plan is
+    [step-4-client.md](step-4-client.md), and item 1, the Rust SDK, is built.
+  - Steps 5–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -90,49 +98,60 @@ billing or plans), this page says so.
 ## 3. Scorecard
 
 Every item of the plan's checklist (§3, 65 items, including the Finder integration item added on
-2026-09-27), scored against the code:
+2026-09-27), scored against the code on `main` at `939b57c` and the results in `bench/results/`
+(refreshed 2026-10-01; the previous scorecard was of 28 September):
 
 | Area | Done | Partly | Missing | State |
 |---|---|---|---|---|
-| Engine (E1–E13) | 8 | 1 | 4 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints and garbage collection work. Missing: the small-file path, direct uploads, encryption, retention policies |
-| Storage backends (B1–B8) | 1 | 1 | 6 | Local disk, R2 and versitygw (the local S3 server the benchmarks use) work. Not yet run on AWS S3 or MinIO. A capability probe checks the bucket at start. No short-lived storage credentials, no adopt or export |
-| Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed, on one node. Missing: a disk cache tier, several nodes, several regions, quotas |
+| Engine (E1–E13) | 9 | 1 | 3 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints, garbage collection, and small files held in the log (RFC 0003, the `inline-data` pool feature) work. Missing: direct uploads, encryption, retention policies |
+| Storage backends (B1–B8) | 2 | 0 | 6 | Local disk, AWS S3, Cloudflare R2, MinIO (built from source in CI) and versitygw work, and rclone works against the server. A capability probe checks the bucket at start. No other providers tried, no short-lived storage credentials, no stored bucket credentials, no adopt or export |
+| Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed (long poll and SSE), on one node. Missing: direct upload and storage credentials, a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
-| Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount (the spike). No agent, journal, CLI, Finder integration, Linux or Windows |
-| SDKs, agents, search (A1–A7) | 0 | 0 | 7 | Stock S3 SDKs and the AWS CLI work; nothing voidfs-specific |
-| Operations (O1–O6) | 1 | 2 | 3 | One binary, with a Compose file. Health checks and Prometheus metrics on a port of their own. A benchmark harness, not yet run in the cloud. No tracing, Helm chart or audit |
-| **Total** | **13** | **11** | **41** | Of the 28 P0 items: 13 done, 7 partly, 8 missing |
+| Clients (D1–D12) | 0 | 3 | 9 | A read-only macOS mount and its menu-bar shell (the spike). No client core, journal, CLI, Finder integration, Linux or Windows |
+| SDKs, agents, search (A1–A7) | 0 | 1 | 6 | A Rust SDK on the official AWS SDK, with a typed call for every extension (step 4, item 1). Stock S3 SDKs, boto3, rclone and curl work. No TypeScript, Python or Go SDK, MCP server or search |
+| Operations (O1–O6) | 1 | 2 | 3 | One binary, with a Compose file. Health checks and Prometheus metrics on a port of their own. A benchmark harness run locally, against R2 and AWS S3 for the small objects, and in CI, not yet in SpaceFS's setup. No tracing, Helm chart, fuzzing or audit |
+| **Total** | **15** | **11** | **39** | Of the 28 P0 items: 14 done, 7 partly, 7 missing |
 
-Earlier stocktakes counted 71 items and 6 more missing than the rows add up to; the checklist has
-65. The P0 counts were right.
+What moved since 28 September: E9 (small files held in the log, RFC 0003) is done, and B1 is done
+now that AWS S3 and MinIO have run the conformance suite and the clients. A1 is partly done since
+1 October, with the Rust SDK (step 4, item 1).
 
 "Partly" means:
-- E1 has no compression.
-- B1 is not yet run on AWS S3 or MinIO.
-- S3 lacks direct upload and credentials; S5 is memory-only; S8 has no operations catalogue.
-- C3 keys can't be minted or revoked.
+- E1 has no compression (`shard-zstd` is a reserved pool feature that servers refuse).
+- S3 lacks direct upload (§4.11), storage credentials (§5.5, which answer `501`), copy-mode forks
+  (`x-voidfs-fork-mode: copy` answers `501`) and display names (`x-voidfs-display-name` is
+  ignored: a drive's display name is its alias). S5 is memory-only. S8 has the protocol header
+  and 38 conformance cases, but no operations catalogue.
+- C3 keys come from command-line flags: they can't be minted or revoked while the server runs, and
+  the drive allowlist exists in the code but no flag sets it.
 - D3 is read-only, D6 relies on the kernel's read-ahead only, and D11 is the spike's shell.
-- O4 has health checks and metrics, not tracing or structured logs. O5 has run locally and
-  against R2, not yet in SpaceFS's setup.
+- A1 has the Rust SDK; TypeScript (P0) waits for step 7, with Python and Go (P1).
+- O4 has health checks and metrics, not tracing or structured logs. O5 has run locally, against R2
+  and AWS S3 (the 23 small-object scenarios) and in CI, not yet in SpaceFS's setup.
+
+Two items count as done with a gap that can't matter yet:
+- E7: a fork across pools answers `501` rather than copying, but a deployment has one pool.
+- B3: temporary credentials are reported as not probed (AWS needs a role to assume, R2 an API
+  token); B4 adds them.
 
 The 28 P0 items, which a credible v1 needs:
 
 | Status | Items |
 |---|---|
-| Done (13) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, E11 checkpoints, B3 capability probe, S1 S3 server, S2 S3 subset, S4 per-drive authority and change feed, O1 single binary and compose |
-| Partly (7) | E1 chunking, B1 backends, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount |
-| Missing (8) | B5 stored bucket credentials, C1 sign-in, C2 workspaces, C4 bucket connections, D1 client daemon, D5 desktop semantics, D9 CLI, A1 Rust and TypeScript SDKs |
+| Done (14) | E2 format spec, E3 namespace, E4 versions, E5 edits, E6 commit protocol, E7 forks, E8 garbage collection, E11 checkpoints, B1 backends, B3 capability probe, S1 S3 server, S2 S3 subset, S4 per-drive authority and change feed, O1 single binary and compose |
+| Partly (7) | E1 chunking, S3 extensions, S5 shard cache, S8 conformance and catalogue, C3 access keys, D3 macOS mount, A1 Rust and TypeScript SDKs (Rust done) |
+| Missing (7) | B5 stored bucket credentials, C1 sign-in, C2 workspaces, C4 bucket connections, D1 client daemon, D5 desktop semantics, D9 CLI |
 
 ## 4. Product by product
 
 | SpaceFS | voidfs today |
 |---|---|
-| S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 35 conformance cases, path or virtual-host addressing. Missing: direct uploads, storage credentials |
-| macOS app: writable mount, transfers (pause, resume, speed limits), previews, video reviews, Space Search, Finder badges | Read-only FSKit mount and a menu-bar shell |
-| `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version | None |
+| S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 38 conformance cases, path or virtual-host addressing. Missing: direct uploads, storage credentials, display names, copy-mode forks |
+| macOS app: writable mount (a loopback SMB server by default since 0.2.333, or FSKit), transfers (pause, resume, speed limits), a disk and a memory cache, pinned files, previews, video reviews, Space Search, Finder badges | Read-only FSKit mount and a menu-bar shell |
+| `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version, and `update` | None yet: step 4 plans every command that needs no account ([step-4-client.md](step-4-client.md)) |
 | Linux FUSE mount | None (step 9) |
 | Web app: sign-in, settings, access keys, billing | None (billing does not apply) |
-| SDKs: TypeScript, Python, Go, Rust (MIT) | None |
+| SDKs: TypeScript, Python, Go, Rust (MIT), each on the official AWS SDK | Rust (`crates/voidfs-sdk`): the official AWS SDK for S3, a typed call for every extension, one error type, the retry rule. Not yet: direct uploads (step 4, item 5), TypeScript, Python, Go |
 | Agent docs: `llms.txt`, `llms-full.txt`, `operations.json` | None |
 | Public and restricted share links | None |
 | Passwordless email sign-in, workspaces, scoped keys with drive allowlists, revocation within a minute | Static scoped keys; the allowlist exists in the code but cannot be set |
@@ -161,6 +180,19 @@ What voidfs takes from this:
 - Finder Sync, not File Provider, gives the Finder badges. It is now checklist item D12.
 - The split between a thin extension and a Rust core in a separate process is confirmed by a
   shipping product.
+
+**What changed by 0.2.333** (observed on 1 October, when the app had updated itself; details in
+[step 4's plan, §1](step-4-client.md#1-what-spacefs-offers)):
+- The drive is mounted by `spacefs mount --retained-v1 --adapter smb`, a loopback SMB server on
+  this Mac, at `/tmp/Space`; Settings → Advanced → Mount Method says SMB, "backed by a local
+  journal", and the FSKit daemon is "Not running". FSKit stays a choice.
+- The journal is one SQLite database per drive: inodes, written blocks, fetched blocks, pins and
+  the publishing state (from its schema; no rows were read).
+- Settings show an upload bandwidth slider (adaptive by default, a cap, or unlimited), a 20 GB disk
+  cache and a 192 MB memory cache, and **pinned files** for offline access, which voidfs's plan had
+  after parity (D8).
+- New processes, `space-agent` and `space-computer-use`, belong to its AI features (inferred).
+- Its CLI's `status` and `mounts` report no daemon and no mounts while the SMB mount is up.
 
 ## 6. Performance
 
@@ -649,13 +681,23 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      emulated, and 34–37 on loopback; cold, the four rows SpaceFS gives cache-cleared figures for
      are all ahead with S3's bandwidth. Next: the real run (item 7.2), which also judges the three
      warm large reads.
-4. **Client core, CLI and Rust SDK.**
-   - `crates/client`: cache, journal, upload queue, change-feed client.
-   - Direct uploads (§4.11), and short-lived storage credentials: R2, AWS STS, and presigned URLs
-     as the fallback.
-   - A `voidfs` CLI matching every `spacefs` command that needs no account: drives, drive, mount,
-     unmount, mounts, uploads, upload, status, daemon, history, show, restore, version.
-   - The Rust SDK.
+4. **Client core, CLI and Rust SDK.** The work items, with what SpaceFS's CLI and app do, are in
+   [step-4-client.md](step-4-client.md). In order:
+   - The Rust SDK (A1). **Done** (1 October): `crates/voidfs-sdk`, the official AWS SDK for S3 with
+     a typed call for every extension and the change feed (long poll and events), one error type,
+     and the retry rule: an unguarded insert or removal is never sent twice. Its tests run against
+     a server in the same process, which `voidfs-server` now offers as a library, and through a
+     proxy that fails requests; the conformance runner signs with the SDK's code.
+   - A `voidfs` CLI on the protocol (D9): drives, drive, fork, history, show, restore, version, a
+     foreground upload, and a key generator for `voidfs-server --key`; JSON output everywhere.
+   - `crates/voidfs-client` (D1): the disk cache, the write journal, the upload queue (pause,
+     resume, a bandwidth cap) and the change-feed client.
+   - The daemon, and the CLI's commands on it: daemon, upload, uploads, status, and the mount table
+     that mount, unmount and mounts use (mounting comes with step 5).
+   - Direct uploads (E10, §4.11), server and client.
+   - Short-lived storage credentials (B4, §5.5): AWS STS, R2, MinIO. Presigned URLs as a fallback,
+     and an object's shard list for the API path, would be protocol additions (RFC first).
+   - **Status (2026-10-01):** item 1 of 6 done.
 5. **Writable macOS drive** (Phase 2).
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
@@ -705,7 +747,8 @@ plain objects, file locking, offline pinning.
   [bench/README.md](../bench/README.md#the-real-run). SpaceFS ran their layer on the client VM,
   so that topology is the like-for-like one; the plan's server in us-east-1 is a second run.
 - **Test data in the SpaceFS trial:** uploading the benchmark data into a trial drive needs the
-  account owner's go-ahead each time.
+  account owner's go-ahead each time. **The trial ends on 4 October** (Settings → Plan & Storage,
+  observed 1 October); step 1's Mac comparison needs it, or a plan.
 - **CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), added 2026-09-29): tests,
   clippy and the spec's cases; the conformance suite, boto3, rclone and the admin endpoints over
   memory, local disk, versitygw and MinIO; the Compose files; and on `main`, the release GC model

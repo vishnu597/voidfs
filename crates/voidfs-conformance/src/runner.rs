@@ -2,21 +2,16 @@
 //! Executes cases: builds and signs each request, sends it, and checks the response.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningSettings, UriPathNormalizationMode, sign};
-use aws_sigv4::sign::v4;
 use base64::Engine;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::utf8_percent_encode;
 use rand::RngExt;
 use serde_json::Value;
+use voidfs_sdk::sign::{QUERY, Signer};
 
 use crate::cases::{Body, BodyExpect, Case, Step, seeded_bytes};
 use crate::check::{self, Subject, Vars, subst};
-
-/// RFC 3986 unreserved characters stay; everything else is encoded (as SigV4 requires).
-const QUERY: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
 #[derive(Clone, Debug)]
 pub struct Key {
@@ -41,7 +36,6 @@ pub struct CaseResult {
 pub struct Runner {
     client: reqwest::Client,
     endpoint: String,
-    authority: String,
     keys: HashMap<String, Key>,
     /// Print every request and response while running.
     pub verbose: bool,
@@ -61,10 +55,9 @@ impl Runner {
     pub fn new(endpoint: &str, keys: HashMap<String, Key>) -> anyhow::Result<Runner> {
         anyhow::ensure!(keys.contains_key("admin"), "an admin key is required");
         let endpoint = endpoint.trim_end_matches('/').to_owned();
-        let url: http::Uri = endpoint.parse()?;
-        let authority = url.authority().ok_or_else(|| anyhow::anyhow!("endpoint has no host"))?.to_string();
+        Signer::new(&endpoint, "", "")?; // checks the endpoint
         let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build()?;
-        Ok(Runner { client, endpoint, authority, keys, verbose: false, virtual_host: None })
+        Ok(Runner { client, endpoint, keys, verbose: false, virtual_host: None })
     }
 
     pub async fn run_case(&self, case: &Case) -> CaseResult {
@@ -133,40 +126,14 @@ impl Runner {
         method: &str,
         path: &str,
         query: &str,
-        mut headers: Vec<(String, String)>,
+        headers: Vec<(String, String)>,
         unsigned: &[String],
         body: Vec<u8>,
         key: &Key,
     ) -> Result<Response, String> {
-        let (host, path) = self.address(path);
-        let uri = if query.is_empty() { format!("{}{}", self.endpoint, path) } else { format!("{}{}?{}", self.endpoint, path, query) };
-        headers.push(("host".into(), host));
-        let (signed, extra): (Vec<_>, Vec<_>) = headers.into_iter().partition(|(k, _)| !unsigned.contains(k));
-
-        let identity = Credentials::new(&key.id, &key.secret, None, None, "voidfs-conformance").into();
-        let mut settings = SigningSettings::default();
-        settings.percent_encoding_mode = PercentEncodingMode::Single;
-        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
-        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-        let params = v4::SigningParams::builder()
-            .identity(&identity)
-            .region("us-east-1")
-            .name("s3")
-            .time(SystemTime::now())
-            .settings(settings)
-            .build()
-            .map_err(|e| e.to_string())?
-            .into();
-        let signable = SignableRequest::new(method, &uri, signed.iter().map(|(k, v)| (k.as_str(), v.as_str())), SignableBody::Bytes(&body))
-            .map_err(|e| format!("cannot sign: {e}"))?;
-        let (instructions, _) = sign(signable, &params).map_err(|e| format!("cannot sign: {e}"))?.into_parts();
-
-        let mut builder = http::Request::builder().method(method).uri(&uri);
-        for (k, v) in signed.iter().chain(extra.iter()) {
-            builder = builder.header(k, v);
-        }
-        let mut request = builder.body(body).map_err(|e| e.to_string())?;
-        instructions.apply_to_request_http1x(&mut request);
+        let mut signer = Signer::new(&self.endpoint, &key.id, &key.secret).map_err(|e| e.to_string())?;
+        signer.virtual_host = self.virtual_host.clone();
+        let request = signer.sign(method, path, query, headers, unsigned, body.into()).map_err(|e| e.to_string())?;
         let request = reqwest::Request::try_from(request).map_err(|e| e.to_string())?;
         let resp = self.client.execute(request).await.map_err(|e| format!("request failed: {e}"))?;
         let status = resp.status().as_u16();
@@ -177,18 +144,6 @@ impl Runner {
             .collect();
         let body = resp.bytes().await.map_err(|e| format!("reading body: {e}"))?.to_vec();
         Ok(Response { status, headers, body })
-    }
-
-    /// The host and path a path-style request is sent with.
-    fn address(&self, path: &str) -> (String, String) {
-        let Some(domain) = &self.virtual_host else { return (self.authority.clone(), path.to_owned()) };
-        let port = self.authority.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map(|(_, p)| format!(":{p}")).unwrap_or_default();
-        let rest = path.strip_prefix('/').unwrap_or(path);
-        if rest.is_empty() {
-            return (format!("{domain}{port}"), "/".into());
-        }
-        let (drive, key) = rest.split_once('/').unwrap_or((rest, ""));
-        (format!("{drive}.{domain}{port}"), format!("/{key}"))
     }
 
     fn expect(&self, step: &Step, resp: &Response, vars: &mut Vars) -> Result<(), String> {
@@ -269,21 +224,4 @@ fn fresh_drive_name() -> String {
     let mut rng = rand::rng();
     let suffix: String = (0..10).map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char).collect();
     format!("vfc-{suffix}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn virtual_host_addresses() {
-        let keys = HashMap::from([("admin".to_string(), Key { id: "a".into(), secret: "s".into() })]);
-        let mut r = Runner::new("http://127.0.0.1:9100", keys).unwrap();
-        assert_eq!(r.address("/d/k%20x"), ("127.0.0.1:9100".into(), "/d/k%20x".into()));
-        r.virtual_host = Some("s3.localhost".into());
-        assert_eq!(r.address("/"), ("s3.localhost:9100".into(), "/".into()));
-        assert_eq!(r.address("/d"), ("d.s3.localhost:9100".into(), "/".into()));
-        assert_eq!(r.address("/d/"), ("d.s3.localhost:9100".into(), "/".into()));
-        assert_eq!(r.address("/d/a/b%20c"), ("d.s3.localhost:9100".into(), "/a/b%20c".into()));
-    }
 }
