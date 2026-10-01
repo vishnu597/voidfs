@@ -298,7 +298,7 @@ async fn main() -> anyhow::Result<()> {
     for d in &args.virtual_host_domains {
         tracing::info!("serving virtual-host requests to *.{d}");
     }
-    let app = Arc::new(s3::App { pool: pool.clone(), keys, domains: s3::Domains::new(args.virtual_host_domains), metrics: metrics::S3Metrics::new(), uploads: Default::default() });
+    let app = Arc::new(s3::App { pool: pool.clone(), keys, domains: s3::Domains::new(args.virtual_host_domains), metrics: metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default() });
     let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("listening on {}", args.listen))?;
     tracing::info!("serving on http://{}", args.listen);
     admin.serving(app.clone());

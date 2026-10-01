@@ -278,6 +278,37 @@ async fn an_upload_during_deletion_waits_for_the_run() {
     assert_eq!(sim.read("b", "copy").await.unwrap(), b"again");
 }
 
+/// A page that still parses but is not what was written stops the marking: read as it is, a leaf
+/// that lists another shard in place of one of its own would let that shard be collected while a
+/// file still needs it.
+#[tokio::test]
+async fn a_corrupt_page_stops_collection() {
+    let sim = Sim::new();
+    let pool = sim.pool().await;
+    let d = pool.create_drive("tree", None).await.unwrap();
+    let shards: Vec<voidfs_core::chunk::Shard> = (0..1_100)
+        .map(|i| {
+            let bytes = Bytes::from(format!("piece {i:05}"));
+            voidfs_core::chunk::Shard { hash: ShardHash::of(&bytes), bytes }
+        })
+        .collect();
+    pool.write_shards(&shards).await.unwrap();
+    let desc = pool.describe(shards.iter().map(|s| Extent::Shard { s: s.hash, n: s.bytes.len() as u64 }).collect()).await.unwrap();
+    let ContentDescriptor::Tree { root, .. } = desc else { panic!("1,100 extents make a tree") };
+    pool.commit(&d, move |s| Ok(ops::put(s, "big", desc.clone(), Attrs::default(), Op::Put, &Precondition::default(), &Actor::system())?)).await.unwrap();
+    let page = |h: ShardHash| format!("pages/{}", h.object_path());
+    let ManifestPage::Node { children } = serde_json::from_slice(&sim.store.get(&page(root)).await.unwrap().unwrap()).unwrap() else { panic!("the root is a node") };
+    let leaf = page(children[0].page);
+    let text = String::from_utf8(sim.store.get(&leaf).await.unwrap().unwrap().to_vec()).unwrap();
+    let changed = text.replacen(&shards[0].hash.to_string(), &ShardHash::of(b"elsewhere").to_string(), 1);
+    assert_ne!(changed, text);
+    sim.store.put(&leaf, Bytes::from(changed)).await.unwrap();
+    sim.clock.advance(2 * DAY);
+    let e = step(&pool, &offline()).await.unwrap_err();
+    assert!(format!("{e:#}").contains(&format!("{leaf} is corrupt")), "{e:#}");
+    assert!(sim.has(b"piece 00000").await, "nothing the file needs was collected");
+}
+
 /// The hazard of the server before garbage collection: a shard it holds in its cache may have
 /// been collected by another process since.
 #[tokio::test]

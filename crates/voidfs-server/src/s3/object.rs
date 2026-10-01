@@ -228,6 +228,44 @@ fn parse_range(h: &str, size: u64) -> Result<Option<(u64, u64)>, S3Error> {
     Ok(Some((start, end)))
 }
 
+/// Shard reads a GET keeps in flight ahead of what it is sending...
+const READ_AHEAD: usize = 8;
+/// ...and at most, borrowing those past [`READ_AHEAD`] from [`ReadAhead`], which every GET shares.
+/// Where one connection's rate is the limit, as S3's is, a read alone gets about twice as fast
+/// with 32 as with 8; many at once gain nothing once the bucket's total binds, and fixed windows
+/// that wide made them slower and held more memory (bench/results/shard-fetch).
+const READ_AHEAD_MAX: usize = 32;
+/// Shard reads in flight past [`READ_AHEAD`] per GET, across all of them.
+const READ_AHEAD_SHARED: usize = 32;
+
+/// The shard reads GETs may keep in flight past [`READ_AHEAD`] each, shared: one read alone
+/// reads further ahead, and many at once read no further in all than [`READ_AHEAD`] each and
+/// this besides.
+pub struct ReadAhead(Arc<tokio::sync::Semaphore>);
+
+impl Default for ReadAhead {
+    fn default() -> Self {
+        ReadAhead(Arc::new(tokio::sync::Semaphore::new(READ_AHEAD_SHARED)))
+    }
+}
+
+impl ReadAhead {
+    /// The window for a read of `pieces`, with what it borrowed for it, to hold until the read
+    /// ends. It takes what is free now and never waits for more.
+    fn borrow(&self, pieces: usize) -> (usize, Option<tokio::sync::OwnedSemaphorePermit>) {
+        let n = pieces.min(READ_AHEAD_MAX).saturating_sub(READ_AHEAD).min(self.0.available_permits());
+        match u32::try_from(n).ok().filter(|&n| n > 0).and_then(|n| self.0.clone().try_acquire_many_owned(n).ok()) {
+            Some(p) => (READ_AHEAD + n, Some(p)),
+            None => (READ_AHEAD, None),
+        }
+    }
+
+    #[cfg(test)]
+    fn free(&self) -> usize {
+        self.0.available_permits()
+    }
+}
+
 fn not_modified(v: &View) -> Response {
     object_headers(empty(304), v).body(Body::empty()).unwrap()
 }
@@ -271,6 +309,7 @@ async fn get(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> 
     }
     let extents = app.pool.extents(v.content.as_ref().unwrap_or(&ContentDescriptor::empty())).await?;
     let plan = content::read_plan(&extents, start, len).map_err(|e| S3Error::internal(e.to_string()))?;
+    let (window, borrowed) = app.read_ahead.borrow(plan.len());
     let pool = app.pool.clone();
     let stream = futures::stream::iter(plan)
         .map(move |piece| {
@@ -296,10 +335,15 @@ async fn get(app: &Arc<App>, ctx: &Ctx, d: &Drive) -> Result<Response, S3Error> 
                 }
             }
         })
-        .buffered(8)
+        .buffered(window)
         .flat_map(|r: Result<Vec<Bytes>, std::io::Error>| match r {
             Ok(v) => futures::stream::iter(v.into_iter().map(Ok).collect::<Vec<_>>()),
             Err(e) => futures::stream::iter(vec![Err(e)]),
+        })
+        // What the read borrowed goes back when its body ends, or is dropped.
+        .map(move |r| {
+            let _held = &borrowed;
+            r
         });
     Ok(b.body(Body::from_stream(stream)).unwrap())
 }
@@ -1429,6 +1473,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
+    // Read-ahead
+
+    /// An app over a pool of small shards, with `n` objects `o0`, `o1`… of 40 KiB each (about 160
+    /// shards), its caches dropped, and the bucket holding back its shard GETs until the gate
+    /// opens. Returns the objects' bytes, the gate, and the GETs held so far.
+    async fn cold_objects(n: usize) -> (Arc<App>, Arc<MemStore>, Vec<Vec<u8>>, tokio::sync::watch::Sender<bool>, Arc<AtomicUsize>) {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let pool = pool(&mem).await;
+        pool.create_drive("d", None).await.unwrap();
+        let app = Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default() });
+        let mut bodies = Vec::new();
+        for i in 0..n {
+            let body = random_bytes(i as u64, 40 << 10);
+            send(&app, Method::PUT, &format!("o{i}"), "", &[], &body).await;
+            bodies.push(body);
+        }
+        app.pool.drop_caches();
+        let (open, opened) = tokio::sync::watch::channel(false);
+        let held = Arc::new(AtomicUsize::new(0));
+        let h = held.clone();
+        mem.set_hook(Some(Arc::new(move |op, path| {
+            if op != MemOp::Get || !path.starts_with("shards/") {
+                return futures::future::ready(Fault::None).boxed();
+            }
+            h.fetch_add(1, Ordering::SeqCst);
+            let mut opened = opened.clone();
+            async move {
+                let _ = opened.wait_for(|o| *o).await;
+                Fault::None
+            }
+            .boxed()
+        })));
+        (app, mem, bodies, open, held)
+    }
+
+    /// Waits until `n` reaches `want`, then a little longer to see it go no further; fails after
+    /// five seconds rather than hang.
+    async fn settles_at(n: &AtomicUsize, want: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while n.load(Ordering::SeqCst) < want {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} of {want}", n.load(Ordering::SeqCst)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(n.load(Ordering::SeqCst), want);
+    }
+
+    /// Reads the body of a GET of `key` on a task of its own.
+    async fn reading(app: &Arc<App>, key: &str) -> tokio::task::JoinHandle<Vec<u8>> {
+        let r = send(app, Method::GET, key, "", &[], b"").await;
+        tokio::spawn(async move { axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec() })
+    }
+
+    /// A GET alone reads up to 32 shards ahead; others at once share what it leaves of the
+    /// budget, and read 8 ahead when none is left. The budget comes back when they end.
+    #[tokio::test]
+    async fn gets_share_a_budget_for_reading_further_ahead() {
+        let (app, _mem, bodies, open, held) = cold_objects(3).await;
+        // The first borrows 24 of the 32, the second the 8 left, the third none.
+        let windows = [READ_AHEAD_MAX, READ_AHEAD + READ_AHEAD_SHARED - (READ_AHEAD_MAX - READ_AHEAD), READ_AHEAD];
+        let first = reading(&app, "o0").await;
+        settles_at(&held, windows[0]).await;
+        let second = reading(&app, "o1").await;
+        settles_at(&held, windows[0] + windows[1]).await;
+        let third = reading(&app, "o2").await;
+        settles_at(&held, windows.iter().sum()).await;
+        assert_eq!(app.read_ahead.free(), 0);
+        open.send(true).unwrap();
+        for (r, body) in [first, second, third].into_iter().zip(&bodies) {
+            assert_eq!(&r.await.unwrap(), body);
+        }
+        assert_eq!(app.read_ahead.free(), READ_AHEAD_SHARED, "all given back");
+        // A read of one shard borrows nothing.
+        let one = send(&app, Method::GET, "o0", "", &[("range", "bytes=0-9")], b"").await;
+        assert_eq!(app.read_ahead.free(), READ_AHEAD_SHARED);
+        drop(one);
+    }
+
+    /// A GET whose client goes away gives back what it borrowed, read or not.
+    #[tokio::test]
+    async fn a_get_that_goes_away_gives_its_budget_back() {
+        let (app, _mem, _bodies, open, held) = cold_objects(1).await;
+        let r = send(&app, Method::GET, "o0", "", &[], b"").await;
+        assert_eq!(app.read_ahead.free(), READ_AHEAD_SHARED - (READ_AHEAD_MAX - READ_AHEAD));
+        drop(r);
+        assert_eq!(app.read_ahead.free(), READ_AHEAD_SHARED, "never read");
+        let r = send(&app, Method::GET, "o0", "", &[], b"").await;
+        let mut body = r.into_body().into_data_stream();
+        let reader = tokio::spawn(async move {
+            let first = body.next().await;
+            (first.is_some(), body)
+        });
+        settles_at(&held, READ_AHEAD_MAX).await;
+        open.send(true).unwrap();
+        let (got, body) = reader.await.unwrap();
+        assert!(got);
+        assert_eq!(app.read_ahead.free(), READ_AHEAD_SHARED - (READ_AHEAD_MAX - READ_AHEAD), "held while the body is open");
+        drop(body);
+        assert_eq!(app.read_ahead.free(), READ_AHEAD_SHARED, "partly read");
+    }
+
+    // -----------------------------------------------------------------------------------------
     // Content held in descriptors (format §5)
 
     /// An app over `mem` whose pool has the default chunking and lists `features`, with a drive
@@ -1438,7 +1586,7 @@ mod tests {
         let store = Store::mem(mem.clone());
         let pool = Pool::open_creating(store, 1 << 20, crate::clock::Clock::System, CommitGuard::CreateIfAbsent, &features).await.unwrap();
         let d = pool.create_drive("d", None).await.unwrap();
-        (Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default() }), d)
+        (Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default() }), d)
     }
 
     /// Sends a request for `key` of drive `d` as the admin key, with `payload` as what its
@@ -1942,28 +2090,34 @@ mod tests {
     async fn a_failed_deletion_of_the_records_is_tried_again() {
         let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
         let (app, d) = app_with(&mem, &[]).await;
-        let failures = Arc::new(AtomicUsize::new(1));
+        // Deletions under the upload left to fail.
+        let failures = Arc::new(std::sync::Mutex::new(1usize));
         let left = failures.clone();
         mem.set_hook(Some(Arc::new(move |op, path| {
-            let fail = op == MemOp::Delete && path.contains("/uploads/") && left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+            let fail = op == MemOp::Delete && path.contains("/uploads/") && {
+                let mut n = left.lock().unwrap();
+                let fail = *n > 0;
+                *n = n.saturating_sub(1);
+                fail
+            };
             futures::future::ready(if fail { Fault::Fail } else { Fault::None }).boxed()
         })));
         let id = create(&app, "mp", &[]).await;
         let etag = part(&app, "mp", &id, 1, b"one").await;
         complete(&app, "mp", &id, &[(1, &etag)]).await.unwrap();
-        until("the first deletion fails", || failures.load(Ordering::SeqCst) == 0).await;
+        until("the first deletion fails", || *failures.lock().unwrap() == 0).await;
         assert!(staged(&mem, &d, &id));
         no_upload(complete(&app, "mp", &id, &[(1, &etag)]).await);
         assert!(!uploads_listed(&app).await.contains(&id));
         until("the second deletion succeeds", || !staged(&mem, &d, &id)).await;
         until("and the claim goes", || app.uploads.claims.lock().unwrap().is_empty()).await;
 
-        failures.store(usize::MAX, Ordering::SeqCst);
+        *failures.lock().unwrap() = usize::MAX;
         let id = create(&app, "mp2", &[]).await;
         let etag = part(&app, "mp2", &id, 1, b"two").await;
         complete(&app, "mp2", &id, &[(1, &etag)]).await.unwrap();
-        until("the first deletion fails", || failures.load(Ordering::SeqCst) < usize::MAX).await;
-        failures.store(0, Ordering::SeqCst);
+        until("the first deletion fails", || *failures.lock().unwrap() < usize::MAX).await;
+        *failures.lock().unwrap() = 0;
         assert!(staged(&mem, &d, &id));
         app.uploads.finish(&app.pool).await;
         assert!(!staged(&mem, &d, &id));

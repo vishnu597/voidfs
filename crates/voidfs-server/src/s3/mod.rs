@@ -33,6 +33,8 @@ pub struct App {
     /// Multipart uploads being completed or aborted, and those completed until their staging
     /// records are deleted.
     pub uploads: object::Uploads,
+    /// The shard reads GETs share past their own window.
+    pub read_ahead: object::ReadAhead,
 }
 
 pub fn router(app: Arc<App>) -> axum::Router {

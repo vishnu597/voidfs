@@ -300,7 +300,7 @@ enterprise or later.
 | D3 | macOS mount: native FSKit module (see §5.3), launchd agent, notarized and signed builds | P0 |
 | D4 | Windows mount (WinFsp or the Cloud Files API), service, signed MSI | P1 (after macOS) |
 | D5 | Desktop semantics: atomic-save patterns (temp file plus rename, exchangedata/renamex_np), xattrs and resource forks, AppleDouble `._` files, `.DS_Store` policy, mtime, mode bits, symlinks, sparse files, mmap, `fsync` meaning durably published or journaled | P0–P1 |
-| D6 | Read-ahead and prefetch tuned for video scrubbing and large CAD files; parallel shard fetch | P1 |
+| D6 | Read-ahead and prefetch tuned for video scrubbing and large CAD files; parallel shard fetch; reads of pieces of shards (bounded range GETs of up to 1 MiB, as Space's client appears to do), with how a piece is checked decided then ([shard-fetch results](../bench/results/shard-fetch/README.md#ranged-shard-reads-options-not-built)) | P1 |
 | D7 | File locking: advisory `flock`/`fcntl` propagated through the authority as leases; `.dwl`/`.lck` awareness for CAD | P2 (differentiator) |
 | D8 | Offline pinning ("keep this folder local"), with a conflict policy that uses versions, never loss | P2 (differentiator) |
 | D9 | CLI parity: login, whoami, workspace list/use, drives, drive create/delete, mount/unmount/mounts, status, daemon install/start/stop/restart/info, upload/uploads --watch, history/show/restore, keys create/list/revoke (`--format env`), fork, update --check (JSON output everywhere) | P0 |

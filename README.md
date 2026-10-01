@@ -172,7 +172,8 @@ or a private network, and never publish it. No label names a drive or a key.
 | `voidfs_s3_request_duration_seconds` | `op` | Their latency until the response's headers (histogram) |
 | `voidfs_bucket_requests_total`, `voidfs_bucket_request_errors_total` | `op` | Requests to the bucket (or the `fs:` or `memory` store), and those that failed |
 | `voidfs_bucket_request_duration_seconds` | `op` | Their latency (histogram) |
-| `voidfs_cache_hits_total`, `voidfs_cache_misses_total`, `voidfs_cache_evictions_total` | `cache` (`shard`, `page`) | Reads served from memory, and from the bucket; entries evicted for room |
+| `voidfs_cache_hits_total`, `voidfs_cache_misses_total`, `voidfs_cache_evictions_total` | `cache` (`shard`, `page`) | Reads served from memory, and from the bucket (one request each); entries evicted for room |
+| `voidfs_cache_coalesced_total` | `cache` | Reads that missed while another read was fetching the same shard or page, and waited for that fetch rather than ask the bucket again |
 | `voidfs_cache_bytes`, `voidfs_cache_entries`, `voidfs_cache_capacity_bytes` | `cache` | What each cache holds, and the most it may |
 | `voidfs_cache_drops_total` | | Times the caches were emptied on SIGUSR1 (below) |
 | `voidfs_commit_transactions` | | Transactions in each log entry written: group commit's batches (histogram) |
