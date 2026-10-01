@@ -604,6 +604,44 @@ it gone eventually, and it stays a GC root until then.
 
 ### Item 6. The read path for cold and large reads
 
+**Status (1 October 2026): coalescing and a shared read-ahead budget done; ranged shard reads
+designed, not built.** Measured in [bench/results/shard-fetch](../bench/results/shard-fetch/README.md):
+- **Concurrent misses of a shard make one bucket GET** (`Pool::read`): the fetch runs on a task of
+  its own that every reader waits for, so a reader that goes away leaves it to the others; a
+  failure reaches every reader and is not kept; the hash check and the guard's view stay with the
+  fetch. A wave of eight cold 64 MiB reads makes 3.6 GETs per read instead of 24.
+- **A GET reads up to 32 shards ahead, borrowing past 8 from a budget of 32 that all GETs share.**
+  Alone, a cold 64 MiB read with the cap takes 110 ms instead of 215; many at once read as with 8
+  each, at most 15% more memory. A fixed window of 32 cost many concurrent reads 17–40% more memory
+  and, without the cap's total, up to 2.6× the time.
+- **Cold, against SpaceFS's cache-cleared figures,** as a fraction of the bare bucket's time,
+  `main` → this branch, A B B A B A A B:
+
+  | Row | Capped (`s3`) | Capped, no total | No cap | SpaceFS |
+  |---|--:|--:|--:|--:|
+  | get 32 MiB | 0.71–0.76 → 0.19–0.31 | 0.31–0.36 → 0.24–0.30 | 1.18–1.32 → 0.66–0.68 | 0.50 |
+  | get 64 MiB | 0.71–0.73 → 0.18–0.24 | 0.27–0.31 → 0.14–0.15 | 1.17–1.24 → 0.55–0.56 | 0.38 |
+
+  Both are ahead of SpaceFS's in every run with the cap, and without its total. Without a cap the
+  bare bucket reads 64 MiB in 134 ms rather than S3's 779, so the ratio does not compare. The small
+  cold rows are as they were, and ahead.
+- **Pages are checked against their hashes** when fetched, as shards are, and in garbage
+  collection's marking: a checkpoint segment that parsed but was not what had been written loaded a
+  drive in a state it never had, and a manifest page that lied would have hidden live shards from
+  the marking.
+- **Warm, the three large reads behind SpaceFS with the cap are where they were** (0.78–0.94 of
+  their ratio): served from memory, at this Mac's loopback limit. versitygw, serving the same reads
+  from the page cache, is 6–12% faster than voidfs, and the server's CPU is the kernel's
+  copy into the sockets. Nothing cheap was found to fix; the real run will judge them.
+- With the cap, 45 of the 49 rows are at or ahead of SpaceFS's ratio in both runs (46 before):
+  the same three, and the range read, which sits on SpaceFS's ratio within a tenth of a millisecond.
+  Warm without the cap, the geometric mean against `main` is 0.980.
+
+**What is left:** ranged shard reads, which need a decision first (they either weaken the hash
+check or need block hashes, a format change; the options and their costs are in the results);
+read-ahead across requests for the mount (D6); the disk tier (S5); and the real run, cold too, to
+settle S3's download total.
+
 **Problem.** Measured cold since 1 October (item 7.1), with the bucket 12 ms away and capped as
 S3 was in SpaceFS's run (item 7.4):
 - A GET streams at most 8 shards at a time (`.buffered(8)` in object.rs). A cold 64 MiB read is
@@ -636,9 +674,11 @@ as a fraction of the bare bucket's, cold, two runs, against SpaceFS's cache-clea
 **Changes, in this order:**
 - coalesce concurrent misses (moka's async cache has `try_get_with`, or a small in-flight map):
   537 MB per wave of get 64 MiB becomes 67, and the estimate is about 0.15× the bare bucket's
-  time with the cap;
-- fetch only the bytes a range needs from its shard (a ranged GET of the shard object);
-- raise or adapt the per-request shard window, which bounds one read once reads are coalesced;
+  time with the cap. **Done:** an in-flight map, 0.18–0.24× with the window below;
+- fetch only the bytes a range needs from its shard (a ranged GET of the shard object). **Designed,
+  not built:** it weakens the hash check or needs a format change;
+- raise or adapt the per-request shard window, which bounds one read once reads are coalesced.
+  **Done:** adapted, from a budget all GETs share;
 - add read-ahead;
 - add the disk tier.
 

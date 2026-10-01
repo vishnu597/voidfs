@@ -371,8 +371,16 @@ turns these into work items is [docs/step-3-performance.md](../docs/step-3-perfo
      object fetches every shard, 537 MB for a wave of 64 MiB reads, and the cap's 1,000 MB/s
      total, an assumption for downloads, binds. Without the total they take 0.29–0.39×, ahead.
      A cold 64 KiB range takes about 3× the bare bucket's time: it fetches its whole shard.
-   - Direction (step 3, item 6): coalesce concurrent fetches of a shard, then ranged shard
-     reads, then a wider window. The real run's cold figures will settle the download total.
+   - **Coalesced since 1 October** ([results](results/shard-fetch/README.md)): concurrent misses
+     of a shard make one GET, and a GET reads up to 32 shards ahead, borrowing past 8 from a budget
+     that all GETs share. Cold with the cap, get 32 and 64 MiB take 0.18–0.31× the bare bucket's
+     time, ahead of SpaceFS's 0.38× and 0.50× in every run (`main`: 0.71–0.76×), and 0.14–0.30×
+     without the cap's total. A fixed wider window was measured and not built: many reads at once
+     gained nothing from it, held more memory, and ran up to 2.6× slower without the total.
+   - Still open: a cold range fetches its whole shard (about 3× the bare bucket's time with the
+     cap), and reading only the range weakens the hash check or needs a format change; the warm
+     large reads are at this Mac's loopback limit; and the real run's cold figures will settle the
+     download total.
 
 What the runs confirm from [PARITY.md §6](../docs/PARITY.md#where-voidfs-stands): metadata-only
 work (listing, `head`, small warm reads) is well ahead of the bare bucket at any distance, and
