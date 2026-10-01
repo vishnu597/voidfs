@@ -24,6 +24,11 @@
 #   BENCH_BUCKET_DESC              the bucket, when it is not AWS S3 (e.g. "Cloudflare R2"). The
 #                                  run is then not SpaceFS's setup, and gets no parity column
 #   BENCH_NAME                     base name of the result files
+#   BENCH_COLD=1                   client-host only: measure cold reads (the harness's --cold).
+#                                  Start serve.sh with BENCH_ADMIN_LISTEN=127.0.0.1:9001, and set
+#                                  VOIDFS_SERVER_PID to its process id (`$!` after starting it in
+#                                  the background) and
+#                                  VOIDFS_METRICS_URL=http://127.0.0.1:9001/metrics
 # Extra arguments go to `voidfs-bench run` (for example --scenario, --ops-scale).
 
 set -euo pipefail
@@ -58,6 +63,14 @@ case "$topology" in
         exit 1
         ;;
 esac
+
+if [[ "${BENCH_COLD:-0}" == 1 ]]; then
+    [[ "$topology" == client-host ]] || { echo "BENCH_COLD=1 needs voidfs-server on this machine: BENCH_TOPOLOGY=client-host" >&2; exit 1; }
+    for v in VOIDFS_SERVER_PID VOIDFS_METRICS_URL; do
+        [[ -n "${!v:-}" ]] || { echo "BENCH_COLD=1: $v is not set" >&2; exit 1; }
+    done
+    extra+=(--cold)
+fi
 
 cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p voidfs-bench
 curl -s -o /dev/null -m 5 "$VOIDFS_ENDPOINT/" || { echo "no voidfs server answers at $VOIDFS_ENDPOINT" >&2; exit 1; }

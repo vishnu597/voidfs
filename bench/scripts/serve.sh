@@ -16,6 +16,9 @@
 #                       that admits the client machine alone: the traffic is plain HTTP.
 #   BENCH_POOL_PREFIX   default voidfs-bench/pool
 #   BENCH_CACHE_MIB     default 512, as in SpaceFS's run
+#   BENCH_ADMIN_LISTEN  serve /metrics there too, for example 127.0.0.1:9001, which cold runs
+#                       (BENCH_COLD=1 cloud-run.sh) read. Off by default; not authenticated, so
+#                       keep it on loopback
 #
 # voidfs has no garbage collection yet: everything the benchmark writes through voidfs stays
 # under the pool prefix until you delete it (see bench/README.md, "Clean up").
@@ -30,7 +33,11 @@ done
 cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p voidfs-server
 export VOIDFS_S3_REGION="${VOIDFS_S3_REGION:-us-east-1}"
 export RUST_LOG="${RUST_LOG:-warn}"
+admin=()
+[[ -n "${BENCH_ADMIN_LISTEN:-}" ]] && admin=(--admin-listen "$BENCH_ADMIN_LISTEN")
+# exec: the server keeps this script's process id, which a cold run signals.
 exec "$root/target/release/voidfs-server" \
     --store "s3:$VOIDFS_S3_BUCKET/${BENCH_POOL_PREFIX:-voidfs-bench/pool}" \
     --listen "${BENCH_LISTEN:-127.0.0.1:9000}" \
-    --cache-mib "${BENCH_CACHE_MIB:-512}"
+    --cache-mib "${BENCH_CACHE_MIB:-512}" \
+    ${admin[@]+"${admin[@]}"}
