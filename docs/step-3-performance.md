@@ -605,7 +605,7 @@ it gone eventually, and it stays a GC root until then.
 ### Item 6. The read path for cold and large reads
 
 **Status (1 October 2026): coalescing and a shared read-ahead budget done; ranged shard reads
-designed, not built.** Measured in [bench/results/shard-fetch](../bench/results/shard-fetch/README.md):
+deferred to the mount.** Measured in [bench/results/shard-fetch](../bench/results/shard-fetch/README.md):
 - **Concurrent misses of a shard make one bucket GET** (`Pool::read`): the fetch runs on a task of
   its own that every reader waits for, so a reader that goes away leaves it to the others; a
   failure reaches every reader and is not kept; the hash check and the guard's view stay with the
@@ -637,10 +637,19 @@ designed, not built.** Measured in [bench/results/shard-fetch](../bench/results/
   the same three, and the range read, which sits on SpaceFS's ratio within a tenth of a millisecond.
   Warm without the cap, the geometric mean against `main` is 0.980.
 
-**What is left:** ranged shard reads, which need a decision first (they either weaken the hash
-check or need block hashes, a format change; the options and their costs are in the results);
-read-ahead across requests for the mount (D6); the disk tier (S5); and the real run, cold too, to
-settle S3's download total.
+**Ranged shard reads: decided (1 October 2026) to leave the gateway as it is, and revisit with the
+mount.** A cold 64 KiB range still fetches its whole shard (about 3× the bare bucket's time with the
+cap). SpaceFS's S3 layer does the same: its docs say a range read "Fetches only the shards the range
+touches". Its Mac client appears (from its daemon's strings, not its code) to read pieces of shards
+as well: bounded range GETs of up to 1 MiB, checked only for length, while whole shards are checked
+against their hash. So when the writable mount is built (step 5, checklist D6), its client should
+read pieces the same way, cached and coalesced apart from whole shards, and decide then how a piece
+is checked: by length alone, as SpaceFS appears to, or by block hashes (a format change, so an RFC).
+The evidence and the options are in the
+[results](../bench/results/shard-fetch/README.md#ranged-shard-reads-options-not-built).
+
+**What is left:** pieces of shards for the mount, above; read-ahead across requests for the mount
+(D6); the disk tier (S5); and the real run, cold too, to settle S3's download total.
 
 **Problem.** Measured cold since 1 October (item 7.1), with the bucket 12 ms away and capped as
 S3 was in SpaceFS's run (item 7.4):
@@ -675,8 +684,8 @@ as a fraction of the bare bucket's, cold, two runs, against SpaceFS's cache-clea
 - coalesce concurrent misses (moka's async cache has `try_get_with`, or a small in-flight map):
   537 MB per wave of get 64 MiB becomes 67, and the estimate is about 0.15× the bare bucket's
   time with the cap. **Done:** an in-flight map, 0.18–0.24× with the window below;
-- fetch only the bytes a range needs from its shard (a ranged GET of the shard object). **Designed,
-  not built:** it weakens the hash check or needs a format change;
+- fetch only the bytes a range needs from its shard (a ranged GET of the shard object). **Deferred
+  to the mount** (step 5, D6), as above: SpaceFS's S3 layer reads whole shards too;
 - raise or adapt the per-request shard window, which bounds one read once reads are coalesced.
   **Done:** adapted, from a budget all GETs share;
 - add read-ahead;

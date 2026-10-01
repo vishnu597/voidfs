@@ -378,9 +378,9 @@ turns these into work items is [docs/step-3-performance.md](../docs/step-3-perfo
      without the cap's total. A fixed wider window was measured and not built: many reads at once
      gained nothing from it, held more memory, and ran up to 2.6× slower without the total.
    - Still open: a cold range fetches its whole shard (about 3× the bare bucket's time with the
-     cap), and reading only the range weakens the hash check or needs a format change; the warm
-     large reads are at this Mac's loopback limit; and the real run's cold figures will settle the
-     download total.
+     cap), as SpaceFS's S3 layer does by its docs; reading pieces of shards, as SpaceFS's Mac client
+     appears to, is deferred to the mount (step 5). The warm large reads are at this Mac's loopback
+     limit, and the real run's cold figures will settle the download total.
 
 What the runs confirm from [PARITY.md §6](../docs/PARITY.md#where-voidfs-stands): metadata-only
 work (listing, `head`, small warm reads) is well ahead of the bare bucket at any distance, and

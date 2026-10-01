@@ -74,8 +74,8 @@ billing or plans), this page says so.
     share one round trip), the shard cache's admission, fewer round trips per write
     (checkpoints in the background, pipelined ingest, and small files held in the log, RFC 0003),
     patch chunking each touched shard once, multipart completion in two round trips, and
-    coalesced shard fetches with shared read-ahead. Ranged shard reads are designed, and wait on a
-    decision: they weaken the hash check or change the format.
+    coalesced shard fetches with shared read-ahead. Reading pieces of shards is deferred to the
+    mount (step 5), as SpaceFS's S3 layer also reads whole shards for a range.
   - Steps 4–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -344,9 +344,10 @@ With coalesced shard fetches and shared read-ahead (1 October,
   this Mac's loopback limit (versitygw, serving the same reads from the page cache, is only 6–12%
   faster), and the range read, on SpaceFS's ratio within a tenth of a millisecond.
 - Warm, at 12 ms without the cap, the geometric mean against `main` is 0.980 over the 49 rows.
-- A cold 64 KiB range still fetches its whole shard (about 3× the bare bucket's time). Reading only
-  the range weakens the hash check or needs block hashes, a format change; the options are written
-  up and wait on a decision.
+- A cold 64 KiB range still fetches its whole shard (about 3× the bare bucket's time), as SpaceFS's
+  S3 layer does by its docs ("Fetches only the shards the range touches"). Its Mac client appears to
+  read pieces of shards too, up to 1 MiB, checked only for length. **Decided:** the gateway stays as
+  it is, and the mount (step 5) revisits pieces; the evidence and options are in the results.
 
 With cold reads and S3's bandwidth (1 October,
 [bench/results/cold-reads](../bench/results/cold-reads/README.md)):
@@ -637,8 +638,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      shard make one GET, and a GET reads up to 32 shards ahead, borrowing past 8 from a budget all
      GETs share. Cold with S3's bandwidth, get 32 and 64 MiB take 0.18–0.31× the bare bucket's time
      (SpaceFS 0.38–0.50×, `main` 0.71–0.76×). Pages are now checked against their hashes too.
-     Ranged shard reads are designed and wait on a decision (they weaken the hash check or change
-     the format).
+     Reading pieces of shards is deferred to the mount (step 5): SpaceFS's S3 layer reads whole
+     shards for a range as well.
    - **Done when:** every one of the 49 rows is at least as fast as SpaceFS's.
    - **Status (2026-10-01):** group commit (with its hold), the shard cache's admission, fewer
      round trips per write (pipelined ingest, background checkpoints, small files in the log),
@@ -647,7 +648,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      are done. 29–31 of the 49 rows are there in the local 12 ms runs, 45–46 with S3's bandwidth
      emulated, and 34–37 on loopback; cold, the four rows SpaceFS gives cache-cleared figures for
      are all ahead with S3's bandwidth. Next: the real run (item 7.2), which also judges the three
-     warm large reads, and a decision on ranged shard reads.
+     warm large reads.
 4. **Client core, CLI and Rust SDK.**
    - `crates/client`: cache, journal, upload queue, change-feed client.
    - Direct uploads (§4.11), and short-lived storage credentials: R2, AWS STS, and presigned URLs
@@ -659,6 +660,12 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
+   - Reads of pieces of shards, deferred here from step 3, item 6: bounded range GETs of up to
+     1 MiB, cached and coalesced apart from whole shards, as SpaceFS's client appears to do, so that
+     a cold random read does not wait for a whole shard. Decide then how a piece is checked: by its
+     length alone, as SpaceFS appears to, or by block hashes (a format change, so an RFC first).
+     Whole shards stay checked against their hash. Evidence and options:
+     [bench/results/shard-fetch](../bench/results/shard-fetch/README.md#ranged-shard-reads-options-not-built).
    - A privileged helper that mounts into `/Volumes`, as SpaceFS does.
    - Finder Sync badges.
    - A menu-bar transfer queue (pause, resume, speed limits).

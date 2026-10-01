@@ -18,14 +18,15 @@ reads further ahead when the pool has room.*
 | `capped-branch-1`, `-2` | This branch | 12 ms, `BENCH_BANDWIDTH=s3`, warm, all 49 rows |
 | `warmconc-*` | The same, on loopback | No delay or cap, warm: get 64 MiB at 1, 2, 4 and 8 at once (`--concurrency`), against versitygw |
 
-Each server binary was built with `cargo build --release -p voidfs-server`, in a target directory
-of its own (`main` in a `git worktree` of `origin/main`), and passed with `BENCH_SERVER_BIN`; their
-hashes differ (`main` 62b8ac5d, the branch 9c4ae46f, which the branch's last commit builds to
-again), and only the branch's has `voidfs_cache_coalesced_total` in it (`strings`). The harness ran from the worktree of `main` (it
-did not change), with `BENCH_POOL_FEATURES=inline-data` and `BENCH_BUCKET_REQUESTS=1`, and the
-server's metrics were scraped every 2 seconds. A diagnostic build of the branch, whose read-ahead
-an environment variable sets (`VOIDFS_DIAG_READ_AHEAD`, `VOIDFS_DIAG_READ_AHEAD_SHARED`; nothing
-else differs), served the probe of concurrent reads ([below](#the-window)).
+Each server binary was built with `cargo build --release -p voidfs-server`, in a target directory of
+its own (`main` in a `git worktree` of `origin/main`), and passed with `BENCH_SERVER_BIN`; their
+hashes differ (`main` 62b8ac5d, the branch 9c4ae46f, which the branch's code builds to again), and
+only the branch's has `voidfs_cache_coalesced_total` in it (`strings`). The harness ran from the
+worktree of `main` (it did not change), with `BENCH_POOL_FEATURES=inline-data` and
+`BENCH_BUCKET_REQUESTS=1`, and the server's metrics were scraped every 2 seconds. A diagnostic build
+of the branch, whose read-ahead an environment variable sets (`VOIDFS_DIAG_READ_AHEAD`,
+`VOIDFS_DIAG_READ_AHEAD_SHARED`; nothing else differs), served the probe of concurrent reads
+([below](#the-window)).
 
 Run order: the three cold sets, then the warm A B B A, the two capped runs, the probes, focused runs
 of the rows the warm runs showed slower (A B B A B A A B, four times the operations), the loopback
@@ -384,7 +385,8 @@ GET of the shard would fetch 64 KiB, but a SHA-256 of the whole shard cannot che
 The format already allows the read ([format §4](../../../spec/format.md#4-shards): a shard's object
 is exactly its bytes, "which lets a reader fetch part of a shard without downloading it all";
 readers SHOULD verify every *whole* shard they fetch). Every option below either weakens the check
-voidfs-server makes today or changes the format, so none was built: each needs a decision first.
+voidfs-server makes today or changes the format, so none was built; the decision, after looking at
+what SpaceFS does, is at the end of this section.
 
 | Option | A cold 64 KiB range would cost | What it gives up or adds |
 |---|---|---|
@@ -402,6 +404,35 @@ voidfs-server makes today or changes the format, so none was built: each needs a
 - If cold random reads come to matter before the mount does: option 5 through an RFC, or option 1
   behind a pool setting for buckets the operator trusts.
 
+**What SpaceFS does** (read on 1 October 2026):
+- **Its S3 layer, which the benchmark measures, reads whole shards for a range.** Their operation
+  docs (`docs.spacefs.com/llms-full.txt`, "Read a byte range") say it "Fetches only the shards the
+  range touches", at a cost "proportional to the range, not the object": shard granularity, as
+  voidfs does, served from their edge cache when it holds them.
+- **Its Mac client appears to read parts of shards, checked only for length.** Inferred from the
+  strings of the Rust daemon in Space 0.2.300 (`spacefs-fskitd`), not from its code. Its read path
+  logs two kinds of fetch:
+  - whole shards ("shard: served from cache", "shard: waited for a fetch in flight", "shard:
+    fetched whole"), checked against their hash ("immutable shard checksum mismatch"; through their
+    edge, "edge worker returned bytes that do not match the content-addressed shard key; retry
+    direct origin");
+  - pieces ("piece: served from cache", "piece: waited for a fetch in flight", "piece: fetched"):
+    bounded range GETs of a shard object, of at most 1 MiB ("hydration request exceeds 1MiB"),
+    whose only checks in the strings are of length ("short bounded shard response", "bounded shard
+    response exceeded requested range", "provider did not honor exact bounded range"). No string
+    names BLAKE3, Bao or a Merkle tree.
+
+  That is option 1 above, in the client. It also coalesces fetches as voidfs now does, and its
+  read-ahead takes slots ("block-ahead: issued", "queued", "no slot"), much as the shared budget.
+
+**Decided (1 October 2026): no change to the gateway; revisit with the mount.** The gateway
+already reads ranges as SpaceFS's S3 layer documents, every cold row SpaceFS publishes is ahead, and
+the gateway keeps its whole-shard hash check. When the writable mount is built (parity plan step 5,
+checklist D6), its client should read pieces as SpaceFS's appears to: bounded range GETs of up to
+1 MiB, cached and coalesced apart from whole shards, while every whole shard stays checked. How a
+piece is checked is to be decided then: by its length alone, as SpaceFS appears to (no format
+change; it trusts the bucket for partial reads, as voidfs already trusts it with the log), or by
+block hashes (option 5, an RFC), which would check every piece.
 ## Tests
 
 Nine new tests, each seen to fail with the code it guards broken, running only that test, with a
@@ -458,8 +489,9 @@ were skipped: boto3 is not installed on this Mac (CI runs them).
 
 ## What is left
 
-- **Ranged shard reads,** which need a decision first: each way either weakens the hash check or
-  changes the format ([above](#ranged-shard-reads-options-not-built)).
+- **Ranged shard reads,** deferred to the mount (step 5, checklist D6), where its client should read
+  pieces of shards as SpaceFS's appears to; how a piece is checked is decided then
+  ([above](#ranged-shard-reads-options-not-built)).
 - **The three warm large reads** behind SpaceFS's ratio with the cap, at this Mac's loopback limit:
   the real run in SpaceFS's setup (item 7.2) will judge them, and settle S3's download total, cold.
 - **Read-ahead across requests** for the mount (checklist D6), and **the disk tier** (S5).
