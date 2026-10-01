@@ -111,6 +111,12 @@ pub struct S3Metrics {
     ops: Vec<(Histogram, [IntCounter; 4])>,
 }
 
+impl Default for S3Metrics {
+    fn default() -> Self {
+        S3Metrics::new()
+    }
+}
+
 impl S3Metrics {
     pub fn new() -> S3Metrics {
         let r = Registry::new();
@@ -389,6 +395,12 @@ pub struct ProcessMetrics {
     uptime: IntGauge,
 }
 
+impl Default for ProcessMetrics {
+    fn default() -> Self {
+        ProcessMetrics::new()
+    }
+}
+
 impl ProcessMetrics {
     pub fn new() -> ProcessMetrics {
         let r = Registry::new();
@@ -405,8 +417,7 @@ impl ProcessMetrics {
 }
 
 /// The value of the sample `series` (its name and labels as the text format writes them) in
-/// `text`.
-#[cfg(test)]
+/// `text`. For tests, of this crate and of its binary.
 pub fn sample(text: &str, series: &str) -> Option<f64> {
     text.lines().find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
 }

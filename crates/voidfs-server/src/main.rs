@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `voidfs-server`: serves voidfs drives over the S3 protocol from a pool in your bucket.
 
-mod admin;
-mod clock;
-mod gc;
-mod metrics;
-mod pool;
-mod probe;
-mod s3;
-mod sigv4;
-mod store;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,9 +9,9 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use rand::RngExt;
 use voidfs_core::model::CommitGuard;
-
-use crate::sigv4::{KeyInfo, Keys, Scope};
-use crate::store::Store;
+use voidfs_server::sigv4::{KeyInfo, Keys, Scope};
+use voidfs_server::store::Store;
+use voidfs_server::{admin, clock, gc, metrics, pool, probe, s3};
 
 /// Serve voidfs drives over S3 from a pool in your own storage.
 #[derive(Parser)]
@@ -425,7 +415,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn sigusr1_drops_the_caches() {
-        use crate::metrics::{encode, sample};
+        use voidfs_server::metrics::{encode, sample};
         let pool = pool::Pool::open(Store::memory().unwrap(), 1 << 20).await.unwrap();
         let usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()).unwrap();
         tokio::spawn(drop_caches_on(usr1, pool.clone()));
