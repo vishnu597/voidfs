@@ -487,8 +487,8 @@ and the README's commands run by hand against a server.
 
 **Checklist:** D1 (with D6's cache and D8's pins started).
 
-**Status (2 October 2026): in progress**, in three pull requests: the cache and fetcher (built),
-then the journal and upload queue, then the change-feed client. What the first built:
+**Status (2 October 2026): in progress**, in three pull requests: the cache and fetcher, then the
+journal and upload queue (both built), then the change-feed client. What the first built:
 - `crates/voidfs-client`, with `Store` (the per-user `state.sqlite`), `Cache`, `Reader` and the
   `Fetch` trait with `ApiFetcher`, as designed below.
 - In the SDK, `get_range`: a ranged read that also returns the version's headers, so that the
@@ -534,6 +534,59 @@ then the journal and upload queue, then the change-feed client. What the first b
 - **Where item 6 slots in:** `Fetch` is the interface: a fetcher that reads shards with storage
   credentials implements it, and the cache's key would gain a shard-by-hash form. Neither is needed
   for the API path, so neither decision item 6 waits on was needed here.
+
+What the second built (the journal and the upload queue):
+- `Queue`, with `journal` and `publish`: the journal's calls (`put`, `write`, `truncate`,
+  `rename`, `delete`, `folder`, `set_attrs`), each durable when it returns; `import` of files of
+  the user's as a batch; `pause`, `resume` and `cancel` for everything, a drive, a batch or one
+  entry; `set_bandwidth`; `status`, with items and batches; `close`.
+- In the SDK: `Bandwidth`, a shared token bucket that paces request bodies 64 KiB at a time
+  (`Config::upload_bandwidth`), and multipart calls on the SDK's own requests
+  (`create_multipart_upload`, `upload_part`, `complete_multipart_upload`, `abort_multipart_upload`,
+  `list_parts`), so that the limit covers them.
+
+**Decisions taken while building the second:**
+- **One queue, two ways in,** as Space has (§1.4): the journal's changes, and imports. The journal
+  copies a change's bytes into `<state>/journal/` and syncs the file, its folder and its entry
+  before the call returns. An import is read where it is, when it goes up; its size and
+  modification time are recorded, and its multipart upload starts again if they change.
+- **Order:** one key's changes publish in order, and so do a folder's and the changes under it,
+  and a rename's and the changes to either name. Other keys go at once, 16 at a time.
+- **Coalescing:** a put takes the writes and truncates after it into one put (below 64 MiB);
+  writes take the writes after them into one patch (at most 64 MiB and 10,000 edits), with a
+  truncate only last. Each change is guarded by the version it was based on; a change made on top
+  of one not yet published is guarded by the version that one gets.
+- **The `412` rule:** the local version is published anyway and the version it replaced is
+  recorded as the conflict: a put is put again unguarded, a patch's local version (its base with
+  its edits) is built and put, a rename, delete or attribute change is sent unguarded.
+- **Its own lost answers:** each put carries `x-amz-meta-voidfs-entry` (the state's id and the
+  entry's). A put whose answer was lost, retried into a `412`, or found in flight at a restart, is
+  recognised as its own and not published twice. Other changes can't be told apart that way: a
+  guarded patch retried after it landed gets a `412`, and its local version is published again
+  as a second version with a conflict that wasn't one. A rename or a delete that landed is
+  recognised from the object being gone.
+- **Large files:** from 64 MiB, in 16 MiB parts (larger past 156 GiB), 4 parts of a file at once,
+  within 256 MiB of bodies in memory across all uploads. The upload's id and each finished part
+  are recorded; after a pause or a restart the parts the server still has, by `ListParts`, are not
+  sent again. Pausing stops the parts in flight, which are sent again, as Space's resume does.
+- **Pause, resume, cancel:** for everything, a drive, a batch or one entry, kept across restarts.
+  Space pauses only app uploads, one at a time (§1.4). A cancel stops the transfer, never
+  publishes, cancels the changes made on top of it, and aborts a multipart upload: Space's cancel
+  removes the file but lets its upload finish and publish (§1.4).
+- **Bandwidth:** a token bucket in the SDK, shared by the queue's requests, in 64 KiB pieces with
+  a quarter of a second's burst; a new limit applies to the next piece, and is kept across
+  restarts. Space's applies at the next mount and starts at 24 MiB/s (§1.4).
+- **Failures:** a server or network failure the SDK has already retried is tried again after 2,
+  4, 8 … seconds, at most a minute; another failure (a `409`, a `403`) waits for a resume. A
+  failed change holds back the later changes to its key.
+- **Attributes:** an import keeps its modification time and permission bits (on the put) and its
+  extended attributes (as an attribute version after it), but `com.apple.quarantine`,
+  `com.apple.provenance`, `security.*` and `system.*`. Space's uploader drops extended attributes
+  (head-to-head). A file that exists becomes a new version, as `void upload` does, where Space's
+  imports keep both by default.
+- **Restart safe** (Space's `daemon info`): every change is synced before its call returns, so
+  nothing unpublished is only in memory; `status` reports what is unpublished and its bytes, for
+  the daemon's `info` (item 4).
 
 **Design.** A crate `voidfs-client`, which the daemon (item 4) and the mount (step 5) run. One
 SQLite database per user (`state.sqlite`, WAL, in the platform's application-support or state
@@ -670,6 +723,8 @@ for first); a cold read through the bucket against one through the API.
 - Item 3, the client core: **in progress** (2 October). The cache and fetcher are built: their 13
   tests (9 unit, 4 against a server in the same process and through the fault proxy) each failed
   with the code they guard broken, measured as
-  [bench/results/client-cache](../bench/results/client-cache/README.md) says. Next: the write
-  journal and the upload queue, then the change-feed client.
+  [bench/results/client-cache](../bench/results/client-cache/README.md) says. The write journal and
+  the upload queue are built: their 13 tests (12 against a server in the same process and through
+  the fault proxy, 1 unit), and the SDK's 3 for its bandwidth limit and multipart calls, each
+  failed with the code they guard broken, 35 breaks in all. Next: the change-feed client.
 - Items 4–6: not started.
