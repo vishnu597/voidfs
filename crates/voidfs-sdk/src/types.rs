@@ -131,6 +131,14 @@ pub struct WriteResult {
     pub size: Option<u64>,
 }
 
+/// A part of an open multipart upload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadedPart {
+    pub number: u32,
+    pub etag: String,
+    pub size: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreResult {
     /// The new current version.
