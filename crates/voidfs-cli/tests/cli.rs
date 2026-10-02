@@ -450,6 +450,22 @@ fn deleted_files_say_how_to_bring_them_back() {
 }
 
 #[test]
+fn files_a_folder_restore_took_out_come_back_with_the_hint() {
+    let f = Fixture::new("restored-away");
+    f.drive("footage");
+    f.put("footage", "cuts/a.txt", "one");
+    let at = f.block(f.client.list_versions("footage", "cuts/a.txt", false)).unwrap()[0].last_modified.clone();
+    f.put("footage", "cuts/new.txt", "new");
+    let last = f.put("footage", "cuts/new.txt", "newer");
+    f.void(&["restore", "footage", "cuts", "--at", &at]).ok();
+    let r = f.void(&["history", "footage", "cuts/new.txt"]).fails(1);
+    let command = r.stderr.split('`').nth(1).unwrap_or_else(|| panic!("{}", r.stderr)).to_owned();
+    assert_eq!(command, format!("void restore footage cuts/new.txt --version {last}"));
+    f.void(&command.split(' ').skip(1).collect::<Vec<_>>()).ok();
+    assert_eq!(f.text("footage", "cuts/new.txt"), "newer");
+}
+
+#[test]
 fn show_prints_a_file_as_it_was() {
     let f = Fixture::new("show");
     f.drive("footage");
