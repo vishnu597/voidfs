@@ -29,13 +29,14 @@
 //! client.rename("footage", "cut.txt", "final/cut.txt", Default::default()).await?;
 //! client.fork_drive("footage", "footage-experiment").await?;
 //! // any standard S3 call
-//! client.s3().head_object().bucket("footage").key("final/cut.txt").send().await.map_err(|e| voidfs_sdk::Error::Invalid(e.to_string()))?;
+//! client.s3().head_object().bucket("footage").key("final/cut.txt").send().await?;
 //! # let _ = first;
 //! # Ok(()) }
 //! ```
 //!
 //! **Errors.** Every call fails with [`Error`]: [`Error::status`], [`Error::code`] and, on a
-//! `412`, [`Error::current_version_id`], the version to re-read from before retrying.
+//! `412`, [`Error::current_version_id`], the version to re-read from before retrying. The errors
+//! of [`Client::s3`]'s calls convert into it, with `?`.
 //!
 //! **Retries.** Extension calls are attempted up to [`Config::max_attempts`] times on `429`,
 //! `500`, `502`, `503` and `504`, timeouts and broken connections, with jittered backoff and
@@ -52,6 +53,8 @@ mod retry;
 pub mod sign;
 mod types;
 
+/// The AWS SDK for S3 this crate is built on, for the types of [`Client::s3`]'s calls.
+pub use aws_sdk_s3;
 pub use client::{Client, Config, DEFAULT_ENDPOINT, DEFAULT_REGION, ObjectStream};
 pub use error::{Error, Result, ServiceError};
 pub use feed::ChangeWatch;
