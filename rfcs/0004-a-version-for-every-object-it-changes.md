@@ -70,8 +70,7 @@ needs none of this; with it, cases 1–5 remain.
 ### What SpaceFS does (step 1)
 
 Step 1 ([step 4, §1.4](../docs/step-4-client.md#14-uploads-and-a-folder-restore-observed-through-computer-use-2-october-02333);
-Space 0.2.333, 2 October) could not observe Space's subtree rollback. Only its CLI does one, and
-the CLI needs a signed-in session, which couldn't be had. What it did observe:
+Space 0.2.333, 2 October) observed:
 - Versions are per object: each file and folder has its own version ids, and a history lists only
   that object's. A deleted file's history answers `404`, and there is no recently-deleted listing.
 - Through the S3 API, a restore takes a version id only (`x-s3sdk-as-of` on a restore is `400
@@ -80,11 +79,19 @@ the CLI needs a signed-in session, which couldn't be had. What it did observe:
   restore by version does the same.
 - The mount gave a folder a new version when its entries changed (a file added, one deleted),
   though the API's history of the folder doesn't list it.
-- Inferred from the CLI's strings: its folder restore writes Space's engine transactions directly
-  (`RESTORE`, `GROUP_MOVE_IN`, `GROUP_MOVE_OUT`, `restore_from_version`).
+- Only Space's CLI rolls a folder's subtree back, and it needs a signed-in session. Inferred from
+  its strings, it writes Space's engine transactions directly (`RESTORE`, `GROUP_MOVE_IN`,
+  `GROUP_MOVE_OUT`, `restore_from_version`).
+- The one subtree restore tried, to an instant when every file in the folder existed, printed
+  "restored 3 record(s)" and no version id, and **removed the folder and everything in it**: the
+  API and the CLI both lost the folder, and the files' old versions could no longer be read by id.
+  (Inferred: the CLI's history began after the folder and one file were created, so it took them
+  as not existing at that instant.)
 
-So whether a Space folder restore gives each file a `restore` entry, and whether one id names it,
-remains unknown. Design B follows what SpaceFS documents ("exactly one version", "isLatest
+So whether a working Space folder restore gives each file a `restore` entry, and whether one id
+names it, remains unknown. Space did show what design B prevents: a folder restore that makes
+history unreadable. In voidfs every file keeps its history through a restore, and under this RFC
+the restore's id also reads each file as restored. Design B follows what SpaceFS documents ("exactly one version", "isLatest
 identifies the current head", a history "nothing a writer can skip") and voidfs's own §1.1 and
 §8.2. Should a later observation show Space giving each file its own id, design A (below) is the
 match.
@@ -271,8 +278,7 @@ still need its content, which only a per-object row holds.
 3. **Removed objects' `op`:** `delete` (proposed), or the transaction's `op` (`restore`,
    `rename`)? `delete` keeps §4.4's default listing, which leaves deletions out, as it is.
 4. **Rows for files a folder restore leaves alone:** none (proposed). Step 1 couldn't observe
-   what Space does; an observation with a signed-in Space CLI, before the trial ends on 4
-   October, would settle it and question 3's twin for Space.
+   what Space does: its one subtree restore removed the folder instead.
 5. **Implicit folders' rows in §4.4's default listing:** they follow content (`put`), so they are
    listed; should a folder's first version be listed as `put`, or should folders' histories list
    only explicit operations?

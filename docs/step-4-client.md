@@ -196,9 +196,8 @@ content, then the modification time `cp` sets after it).
 `e.txt` added and `c.txt` deleted (published 14:05:44). The restore point was 14:05:24.
 - The app has no history or restore view: neither its windows nor its strings have one, and the
   Finder extension only pins and unpins. The CLI's `restore --at` (which "rolls the whole subtree
-  back" for a folder) needs `space login`, which didn't work for the user, and it ignores an
-  access key in the environment ("no config … run `space login` first"). So the subtree rollback
-  was **not observed**.
+  back" for a folder) needs `space login`, and it ignores an access key in the environment ("no
+  config … run `space login` first"). The user signed it in.
 - With an access key the user minted in the web app, through the S3 API: histories are per
   object, oldest first, with milliseconds (`a.txt`: `put` then `write`, the second `isLatest`),
   and a deleted file has none (`c.txt` answers `404 NoSuchKey`; there is no recently-deleted
@@ -215,6 +214,21 @@ content, then the modification time `cp` sets after it).
 - Inferred from the CLI's strings: its folder restore works on Space's engine directly
   (`RESTORE`, `GROUP_MOVE_IN`, `GROUP_MOVE_OUT`, `restore_from_version`, transactions with a
   `txn_key`), with the signed-in session's credentials, not through the S3 API.
+- The CLI's `history --json` is not the API's: each entry is `{conflict, created, op
+  (create|update|restore), size_bytes, version}`, and it showed only versions from about
+  14:05:43 on: `a.txt` its write but not its create, `b.txt` and `sub/` nothing, and the folder
+  the `eab883e3…` version (an `update` when its entries changed) and the API's restore. (Inferred:
+  it reads Space's engine log since its last checkpoint.)
+- `spacefs restore --bucket <drive> void-probe/restore --at 2026-10-02T14:05:24.462Z` printed
+  "restored 3 record(s) under 'void-probe/restore' to their state at …" and no version id. After
+  it, **the whole folder was gone**: the API answers `404` for the folder and everything in it
+  (the listing of `void-probe/restore/` is empty, and the old versions by id are `404
+  NoSuchVersion`), the CLI says "no such path" for the folder and each file, and the mount
+  caught up over the next minutes. (Inferred: the CLI found no version of the folder or of
+  `a.txt` at the restore point in the history it reads, took them as not existing then, and
+  removed them; the folder took its subtree with it.) So no restored file could be looked at, and
+  whether a working subtree restore gives each file a `restore` version, under one id, stays
+  unknown. What's left of `void-probe/restore/` stays as it is.
 
 **For the client core (item 3)**, where these differ from item 3's design:
 - One queue behind two ways in, as Space has: the journal's publisher, and imports that a client
