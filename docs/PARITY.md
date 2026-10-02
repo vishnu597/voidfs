@@ -111,7 +111,7 @@ Every item of the plan's checklist (§3, 65 items, including the Finder integrat
 
 | Area | Done | Partly | Missing | State |
 |---|---|---|---|---|
-| Engine (E1–E13) | 9 | 1 | 3 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints, garbage collection, and small files held in the log (RFC 0003, the `inline-data` pool feature) work. Missing: direct uploads, encryption, retention policies |
+| Engine (E1–E13) | 9 | 1 | 3 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints, garbage collection, small files held in the log (RFC 0003, the `inline-data` pool feature), and a folder restore that is one version in the history of every file it changes (RFC 0004, the `multi-object-versions` pool feature) work. Missing: direct uploads, encryption, retention policies |
 | Storage backends (B1–B8) | 2 | 0 | 6 | Local disk, AWS S3, Cloudflare R2, MinIO (built from source in CI) and versitygw work, and rclone works against the server. A capability probe checks the bucket at start. No other providers tried, no short-lived storage credentials, no stored bucket credentials, no adopt or export |
 | Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed (long poll and SSE), on one node. Missing: direct upload and storage credentials, a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |

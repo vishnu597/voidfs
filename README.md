@@ -199,6 +199,17 @@ A feature cannot be removed again. Checkpoints store small files as shards, in t
 only a drive's log since its last checkpoint holds them, and the server keeps no more of them in
 memory than that: about 12 MB of small files a drive.
 
+### A version for every object it changes
+
+With the pool's `multi-object-versions` feature
+([RFC 0004](rfcs/0004-a-version-for-every-object-it-changes.md),
+[format §7.5](spec/format.md#75-changes)), a folder restore is one version in the history of the
+folder and of every file it rolls back, brings back or removes, so each file's history lists it
+and `?versionId=` reads the file as restored; a write that creates folders is their first
+version. Without it, only the folder's history has the restore. Turn it on as `inline-data`
+above (`--new-pool-feature multi-object-versions`, or `pool enable multi-object-versions`). History
+already in checkpoints when it is turned on stays as it was recorded.
+
 ### Garbage collection
 
 Content that nothing references any more, such as the content of hard-deleted drives, is
