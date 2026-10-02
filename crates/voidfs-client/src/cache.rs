@@ -200,12 +200,18 @@ struct Inner {
     fetcher: Arc<dyn Fetch>,
     state: Mutex<State>,
     fills: Mutex<HashMap<BlockKey, Fill>>,
-    /// Fills still writing to disk, for [`Cache::settle`].
-    busy: AtomicUsize,
-    settled: Notify,
+    /// Fills still running, for [`Cache::settle`]. Apart from the rest, so that a fill can let go
+    /// of the cache before it says it is done.
+    busy: Arc<Busy>,
     fetch_permits: Semaphore,
     prefetch_permits: Semaphore,
     stats: Stats,
+}
+
+#[derive(Default)]
+struct Busy {
+    n: AtomicUsize,
+    settled: Notify,
 }
 
 /// The block cache. Cloning shares it.
@@ -251,8 +257,7 @@ impl Cache {
             fetcher,
             state: Mutex::new(State { disk, disk_bytes, pins, mem: Lru::new(), mem_bytes: 0 }),
             fills: Mutex::new(HashMap::new()),
-            busy: AtomicUsize::new(0),
-            settled: Notify::new(),
+            busy: Arc::default(),
             stats: Stats::default(),
         };
         let cache = Cache(Arc::new(inner));
@@ -393,7 +398,8 @@ impl Cache {
         let this = self.clone();
         let c = c.clone();
         let k = key.clone();
-        self.0.busy.fetch_add(1, Ordering::SeqCst);
+        let busy = self.0.busy.clone();
+        busy.n.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
             let r = this.fetch(&c, &k, ahead).await;
             if let Ok(b) = &r {
@@ -406,8 +412,11 @@ impl Cache {
                 let _ = tokio::task::spawn_blocking(move || this2.store_block(&k2, &b)).await;
             }
             this.0.fills.lock().unwrap_or_else(|p| p.into_inner()).remove(&k);
-            if this.0.busy.fetch_sub(1, Ordering::SeqCst) == 1 {
-                this.0.settled.notify_waiters();
+            // Let go of the cache, and so of the store, first: whoever settles and then drops the
+            // cache can open the state directory again at once.
+            drop(this);
+            if busy.n.fetch_sub(1, Ordering::SeqCst) == 1 {
+                busy.settled.notify_waiters();
             }
         });
         let f = async move { rx.await.unwrap_or_else(|_| Err(Error::Invalid("the fetch stopped".into()))) }.boxed().shared();
@@ -610,11 +619,12 @@ impl Cache {
         tokio::task::spawn_blocking(move || this.delete_files(&victims)).await?
     }
 
-    /// Waits until every fill that has started has also been written to disk (or skipped).
+    /// Waits until every fill that has started has also been written to disk (or skipped), and
+    /// has let go of the cache.
     pub async fn settle(&self) {
         loop {
-            let n = self.0.settled.notified();
-            if self.0.busy.load(Ordering::SeqCst) == 0 {
+            let n = self.0.busy.settled.notified();
+            if self.0.busy.n.load(Ordering::SeqCst) == 0 {
                 return;
             }
             n.await;
