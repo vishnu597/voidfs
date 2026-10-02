@@ -13,8 +13,8 @@
 #
 #   VOIDFS_SERVER_BIN, VOIDFS_CONFORMANCE_BIN   binaries (default: target/debug)
 #   S3_PORT, VOIDFS_PORT, ADMIN_PORT            loopback ports (default 7070, 9000 and 9001)
-#   VOIDFS_INTEROP_FEATURES   features the pool is created with (default inline-data; empty for
-#                             none)
+#   VOIDFS_INTEROP_FEATURES   features the pool is created with, which the conformance runner is
+#                             told (default inline-data,multi-object-versions; empty for none)
 
 set -euo pipefail
 
@@ -26,7 +26,7 @@ s3_port="${S3_PORT:-7070}"
 voidfs_port="${VOIDFS_PORT:-9000}"
 admin_port="${ADMIN_PORT:-$((voidfs_port + 1))}"
 require_all="${VOIDFS_INTEROP_REQUIRE_ALL:-0}"
-features="${VOIDFS_INTEROP_FEATURES-inline-data}"
+features="${VOIDFS_INTEROP_FEATURES-inline-data,multi-object-versions}"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/voidfs-interop.XXXXXX")"
 pids=()
@@ -134,6 +134,7 @@ wait_for "$VOIDFS_ENDPOINT/"
 echo "== admin listener ($store)"
 "$root/tests/interop/admin.sh" "http://127.0.0.1:$admin_port"
 echo "== conformance ($store)"
+export VOIDFS_FEATURES="$features"
 "$conformance"
 echo "== conformance, virtual-host style ($store)"
 "$conformance" --virtual-host s3.localhost

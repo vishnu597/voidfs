@@ -24,6 +24,12 @@ How the data is stored is defined separately, in [format.md](format.md).
 
 - Every successful mutation creates exactly one version and returns its id in
   `x-amz-version-id`. There is no unversioned mode.
+- A version can belong to several objects, with the same id in each one's history: a folder
+  restore's version is the folder's and that of every object the restore changes (§4.6); a write
+  that creates folders is their first version (§1.2); a rename that replaces a file is that
+  file's deletion (§4.7). A server whose drives don't keep such versions (voidfs-server on a pool
+  without the `multi-object-versions` feature, format §3.1) gives a version to the object at the
+  request's key alone.
 - History is append-only. Nothing, including a rollback, removes a version. Retention policies
   configured by an administrator are the only exception.
 - Version ids are opaque strings of at most 128 ASCII characters. Clients MUST NOT parse them.
@@ -34,7 +40,8 @@ How the data is stored is defined separately, in [format.md](format.md).
 Folders are real objects, not key prefixes.
 
 - `PutObject` of a key ending in `/` with an empty body creates a folder.
-- Writing `a/b/c` creates the folders `a/` and `a/b/` if they are missing, in the same version.
+- Writing `a/b/c` creates the folders `a/` and `a/b/` if they are missing, in the same version,
+  which is each one's first (§1.1).
 - A file and a folder cannot share a path. `PutObject a` while `a/` exists, or `PutObject a/x`
   while the file `a` exists, fails with `409 PathConflict`.
 - `ListObjectsV2` without a delimiter returns files, plus folders only while they are empty.
@@ -120,7 +127,7 @@ key: requests for it answer `404 NoSuchBucket`, and `ListBuckets` leaves it out.
 | ListObjectVersions | Full history for matching keys; `IsLatest` marks the head. No delete markers are returned; deleted objects are absent (see §4.10 for them) |
 | HeadObject, GetObject | `Range` (a single range), `versionId`, `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`. `partNumber` is not supported |
 | PutObject | `If-Match`, and `If-None-Match: *` |
-| CopyObject | Within a drive: by reference, with no bytes copied. Across drives: copies bytes, unless both drives are in the same pool, in which case it is also by reference |
+| CopyObject | Within a drive: by reference, with no bytes copied. Across drives: copies bytes, unless both drives are in the same pool, in which case it is also by reference. A `versionId` in `x-amz-copy-source` is a version of the object at the source key, as for GetObject (§4.5) |
 | DeleteObject, DeleteObjects | With `versionId`: `501 NotImplemented`, because history is immutable |
 | CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads | A completed upload is one version |
 
@@ -224,16 +231,21 @@ first attempt may have succeeded, and a second would insert or remove twice. Cli
 ```
 
 - Versions are ordered oldest to newest.
-- `operation` is one of `put`, `write`, `copy`, `restore`, `rename`, `attrs` or `other`. Rename
-  and attrs versions are included only with `x-voidfs-all=true`, because by default the listing
-  follows content.
+- `operation` is one of `put`, `write`, `copy`, `restore`, `rename`, `attrs`, `delete` or
+  `other`. Rename, attrs and delete versions are included only with `x-voidfs-all=true`, because
+  by default the listing follows content. A delete version is in the history of an object that
+  was deleted and brought back.
+- `isLatest` marks the newest version listed. With `x-voidfs-all=true` that is the object's
+  current version, whose id a plain `GET` returns.
 - History follows the object: after a rename, the whole history answers at the new key.
 - `max-keys` (default 1,000) and `continuation-token` paginate.
 - `lastModified` carries microseconds. Pass it unchanged to `x-voidfs-as-of`.
 
 ### 4.5 Read the past
 
-- `GET`/`HEAD /{drive}/{key}?versionId=<id>`: that version.
+- `GET`/`HEAD /{drive}/{key}?versionId=<id>`: that version of the object now at `{key}`, or, if
+  it has none, of an object deleted from `{key}` (§4.10), the most recently deleted first.
+  Otherwise the answer is `404 NoSuchVersion`.
 - `GET`/`HEAD /{drive}/{key}` with `x-voidfs-as-of: <timestamp>`: the version that was current
   at that instant, for the object now at `{key}`. If that object did not exist then, the answer
   is `404 NoSuchVersion`.
@@ -249,10 +261,16 @@ With `versionId=<id>`, creates a new current version whose content and attribute
 `404 NoSuchVersion`.
 
 With a folder key and `x-voidfs-as-of: <timestamp>` instead of `versionId`, restores the whole
-subtree to its state at that instant, as one version of the folder:
+subtree to its state at that instant, as one version. It is the folder's version and that of
+every object the restore changes (§1.1):
 - files changed since then are restored;
 - files created since then are removed;
 - files deleted since then are brought back.
+
+A file it restores or brings back lists the version with `operation: restore` and `restoredFrom`
+naming the file's own version that was current at the instant, and `GET ?versionId=<id>` at the
+file serves it as restored. A file it removes is listed by §4.10, with the version before the
+restore as its `lastVersionId`. Files already as they were keep their current version.
 
 A server MAY answer `400 InvalidArgument` for an instant outside the drive's point-in-time
 window (format §8.5).
@@ -275,7 +293,7 @@ exactly as if its `versionId` had been given.
 - Without `x-voidfs-replace: true`, the destination MUST NOT exist (`409 PathConflict`). With
   it, an existing destination file is removed in the same version. That is the atomic save that
   desktop applications perform, where a temporary file is written and renamed over the
-  original.
+  original. The removed file is listed by §4.10 with its own last version as `lastVersionId`.
 - Preconditions apply to the source.
 
 Errors: `404 NoSuchKey`, `409 PathConflict`, `412 PreconditionFailed`, `400 InvalidArgument`.
@@ -478,7 +496,14 @@ for at least one change. The body is
 - `op` is the version's operation (§4.4), or `delete`.
 - Folders created implicitly by a write are reported first, as `create` changes with the same
   `seq`.
-- A rename carries `fromKey`.
+- Objects the version removed besides the one named, such as the file a rename replaces or the
+  files a folder restore removes, come next, as `delete` changes at their old keys, children
+  before their folders.
+- Then the change of the object the request named, then one for each other object the version
+  changed, folders before their children: for a folder restore, each object it restores or
+  brings back, with `op: restore`.
+- A change that moved an object (a rename, or a folder restore that moves one back) carries
+  `fromKey`.
 - A folder rename is **one** change for the folder, not one per descendant.
 - If `since` is older than the server can replay, the answer is `410 ChangesExpired`. The client
   then relists (§4.9) and resumes from the `seq` that listing returns.

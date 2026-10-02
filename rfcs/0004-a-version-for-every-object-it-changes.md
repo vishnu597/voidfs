@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| Status | Proposed (draft, 2 October 2026) |
+| Status | Implemented (accepted 2026-10-02) |
 | Author(s) | voidfs maintainers |
 | Created | 2026-10-02 |
 | Affects | both |
-| Implemented by | (links, once implemented) |
+| Implemented by | [`spec/format.md`](../spec/format.md) §3.1, §7.1, §7.5, §8.2 and [`spec/protocol.md`](../spec/protocol.md) §1.1, §1.2, §3, §4.4–§4.7, §5.6 (draft 1, revision 6), five conformance cases, voidfs-core and voidfs-server ([#28](https://github.com/vishnu597/voidfs/pull/28)) |
 
 ## Summary
 
@@ -270,6 +270,32 @@ answer "which objects did this version change", but every read of a file at such
 still need its content, which only a per-object row holds.
 
 ## Open questions
+
+Accepted as proposed (2 October 2026), which settles them so:
+1. The feature is `multi-object-versions`.
+2. History is not rebuilt. A reader that implements the feature applies the rule to every commit
+   it replays, written before the feature was added or after; history in checkpoints written
+   before stays as it was recorded. An operator turns the feature on as for `inline-data`:
+   `--new-pool-feature multi-object-versions` for a pool the server creates, `voidfs-server pool
+   enable multi-object-versions` for an existing one. A rebuild can be a later tool.
+3. An object a transaction takes out gets a `delete` row, which §4.4's default listing leaves out.
+4. Files a folder restore leaves as they were get no row and keep their head.
+5. An implicit folder's first row has the write's `op`, so it is in the default listing after a
+   `put`, `write` or `copy`, and only with `x-voidfs-all=true` after a `rename`.
+
+The implementation changed two things from the design above:
+- **§5.6's order.** The objects a version takes out are reported before its target, children
+  before their folders, and the other objects it changed after it, folders before their children.
+  A rename that replaces `doc.txt` is then `delete doc.txt` (the old file) followed by `rename
+  doc.txt`, so a client that applies changes in order keeps the new file. A folder restore that
+  moves an object back reports `fromKey`.
+- **The conformance cases** are `folder-restore-versions-each-object` (the history, as-of and
+  recently-deleted cases above), `writes-version-the-folders-they-make` (implicit folders, and one
+  restored by its `lastVersionId`), `folder-restore-in-the-feed` (with a replacing rename),
+  `replaced-file-comes-back-by-its-last-version` and `version-of-another-object` (reads and copy
+  sources). The last two hold without the feature.
+
+As they were asked:
 
 1. **The feature's name.** `multi-object-versions` is proposed.
 2. **Rebuilding history when the feature is enabled.** Replay each drive's log from its start
