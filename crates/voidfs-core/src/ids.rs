@@ -96,6 +96,11 @@ impl ObjectId {
         ObjectId(Arc::from(Self::ROOT_STR))
     }
 
+    /// Sorts before every id: a range's lower bound, never an object's id.
+    pub(crate) fn lowest() -> Self {
+        ObjectId(Arc::from(""))
+    }
+
     pub fn generate() -> Self {
         ObjectId(Arc::from(format!("o-{}", ulid::Ulid::generate())))
     }

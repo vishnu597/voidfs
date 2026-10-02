@@ -10,7 +10,8 @@ Cloudflare R2, MinIO, and others. There is no hosted voidfs; you run it.
 
 > **Status: Phase 1 (engine and S3 server), pre-alpha.** The server passes the whole
 > [conformance suite](spec/conformance/) and works with stock boto3, rclone and the AWS CLI, and
-> there is a [Rust SDK](#the-rust-sdk). There is no Mac drive or CLI yet. Garbage collection reclaims deleted drives and abandoned uploads, but every
+> there is a [command line](#the-command-line) and a [Rust SDK](#the-rust-sdk). There is no Mac
+> drive yet. Garbage collection reclaims deleted drives and abandoned uploads, but every
 > version of a file in a live drive is kept, because there are no retention policies yet. The
 > protocol and on-bucket format are drafts and will change. See the
 > [roadmap](docs/RESEARCH_AND_PLAN.md#9-phased-roadmap).
@@ -53,6 +54,40 @@ VOIDFS_ENDPOINT=http://127.0.0.1:9000 VOIDFS_ACCESS_KEY_ID=<id> VOIDFS_SECRET_AC
   cargo run -p voidfs-conformance
 ```
 
+### The command line
+
+`void` ([`crates/voidfs-cli`](crates/voidfs-cli/)) works with drives from a terminal: create, fork
+and delete them, upload into them, and read and restore their history.
+
+```bash
+cargo install --path crates/voidfs-cli
+eval "$(void keys generate --scope admin --format env)"   # sets VOIDFS_ACCESS_KEY_ID and _SECRET_ACCESS_KEY
+cargo run --release -p voidfs-server -- --store fs:./voidfs-data &   # takes its admin key from them
+
+void drive create footage
+void upload clip.mov renders/ footage:/cuts   # files and folders; large files go up in parts
+void drives
+void history footage cuts/clip.mov            # every version, and the time of each
+void show footage cuts/clip.mov --at 2026-10-01T09:00:00Z -o old.mov
+void restore footage cuts --at 2026-10-01T09:00:00Z   # a whole folder, as one new version
+void fork footage footage-try                 # a copy-on-write copy, ready at once
+void drive delete footage-try                 # asks for the name; recoverable for 30 days
+```
+
+- The server and key come from `VOIDFS_ENDPOINT` (default `http://127.0.0.1:9000`),
+  `VOIDFS_ACCESS_KEY_ID` and `VOIDFS_SECRET_ACCESS_KEY`, or from `--endpoint` and `--key-file`
+  (a file `void keys generate --format json` or `--format env` wrote).
+- Drives are named by alias or id. `history`, `show` and `restore` also take
+  `--bucket <drive> <path>`, as SpaceFS's CLI does. `--at` takes RFC 3339 or Unix seconds.
+- A folder's history lists every version of every file in it. Asked about a deleted file,
+  `history`, `show` and `restore` say how to bring it back.
+- With `--json`, every command prints one JSON document on stdout, and errors go to stderr as
+  `{"error": {"code", "status", "message", …}}`, with exit status 1 (2 for a usage error).
+- `void keys generate --scope read|write|admin` makes more keys: give each to the server as
+  `--key <id>:<secret>:<scope>`.
+- `void upload` runs in the foreground for now. Background uploads, mounts and the daemon come
+  next ([step 4's plan](docs/step-4-client.md)).
+
 ### The Rust SDK
 
 [`crates/voidfs-sdk`](crates/voidfs-sdk/) is the official AWS SDK for S3 (`client.s3()`, for
@@ -84,7 +119,7 @@ for v in client.list_versions("footage", "cut.txt", false).await? {
 Every call fails with one error type, which carries the status, the S3 code and, on a `412`, the
 version that won. Calls are retried on server errors and broken connections, except an insert or
 removal without a precondition, which is never sent twice: pass `if_version` to make it safe to
-retry. The CLI and the client core come next ([step 4's plan](docs/step-4-client.md)).
+retry. The client core comes next ([step 4's plan](docs/step-4-client.md)).
 
 ### Virtual-host addressing
 
@@ -238,6 +273,7 @@ nothing on either port does. The drives' state, which the server serves from, st
 | [`crates/voidfs-core`](crates/voidfs-core/) | The engine: format types, chunking, in-place edits, manifests, drive state, planning |
 | [`crates/voidfs-server`](crates/voidfs-server/) | The S3 server: storage backends, commit log, checkpoints, forks, SigV4, change feed |
 | [`crates/voidfs-sdk`](crates/voidfs-sdk/) | The Rust SDK: the AWS SDK for S3 plus typed calls for the extensions |
+| [`crates/voidfs-cli`](crates/voidfs-cli/) | `void`, the command line, on the SDK |
 | [`crates/voidfs-conformance`](crates/voidfs-conformance/) | Runs the conformance suite against any endpoint |
 | [`crates/voidfs-bench`](crates/voidfs-bench/), [`bench/`](bench/) | SpaceFS's 49 benchmark scenarios, run through voidfs and against the bare bucket; scripts and results |
 | [`tests/interop/`](tests/interop/) | Checks with stock S3 clients (boto3, rclone); `run.sh` runs them and the conformance suite over each kind of store |

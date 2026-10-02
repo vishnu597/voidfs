@@ -156,6 +156,16 @@ impl From<reqwest::Error> for Error {
     }
 }
 
+/// An error of the AWS client underneath ([`crate::Client::s3`]), so that its calls can use `?`.
+impl<E> From<SdkError<E, HttpResponse>> for Error
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    fn from(e: SdkError<E, HttpResponse>) -> Error {
+        from_s3(e)
+    }
+}
+
 /// An error of the AWS SDK, as this type.
 pub(crate) fn from_s3<E>(e: SdkError<E, HttpResponse>) -> Error
 where
