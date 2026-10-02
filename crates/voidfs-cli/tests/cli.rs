@@ -464,7 +464,8 @@ fn show_prints_a_file_as_it_was() {
     let history = f.block(f.client.list_versions("footage", "a.txt", false)).unwrap();
     assert_eq!(f.void(&["show", "footage", "a.txt", "--at", &history[0].last_modified]).ok().out(), "first", "a time from the history");
     assert_eq!(f.void(&["show", "footage", "a.txt", "--at", &between]).ok().out(), "first", "Unix seconds");
-    assert!(f.void(&["show", "footage", "a.txt", "--at", &chrono::Utc::now().timestamp().to_string()]).ok().stdout == body);
+    // A second past now: whole seconds round down, to before a write made in this second.
+    assert!(f.void(&["show", "footage", "a.txt", "--at", &(chrono::Utc::now().timestamp() + 1).to_string()]).ok().stdout == body);
     let r = f.void(&["show", "footage", "a.txt", "--at", "1"]).fails(1);
     assert_eq!(r.stderr.trim(), "error: a.txt did not exist at 1970-01-01T00:00:01.000000Z");
     let r = f.void(&["show", "footage", "a.txt", "--at", "1", "--json", "-o", "x"]).fails(1);
