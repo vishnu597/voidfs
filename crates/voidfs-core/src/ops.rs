@@ -584,6 +584,36 @@ mod tests {
         assert!(matches!(restore_subtree(&d.state, &then, "q/", &actor()), Err(OpError::NoSuchKey)));
     }
 
+    /// A transaction can remove objects it doesn't target. Each keeps its own last version, so
+    /// that the id the recently-deleted listing gives brings that object back (protocol §4.10).
+    #[test]
+    fn files_a_folder_restore_takes_out_keep_their_own_last_version() {
+        let mut d = Drive::new();
+        d.put("p/a.txt", b"1").unwrap();
+        let then = d.state.clone();
+        d.put("p/new.txt", b"n").unwrap();
+        let last = d.put("p/new.txt", b"nn").unwrap();
+        d.run(restore_subtree(&d.state, &then, "p/", &actor())).unwrap();
+        let rows: Vec<_> = d.state.removed("p/", None).cloned().collect();
+        assert_eq!(rows.iter().map(|r| (r.key.as_str(), r.last_version)).collect::<Vec<_>>(), [("p/new.txt", last)]);
+        d.run(restore(&d.state, "p/new.txt", last, &Precondition::default(), &actor())).unwrap();
+        assert_eq!(d.size("p/new.txt"), Some(2));
+    }
+
+    #[test]
+    fn a_destination_a_rename_replaces_keeps_its_own_last_version() {
+        let mut d = Drive::new();
+        let (none, pre) = (AttrsPatch::default(), Precondition::default());
+        let old = d.put("doc.txt", b"old").unwrap();
+        d.put(".doc.tmp", b"newer").unwrap();
+        d.run(rename(&d.state, ".doc.tmp", "doc.txt", true, &none, &pre, &actor())).unwrap();
+        let row = d.state.removed("doc.txt", None).next().unwrap().clone();
+        assert_eq!(row.last_version, old);
+        d.run(rename(&d.state, "doc.txt", "doc.new", false, &none, &pre, &actor())).unwrap();
+        d.run(restore(&d.state, "doc.txt", row.last_version, &pre, &actor())).unwrap();
+        assert_eq!((d.size("doc.txt"), d.size("doc.new")), (Some(3), Some(5)));
+    }
+
     #[test]
     fn attributes_are_validated() {
         let mut d = Drive::new();
