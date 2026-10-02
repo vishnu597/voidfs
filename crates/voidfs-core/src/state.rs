@@ -449,7 +449,7 @@ impl DriveState {
     pub fn removed<'a>(&'a self, prefix: &'a str, after: Option<&'a str>) -> impl Iterator<Item = &'a RemovedRow> + 'a {
         let lower = match after {
             Some(a) => Bound::Excluded((a.to_owned(), ObjectId::root())),
-            None => Bound::Included((prefix.to_owned(), ObjectId::root())),
+            None => Bound::Included((prefix.to_owned(), ObjectId::lowest())),
         };
         self.removed
             .range((lower, Bound::Unbounded))
@@ -818,6 +818,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].key, "a/");
         assert_eq!(rows[0].last_version, VersionId::new(1, 0));
+        // A prefix that is the whole key finds it too.
+        assert_eq!((removed.removed("a/", None).count(), removed.removed("a", None).count(), removed.removed("a/b", None).count()), (1, 1, 0));
         let back = removed.apply(&commit(3, vec![txn(&a, Op::Restore, vec![create(&a, &root, "a", Kind::Folder)])])).unwrap();
         assert_eq!(back.key_of(&b).as_deref(), Some("a/b.txt"));
         assert_eq!(back.removed("", None).count(), 0);
