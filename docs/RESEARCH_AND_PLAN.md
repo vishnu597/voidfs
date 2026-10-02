@@ -469,7 +469,8 @@ What that implies (updated 2026-09-27 from the [FSKit spike](spikes/fskit.md)):
   2.3–2.5 GB/s and listed 1,000 files in 21–33 ms. What remains hard:
   - Kernel caches can only be revoked, not updated. Phase 2 reads open files at the version
     current when they were opened (snapshot-at-open).
-  - `RENAME_SWAP` loses data on Apple's FSKit FAT module (it reports success and overwrites).
+  - `RENAME_SWAP` loses data on Apple's FSKit FAT module (it reports success and overwrites;
+    unconfirmed since the probe's printout was found wrong on 1 October, spike §4.5).
   - Locks never reach the module.
   - Finder looks up an AppleDouble `._` file for every file.
   - A hung connection blocks callers for the whole request timeout.

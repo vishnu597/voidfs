@@ -1,0 +1,64 @@
+== APFS (local, for reference): semantics <scratchpad>/s (2026-10-02T00:26:10Z)
+<scratchpad>/apfs-scratch (apfs, /dev/disk3s5)
+  advertised: CASE_SENSITIVE=no PERSISTENTOBJECTIDS=yes SYMBOLICLINKS=yes HARDLINKS=yes 2TB_FILESIZE=yes EXTENDED_ATTR=yes NAMEDSTREAMS=yes EXCHANGEDATA=no RENAME_SWAP=yes RENAME_EXCL=yes CLONE=yes FLOCK=yes ADVLOCK=yes ALLOCATE=yes
+  setxattr user.test                                   ok
+    AppleDouble ._a.txt created?                       no
+  setxattr com.apple.FinderInfo (32 bytes)             ok
+  setxattr com.apple.ResourceFork                      ok
+    AppleDouble ._b.txt created?                       no
+  atomic save: rename(save.tmp, a.txt) over a.txt      ok
+    after                                              a=A2
+  renamex_np(a, b, RENAME_SWAP)                        ok
+    after (a swap leaves a=B b=A)                      a=B b=A
+  renamex_np(a, b, RENAME_EXCL) onto existing b        File exists
+    after (EEXIST leaves a=A b=B)                      a=A b=B
+  exchangedata(a, b)                                   Operation not supported
+    after                                              a=A b=B
+  clonefile(a, clone)                                  ok
+  fcntl F_FULLFSYNC                                    ok
+  fcntl F_BARRIERFSYNC                                 ok
+  flock LOCK_EX|LOCK_NB                                ok
+  fcntl F_SETLK write lock                             Resource temporarily unavailable
+  mmap MAP_SHARED write + msync(MS_SYNC)               ok
+    a.txt after the mapped write                       mapped
+  unlink while open                                    ok
+    read from the open descriptor                      still readable
+  link (hard link)                                     ok
+  symlink                                              ok
+  chmod 0600                                           ok
+  open O_EXLOCK                                        ok
+
+== space: semantics /tmp/Space/h2h/scratch (2026-10-02T00:26:10Z)
+/tmp/Space/h2h (smbfs, //spacefs<id>@space.localhost:64380/Space)
+  advertised: CASE_SENSITIVE=yes PERSISTENTOBJECTIDS=no SYMBOLICLINKS=yes HARDLINKS=no 2TB_FILESIZE=yes EXTENDED_ATTR=yes NAMEDSTREAMS=yes EXCHANGEDATA=no RENAME_SWAP=? RENAME_EXCL=? CLONE=? FLOCK=yes ADVLOCK=no ALLOCATE=no
+  setxattr user.test                                   ok
+    AppleDouble ._a.txt created?                       no
+  setxattr com.apple.FinderInfo (32 bytes)             ok
+  setxattr com.apple.ResourceFork                      Invalid argument
+    AppleDouble ._b.txt created?                       no
+  atomic save: rename(save.tmp, a.txt) over a.txt      ok
+    after                                              a=A2
+  renamex_np(a, b, RENAME_SWAP)                        Operation not supported
+    after (a swap leaves a=B b=A)                      a=A b=B
+  renamex_np(a, b, RENAME_EXCL) onto existing b        File exists
+    after (EEXIST leaves a=A b=B)                      a=A b=B
+  exchangedata(a, b)                                   Operation not supported
+    after                                              a=A b=B
+  clonefile(a, clone)                                  Operation not supported
+  fcntl F_FULLFSYNC                                    Operation not supported
+  fcntl F_BARRIERFSYNC                                 Operation not supported
+  flock LOCK_EX|LOCK_NB                                ok
+  fcntl F_SETLK write lock                             Operation not supported
+  mmap MAP_SHARED write + msync(MS_SYNC)               ok
+    a.txt after the mapped write                       mapped
+  unlink while open                                    ok
+    read from the open descriptor                      still readable
+  link (hard link)                                     Operation not supported
+  symlink                                              ok
+  chmod 0600                                           ok
+  open O_EXLOCK                                        ok
+
+== voidfs: semantics ~/voidfs/h2h/h2h/scratch (2026-10-02T00:26:10Z)
+/Users/vishnu/voidfs/h2h/h2h (voidfs, voidfs://127.0.0.1:9000/h2h)
+  advertised: CASE_SENSITIVE=yes PERSISTENTOBJECTIDS=no SYMBOLICLINKS=yes HARDLINKS=no 2TB_FILESIZE=yes EXTENDED_ATTR=yes NAMEDSTREAMS=no EXCHANGEDATA=no RENAME_SWAP=no RENAME_EXCL=no CLONE=no FLOCK=yes ADVLOCK=yes ALLOCATE=no
+  mkdir /Users/vishnu/voidfs/h2h/h2h/scratch: Read-only file system

@@ -4,8 +4,8 @@
 capability probe, group commit and the shard cache's admission, on 2026-09-29 after
 virtual-host addressing and then health checks and metrics, and on 2026-10-01 for cold reads and
 S3's bandwidth in the local benchmark, then coalesced shard fetches, and then for the start of
-step 4 (the scorecard refreshed, SpaceFS 0.2.333 looked at again, the Rust SDK, then the CLI);
-the first was taken on 2026-09-27.*
+step 4 (the scorecard refreshed, SpaceFS 0.2.333 looked at again, the Rust SDK, then the CLI),
+and then for the Mac apps head to head; the first was taken on 2026-09-27.*
 
 Sources:
 - the voidfs code on `main` at `939b57c` (everything through coalesced shard fetches merged), with
@@ -73,8 +73,9 @@ billing or plans), this page says so.
   October) it mounts drives through a loopback SMB server by default, backed by a local journal,
   with FSKit as the other choice, and offers pinned files for offline use: step 5 weighs both.
 - **The plan (§7):**
-  - Step 1 has its harness, local results and CI. Still to do: the run in SpaceFS's setup
-    (which waits on cloud accounts, §8), and the Mac comparison.
+  - Step 1 has its harness, local results and CI, and the Mac apps have been compared on one
+    Mac (1 October, §6). Still to do: the run in SpaceFS's setup (which waits on cloud accounts,
+    §8).
   - Step 2 is done: garbage collection, content-defined checkpoint segments, the bucket
     capability probe, runs on AWS S3, MinIO and rclone, virtual-host addressing, and the
     Compose file with health checks and metrics.
@@ -309,8 +310,43 @@ What the runs show:
 - **Completing a multipart upload was a chain of round trips**: the upload's record, a listing,
   each part's record one after another, the commit, and a delete, before it answered. It now reads
   the records together and answers once it commits (step 3, item 5, 30 September, below).
-- The FSKit spike's mount numbers (loopback: 2.3–2.5 GB/s sequential, 1,000 files listed in
-  21–33 ms, random 4 KiB reads at 1.5–1.9 ms p50) are still the only ones for the mount.
+- The mount was measured against SpaceFS's own app on 1 October (below). Before that, the FSKit
+  spike's loopback numbers (2.3–2.5 GB/s sequential, 1,000 files listed in 21–33 ms, random 4 KiB
+  reads at 1.5–1.9 ms p50) were the only ones for it.
+
+### The Mac apps head to head
+
+*1 October 2026, one Mac on home internet ([bench/results/mac-head-to-head](../bench/results/mac-head-to-head/README.md)).*
+SpaceFS's app 0.2.333 with its trial drive, mounted through its loopback SMB server, against the
+read-only FSKit spike with `voidfs-server` on the same Mac and the pool in Cloudflare R2 (location
+hint ENAM). Space's drive also appears to be in R2, with its service on Railway (inferred from the
+addresses its mount connects to; the bucket's location is not confirmed). The same 11,005 files and
+1 GiB file in each, runs alternated, every run cold, two runs each; on-screen steps were driven
+through computer use and timed from screen captures.
+
+| | SpaceFS | voidfs |
+|---|---|---|
+| Mount, from the app | 5.3–7.1 s | 0.07–0.31 s |
+| Finder: 1,000 files / 10,000 files, icon view | 0.26–0.47 s / 5.4 s | ≤ 0.15 s / 1.9–2.8 s |
+| Finder: copy the 1 GiB file out | 28–30 s | 57–67 s |
+| `getattrlistbulk`, 10,000 files, cold | 68–71 ms | 114–137 ms |
+| `ls -l`, 10,000 files, cold | 137–142 ms | 1.56–1.60 s |
+| `dd` of the 1 GiB file, cold | 38–42 MB/s | 32–36 MB/s |
+| Random 4 KiB reads, cold, p50 / p90 | 1.2 ms / 270–299 ms | 140–164 ms / 246–327 ms |
+| Writable, `F_FULLFSYNC`, `fcntl` locks, hard links, swap | yes, no, no, no, no | read-only (the spike) |
+
+What it shows:
+- voidfs mounts faster and Finder shows a large folder sooner; shell listings are close but for
+  `ls -l`, which pays the spike's FSKit upcalls per file.
+- Sequential reads are level when the kernel reads ahead (`dd`). Finder's copy is not: voidfs
+  fetched its 452 shards one at a time. The Mac client needs its own read-ahead.
+- Space's random reads hit its 8 MiB blocks on disk most of the time (inferred); voidfs, with
+  shards of about 2.4 MB and no cache on the Mac, went to the bucket for 205–210 of 300 reads.
+- Space's uploader dropped `tagged.txt`'s xattrs, and an xattr write moves a file's creation date
+  on its SMB volume.
+- The run also found a bug in the spike's `semantics.c` (two files printed from one buffer),
+  which had made a correct `RENAME_SWAP` look like data loss; it is fixed, and the spike's FAT
+  finding is marked unconfirmed.
 
 ### Against SpaceFS's ratios
 
@@ -570,9 +606,14 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - **Status (2026-09-29):** the scenarios are ported and have run locally and against R2 (§6).
      CI (GitHub Actions) runs them on every push to `main` at a tenth of the operations, with
      versitygw 12 ms away as in the local runs, and keeps the results; MinIO no longer publishes
-     binaries, so the benchmark doesn't use it. The run in SpaceFS's setup and the Mac comparison
-     are still to do. Since 2026-10-01 the harness also measures cold reads (`BENCH_COLD=1`, in
-     the `client-host` topology too), and emulates S3's bandwidth locally (`BENCH_BANDWIDTH=s3`).
+     binaries, so the benchmark doesn't use it. Since 2026-10-01 the harness also measures cold
+     reads (`BENCH_COLD=1`, in the `client-host` topology too), and emulates S3's bandwidth locally
+     (`BENCH_BANDWIDTH=s3`).
+   - **Status (2026-10-01):** the Mac apps are compared, on screen through computer use and with
+     the spike's scripts: SpaceFS 0.2.333 on its trial drive against the FSKit spike on R2, the
+     same test data, two cold runs each ([results](../bench/results/mac-head-to-head/README.md),
+     §6). The mount's table is published; SpaceFS publishes none for its own. Still to do: the run
+     in SpaceFS's setup, for the S3 layer's table.
 2. **Finish the engine** (the Phase 1 exit criteria).
    - Garbage collection first. **Done** (E8): two phases per format §12 as amended by
      [RFC 0002](../rfcs/0002-gc-safe-against-writers.md), which closes a race in draft 1 that

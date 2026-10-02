@@ -34,8 +34,9 @@ Everything below was measured or observed on the machine above unless it says ot
   torn read. A descriptor opened before a change keeps the old size and reads new bytes cut at
   it. Phase 2 should serve reads from the version current at open (snapshot-at-open).
 - **A writable mount has sharp edges**, found on Apple's own FSKit volume (FAT): `renamex_np`
-  with `RENAME_SWAP` reports success but overwrites the destination and loses its data; locks are
-  local only; Finder and `ls -l` look up an AppleDouble `._name` for every file; macOS sets
+  with `RENAME_SWAP` reports success but overwrites the destination and loses its data
+  (unconfirmed since 1 October: `semantics.c` printed both files from one buffer, which makes a
+  correct swap look like this; see §4.5); locks are local only; Finder and `ls -l` look up an AppleDouble `._name` for every file; macOS sets
   `com.apple.provenance` on nearly every new file.
 
 ## 2. What was built
@@ -293,7 +294,7 @@ Observed on the voidfs mount (read-only) and on Apple's FSKit FAT module (writab
 | **xattrs and AppleDouble** | Finder opening a 1,000-file folder asked about 470 `getxattr`s (FinderInfo, ResourceFork, TextEncoding, quarantine) and looked up `._name` for every file; `ls -l` did the same. FAT, which has no native xattrs, got `._a.txt` files | Implement `XattrHandler` for every name (so the kernel never falls back to AppleDouble); answer `._*` lookups from cache; never store `._` files. Put xattr names in listings (RFC below) |
 | **`com.apple.provenance`** | Set on almost every file created from this machine, even by `echo hi > f` | Fold xattrs set right after create into the file's creating version, or each new file costs two commits |
 | **Atomic-save rename over an existing file** | Works on FSKit (`renameItem` with `overItem`) | Implement as one rename version with the replaced object's history kept |
-| **`RENAME_SWAP`** | On FSKit FAT: **returns success and overwrites**. `b`'s data was lost; confirmed after a remount. APFS swaps correctly. FSKit's rename callback has no flags | Advertise `RENAME_SWAP = no` (FSKit does) and test the voidfs module the same way. File a Feedback with Apple |
+| **`RENAME_SWAP`** | On FSKit FAT: **returns success and overwrites**. `b`'s data was lost; confirmed after a remount. APFS swaps correctly. FSKit's rename callback has no flags. *1 October: `semantics.c` printed `a=` and `b=` from one buffer, so a correct swap printed as "a=A b=A" too (seen on APFS). The probe is fixed; FAT was not tested again, so this finding is unconfirmed ([head-to-head](../../bench/results/mac-head-to-head/README.md#semanticsc-observed))* | Advertise `RENAME_SWAP = no` (FSKit does) and test the voidfs module the same way. File a Feedback with Apple |
 | `RENAME_EXCL` | Correct on FSKit (`EEXIST`, no change) | Nothing extra |
 | `exchangedata`, `clonefile` | `ENOTSUP`, as advertised | Nothing; apps fall back |
 | **`flock` and `fcntl` locks** | Succeed on the voidfs mount and never reach the module. FSKit has no lock callbacks | Locks are per-Mac. Cross-machine locking (D7) needs its own mechanism, for example lock objects on the server that the host app shows |

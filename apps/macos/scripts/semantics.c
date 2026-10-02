@@ -38,14 +38,18 @@ static void put(const char *name, const char *text) {
     close(fd);
 }
 
+/// Reads a small file. Rotates buffers like p(), so that two calls can share one printf: with a
+/// single buffer, "a=%s b=%s" printed whichever file was read last, twice.
 static const char *get(const char *name) {
-    static char buf[64];
+    static char buf[4][64];
+    static int i;
+    i = (i + 1) % 4;
     int fd = open(p(name), O_RDONLY);
     if (fd < 0) return strerror(errno);
-    ssize_t n = read(fd, buf, sizeof buf - 1);
+    ssize_t n = read(fd, buf[i], sizeof buf[i] - 1);
     close(fd);
-    buf[n < 0 ? 0 : n] = 0;
-    return buf;
+    buf[i][n < 0 ? 0 : n] = 0;
+    return buf[i];
 }
 
 static int exists(const char *name) {
