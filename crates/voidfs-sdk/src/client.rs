@@ -12,6 +12,7 @@ use bytes::Bytes;
 use http::{HeaderMap, Method};
 use serde::de::DeserializeOwned;
 
+use crate::bandwidth::Bandwidth;
 use crate::error::{from_s3, service_error};
 use crate::feed::ChangeWatch;
 use crate::retry::{self, Replay};
@@ -38,6 +39,9 @@ pub struct Config {
     /// Attempts per extension call, the first included (the retry rule is in [`crate::Error`]'s
     /// docs). The AWS client keeps its own.
     pub max_attempts: u32,
+    /// A limit on how fast this client's request bodies go out, which clients may share. It
+    /// covers the SDK's own requests, not [`Client::s3`]'s.
+    pub upload_bandwidth: Option<Arc<Bandwidth>>,
 }
 
 impl Default for Config {
@@ -50,6 +54,7 @@ impl Default for Config {
             timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(10),
             max_attempts: 3,
+            upload_bandwidth: None,
         }
     }
 }
@@ -63,6 +68,7 @@ impl fmt::Debug for Config {
             .field("timeout", &self.timeout)
             .field("connect_timeout", &self.connect_timeout)
             .field("max_attempts", &self.max_attempts)
+            .field("upload_bandwidth", &self.upload_bandwidth.as_ref().map(|b| b.get()))
             .finish_non_exhaustive()
     }
 }
@@ -172,6 +178,12 @@ impl Req {
         self.header_opt("x-voidfs-mtime", mtime.cloned()).header_opt("x-voidfs-mode", mode.map(|m| format!("{m:04o}")))
     }
 
+    /// Sent again only when it cannot have reached the server, whatever guards it.
+    fn once(mut self) -> Req {
+        self.replay = Replay::OnlyIfUnsent;
+        self
+    }
+
     /// Sent again only when it cannot have reached the server, unless a precondition guards it:
     /// then a second attempt after the first landed fails with `412` instead of applying twice.
     fn not_idempotent(mut self) -> Req {
@@ -210,6 +222,28 @@ impl Reply {
             size: self.header("x-voidfs-size").and_then(|s| s.parse().ok()),
         })
     }
+}
+
+/// `body` in pieces, each after the limit allows it.
+fn paced(body: Bytes, bw: Arc<Bandwidth>) -> impl futures::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + 'static {
+    futures::stream::unfold((body, bw), |(mut rest, bw)| async move {
+        if rest.is_empty() {
+            return None;
+        }
+        let piece = rest.split_to(rest.len().min(crate::bandwidth::PIECE));
+        bw.take(piece.len()).await;
+        Some((Ok(piece), (rest, bw)))
+    })
+}
+
+/// The text of the first element called `name`.
+fn xml_text(body: &[u8], name: &str) -> Option<String> {
+    let doc = roxmltree::Document::parse(std::str::from_utf8(body).ok()?).ok()?;
+    doc.descendants().find(|n| n.tag_name().name() == name).and_then(|n| n.text()).map(str::to_owned)
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn header(h: &HeaderMap, name: &str) -> Option<String> {
@@ -294,6 +328,14 @@ impl Client {
     async fn attempt(&self, req: &Req, patience: Patience) -> Result<reqwest::Response> {
         let signed = self.0.signer.sign(req.method.as_str(), &req.path, &req.query_string(), req.headers.clone(), &[], req.body.clone())?;
         let mut request = reqwest::Request::try_from(signed).map_err(|e| Error::Invalid(e.to_string()))?;
+        if let Some(bw) = &self.0.config.upload_bandwidth
+            && !req.body.is_empty()
+        {
+            // Sent a piece at a time as the limit allows; its length still says how much.
+            let pieces = paced(req.body.clone(), bw.clone());
+            request.headers_mut().insert(http::header::CONTENT_LENGTH, req.body.len().into());
+            *request.body_mut() = Some(reqwest::Body::wrap_stream(pieces));
+        }
         let http = match patience {
             Patience::Prompt => &self.0.http,
             Patience::Wait(w) => {
@@ -429,6 +471,80 @@ impl Client {
             req = req.header(&format!("x-amz-meta-{k}"), v.clone());
         }
         self.execute(req).await?.write_result()
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Multipart uploads (S3's, protocol §3), through this client's own requests, so that its
+    // upload bandwidth limit applies to them
+
+    /// Starts a multipart upload: the id its parts go with. `opts` are a put's: content type,
+    /// mtime, mode and metadata; its preconditions go on [`Client::complete_multipart_upload`].
+    pub async fn create_multipart_upload(&self, drive: &str, key: &str, opts: PutOptions) -> Result<String> {
+        require("key", key)?;
+        let mut req = Req::new(Method::POST, object_path(drive, key)).query("uploads", "").header_opt("content-type", opts.content_type).attrs(opts.mtime.as_ref(), opts.mode);
+        for (k, v) in &opts.metadata {
+            req = req.header(&format!("x-amz-meta-{k}"), v.clone());
+        }
+        let r = self.execute(req).await?;
+        xml_text(&r.body, "UploadId").ok_or_else(|| Error::decode("no UploadId in the answer"))
+    }
+
+    /// Sends part `number` (1 to 10,000): its ETag, which the completion names.
+    pub async fn upload_part(&self, drive: &str, key: &str, upload_id: &str, number: u32, body: impl Into<Bytes>) -> Result<String> {
+        require("key", key)?;
+        let req = Req::new(Method::PUT, object_path(drive, key)).query("partNumber", number.to_string()).query("uploadId", upload_id).body(body);
+        self.execute(req).await?.header("etag").ok_or_else(|| Error::decode("no ETag on an uploaded part"))
+    }
+
+    /// Joins the parts, in order, into one version of the object, under `pre` as a put would be.
+    /// It is not sent again once it may have reached the server: a completion after one that
+    /// committed finds no upload (`404 NoSuchUpload`), so a caller that lost the answer looks at
+    /// the object instead.
+    pub async fn complete_multipart_upload(&self, drive: &str, key: &str, upload_id: &str, parts: &[(u32, String)], pre: Preconditions) -> Result<WriteResult> {
+        require("key", key)?;
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (n, etag) in parts {
+            xml.push_str(&format!("<Part><PartNumber>{n}</PartNumber><ETag>{}</ETag></Part>", xml_escape(etag)));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let req = Req::new(Method::POST, object_path(drive, key)).query("uploadId", upload_id).guard(pre.if_version.as_ref(), pre.if_match.as_ref()).header("content-type", "application/xml").body(xml).once();
+        self.execute(req).await?.write_result()
+    }
+
+    /// Abandons an upload and its parts.
+    pub async fn abort_multipart_upload(&self, drive: &str, key: &str, upload_id: &str) -> Result<()> {
+        require("key", key)?;
+        self.execute(Req::new(Method::DELETE, object_path(drive, key)).query("uploadId", upload_id)).await?;
+        Ok(())
+    }
+
+    /// The parts an upload has so far, in order.
+    pub async fn list_parts(&self, drive: &str, key: &str, upload_id: &str) -> Result<Vec<UploadedPart>> {
+        require("key", key)?;
+        let mut out = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let req = Req::new(Method::GET, object_path(drive, key)).query("uploadId", upload_id).query_opt("part-number-marker", marker.clone());
+            let r = self.execute(req).await?;
+            let text = std::str::from_utf8(&r.body).map_err(|e| Error::decode(e.to_string()))?;
+            let doc = roxmltree::Document::parse(text).map_err(|e| Error::decode(e.to_string()))?;
+            let child = |n: roxmltree::Node, name: &str| n.children().find(|c| c.tag_name().name() == name).and_then(|c| c.text()).map(str::to_owned);
+            for p in doc.descendants().filter(|n| n.tag_name().name() == "Part") {
+                out.push(UploadedPart {
+                    number: child(p, "PartNumber").and_then(|v| v.parse().ok()).ok_or_else(|| Error::decode("a part without a number"))?,
+                    etag: child(p, "ETag").unwrap_or_default(),
+                    size: child(p, "Size").and_then(|v| v.parse().ok()).unwrap_or(0),
+                });
+            }
+            let root = doc.root_element();
+            if child(root, "IsTruncated").as_deref() != Some("true") {
+                return Ok(out);
+            }
+            match child(root, "NextPartNumberMarker") {
+                Some(m) if Some(&m) != marker.as_ref() => marker = Some(m),
+                _ => return Ok(out),
+            }
+        }
     }
 
     fn read_req(&self, method: Method, drive: &str, key: &str, opts: &ReadOptions) -> Result<Req> {

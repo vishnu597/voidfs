@@ -22,6 +22,19 @@ const MIGRATIONS: &[&str] = &[
          len INTEGER NOT NULL, sums BLOB NOT NULL, last_used INTEGER NOT NULL,
          PRIMARY KEY(drive, etag, block)) WITHOUT ROWID;
      CREATE TABLE cache_pins(drive TEXT NOT NULL, etag TEXT NOT NULL, PRIMARY KEY(drive, etag)) WITHOUT ROWID;",
+    // 2: the write journal and the upload queue (journal.rs, queue.rs).
+    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+     CREATE TABLE batches(id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, created INTEGER NOT NULL, paused INTEGER NOT NULL DEFAULT 0);
+     CREATE TABLE entries(
+         id INTEGER PRIMARY KEY AUTOINCREMENT, drive TEXT NOT NULL, key TEXT NOT NULL, op TEXT NOT NULL, base TEXT NOT NULL,
+         source TEXT, staged INTEGER NOT NULL DEFAULT 0, stamp TEXT, pos INTEGER NOT NULL DEFAULT 0, length INTEGER NOT NULL DEFAULT 0,
+         to_key TEXT, overwrite INTEGER NOT NULL DEFAULT 0, attrs TEXT, batch INTEGER REFERENCES batches(id),
+         state TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0,
+         version TEXT, conflict TEXT, error TEXT, upload_id TEXT, created INTEGER NOT NULL);
+     CREATE INDEX entries_state ON entries(state, id);
+     CREATE TABLE parts(entry INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE, number INTEGER NOT NULL,
+         etag TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(entry, number)) WITHOUT ROWID;
+     CREATE TABLE paused_drives(drive TEXT PRIMARY KEY) WITHOUT ROWID;",
 ];
 
 pub struct Store {
@@ -59,6 +72,29 @@ impl Store {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// This state's own id, made once: it names what this client wrote, so that it can tell its
+    /// own writes from others' after losing an answer.
+    pub fn id(&self) -> Result<String> {
+        if let Some(id) = self.meta("id")? {
+            return Ok(id);
+        }
+        let mut raw = [0u8; 12];
+        use std::io::Read;
+        File::open("/dev/urandom")?.read_exact(&mut raw)?;
+        let id = hex::encode(raw);
+        self.set_meta("id", &id)?;
+        Ok(id)
+    }
+
+    pub(crate) fn meta(&self, key: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.with(|c| c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional())
+    }
+
+    pub(crate) fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.with(|c| c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)", [key, value]).map(drop))
     }
 
     /// Runs `f` on the connection. It blocks: async callers run it on a blocking thread.

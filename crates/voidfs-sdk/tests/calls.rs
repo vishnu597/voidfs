@@ -386,3 +386,54 @@ async fn the_aws_client_underneath_shares_the_drive() {
     let e: Error = s3.get_object().bucket("drv").key("missing").send().await.unwrap_err().into();
     assert_eq!((e.status(), e.code()), (Some(404), Some("NoSuchKey")));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_uploads_go_through_the_sdks_own_requests() {
+    let (_s, c) = setup().await;
+    c.create_drive("drv", Default::default()).await.unwrap();
+    let a = Bytes::from(vec![1u8; 5 << 20]);
+    let b = Bytes::from_static(b"tail");
+    let opts = PutOptions { mtime: Some("2026-09-02T10:00:00.000000Z".into()), mode: Some(0o600), metadata: BTreeMap::from([("from".to_string(), "test".to_string())]), ..Default::default() };
+    let id = c.create_multipart_upload("drv", "big/file", opts).await.unwrap();
+    let e1 = c.upload_part("drv", "big/file", &id, 1, a.clone()).await.unwrap();
+    let e2 = c.upload_part("drv", "big/file", &id, 2, b.clone()).await.unwrap();
+    let parts = c.list_parts("drv", "big/file", &id).await.unwrap();
+    assert_eq!(parts.iter().map(|p| (p.number, p.etag.as_str(), p.size)).collect::<Vec<_>>(), [(1, e1.as_str(), 5 << 20), (2, e2.as_str(), 4)]);
+    let w = c.complete_multipart_upload("drv", "big/file", &id, &[(1, e1.clone()), (2, e2.clone())], Preconditions::default()).await.unwrap();
+    let o = c.get_object("drv", "big/file", Default::default()).await.unwrap();
+    assert_eq!((o.body.len(), &o.body[(5 << 20)..], o.meta.version_id.as_str()), (a.len() + 4, &b"tail"[..], w.version_id.as_str()));
+    assert_eq!((o.meta.mtime.as_deref(), o.meta.mode.as_deref(), o.meta.metadata.get("from").map(String::as_str)), (Some("2026-09-02T10:00:00.000000Z"), Some("0600"), Some("test")));
+    let again = c.complete_multipart_upload("drv", "big/file", &id, &[(1, e1), (2, e2)], Preconditions::default()).await.unwrap_err();
+    assert_eq!(again.code(), Some("NoSuchUpload"), "a completion after one that committed");
+
+    // Guarded on the version it replaces; aborted, it leaves nothing.
+    let id = c.create_multipart_upload("drv", "big/file", Default::default()).await.unwrap();
+    let e = c.upload_part("drv", "big/file", &id, 1, "x").await.unwrap();
+    let stale = Preconditions::if_version("999.0");
+    assert_eq!(c.complete_multipart_upload("drv", "big/file", &id, &[(1, e.clone())], stale).await.unwrap_err().status(), Some(412));
+    c.complete_multipart_upload("drv", "big/file", &id, &[(1, e)], Preconditions::if_version(w.version_id.clone())).await.unwrap();
+    let id = c.create_multipart_upload("drv", "other", Default::default()).await.unwrap();
+    c.upload_part("drv", "other", &id, 1, "y").await.unwrap();
+    c.abort_multipart_upload("drv", "other", &id).await.unwrap();
+    assert_eq!(c.list_parts("drv", "other", &id).await.unwrap_err().code(), Some("NoSuchUpload"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_bodies_keep_to_a_shared_bandwidth_limit() {
+    let s = TestServer::start().await.unwrap();
+    let bw = std::sync::Arc::new(Bandwidth::new(Some(4 << 20)));
+    let c = common::client_for(&s.endpoint, Config { upload_bandwidth: Some(bw.clone()), ..Default::default() });
+    c.create_drive("drv", Default::default()).await.unwrap();
+    let t = std::time::Instant::now();
+    let keys = ["f0", "f1"];
+    let puts = keys.iter().map(|k| c.put_object("drv", k, vec![7u8; 2 << 20], Default::default()));
+    futures::future::try_join_all(puts).await.unwrap();
+    // 4 MiB at 4 MiB/s, less up to a quarter of a second's burst built up while the drive was made.
+    let secs = t.elapsed().as_secs_f64();
+    assert!((0.7..1.3).contains(&secs), "4 MiB at 4 MiB/s took {secs} s");
+    assert_eq!(c.get_object("drv", "f1", Default::default()).await.unwrap().body.len(), 2 << 20, "the whole body arrives");
+    bw.set(Some(64 << 20));
+    let t = std::time::Instant::now();
+    c.put_object("drv", "f2", vec![7u8; 4 << 20], Default::default()).await.unwrap();
+    assert!(t.elapsed().as_secs_f64() < 0.5, "a new rate applies to the next request");
+}
