@@ -622,7 +622,11 @@ impl Queue {
     // The publisher
 
     async fn publisher(&self) {
+        // The runs' tasks: the publisher stops only once each has let go of the queue, and of the
+        // store with it, so that whoever closed the queue can open the state directory again.
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
+            while tasks.try_join_next().is_some() {}
             let wait = {
                 let mut st = self.st();
                 if st.closed && st.runs == 0 {
@@ -641,7 +645,7 @@ impl Queue {
                     st.runs += 1;
                     let may_have_landed = st.may_have_landed.remove(&run[0].id);
                     let this = self.clone();
-                    tokio::spawn(async move { this.run(run, r, may_have_landed).await });
+                    tasks.spawn(async move { this.run(run, r, may_have_landed).await });
                 }
                 wait
             };
@@ -653,6 +657,7 @@ impl Queue {
                 None => notified.await,
             }
         }
+        while tasks.join_next().await.is_some() {}
     }
 
     /// The runs that may start now, and how long until a failed one may be tried again.
