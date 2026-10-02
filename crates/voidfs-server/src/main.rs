@@ -50,8 +50,9 @@ struct Args {
     commit_guard: Guard,
     /// A feature of the on-bucket format that a pool this server creates uses from the start
     /// (repeatable): `inline-data` holds files of up to 4 KiB in the log, so that a small write
-    /// takes one request to the bucket instead of two. Servers and readers that don't implement
-    /// a feature refuse a pool that has it. An existing pool keeps its features; add one with
+    /// takes one request to the bucket instead of two; `multi-object-versions` gives a version to
+    /// every object it changes, so a folder restore is in each restored file's history. Servers
+    /// and readers that don't implement a feature refuse a pool that has it. An existing pool keeps its features; add one with
     /// `voidfs-server pool enable`.
     #[arg(long = "new-pool-feature", env = "VOIDFS_NEW_POOL_FEATURES", value_delimiter = ',', global = true)]
     new_pool_features: Vec<String>,
@@ -107,7 +108,8 @@ enum PoolCommand {
     /// So run this only once every server that writes the pool implements it, then restart them.
     /// A feature cannot be removed.
     Enable {
-        /// The feature: `inline-data` holds files of up to 4 KiB in the log (RFC 0003).
+        /// The feature: `inline-data` holds files of up to 4 KiB in the log (RFC 0003);
+        /// `multi-object-versions` gives a version to every object it changes (RFC 0004).
         feature: String,
     },
 }

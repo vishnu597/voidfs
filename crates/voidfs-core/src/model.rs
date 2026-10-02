@@ -247,8 +247,12 @@ pub struct PoolDescriptor {
 /// The feature that lets content descriptors hold data extents (format §3.1, §5).
 pub const INLINE_DATA: &str = "inline-data";
 
+/// The feature under which a transaction's version belongs to every object it changes, each with
+/// a history row (format §7.1, RFC 0004).
+pub const MULTI_OBJECT_VERSIONS: &str = "multi-object-versions";
+
 /// The incompatible features this implementation understands.
-pub const KNOWN_INCOMPATIBLE_FEATURES: &[&str] = &[INLINE_DATA];
+pub const KNOWN_INCOMPATIBLE_FEATURES: &[&str] = &[INLINE_DATA, MULTI_OBJECT_VERSIONS];
 
 impl PoolDescriptor {
     /// Whether the pool lists `feature` in `features.incompatible`.

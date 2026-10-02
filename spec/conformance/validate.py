@@ -17,6 +17,8 @@ CASES = Path(__file__).with_name("cases.json")
 METHODS = {"GET", "HEAD", "PUT", "POST", "DELETE"}
 BUILTIN_VARS = {"drive", "drive2", "drive3"}
 KNOWN_KEYS = {"admin", "read"}
+# Pool features (format §3.1) a case may need the server's drives to have.
+KNOWN_FEATURES = {"inline-data", "multi-object-versions"}
 BODY_FORMS = {"text", "base64", "bytes", "patch", "json"}
 MATCHER_MEMBERS = {"equals", "matches", "present", "contains", "not_equals", "count", "capture"}
 BODY_MATCHERS = {"text", "base64", "size", "s3_error", "json", "xml"}
@@ -220,6 +222,8 @@ class Checker:
             for r in requires if isinstance(requires, list) else [None]:
                 if isinstance(r, str) and r.startswith("key:") and r[4:] in KNOWN_KEYS:
                     allowed_keys.add(r[4:])
+                elif isinstance(r, str) and r.startswith("feature:") and r[8:] in KNOWN_FEATURES:
+                    pass
                 else:
                     self.err(where, f"unknown requirement {r!r}")
             steps = case.get("steps")

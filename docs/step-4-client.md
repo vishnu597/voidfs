@@ -462,17 +462,20 @@ moved signing code on memory, local disk and versitygw.
   `use` and `keys list|revoke` (step 6); `update` (D10); `mount`, `unmount`, `mounts`, `uploads`,
   `status` and `daemon` (item 4, step 5).
 
-**What it showed about the server, for later** (not changed here: each changes what replay derives
-and checkpoints store, so it is the user's to decide):
-- **A folder restore** (§4.6) gives each file it restores the folder's new version, but a
-  transaction writes one history row, for its target, so the files' histories don't list that
-  version: `isLatest` marks an older row, and `show --version` with the file's current version
-  answers `404 NoSuchVersion`. The folder's own HEAD keeps its old version, while its history
-  lists the restore. Format §8.2 says `history` holds every version of every object.
+**What it showed about the server** (not changed in this item: each changes what replay derives
+and checkpoints store; both are fixed since):
+- **A folder restore** (§4.6) gave each file it restores the folder's new version, but a
+  transaction wrote one history row, for its target, so the files' histories didn't list that
+  version: `isLatest` marked an older row, and `show --version` with the file's current version
+  answered `404 NoSuchVersion`. The folder's own HEAD kept its old version, while its history
+  listed the restore. Format §8.2 says `history` holds every version of every object. Fixed by
+  [RFC 0004](../rfcs/0004-a-version-for-every-object-it-changes.md), in a pool with the
+  `multi-object-versions` feature: the restore's version is the folder's and every changed
+  file's, each with its own row.
 - **`lastVersionId`** (§4.10) of an object that a folder restore removes, or that a rename with
-  `x-voidfs-replace` replaces, is the head of the transaction's target, not the object's own
-  (`state.rs`, `remove`, takes `prior_head`): bringing it back with that id fails, or brings back
-  the wrong object. The value is stored in checkpoints; the fix is to use the object's own head.
+  `x-voidfs-replace` replaces, was the head of the transaction's target, not the object's own:
+  bringing it back with that id failed, or brought back the wrong object. Fixed in
+  [#23](https://github.com/vishnu597/voidfs/pull/23): the object's own head.
 - `ListObjectVersions` gives times in milliseconds (above), and `undelete` finds deleted drives
   by alias only.
 
@@ -596,11 +599,12 @@ What the third built (the change-feed client and connectivity):
 
 **Decisions taken while building the third:**
 - **What a change makes stale:** an `Object` (its attributes and content, and its entry in its
-  folder's listing) for each key a change names, a rename's source too; a `Subtree` as well for a
-  folder renamed, deleted or restored, which the feed reports as one change for the folder
-  (protocol §5.6); and `All` after a relisting. The block cache needs none of it: its blocks are
-  keyed by ETag. Under RFC 0004 a folder restore will also report each object it changes; the
-  subtree stays stale all the same.
+  folder's listing) for each key a change names, and its `fromKey` too (a rename's source, or
+  where a folder restore moved an object back from); a `Subtree` as well for a folder renamed,
+  deleted or restored, which the feed reports as one change for the folder (protocol §5.6); and
+  `All` after a relisting. The block cache needs none of it: its blocks are keyed by ETag. Under
+  RFC 0004 a folder restore also reports each object it changes; the subtree is stale all the
+  same.
 - **Positions:** a watch starts from the `seq` of the listing its caller holds. The SDK reconnects
   a broken stream from the last position it delivered (with `since`; the server ignores
   `Last-Event-ID`, item 1). On `410 ChangesExpired` the watcher relists only the root's first page,
@@ -745,8 +749,8 @@ for first); a cold read through the bucket against one through the API.
   binary against a server in the same process, every command in text and JSON and its errors)
   each failed with the code it guards broken, 63 breaks in all, each run alone with a timeout;
   two of them break the core fix and the SDK change it brought. The conformance suite passes on
-  memory, local disk and versitygw, and the README's commands were run by hand. Two server issues
-  it found wait for the user (item 2, above).
+  memory, local disk and versitygw, and the README's commands were run by hand. The two server
+  issues it found are fixed (item 2, above).
 - Item 3, the client core: **done** (2 October). The cache and fetcher are built: their 13
   tests (9 unit, 4 against a server in the same process and through the fault proxy) each failed
   with the code they guard broken, measured as
@@ -757,6 +761,7 @@ for first); a cold read through the bucket against one through the API.
   connectivity are built: their 7 tests (3 unit, 4 against a server in the same process and
   through the fault proxy), and the SDK's 1 for its observer, each failed with the code they guard
   broken, 16 breaks in all.
-- Next: the daemon and the CLI's daemon commands (item 4), and RFC 0004's implementation, which
-  the user accepted on 2 October.
+- RFC 0004, which the user accepted on 2 October, is implemented: folder restores are in every
+  restored file's history in a pool with `multi-object-versions` (item 2, above).
+- Next: the daemon and the CLI's daemon commands (item 4).
 - Items 4–6: not started.

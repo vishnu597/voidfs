@@ -341,7 +341,7 @@ pub fn rename(
 /// (protocol §4.6, §4.10).
 pub fn restore(state: &DriveState, key: &str, version: VersionId, pre: &Precondition, actor: &Actor) -> Result<Txn, OpError> {
     let key = parse(key)?;
-    let row = state.version(&version).ok_or(OpError::NoSuchVersion)?;
+    let row = state.find_version(&key, &version).or_else(|| state.find_removed_version(&version)).ok_or(OpError::NoSuchVersion)?;
     let oid = row.oid.clone();
     let kind = state.kind(&oid).ok_or(OpError::NoSuchVersion)?;
     if key.is_root() || key.is_folder() != (kind == Kind::Folder) {
@@ -415,13 +415,18 @@ pub fn restore_subtree(now: &DriveState, then: &DriveState, key: &str, actor: &A
             b.changes.push(Change::Create(CreateChange { oid: oid.clone(), parent: parent.clone(), name: name.clone(), kind: *kind }));
         }
         let (Some(was), Some(is)) = (then.record(oid), now.record(oid)) else { continue };
-        if was.etag != is.etag || was.attrs != is.attrs {
+        let differs = was.etag != is.etag || was.attrs != is.attrs;
+        // Brought back, or moved back: restored, though its record may be as it was.
+        let elsewhere = now.location(oid).is_none_or(|l| l.parent != *parent || l.name != *name);
+        if differs || elsewhere {
             let mut s = SetChange::new(oid.clone());
-            if *kind == Kind::File {
-                s.content = was.content.clone();
-                s.etag = Some(was.etag.clone());
+            if differs {
+                if *kind == Kind::File {
+                    s.content = was.content.clone();
+                    s.etag = Some(was.etag.clone());
+                }
+                s.attrs = Some(was.attrs.clone());
             }
-            s.attrs = Some(was.attrs.clone());
             s.restored_from = Some(was.head);
             b.changes.push(Change::Set(s));
         }
@@ -456,6 +461,20 @@ mod tests {
     impl Drive {
         fn new() -> Self {
             Drive { state: DriveState::empty() }
+        }
+
+        /// Under `multi-object-versions` (RFC 0004).
+        fn multi() -> Self {
+            Drive { state: DriveState::empty().with_multi_object_versions(true) }
+        }
+
+        fn oid(&self, key: &str) -> ObjectId {
+            self.state.lookup(&Key::parse(key).unwrap()).unwrap()
+        }
+
+        /// `(version, op, restored_from)` of each of an object's versions.
+        fn history(&self, oid: &ObjectId) -> Vec<(VersionId, Op, Option<VersionId>)> {
+            self.state.history(oid).map(|h| h.iter().map(|r| (r.version, r.op, r.restored_from)).collect()).unwrap_or_default()
         }
 
         fn run(&mut self, txn: Result<Txn, OpError>) -> Result<VersionId, OpError> {
@@ -612,6 +631,100 @@ mod tests {
         d.run(rename(&d.state, "doc.txt", "doc.new", false, &none, &pre, &actor())).unwrap();
         d.run(restore(&d.state, "doc.txt", row.last_version, &pre, &actor())).unwrap();
         assert_eq!((d.size("doc.txt"), d.size("doc.new")), (Some(3), Some(5)));
+    }
+
+    /// RFC 0004: a folder restore is one version, of the folder and of every object it changes,
+    /// each with a row, and not of what it leaves alone.
+    #[test]
+    fn a_folder_restore_is_one_version_of_every_object_it_changes() {
+        let mut d = Drive::multi();
+        let a1 = d.put("p/a.txt", b"1").unwrap();
+        let b1 = d.put("p/b.txt", b"keep").unwrap();
+        let g1 = d.put("p/gone.txt", b"g").unwrap();
+        let then = d.state.clone();
+        d.put("p/a.txt", b"22").unwrap();
+        let n = d.put("p/new.txt", b"n").unwrap();
+        let (a, b, g, new, p) = (d.oid("p/a.txt"), d.oid("p/b.txt"), d.oid("p/gone.txt"), d.oid("p/new.txt"), d.oid("p/"));
+        d.run(delete(&d.state, "p/gone.txt", &Precondition::default(), &actor()).map(Option::unwrap)).unwrap();
+        let r = d.run(restore_subtree(&d.state, &then, "p/", &actor())).unwrap();
+        assert_eq!(d.history(&a).last(), Some(&(r, Op::Restore, Some(a1))), "rolled back");
+        assert_eq!(d.history(&g).last(), Some(&(r, Op::Restore, Some(g1))), "brought back");
+        assert_eq!(d.history(&new).last(), Some(&(r, Op::Delete, None)), "taken out");
+        assert_eq!(d.state.removed("p/new.txt", None).next().unwrap().last_version, n);
+        assert_eq!(d.history(&b), [(b1, Op::Put, None)], "left alone: no row");
+        assert_eq!(d.state.record(&b).unwrap().head, b1, "and the head it had");
+        assert_eq!(d.history(&p).last(), Some(&(r, Op::Restore, None)));
+        for (oid, key) in [(&a, "p/a.txt"), (&g, "p/gone.txt"), (&p, "p/")] {
+            assert_eq!(d.state.record(oid).unwrap().head, r, "{key}");
+            assert_eq!(d.state.find_version(&Key::parse(key).unwrap(), &r).map(|row| &row.oid), Some(oid), "{key} at the restore's version");
+        }
+        assert_eq!(d.state.find_version(&Key::parse("p/new.txt").unwrap(), &r).map(|row| row.op), Some(Op::Delete), "removed from that key");
+        assert_eq!(d.state.last_changed().iter().next(), Some(&p), "the target first");
+        assert_eq!(d.state.last_changed().len(), 4);
+        // Reading the past after the restore reads what it restored.
+        assert_eq!(d.state.as_of(&a, d.state.time().unwrap()).unwrap().size, 1);
+        // A checkpoint keeps the rows of one version under each object.
+        let back = DriveState::from_rows(d.state.seq(), d.state.time(), d.state.rows()).unwrap().with_multi_object_versions(true);
+        assert_eq!(back.rows(), d.state.rows());
+        assert_eq!(back.find_version(&Key::parse("p/gone.txt").unwrap(), &r).unwrap().oid, g);
+
+        // The same restore without the feature: one row, the folder's.
+        let mut old = Drive::new();
+        old.put("p/a.txt", b"1").unwrap();
+        let then = old.state.clone();
+        old.put("p/a.txt", b"22").unwrap();
+        let a = old.oid("p/a.txt");
+        let r = old.run(restore_subtree(&old.state, &then, "p/", &actor())).unwrap();
+        assert!(old.history(&a).iter().all(|(v, ..)| *v != r));
+    }
+
+    /// What a folder restore moves back, from outside the folder or from a swapped name, is
+    /// restored though its content is as it was; its version reads it back.
+    #[test]
+    fn a_folder_restore_versions_what_it_moves_back() {
+        let mut d = Drive::multi();
+        let (none, pre) = (AttrsPatch::default(), Precondition::default());
+        let x1 = d.put("p/x", b"x").unwrap();
+        let y1 = d.put("p/y", b"y").unwrap();
+        let m1 = d.put("p/m", b"m").unwrap();
+        let then = d.state.clone();
+        let (x, y, m) = (d.oid("p/x"), d.oid("p/y"), d.oid("p/m"));
+        for (from, to) in [("p/x", "p/t"), ("p/y", "p/x"), ("p/t", "p/y"), ("p/m", "q/m")] {
+            d.run(rename(&d.state, from, to, false, &none, &pre, &actor())).unwrap();
+        }
+        let r = d.run(restore_subtree(&d.state, &then, "p/", &actor())).unwrap();
+        for (oid, key, v) in [(&x, "p/x", x1), (&y, "p/y", y1), (&m, "p/m", m1)] {
+            assert_eq!(d.oid(key), *oid, "{key} moved back");
+            assert_eq!(d.history(oid).last(), Some(&(r, Op::Restore, Some(v))), "{key}");
+        }
+        let later = d.put("p/x", b"later").unwrap();
+        assert_eq!(d.history(&x).last(), Some(&(later, Op::Put, None)), "a put is no restore");
+        d.run(restore(&d.state, "p/x", r, &pre, &actor())).unwrap();
+        assert_eq!(d.size("p/x"), Some(1), "the folder restore's version of p/x");
+        assert_eq!(d.history(&x).last().map(|h| h.2), Some(Some(r)));
+    }
+
+    #[test]
+    fn folders_a_write_makes_and_a_file_a_rename_replaces_get_rows() {
+        let mut d = Drive::multi();
+        let v = d.put("a/b/c.txt", b"c").unwrap();
+        for key in ["a/", "a/b/"] {
+            let oid = d.oid(key);
+            assert_eq!(d.history(&oid), [(v, Op::Put, None)], "{key}: its first version is the put's");
+            assert_eq!(d.state.record(&oid).unwrap().head, v);
+        }
+        let (none, pre) = (AttrsPatch::default(), Precondition::default());
+        let old = d.put("doc.txt", b"old").unwrap();
+        let replaced = d.oid("doc.txt");
+        d.put(".doc.tmp", b"newer").unwrap();
+        let tmp = d.oid(".doc.tmp");
+        let rn = d.run(rename(&d.state, ".doc.tmp", "doc.txt", true, &none, &pre, &actor())).unwrap();
+        assert_eq!(d.history(&replaced).last(), Some(&(rn, Op::Delete, None)));
+        assert_eq!(d.history(&tmp).last(), Some(&(rn, Op::Rename, None)));
+        // Its last version brings it back, at another key too (protocol §4.10).
+        d.run(restore(&d.state, "doc.old", old, &pre, &actor())).unwrap();
+        assert_eq!(d.size("doc.old"), Some(3));
+        assert_eq!(d.oid("doc.old"), replaced);
     }
 
     #[test]

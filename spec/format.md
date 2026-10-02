@@ -93,6 +93,7 @@ Defined features:
 | Feature | Kind | Meaning |
 |---|---|---|
 | `inline-data` | incompatible | Content descriptors may hold data extents, `{ "d": … }` (§5). [RFC 0003](../rfcs/0003-small-content-in-descriptors.md) |
+| `multi-object-versions` | incompatible | A transaction's version is that of every object it changes, each with a `history` row (§7.5). [RFC 0004](../rfcs/0004-a-version-for-every-object-it-changes.md) |
 
 *(informative)* Writers read `voidfs.json` when they start. A feature is therefore added by an
 operator, after every writer of the pool implements it, never by a writer that finds it missing;
@@ -253,7 +254,9 @@ A commit is stored at `drives/<drive-id>/log/<seq>.json`:
 - `txns` has at least one transaction. The **version id** of transaction `i` (counting from 0)
   in commit `seq` is the string `"<seq>.<i>"`, for example `"42.0"`.
 - Clients of the protocol treat version ids as opaque. Only this format gives them structure.
-- A transaction's `target` is the object whose version it is.
+- A transaction's `target` is the object the request named. Its version is the target's, and,
+  in a pool with `multi-object-versions` (§3.1), that of every object the transaction changes
+  (§7.5).
 - `op` records what made it: `put`, `write` (offset write, patch, splice, truncate), `copy`,
   `restore`, `rename`, `attrs` (attributes only), `delete` or `other`.
 - `actor` records who made it (`key`, `user`, `mount` or `system`, with an id), for audit.
@@ -305,7 +308,7 @@ is a tree of `(parent, name)` entries (§7.6).
 | Change | Members | Effect |
 |---|---|---|
 | `create` | `oid`, `parent`, `name`, `kind` (`file`, `folder`, `symlink`) | Adds a namespace entry. `parent` is a folder's oid, or `"root"`. For a new `oid` this creates the object. For an `oid` that has history but no entry (a deleted object), it puts the object back, and its record and history continue. |
-| `set` | `oid`, and any of `content`, `size`, `etag`, `attrs`, `restored_from` | Replaces the object's current record with these members. Members not given keep their values. Creates a version of the object when it is the target. |
+| `set` | `oid`, and any of `content`, `size`, `etag`, `attrs`, `restored_from` | Replaces the object's current record with these members. Members not given keep their values. Which objects get a version is below. |
 | `move` | `oid`, `parent`, `name` | Changes the entry's parent and name. A folder moves with its whole subtree. |
 | `remove` | `oid`, `recursive` | Removes the object's entry from the namespace. A folder MUST be empty unless `recursive: true`; a recursively removed folder keeps its children attached to it, so they leave the namespace with it and come back with it (§7.5 `create`). The object's history is kept, and a `removed` row records it (§8.2). |
 
@@ -314,6 +317,35 @@ Invariants, which every transaction MUST preserve:
 2. No two entries share `(parent, name)`.
 3. No folder is its own ancestor.
 4. `size` of a file equals the size of its `content`.
+
+**Versions.** An object's **state** is its record (§7.7) but for `head`, and its namespace entry
+if it has one. A transaction **changes** an object if the object's state after the transaction
+differs from its state before, or if the transaction creates it. A transaction **takes out** an
+object that has an entry before it and none after.
+
+In a pool with `multi-object-versions` (§3.1):
+- The transaction's version belongs to its target and to every object it changes. Each of them
+  gets one `history` row at that version (§8.2), built from its record after the transaction,
+  and its `head` becomes that version.
+- A row's `op` is the transaction's, except for an object the transaction takes out: its row's
+  `op` is `delete`.
+- An object's `restored_from` is the value a `set` in the transaction gave it. Any other
+  transaction that changes the object clears it.
+- An object that a change names but that ends as it was gets no row and keeps its `head`. The
+  target always gets its row.
+- The descendants of a folder that moves, or that is removed with `recursive: true`, keep their
+  records and entries, so they are not changed; only their keys follow the folder.
+- A planner that restores objects (protocol §4.6) sets `restored_from` on each object it rolls
+  back, moves back or brings back, to that object's `head` at the instant restored to.
+
+Otherwise, the version is the target's alone. The target gets one `history` row, built from its
+record after the transaction, and every object a change names takes the version as its `head`.
+The target's `restored_from` is cleared unless `op` is `restore`.
+
+*(informative)* Without the feature, the objects a folder restore changes and the folders a write
+creates have a `head` missing from their history. A reader that implements the feature applies
+it to every commit it replays, written before the feature was added or after; history in
+checkpoints written before stays as it was recorded.
 
 ### 7.6 Names and paths
 
@@ -383,11 +415,12 @@ the keys of the first and last rows, encoded as strings in the forms below.
 |---|---|---|
 | `entries` | `parent` then `segment` (§7.6), encoded `"<parent>/<segment>"` | `{ "parent", "name", "oid", "kind" }` |
 | `objects` | `oid` | `{ "oid", ...the object record (§7.7), "head": "<version id>" }` |
-| `history` | `oid` then version order, encoded `"<oid>@<seq, 20 digits>.<i>"` | `{ "oid", "version", "time", "op", "size", "etag", "content", "restored_from", "actor" }` |
-| `removed` | the key the object had when removed, then `oid`, encoded `"<key>@<oid>"` | `{ "key", "oid", "version", "time" }`: one row per object that is out of the namespace and still retained. Deleted when the object is put back or its history expires. Serves the protocol's "recently deleted" listing |
+| `history` | `oid` then version order, encoded `"<oid>@<seq, 20 digits>.<i>"` | `{ "oid", "version", "time", "op", "size", "etag", "content", "attrs", "restored_from", "actor" }` |
+| `removed` | the key the object had when removed, then `oid`, encoded `"<key>@<oid>"` | `{ "key", "oid", "version", "last_version", "time", "kind", "size" }`: one row per object that is out of the namespace and still retained. `version` is the version that took the object out, and `last_version` the object's `head` before that transaction. Deleted when the object is put back or its history expires. Serves the protocol's "recently deleted" listing |
 
 `history` holds every version of every object that is still retained (§10), including versions
-inherited from a fork's parent (§9). It carries each version's content descriptor, or an
+inherited from a fork's parent (§9). With `multi-object-versions`, one version can have rows
+under several objects (§7.5). It carries each version's content descriptor, or an
 equivalent of it (below), so a reader never needs an old commit to read an old version.
 
 A checkpoint MUST NOT contain data extents (§5). For each `objects` and `history` row whose

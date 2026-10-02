@@ -42,6 +42,8 @@ pub struct Runner {
     /// Send `/<drive>/<key>` as `/<key>` to host `<drive>.<domain>` (virtual-host addressing),
     /// still connecting to the endpoint. `/` goes to `<domain>` itself.
     pub virtual_host: Option<String>,
+    /// The pool features the server's drives have, for cases that require `feature:<name>`.
+    pub features: Vec<String>,
 }
 
 struct Response {
@@ -57,13 +59,13 @@ impl Runner {
         let endpoint = endpoint.trim_end_matches('/').to_owned();
         Signer::new(&endpoint, "", "")?; // checks the endpoint
         let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build()?;
-        Ok(Runner { client, endpoint, keys, verbose: false, virtual_host: None })
+        Ok(Runner { client, endpoint, keys, verbose: false, virtual_host: None, features: Vec::new() })
     }
 
     pub async fn run_case(&self, case: &Case) -> CaseResult {
         let started = Instant::now();
         for r in &case.requires {
-            let have = r.strip_prefix("key:").is_some_and(|k| self.keys.contains_key(k));
+            let have = r.strip_prefix("key:").is_some_and(|k| self.keys.contains_key(k)) || r.strip_prefix("feature:").is_some_and(|f| self.features.iter().any(|g| g == f));
             if !have {
                 return CaseResult { id: case.id.clone(), outcome: Outcome::Skip(format!("needs {r}")), elapsed: started.elapsed() };
             }

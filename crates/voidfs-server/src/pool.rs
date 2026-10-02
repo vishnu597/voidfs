@@ -15,7 +15,7 @@ use voidfs_core::chunk::{Params, Shard};
 use voidfs_core::ids::{DriveId, ObjectId, ShardHash, Timestamp, VersionId};
 use voidfs_core::manifest::{self, Page};
 use voidfs_core::model::{
-    Chunking, Commit, CommitGuard, ContentDescriptor, DriveDescriptor, Extent, Features, ForkOf, INLINE_DATA, KNOWN_INCOMPATIBLE_FEATURES, Kind, Op, PoolDescriptor,
+    Chunking, Commit, CommitGuard, ContentDescriptor, DriveDescriptor, Extent, Features, ForkOf, INLINE_DATA, KNOWN_INCOMPATIBLE_FEATURES, MULTI_OBJECT_VERSIONS, Kind, Op, PoolDescriptor,
     Txn,
 };
 use voidfs_core::ops::OpError;
@@ -108,6 +108,26 @@ fn feed_of(txn: &Txn, v: VersionId, before: &DriveState, after: &DriveState, cha
                     changes.push(FeedChange { op: "create", key, from_key: None, object_id: c.oid.clone(), version_id: v, kind: Kind::Folder });
                 }
     }
+    // Every other object the version changed (RFC 0004): what a folder restore rolls back, brings
+    // back or takes out, and what a rename replaces. What it took out comes before the target,
+    // children before their folders, as the version took them out; the rest after, folders first.
+    let (mut gone, mut rest) = (Vec::new(), Vec::new());
+    if after.multi_object_versions() {
+        for oid in after.last_changed().iter().filter(|o| **o != txn.target && before.record(o).is_some()) {
+            let kind = after.kind(oid).unwrap_or(Kind::File);
+            match (before.key_of(oid), after.key_of(oid)) {
+                (Some(was), None) => gone.push(FeedChange { op: "delete", key: was, from_key: None, object_id: oid.clone(), version_id: v, kind }),
+                (was, Some(is)) => {
+                    let from_key = was.filter(|w| *w != is);
+                    rest.push(FeedChange { op: txn.op.as_str(), key: is, from_key, object_id: oid.clone(), version_id: v, kind });
+                }
+                (None, None) => {}
+            }
+        }
+    }
+    gone.sort_by(|a, b| b.key.cmp(&a.key));
+    rest.sort_by(|a, b| a.key.cmp(&b.key));
+    changes.extend(gone);
     let kind = after.kind(&txn.target).unwrap_or(Kind::File);
     let (key, from_key) = match txn.op {
         Op::Delete => (before.key_of(&txn.target), None),
@@ -117,6 +137,7 @@ fn feed_of(txn: &Txn, v: VersionId, before: &DriveState, after: &DriveState, cha
     if let Some(key) = key {
         changes.push(FeedChange { op: txn.op.as_str(), key, from_key, object_id: txn.target.clone(), version_id: v, kind });
     }
+    changes.extend(rest);
 }
 
 /// Applies `commit` a transaction at a time, so that each one's feed changes name keys as they
@@ -466,6 +487,9 @@ pub struct Pool {
     /// Whether the pool lists `inline-data`, so that content may be held in data extents
     /// (format §3.1, §5). Read when the pool opens, as the rest of `voidfs.json` is.
     pub inline_data: bool,
+    /// Whether the pool lists `multi-object-versions`, so that a transaction's version is every
+    /// object's it changes (format §7.1, RFC 0004). Read when the pool opens.
+    pub multi_object_versions: bool,
     shards: moka::sync::Cache<ShardHash, Bytes>,
     pages: moka::sync::Cache<ShardHash, Bytes>,
     /// Shards and pages being fetched from the bucket, which reads that miss meanwhile wait for.
@@ -617,6 +641,7 @@ impl Pool {
         let pool = Arc::new(Pool {
             store,
             inline_data: desc.has(INLINE_DATA),
+            multi_object_versions: desc.has(MULTI_OBJECT_VERSIONS),
             desc,
             params,
             clock,
@@ -713,6 +738,11 @@ impl Pool {
         d
     }
 
+    /// An empty drive under the pool's rule for versions.
+    fn empty_state(&self) -> DriveState {
+        DriveState::empty().with_multi_object_versions(self.multi_object_versions)
+    }
+
     async fn load_drive(&self, id: &DriveId) -> anyhow::Result<Option<Drive>> {
         let Some(b) = self.store.get(&format!("drives/{id}/drive.json")).await? else { return Ok(None) };
         let desc: DriveDescriptor = serde_json::from_slice(&b).context("reading drive.json")?;
@@ -720,7 +750,7 @@ impl Pool {
         let (mut state, last) = match self.latest_checkpoint(id).await? {
             Some((s, c)) => (s, Some(c)),
             None if desc.fork_of.is_some() => bail!("fork {id} has no checkpoint"),
-            None => (DriveState::empty(), None),
+            None => (self.empty_state(), None),
         };
         let from = state.seq();
         let drive_feed = self.replay(id, &mut state, &mut cadence).await?;
@@ -803,7 +833,7 @@ impl Pool {
             history: rows_of(&mut pages, t.history.len()).await?,
             removed: rows_of(&mut pages, t.removed.len()).await?,
         };
-        let state = DriveState::from_rows(idx.seq, idx.time, rows)?;
+        let state = DriveState::from_rows(idx.seq, idx.time, rows)?.with_multi_object_versions(self.multi_object_versions);
         Ok((state, Checkpointed { index: path.to_owned(), pages: t.pages(), seen }))
     }
 
@@ -1126,7 +1156,7 @@ impl Pool {
         let id = DriveId::generate();
         let mut last = None;
         let (state, fork_of, deadline) = match source {
-            None => (Arc::new(DriveState::empty()), None, None),
+            None => (Arc::new(self.empty_state()), None, None),
             Some(src) => {
                 // Hold the source's checkpoint lock so that its last checkpoint is not still
                 // being written, and its commit lock so the fork includes every acknowledged
@@ -1578,7 +1608,7 @@ impl Pool {
 
     /// The drive's state at instant `t`, rebuilt from its checkpoints and log.
     pub async fn state_at(&self, d: &Drive, t: Timestamp) -> anyhow::Result<DriveState> {
-        let mut state = DriveState::empty();
+        let mut state = self.empty_state();
         if let Some(fork) = &d.desc.fork_of {
             // A fork's namespace before its own log exists only as its first checkpoint, so its
             // point-in-time window starts at the fork point (format §8.5, §9).
@@ -1760,7 +1790,7 @@ mod tests {
             let c = pool.create_drive("gamma", None).await.unwrap();
             pool.soft_delete(&c).await.unwrap();
             assert_eq!(read(&pool, &b, "docs/only-alpha.txt").await, None);
-            assert_eq!(b.snapshot().version(&v1).map(|r| r.size), Some(5));
+            assert_eq!(b.snapshot().find_version(&voidfs_core::names::Key::parse("docs/a.txt").unwrap(), &v1).map(|r| r.size), Some(5));
         }
         {
             let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
@@ -2754,6 +2784,78 @@ mod tests {
         let e = Pool::open(fresh.clone(), 1 << 20).await.err().unwrap();
         assert!(format!("{e:#}").contains("unsupported features"), "{e:#}");
         assert!(enable_feature(&fresh, INLINE_DATA).await.is_err(), "nor changed");
+    }
+
+    fn restore_plan(key: &str, then: Arc<DriveState>) -> TestPlan {
+        let key = key.to_owned();
+        Box::new(move |s| Ok(ops::restore_subtree(s, &then, &key, &Actor::system())?))
+    }
+
+    /// The versions in the history of the object at `key`.
+    fn versions(s: &DriveState, key: &str) -> Vec<VersionId> {
+        s.history(&s.lookup(&Key::parse(key).unwrap()).unwrap()).unwrap().iter().map(|r| r.version).collect()
+    }
+
+    /// RFC 0004: once `multi-object-versions` is enabled, a server replays the log under its rule,
+    /// so a folder restore made before is in the restored file's history; history a checkpoint
+    /// recorded before stays as it was. The feed reports what a version took out, its target,
+    /// then the rest.
+    #[tokio::test]
+    async fn multi_object_versions_apply_to_the_log_replayed_once_enabled() {
+        let store = Store::memory().unwrap();
+        let pool = Pool::open_creating(store.clone(), 1 << 20, Clock::System, CommitGuard::CreateIfAbsent, &[]).await.unwrap();
+        assert!(!pool.multi_object_versions);
+        let d = pool.create_drive("d", None).await.unwrap();
+        put(&pool, &d, "c/a", b"1").await;
+        let then = d.snapshot();
+        put(&pool, &d, "c/a", b"2").await;
+        let in_checkpoint = pool.commit(&d, restore_plan("c/", then)).await.unwrap().0;
+        checkpoint_now(&pool, &d).await;
+        put(&pool, &d, "l/a", b"1").await;
+        let then = d.snapshot();
+        put(&pool, &d, "l/a", b"2").await;
+        let in_log = pool.commit(&d, restore_plan("l/", then)).await.unwrap().0;
+        assert!(!versions(&d.snapshot(), "l/a").contains(&in_log), "the folder's version alone");
+        drop((d, pool));
+
+        assert!(enable_feature(&store, MULTI_OBJECT_VERSIONS).await.unwrap());
+        let pool = Pool::open(store.clone(), 1 << 20).await.unwrap();
+        assert!(pool.multi_object_versions);
+        let d = pool.drive("d").unwrap();
+        let s = d.snapshot();
+        assert_eq!(versions(&s, "l/a").last(), Some(&in_log), "replayed under the rule");
+        assert_eq!(s.record(&s.lookup(&Key::parse("l/a").unwrap()).unwrap()).unwrap().head, in_log);
+        assert!(!versions(&s, "c/a").contains(&in_checkpoint), "as the checkpoint recorded it");
+
+        for key in ["f/a", "f/b", "f/c"] {
+            put(&pool, &d, key, b"1").await;
+        }
+        let then = d.snapshot();
+        put(&pool, &d, "f/a", b"2").await;
+        for key in ["f/b", "f/c"] {
+            pool.commit(&d, delete_plan(key)).await.unwrap();
+        }
+        put(&pool, &d, "f/n/x", b"x").await;
+        put(&pool, &d, "f/z", b"z").await;
+        let since = d.snapshot().seq();
+        let v = pool.commit(&d, restore_plan("f/", then)).await.unwrap().0;
+        let feed = d.changes_since(since).unwrap();
+        let got: Vec<(&str, &str)> = feed[0].changes.iter().map(|c| (c.op, c.key.as_str())).collect();
+        // The planner names them in another order: what it takes out as it walks the folder, and
+        // what it brings back after what it rolls back.
+        assert_eq!(got, [
+            ("delete", "f/z"),
+            ("delete", "f/n/x"),
+            ("delete", "f/n/"),
+            ("restore", "f/"),
+            ("restore", "f/a"),
+            ("restore", "f/b"),
+            ("restore", "f/c"),
+        ]);
+        assert!(feed[0].changes.iter().all(|c| c.version_id == v));
+        let e = pool.create_drive("e", None).await.unwrap();
+        let v = put(&pool, &e, "a/b", b"b").await;
+        assert_eq!(versions(&e.snapshot(), "a/"), [v], "a new drive under the rule");
     }
 
     /// One task drains a drive's queue at a time, so whatever else waits for the commit lock (a

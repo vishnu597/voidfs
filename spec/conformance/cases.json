@@ -764,7 +764,161 @@
         { "request": { "method": "GET", "path": "/${drive}/k.bin", "query": { "x-voidfs-versions": "" } },
           "expect": { "status": 200, "body": { "json": [ { "path": "$.versions.length", "equals": 5 }, { "path": "$.versions[0].etag", "equals": "${e1}" }, { "path": "$.versions[1].etag", "equals": "${e2}" }, { "path": "$.versions[2].etag", "equals": "${e3}" }, { "path": "$.versions[3].etag", "equals": "${e4}" }, { "path": "$.versions[4].etag", "equals": "${e1}" }, { "path": "$.versions[4].operation", "equals": "restore" }, { "path": "$.versions[4].restoredFrom", "equals": "${v1}" } ] } } }
       ]
+    },
+    {
+      "id": "folder-restore-versions-each-object",
+      "title": "A folder restore is one version, in the history of every object it changes",
+      "spec": ["protocol §1.1", "protocol §4.4", "protocol §4.5", "protocol §4.6", "format §7.5"],
+      "requires": ["feature:multi-object-versions"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/a.txt", "body": { "text": "1" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "va1" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/keep.txt", "body": { "text": "k" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "vk" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/gone.txt", "body": { "text": "g" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "vg1" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/d/gone.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions[0].lastModified", "capture": "t1" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/a.txt", "body": { "text": "22" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/new.txt", "body": { "text": "n" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "vn" } } } },
+        { "request": { "method": "DELETE", "path": "/${drive}/d/gone.txt" }, "expect": { "status": 204 } },
+        { "request": { "method": "POST", "path": "/${drive}/d/", "query": { "x-voidfs-restore": "" }, "headers": { "x-voidfs-as-of": "${t1}" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "vr" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/d/a.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.versions.length", "equals": 3 },
+            { "path": "$.versions[2].versionId", "equals": "${vr}" },
+            { "path": "$.versions[2].isLatest", "equals": true },
+            { "path": "$.versions[2].operation", "equals": "restore" },
+            { "path": "$.versions[2].restoredFrom", "equals": "${va1}" } ] } } },
+        { "request": { "method": "GET", "path": "/${drive}/d/a.txt", "query": { "versionId": "${vr}" } }, "expect": { "status": 200, "body": { "text": "1" } } },
+        { "request": { "method": "GET", "path": "/${drive}/d/a.txt" },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "equals": "${vr}" } }, "body": { "text": "1" } } },
+        { "request": { "method": "GET", "path": "/${drive}/d/gone.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.versions[-1].versionId", "equals": "${vr}" },
+            { "path": "$.versions[-1].operation", "equals": "restore" },
+            { "path": "$.versions[-1].restoredFrom", "equals": "${vg1}" } ] } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/d/" }, "expect": { "status": 200, "headers": { "x-amz-version-id": { "equals": "${vr}" } } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/d/keep.txt" }, "expect": { "status": 200, "headers": { "x-amz-version-id": { "equals": "${vk}" } } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-deleted": "", "prefix": "d/new.txt" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.deleted[0].lastVersionId", "equals": "${vn}" } ] } } },
+        { "request": { "method": "GET", "path": "/${drive}/d/a.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions[2].lastModified", "capture": "tr" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/a.txt", "body": { "text": "333" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/d/a.txt", "headers": { "x-voidfs-as-of": "${tr}" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "equals": "${vr}" } }, "body": { "text": "1" } } }
+      ]
+    },
+    {
+      "id": "writes-version-the-folders-they-make",
+      "title": "A write that makes folders is each one's first version, which brings one back once deleted",
+      "spec": ["protocol §1.1", "protocol §1.2", "protocol §4.4", "protocol §4.10", "format §7.5"],
+      "requires": ["feature:multi-object-versions"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/x/y/z.txt", "body": { "text": "z" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "v" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/x/y/", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.versions.length", "equals": 1 },
+            { "path": "$.versions[0].versionId", "equals": "${v}" },
+            { "path": "$.versions[0].isLatest", "equals": true } ] } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/x/" }, "expect": { "status": 200, "headers": { "x-amz-version-id": { "equals": "${v}" } } } },
+        { "request": { "method": "DELETE", "path": "/${drive}/x/y/z.txt" }, "expect": { "status": 204 } },
+        { "request": { "method": "DELETE", "path": "/${drive}/x/y/" }, "expect": { "status": 204 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-deleted": "", "prefix": "x/y/" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.deleted[0].key", "equals": "x/y/" }, { "path": "$.deleted[0].lastVersionId", "equals": "${v}" } ] } } },
+        { "request": { "method": "POST", "path": "/${drive}/x/y/", "query": { "x-voidfs-restore": "", "versionId": "${v}" } },
+          "expect": { "status": 200, "headers": { "x-voidfs-restored-from": { "equals": "${v}" } } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/x/y/" }, "expect": { "status": 200 } }
+      ]
+    },
+    {
+      "id": "folder-restore-in-the-feed",
+      "title": "The change feed reports each object a version changes: what it takes out first, then its target, then what it rolls back",
+      "spec": ["protocol §5.6", "protocol §4.6", "protocol §4.7"],
+      "requires": ["feature:multi-object-versions"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/a.txt", "body": { "text": "1" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/d/a.txt", "query": { "x-voidfs-versions": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.versions[0].lastModified", "capture": "t1" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/a.txt", "body": { "text": "2" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/new.txt", "body": { "text": "n" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-list": "", "prefix": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.seq", "capture": "s0" } ] } } },
+        { "request": { "method": "POST", "path": "/${drive}/d/", "query": { "x-voidfs-restore": "" }, "headers": { "x-voidfs-as-of": "${t1}" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "vr" } } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-changes": "", "since": "${s0}" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.changes.length", "equals": 3 },
+            { "path": "$.changes[0].op", "equals": "delete" },
+            { "path": "$.changes[0].key", "equals": "d/new.txt" },
+            { "path": "$.changes[0].versionId", "equals": "${vr}" },
+            { "path": "$.changes[1].op", "equals": "restore" },
+            { "path": "$.changes[1].key", "equals": "d/" },
+            { "path": "$.changes[2].op", "equals": "restore" },
+            { "path": "$.changes[2].key", "equals": "d/a.txt" },
+            { "path": "$.changes[2].versionId", "equals": "${vr}" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/a.tmp", "body": { "text": "t" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-list": "", "prefix": "" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.seq", "capture": "s1" } ] } } },
+        { "request": { "method": "PUT", "path": "/${drive}/d/a.txt", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": "d/a.tmp", "x-voidfs-replace": "true" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "vn" } } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-changes": "", "since": "${s1}" } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.changes.length", "equals": 2 },
+            { "path": "$.changes[0].op", "equals": "delete" },
+            { "path": "$.changes[0].key", "equals": "d/a.txt" },
+            { "path": "$.changes[0].versionId", "equals": "${vn}" },
+            { "path": "$.changes[1].op", "equals": "rename" },
+            { "path": "$.changes[1].key", "equals": "d/a.txt" },
+            { "path": "$.changes[1].fromKey", "equals": "d/a.tmp" } ] } } }
+      ]
+    },
+    {
+      "id": "replaced-file-comes-back-by-its-last-version",
+      "title": "A file a rename replaced is listed with its own last version, which brings it back at another key",
+      "spec": ["protocol §4.7", "protocol §4.10", "protocol §4.6"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/doc.txt", "body": { "text": "old" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "vold" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/doc.tmp", "body": { "text": "newer" } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/doc.txt", "query": { "x-voidfs-rename": "" }, "headers": { "x-voidfs-source": "doc.tmp", "x-voidfs-replace": "true" } },
+          "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-deleted": "", "prefix": "doc.txt" } },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.deleted[0].lastVersionId", "equals": "${vold}" } ] } } },
+        { "request": { "method": "POST", "path": "/${drive}/doc.old", "query": { "x-voidfs-restore": "", "versionId": "${vold}" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/doc.old" }, "expect": { "status": 200, "body": { "text": "old" } } },
+        { "request": { "method": "GET", "path": "/${drive}/doc.txt" }, "expect": { "status": 200, "body": { "text": "newer" } } }
+      ]
+    },
+    {
+      "id": "version-of-another-object",
+      "title": "A version id read or copied at a key is a version of the object there, or of one deleted from it",
+      "spec": ["protocol §3", "protocol §4.5"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/a", "body": { "text": "aaa" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "capture": "va" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/b", "body": { "text": "bbb" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/b", "query": { "versionId": "${va}" } },
+          "expect": { "status": 404, "body": { "s3_error": "NoSuchVersion" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/c", "headers": { "x-amz-copy-source": "/${drive}/b?versionId=${va}" } },
+          "expect": { "status": 404, "body": { "s3_error": "NoSuchVersion" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/c", "headers": { "x-amz-copy-source": "/${drive}/a?versionId=${va}" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/c" }, "expect": { "status": 200, "body": { "text": "aaa" } } },
+        { "request": { "method": "DELETE", "path": "/${drive}/a" }, "expect": { "status": 204 } },
+        { "request": { "method": "PUT", "path": "/${drive}/a", "body": { "text": "another" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/a", "query": { "versionId": "${va}" } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "equals": "${va}" } }, "body": { "text": "aaa" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/d", "headers": { "x-amz-copy-source": "/${drive}/a?versionId=${va}" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/d" }, "expect": { "status": 200, "body": { "text": "aaa" } } }
+      ]
     }
-
   ]
 }

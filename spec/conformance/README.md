@@ -32,7 +32,7 @@ in Phase 1.
 | `id` | yes | Unique, lowercase, hyphen-separated |
 | `title` | yes | One line describing what is tested |
 | `spec` | yes | The sections exercised, for example `["protocol §4.1"]` |
-| `requires` | no | Capabilities the runner must have, for example `["key:read"]`. A runner without them reports the case as skipped, never as passed |
+| `requires` | no | Capabilities the runner must have, for example `["key:read"]`, or pool features (format §3.1) the server's drives must have, for example `["feature:multi-object-versions"]`. A runner without them reports the case as skipped, never as passed |
 | `steps` | yes | Requests, run in order. The case fails at the first step whose expectations are not met |
 
 ### Runner environment
@@ -45,6 +45,8 @@ in Phase 1.
   |---|---|
   | `read` | read, every drive |
 
+- The runner is told which pool features the server's drives have (`voidfs-conformance --feature
+  <name>`); a case that requires `feature:<name>` runs only then.
 - Before a case, the runner picks fresh, unused drive names for the variables `drive`, `drive2`
   and `drive3` (valid S3 bucket names such as `vfc-3k9x2m1q`). It does not create them. After
   the case, it hard-deletes every drive the case created, whether the case passed or not.

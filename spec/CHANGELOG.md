@@ -4,6 +4,34 @@ Every change to the [protocol](protocol.md), the [format](format.md) and the
 [conformance suite](conformance/) is recorded here, newest first. Drafts may change
 incompatibly; entries say when they do.
 
+## Draft 1, revision 6: a version for every object it changes (2026-10-02)
+
+[RFC 0004](../rfcs/0004-a-version-for-every-object-it-changes.md). Readers that do not implement
+it refuse pools that use it, through the new feature flag. Clients see more history rows and feed
+changes; no request, header or response member is added or removed.
+
+- **Format §3.1:** the `multi-object-versions` incompatible feature, added by an operator once
+  every writer of the pool implements it.
+- **Format §7.1, §7.5:** with it, a transaction's version is its target's and that of every
+  object it changes, each with a `history` row; an object it takes out gets a `delete` row, and
+  one it leaves as it was gets none. Without it, the rule is unchanged and now written down.
+- **Format §8.2:** `history` rows list `attrs`, and `removed` rows `last_version`, `kind` and
+  `size`, which writers already stored.
+- **Protocol §1.1, §1.2:** a version can belong to several objects: a folder restore's, a write's
+  that creates folders, a rename's that replaces a file.
+- **Protocol §3, §4.5:** a `versionId`, in a read or a copy source, is a version of the object at
+  the key, or of one deleted from it. A version of another object is `404 NoSuchVersion`.
+- **Protocol §4.4:** `delete` is listed among the operations, and `isLatest` is the newest
+  version listed.
+- **Protocol §4.6, §4.7:** what a folder restore and a replacing rename record for each file.
+- **Protocol §5.6:** a version's changes in order: implicit folders, what it removed, its
+  target, then the other objects it changed; a folder restore that moves an object back carries
+  `fromKey`.
+- **Conformance:** `requires` accepts `feature:<name>`, and the runner takes `--feature`.
+  `folder-restore-versions-each-object`, `writes-version-the-folders-they-make` and
+  `folder-restore-in-the-feed` need `multi-object-versions`;
+  `replaced-file-comes-back-by-its-last-version` and `version-of-another-object` do not.
+
 ## Draft 1, revision 5: small content inside the content descriptor (2026-09-29)
 
 [RFC 0003](../rfcs/0003-small-content-in-descriptors.md). Readers that do not implement it refuse

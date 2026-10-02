@@ -154,13 +154,8 @@ fn resolve_view(ctx: &Ctx, s: &DriveState) -> Result<View, S3Error> {
     }
     if let Some(v) = version {
         let v: VersionId = v.parse().map_err(|_| no_version())?;
-        let row = s.version(&v).ok_or_else(no_version)?;
-        // The version must belong to the object at this key, or to a deleted object last there.
-        let at_key = s.lookup(&key);
-        let ok = at_key.as_ref() == Some(&row.oid) || s.removed_row(&row.oid).is_some_and(|r| r.key == key.render());
-        if !ok {
-            return Err(no_version());
-        }
+        // A version of the object at this key, or of a deleted object last there.
+        let row = s.find_version(&key, &v).ok_or_else(no_version)?;
         return Ok(View::of_row(s, row));
     }
     let oid = s.lookup(&key).ok_or_else(S3Error::no_key)?;
@@ -493,7 +488,8 @@ async fn copy(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>) -> Result<Response, S3E
     let (row_version, content, size, src_attrs, kind) = match &src_version {
         Some(v) => {
             let v: VersionId = v.parse().map_err(|_| S3Error::new(404, "NoSuchVersion", "no such version"))?;
-            let r = ss.version(&v).ok_or_else(|| S3Error::new(404, "NoSuchVersion", "no such version"))?;
+            // A version of the object at the source key, or of one deleted from it.
+            let r = ss.find_version(&k, &v).ok_or_else(|| S3Error::new(404, "NoSuchVersion", "no such version"))?;
             (r.version, r.content.clone(), r.size, r.attrs.clone(), ss.kind(&r.oid).unwrap_or(Kind::File))
         }
         None => {
