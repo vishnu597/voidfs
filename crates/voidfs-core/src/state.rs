@@ -78,9 +78,26 @@ pub struct DriveState {
     locations: IMap<ObjectId, Location>,
     objects: IMap<ObjectId, ObjectRecord>,
     history: IMap<ObjectId, Vector<HistoryRow>>,
-    versions: IMap<VersionId, ObjectId>,
     removed: OrdMap<(String, ObjectId), RemovedRow>,
     removed_keys: IMap<ObjectId, String>,
+    /// The pool's `multi-object-versions` (format §7.1): a transaction's version is every object's
+    /// it changes, not only its target's.
+    multi: bool,
+    /// The objects the last transaction gave a version, its target first.
+    last_changed: Vector<ObjectId>,
+}
+
+/// An object's state as a transaction compares it: its record but for when it last changed, and
+/// its entry.
+#[derive(PartialEq)]
+struct Shape {
+    content: Option<ContentDescriptor>,
+    size: u64,
+    etag: String,
+    attrs: crate::model::Attrs,
+    target: Option<String>,
+    restored_from: Option<VersionId>,
+    location: Option<Location>,
 }
 
 impl DriveState {
@@ -88,6 +105,34 @@ impl DriveState {
     /// fork's own log).
     pub fn empty() -> Self {
         DriveState::default()
+    }
+
+    /// This state under the pool's `multi-object-versions` feature, or not.
+    pub fn with_multi_object_versions(mut self, on: bool) -> Self {
+        self.multi = on;
+        self
+    }
+
+    pub fn multi_object_versions(&self) -> bool {
+        self.multi
+    }
+
+    /// The objects the last transaction applied gave a version, its target first.
+    pub fn last_changed(&self) -> &Vector<ObjectId> {
+        &self.last_changed
+    }
+
+    fn shape(&self, oid: &ObjectId) -> Option<Shape> {
+        let r = self.objects.get(oid)?;
+        Some(Shape {
+            content: r.content.clone(),
+            size: r.size,
+            etag: r.etag.clone(),
+            attrs: r.attrs.clone(),
+            target: r.target.clone(),
+            restored_from: r.restored_from,
+            location: self.locations.get(oid).cloned(),
+        })
     }
 
     pub fn seq(&self) -> u64 {
@@ -153,17 +198,39 @@ impl DriveState {
         if txn.changes.is_empty() {
             return Err(StateError::EmptyTxn);
         }
+        let mut named: Vec<ObjectId> = vec![txn.target.clone()];
+        for change in &txn.changes {
+            let oid = match change {
+                Change::Create(c) => &c.oid,
+                Change::Set(c) => &c.oid,
+                Change::Move(c) => &c.oid,
+                Change::Remove(c) => &c.oid,
+            };
+            if !named.contains(oid) {
+                named.push(oid.clone());
+            }
+        }
+        let before: Vec<Option<Shape>> = if self.multi { named.iter().map(|o| self.shape(o)).collect() } else { Vec::new() };
+        let mut restored = Vec::new();
         let mut touched: Vec<ObjectId> = Vec::new();
         for change in &txn.changes {
             let oid = match change {
                 Change::Create(c) => self.create(c, v, time)?,
-                Change::Set(c) => self.set(c)?,
+                Change::Set(c) => {
+                    if c.restored_from.is_some() {
+                        restored.push(c.oid.clone());
+                    }
+                    self.set(c)?
+                }
                 Change::Move(c) => self.move_(c)?,
                 Change::Remove(c) => self.remove(c, v, time)?,
             };
             if !touched.contains(&oid) {
                 touched.push(oid);
             }
+        }
+        if self.multi {
+            return self.version_changed(txn, v, time, &named, before, &restored);
         }
         for oid in &touched {
             if let Some(r) = self.objects.get_mut(oid) {
@@ -188,7 +255,48 @@ impl DriveState {
             actor: txn.actor.clone(),
         };
         self.history.entry(txn.target.clone()).or_default().push_back(row);
-        self.versions.insert(v, txn.target.clone());
+        self.last_changed = Vector::unit(txn.target.clone());
+        Ok(())
+    }
+
+    /// RFC 0004's rule: the version is the target's and every changed object's, each with a row.
+    /// An object a change named but that ends as it was (a folder restore takes out and puts back
+    /// what it leaves alone) keeps its head and gets no row.
+    fn version_changed(&mut self, txn: &Txn, v: VersionId, time: Timestamp, named: &[ObjectId], before: Vec<Option<Shape>>, restored: &[ObjectId]) -> Result<(), StateError> {
+        if !self.objects.contains_key(&txn.target) {
+            return Err(StateError::UnknownObject(txn.target.clone()));
+        }
+        let mut changed = Vector::new();
+        for (oid, was) in named.iter().zip(before) {
+            let now = self.shape(oid);
+            if *oid != txn.target && now == was {
+                continue;
+            }
+            let was_linked = was.as_ref().is_some_and(|w| w.location.is_some());
+            let taken_out = was_linked && !self.locations.contains_key(oid);
+            let Some(r) = self.objects.get_mut(oid) else { continue };
+            r.head = v;
+            r.time = time;
+            // A version that doesn't set where it was restored from isn't a restore of it.
+            if !restored.contains(oid) {
+                r.restored_from = None;
+            }
+            let row = HistoryRow {
+                oid: oid.clone(),
+                version: v,
+                time,
+                op: if taken_out { Op::Delete } else { txn.op },
+                size: r.size,
+                etag: r.etag.clone(),
+                content: r.content.clone(),
+                attrs: r.attrs.clone(),
+                restored_from: r.restored_from,
+                actor: txn.actor.clone(),
+            };
+            self.history.entry(oid.clone()).or_default().push_back(row);
+            changed.push_back(oid.clone());
+        }
+        self.last_changed = changed;
         Ok(())
     }
 
@@ -431,12 +539,32 @@ impl DriveState {
         self.history.get(oid)
     }
 
-    /// Finds a version anywhere in the drive.
-    pub fn version(&self, v: &VersionId) -> Option<&HistoryRow> {
-        let oid = self.versions.get(v)?;
+    /// Version `v` of an object.
+    pub fn version_of(&self, oid: &ObjectId, v: &VersionId) -> Option<&HistoryRow> {
         let rows = self.history.get(oid)?;
         let i = rows.binary_search_by(|r| r.version.cmp(v)).ok()?;
         rows.get(i)
+    }
+
+    /// Version `v` of the object at `key`, or of an object removed from it (protocol §4.5,
+    /// §4.10): the one there now first, then the one removed last. A version id names a version of
+    /// each object it changed (RFC 0004), so the key says which.
+    pub fn find_version(&self, key: &Key, v: &VersionId) -> Option<&HistoryRow> {
+        if let Some(row) = self.lookup(key).and_then(|o| self.version_of(&o, v)) {
+            return Some(row);
+        }
+        let k = key.render();
+        let mut gone: Vec<&RemovedRow> = self.removed.range((k.clone(), ObjectId::lowest())..).take_while(|((rk, _), _)| *rk == k).map(|(_, r)| r).collect();
+        gone.sort_by_key(|r| std::cmp::Reverse(r.version));
+        gone.into_iter().find_map(|r| self.version_of(&r.oid, v))
+    }
+
+    /// Version `v` of any object out of the namespace, the one removed last first: a deleted
+    /// object can come back at another key (protocol §4.10).
+    pub fn find_removed_version(&self, v: &VersionId) -> Option<&HistoryRow> {
+        let mut gone: Vec<&RemovedRow> = self.removed.values().filter(|r| self.version_of(&r.oid, v).is_some()).collect();
+        gone.sort_by_key(|r| std::cmp::Reverse(r.version));
+        gone.first().and_then(|r| self.version_of(&r.oid, v))
     }
 
     /// The version of an object that was current at `t` (protocol §4.5).
@@ -541,8 +669,8 @@ pub struct Spilled {
     pub shards: Vec<Shard>,
     /// An object's current content.
     pub objects: Vec<(ObjectId, ContentDescriptor, ContentDescriptor)>,
-    /// A version's content.
-    pub versions: Vec<(VersionId, ContentDescriptor, ContentDescriptor)>,
+    /// A version's content: the object's and the version's.
+    pub versions: Vec<(ObjectId, VersionId, ContentDescriptor, ContentDescriptor)>,
 }
 
 impl Rows {
@@ -567,7 +695,7 @@ impl Rows {
         }
         for r in &mut self.history {
             if let Some((from, to)) = spill(&mut r.content, &mut out.shards) {
-                out.versions.push((r.version, from, to));
+                out.versions.push((r.oid.clone(), r.version, from, to));
             }
         }
         out
@@ -611,7 +739,6 @@ impl DriveState {
             s.link(&e.oid, e.kind, &e.parent, &e.name);
         }
         for h in rows.history {
-            s.versions.insert(h.version, h.oid.clone());
             s.history.entry(h.oid.clone()).or_default().push_back(h);
         }
         for (_, list) in s.history.iter_mut() {
@@ -636,8 +763,8 @@ impl DriveState {
                 r.content = Some(to.clone());
             }
         }
-        for (v, from, to) in &s.versions {
-            let Some(rows) = next.versions.get(v).and_then(|oid| next.history.get_mut(oid)) else { continue };
+        for (oid, v, from, to) in &s.versions {
+            let Some(rows) = next.history.get_mut(oid) else { continue };
             if let Ok(i) = rows.binary_search_by(|r| r.version.cmp(v))
                 && let Some(r) = rows.get_mut(i)
                 && r.content.as_ref() == Some(from)
@@ -728,7 +855,8 @@ mod tests {
         assert_eq!(s.key_of(&z).as_deref(), Some("z.txt"));
         assert_eq!(s.record(&b).unwrap().size, 3);
         assert_eq!(s.record(&b).unwrap().head, VersionId::new(1, 0));
-        assert_eq!(s.version(&VersionId::new(1, 2)).unwrap().oid, z);
+        assert_eq!(s.find_version(&Key::parse("z.txt").unwrap(), &VersionId::new(1, 2)).unwrap().oid, z);
+        assert!(s.find_version(&Key::parse("a/b.txt").unwrap(), &VersionId::new(1, 2)).is_none(), "a version of another object");
     }
 
     #[test]
@@ -861,7 +989,7 @@ mod tests {
         assert_eq!(back.rows(), s.rows());
         assert_eq!(back.key_of(&a).as_deref(), Some("a/"));
         assert_eq!(back.removed("", None).count(), 1);
-        assert_eq!(back.version(&VersionId::new(1, 0)).unwrap().oid, b);
+        assert_eq!(back.find_version(&Key::parse("a/b.txt").unwrap(), &VersionId::new(1, 0)).unwrap().oid, b, "removed from that key");
         assert_eq!(back.live_bytes(), 1);
         assert_eq!(s.subtree(&ObjectId::root()).len(), 3);
     }
@@ -927,10 +1055,30 @@ mod tests {
         assert_eq!(swapped.seq(), later.seq());
         assert_eq!(swapped.record(&b).unwrap().content, Some(data(b"new")));
         assert_eq!(swapped.record(&a).unwrap().content, rows.objects.iter().find(|r| r.oid == a).unwrap().content);
-        assert_eq!(swapped.version(&VersionId::new(1, 1)).unwrap().content, rows.history.iter().find(|r| r.oid == b).unwrap().content);
-        assert_eq!(swapped.version(&VersionId::new(3, 1)).unwrap().content, Some(data(b"two")));
+        assert_eq!(swapped.version_of(&b, &VersionId::new(1, 1)).unwrap().content, rows.history.iter().find(|r| r.oid == b).unwrap().content);
+        assert_eq!(swapped.version_of(&a, &VersionId::new(3, 1)).unwrap().content, Some(data(b"two")));
         assert_eq!(spilled(&swapped.rows()), spilled(&later.rows()));
         assert_eq!(swapped.key_of(&a).as_deref(), Some("a2"));
+    }
+
+    /// RFC 0004: one version's rows under two objects spill, and swap back, each under its object.
+    #[test]
+    fn a_version_of_two_objects_spills_under_each() {
+        let root = ObjectId::root();
+        let [a, b] = [(); 2].map(|_| ObjectId::generate());
+        let s = DriveState::empty()
+            .with_multi_object_versions(true)
+            .apply(&commit(1, vec![txn(&a, Op::Put, vec![create(&a, &root, "a", Kind::File), set_to(&a, data(b"aa")), create(&b, &root, "b", Kind::File), set_to(&b, data(b"bb"))])]))
+            .unwrap();
+        let v = VersionId::new(1, 0);
+        assert!(s.version_of(&a, &v).is_some() && s.version_of(&b, &v).is_some(), "a row under each");
+        let mut rows = s.rows();
+        let spill = rows.spill();
+        assert_eq!(spill.versions.len(), 2);
+        let swapped = s.with_spilled(&spill);
+        for oid in [&a, &b] {
+            assert!(swapped.version_of(oid, &v).unwrap().content.as_ref().is_some_and(|c| !c.has_data()), "swapped under {oid}");
+        }
     }
 
     #[test]
