@@ -57,7 +57,7 @@ mod types;
 /// The AWS SDK for S3 this crate is built on, for the types of [`Client::s3`]'s calls.
 pub use aws_sdk_s3;
 pub use bandwidth::Bandwidth;
-pub use client::{Client, Config, DEFAULT_ENDPOINT, DEFAULT_REGION, ObjectStream};
+pub use client::{Client, Config, DEFAULT_ENDPOINT, DEFAULT_REGION, ObjectStream, Observation, Observe};
 pub use error::{Error, Result, ServiceError};
 pub use feed::ChangeWatch;
 pub use types::*;
