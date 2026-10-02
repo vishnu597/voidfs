@@ -50,16 +50,15 @@ pub fn invalidations(changes: &[Change]) -> Vec<Invalidation> {
                 out.push(Invalidation::Subtree(folder_key(key)));
             }
         };
+        // A change that moved an object carries where it was: a rename, or a folder restore that
+        // moves one back (RFC 0004).
+        if let Some(from) = &c.from_key {
+            both(from);
+        }
         match c.op.as_str() {
-            "rename" => {
-                if let Some(from) = &c.from_key {
-                    both(from);
-                }
-                both(&c.key);
-            }
             // A folder rename, delete or restore is one change for the folder, not one for each
             // object in it (protocol §5.6).
-            "delete" | "restore" => both(&c.key),
+            "rename" | "delete" | "restore" => both(&c.key),
             _ => out.push(Invalidation::Object(c.key.clone())),
         }
     }
@@ -159,6 +158,7 @@ mod tests {
             change("rename", "c/", Some("a/"), Kind::Folder),
             change("delete", "z", None, Kind::File),
             change("restore", "d/", None, Kind::Folder),
+            change("restore", "d/m", Some("q/m"), Kind::File),
             change("write", "a/x", None, Kind::File),
         ]);
         assert_eq!(got, [
@@ -167,6 +167,8 @@ mod tests {
             Object("b/y".into()),
             Object("c/".into()),
             Object("d/".into()),
+            Object("d/m".into()),
+            Object("q/m".into()),
             Object("z".into()),
             Subtree("a/".into()),
             Subtree("c/".into()),
