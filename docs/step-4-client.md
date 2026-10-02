@@ -650,7 +650,7 @@ content lives in files beside it.
 **Checked by:** unit tests of each part against the in-process server and a fault proxy: cache
 eviction under the cap and the floor, pins kept, corrupt cache files refetched; journal replay
 after a simulated crash at each step, coalescing, and the `412` rule; queue pause, resume,
-cancel, the cap's rate within 10%, and resumption after restart; feed reconnection and the `410`
+cancel, the cap's rate (never faster, and at most a third slower), and resumption after restart; feed reconnection and the `410`
 relist.
 
 ### Item 4. The daemon and the CLI's daemon commands
