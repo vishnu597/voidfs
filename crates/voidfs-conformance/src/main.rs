@@ -43,6 +43,10 @@ struct Args {
     /// connecting to --endpoint. The server must serve the domain (`--virtual-host-domain`).
     #[arg(long, env = "VOIDFS_VIRTUAL_HOST", value_name = "DOMAIN")]
     virtual_host: Option<String>,
+    /// A pool feature the server's drives have (repeatable, or comma-separated): runs the cases
+    /// that require `feature:<name>`.
+    #[arg(long = "feature", env = "VOIDFS_FEATURES", value_delimiter = ',')]
+    features: Vec<String>,
 }
 
 #[tokio::main]
@@ -77,6 +81,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     let mut runner = Runner::new(&need(args.endpoint, "--endpoint")?, keys)?;
     runner.verbose = args.verbose;
     runner.virtual_host = args.virtual_host;
+    runner.features = args.features.into_iter().filter(|f| !f.is_empty()).collect();
 
     let (mut pass, mut fail, mut skip) = (0, 0, 0);
     for case in selected {
