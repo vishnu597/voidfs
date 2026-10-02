@@ -80,6 +80,12 @@ async fn objects_are_written_read_by_range_and_deleted() {
     assert_eq!(&c.read_range("drv", "dir/a b+é.txt", 8, Some(100), Default::default()).await.unwrap()[..], b"89");
     assert!(c.read_range("drv", "dir/a b+é.txt", 3, Some(0), Default::default()).await.unwrap().is_empty());
     assert_eq!(c.read_range("drv", "dir/a b+é.txt", 10, None, Default::default()).await.unwrap_err().status(), Some(416));
+    let r = c.get_range("drv", "dir/a b+é.txt", 2, Some(3), Default::default()).await.unwrap();
+    assert_eq!((&r.body[..], r.meta.size, r.meta.version_id.as_str(), r.meta.etag.as_str()), (&b"234"[..], 10, w.version_id.as_str(), o.meta.etag.as_str()), "the whole size, and the version's headers");
+    let first = c.put_object("drv", "ranged", "aaaaaaaaaa", Default::default()).await.unwrap();
+    c.put_object("drv", "ranged", "bbbbbbbbbbbb", Default::default()).await.unwrap();
+    let r = c.get_range("drv", "ranged", 4, None, ReadOptions { version_id: Some(first.version_id.clone()), ..Default::default() }).await.unwrap();
+    assert_eq!((&r.body[..], r.meta.size, r.meta.version_id.as_str()), (&b"aaaaaa"[..], 10, first.version_id.as_str()), "an older version");
 
     let mut s = c.get_object_stream("drv", "dir/a b+é.txt", Default::default()).await.unwrap();
     assert_eq!(s.meta.size, 10);

@@ -274,6 +274,7 @@ nothing on either port does. The drives' state, which the server serves from, st
 | [`crates/voidfs-server`](crates/voidfs-server/) | The S3 server: storage backends, commit log, checkpoints, forks, SigV4, change feed |
 | [`crates/voidfs-sdk`](crates/voidfs-sdk/) | The Rust SDK: the AWS SDK for S3 plus typed calls for the extensions |
 | [`crates/voidfs-cli`](crates/voidfs-cli/) | `void`, the command line, on the SDK |
+| [`crates/voidfs-client`](crates/voidfs-client/) | The client core the daemon and the mount will run: the block cache with read-ahead (so far), on the SDK |
 | [`crates/voidfs-conformance`](crates/voidfs-conformance/) | Runs the conformance suite against any endpoint |
 | [`crates/voidfs-bench`](crates/voidfs-bench/), [`bench/`](bench/) | SpaceFS's 49 benchmark scenarios, run through voidfs and against the bare bucket; scripts and results |
 | [`tests/interop/`](tests/interop/) | Checks with stock S3 clients (boto3, rclone); `run.sh` runs them and the conformance suite over each kind of store |

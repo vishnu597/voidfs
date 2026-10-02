@@ -487,6 +487,54 @@ and the README's commands run by hand against a server.
 
 **Checklist:** D1 (with D6's cache and D8's pins started).
 
+**Status (2 October 2026): in progress**, in three pull requests: the cache and fetcher (built),
+then the journal and upload queue, then the change-feed client. What the first built:
+- `crates/voidfs-client`, with `Store` (the per-user `state.sqlite`), `Cache`, `Reader` and the
+  `Fetch` trait with `ApiFetcher`, as designed below.
+- In the SDK, `get_range`: a ranged read that also returns the version's headers, so that the
+  fetcher checks it got the version it asked for.
+- [`bench/scripts/client-randread.sh`](../bench/scripts/client-randread.sh) and the `randread`
+  example, which measure it as the head-to-head measured the apps
+  ([bench/results/client-cache](../bench/results/client-cache/README.md)): random 4 KiB reads at
+  p50 0.06–0.15 ms cold (R2 included) and 0.03–0.05 ms warm, where the spike took 140–164 ms and
+  Space 1.2 ms; and a reader that waits for each 1 MiB read streams at 37–40 MB/s from R2 (Space's
+  Finder copy: 36–38) and 760 MB/s through the 12 ms relay, where reading directly gives 9–11 and
+  56.
+
+**Decisions taken while building it:**
+- **SQLite:** `rusqlite` 0.40 with its `bundled` feature (SQLite compiled in, so the Mac's system
+  SQLite doesn't matter). It declares no minimum Rust; it builds here on 1.98, and the APIs this
+  crate uses are older than 1.90 (checked by hand: `File::try_lock` 1.89, `as_chunks` 1.88). The
+  database is WAL with `synchronous = FULL`, for the journal's durability. One process owns a state
+  directory: `Store::open` takes an exclusive lock on `<dir>/lock`. The state directory is
+  `~/Library/Application Support/voidfs` on macOS, `$XDG_STATE_HOME/voidfs` elsewhere, and
+  `VOIDFS_STATE_DIR` overrides both.
+- **Blocks:** a file per block under `<state>/cache/`, named by the SHA-256 of drive, ETag and
+  block number. A miss fetches the whole block (8 MiB, or the file's end), as SpaceFS's 8 MiB
+  blocks do; a reader of many large files' first bytes pays 8 MiB each, which step 5 can tune.
+- **Verified as filled:** through the API, the fetcher checks the response's version id and ETag
+  against the ones asked for, and the cache checks the length. Checking the bytes themselves against
+  the format's shard hashes needs an object's shard list, item 6's second open decision. On disk,
+  each block's CRC-32C per 64 KiB is in the index and is checked on every read of those 64 KiB: a
+  block that fails, or whose file is gone or the wrong size, is dropped and fetched again.
+- **Limits:** 20 GiB at most and 5 GiB free on the volume at least (SpaceFS's reserve isn't
+  known). A fill evicts what was used longest ago, a read from memory counting as a use; pinned
+  content (by drive and ETag) never goes. When nothing more can go, the block isn't stored and is
+  served from memory. `trim` applies both limits now (for the daemon, when the volume fills from
+  elsewhere); `clear` removes all but pinned content, as SpaceFS's Clear Cache does. Use times are
+  written to the index at most once a minute per block.
+- **Memory:** 192 MiB of the blocks fetched most recently. A random read found on disk reads only
+  the 64 KiB pieces it needs and doesn't load the block into memory.
+- **Fetching:** one fetch per block however many readers wait (a fetch runs as its own task, so a
+  reader that gives up doesn't stop it), a failure reaches every waiter and the next read tries
+  again, and at most 16 fetches at once, of which at most 8 read ahead.
+- **Read-ahead:** per `Reader`. A read is forward if it starts at or after the last one's start and
+  no more than a block past its end (the kernel's reads of a stream overlap and arrive a little out
+  of order); each forward read doubles how far ahead the reader fetches, from one block to 64 MiB.
+- **Where item 6 slots in:** `Fetch` is the interface: a fetcher that reads shards with storage
+  credentials implements it, and the cache's key would gain a shard-by-hash form. Neither is needed
+  for the API path, so neither decision item 6 waits on was needed here.
+
 **Design.** A crate `voidfs-client`, which the daemon (item 4) and the mount (step 5) run. One
 SQLite database per user (`state.sqlite`, WAL, in the platform's application-support or state
 directory, as SpaceFS keeps one per drive) holds the journal, the queue and the cache's index;
@@ -619,4 +667,9 @@ for first); a cold read through the bucket against one through the API.
   two of them break the core fix and the SDK change it brought. The conformance suite passes on
   memory, local disk and versitygw, and the README's commands were run by hand. Two server issues
   it found wait for the user (item 2, above).
-- Items 3–6: not started. Next: the client core (item 3).
+- Item 3, the client core: **in progress** (2 October). The cache and fetcher are built: their 13
+  tests (9 unit, 4 against a server in the same process and through the fault proxy) each failed
+  with the code they guard broken, measured as
+  [bench/results/client-cache](../bench/results/client-cache/README.md) says. Next: the write
+  journal and the upload queue, then the change-feed client.
+- Items 4–6: not started.
