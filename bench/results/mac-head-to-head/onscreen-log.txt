@@ -1,0 +1,47 @@
+1790883122.88 space: Finder drag of h2h onto Space (sidebar) starts
+# 1790883125 ± 5 (15:32:05): the aborted full-screen drag released h2h over Space's Settings window; Space started an upload of it itself
+# 1790883219.43 (15:33:39): /tmp/Space/h2h exists (dir mtime 15:32); spacefs-fskitd pid 12530 reads the source files directly; many10k has 1,909 of 10,000 entries; media/ empty
+# seed voidfs (S3 API via rclone, not the mount): 11,004 small files in 266.6 s (16 at once); xattrs by POST ?x-voidfs-attrs; media/big.bin 1 GiB in 21.4 s (64 MiB parts, 8 at once)
+# space: all 11,005 files in the journal by 15:36 (dir mtimes); publishing ~12 objects/s at 19:41-19:43Z, 4,366 pending at 19:42:57Z
+voidfs mount wall .327 s
+## voidfs run 1 (on screen, cold: server restarted, fresh mount), 2026-10-01 ~15:48-15:54 EDT
+# mount via the app's `mount` command: 0.31 s (0.327 s wall)
+# Finder, frames at ~0.13-0.15 s, times from the click's first visible effect:
+#   h2h (7 items): one frame (<= 0.15 s); many (1,000, icon view): one frame (<= 0.15 s)
+#   many10k (10,000, icon view): click highlight at 0.65 s, folder shown at 3.49 s -> 2.84 s
+#   many10k list view (cmd+2): one frame; End: one frame
+#   requests since the restart (server /metrics): 65 extension (describe, listings), 53 object GETs (Finder icon previews, inferred); R2: 216 GETs to load the drive, 3 lists, 1 head, 1 put_new (probe)
+# Quick Look hello.txt: shows "hello from voidfs"; open in TextEdit: "hello.txt — Locked" (read-only volume)
+# Get Info tagged.txt: tag h2h shown (greyed), 11 bytes (4 KB on disk), Where h2h > h2h, created/modified = upload time 3:42 PM, preview "has xattrs"
+# Get Info ünïcödé – 名前.txt: name correct, 8 bytes, preview "unicode", created/modified = upload time 3:38 PM
+# Quick Look big.bin: generic BIN icon, 1.07 GB, "Uncompress" button (Finder: MacBinary archive)
+# Finder copy of media/big.bin to local disk: file appeared at 1790884359.358, full size 67.24 s later (~16 MB/s); sha256 matches
+#   R2 GETs for it: 455 (671-216), ~2.3 MB each, sum of GET time ~ the copy's time (sequential fetches)
+1790884554.269 before Mount click
+1790884556.709 after Mount click returned
+## space run 1 (on screen, cold: Clear Cache "Cleared 28 KB", Eject, Mount), 2026-10-01 ~15:54-16:00 EDT
+# space publishing finished 19:50:23Z ("everything written here is in the cloud", 1,073,985,657 bytes): ~18 min 18 s after the drop (voidfs seeding overlapped 15:38-15:43); local store 185 MB after, cache 0
+# Eject: smbfs mount gone 0.65 s after the click (1790884538.776 -> 539.421 by mountwatch; click between)
+# Mount: backend started 19:55:54.934Z, mount_backend_ready 19:56:02.020Z, smbfs mount seen 1790884562.010 -> 7.1 s from backend start, ~7.7 s from the click
+# (session paused 15:56-19:23 and 19:24-20:07 EDT; Space cache stayed 0 bytes, cloud-cache 12-24 KB, so the run stayed cold)
+# Finder (frames, from the first visible change): h2h (7): content within a frame, thumbnails by 0.31 s; many (1,000, icon): "Loading" view at 0.38 s, icons at 0.85 s -> 0.47 s
+#   many10k (10,000, icon): loading view at 0.00, icons at 5.39 s (thumbnails filling to 6.3 s); voidfs's 2.84 s is the same interval (loading view -> icons)
+#   many10k list view (cmd+2) and End: list shown; Date Modified "Today at 3:25 PM" = the source files' mtime (voidfs shows upload time)
+# Quick Look hello.txt: "hello from voidfs"; open in TextEdit: "hello.txt" editable (not Locked); opening it added com.apple.lastuseddate#PS to hello.txt on the drive
+# xattrs: Space's drop-upload did NOT carry tagged.txt's xattrs (none on the drive); Get Info: "Add Tags…", 11 bytes (11 bytes on disk), Server smb://space.localhost/Space/h2h/tagged.txt, created 3:32 PM (upload), modified 3:25 PM (source), Last opened 3:25 PM
+#   added tag h2h in Get Info (same bplist bytes as the source); Created then changed to 8:10 PM; then xattr -w user.voidfs.test hello through the mount
+# Get Info ünïcödé – 名前.txt: name correct, 8 bytes (8 bytes on disk), preview "unicode"; readdir gives NFD (30 bytes) on Space's SMB mount, NFC (26 bytes) on voidfs's
+# Quick Look big.bin: generic BIN icon, 1.07 GB, last modified 3:25:39 PM (source time), "Uncompress"
+# Finder copy of media/big.bin to local disk: progress window "Copying big.bin to out-s1 ... 50.3 MB of 1.07 GB - Less than a minute"
+#   file appeared 1790899895.139, full size 29.70 s later (~36 MB/s); sha256 matches; Space's cloud-cache then 1.0 GB (it keeps what it reads)
+## space run 2 (on screen, cold: Clear Cache "Cleared 1.06 GB", Eject, Mount), 2026-10-01 20:12-20:15 EDT
+# Eject: mount gone at 1790899984.670; Mount: backend started 00:13:19.473Z, ready 00:13:24.755Z (5.28 s), smbfs seen 1790900004.785
+# many (1,000, icon): loading view 0.82 s, icons 1.08 s -> 0.26 s; many10k (10,000, icon): loading 0.73 s, icons 6.08 s -> 5.35 s; list view: one frame
+# Finder copy big.bin: full size 27.73 s after the file appeared (~38.7 MB/s); sha256 matches
+voidfs run 2 mount wall .088 s
+## voidfs run 2 (on screen, cold: server restarted, remounted), 2026-10-01 20:15-20:18 EDT
+# mount: 0.073 s (0.088 s wall)
+# many (1,000, icon): one frame (no loading view); many10k (10,000, icon): loading 0.70 s, icons 2.57 s -> 1.87 s; list view: one frame
+# Finder copy big.bin: full size 56.89 s after the file appeared (~18.9 MB/s); sha256 matches; R2 GETs 452 (611-159); drive load at start 159 GETs
+## cleanup, 2026-10-01 20:42 EDT
+# voidfs unmounted, server stopped; R2: 11,318 objects under voidfs-bench/ counted, then purged (0 left); screen captures deleted
