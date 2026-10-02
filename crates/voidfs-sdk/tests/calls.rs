@@ -373,4 +373,10 @@ async fn the_aws_client_underneath_shares_the_drive() {
     assert_eq!(o.meta.size, (5 << 20) + 4);
     assert_eq!(&o.body[5 << 20..], b"tail");
     assert_eq!(c.list_versions("drv", "mp", false).await.unwrap().len(), 1, "one version");
+    // Its errors are this crate's.
+    let missing = async { Ok::<_, Error>(s3.head_object().bucket("drv").key("missing").send().await?) };
+    let e = missing.await.unwrap_err();
+    assert_eq!((e.status(), e.code()), (Some(404), Some("NotFound")));
+    let e: Error = s3.get_object().bucket("drv").key("missing").send().await.unwrap_err().into();
+    assert_eq!((e.status(), e.code()), (Some(404), Some("NoSuchKey")));
 }

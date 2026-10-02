@@ -128,8 +128,8 @@ client. JSON output everywhere, as SpaceFS's CLI has.
 
 1. **The Rust SDK** (A1, Rust): every protocol call, typed. It runs on the protocol as it is, so
    it is usable at once, and everything after builds on it.
-2. **The CLI on the protocol** (D9): `drives`, `drive`, `fork`, `history`, `show`, `restore`,
-   `version`, and a foreground `upload`, with `--json` everywhere.
+2. **The CLI on the protocol** (D9), whose command is `void`: `drives`, `drive`, `fork`,
+   `history`, `show`, `restore`, `version`, and a foreground `upload`, with `--json` everywhere.
 3. **The client core** (D1): the disk cache, the write journal, the upload queue and the
    change-feed client, in `crates/voidfs-client`.
 4. **The daemon and the CLI's daemon commands** (D1, D9): `daemon`, `upload` (handed to the
@@ -222,32 +222,131 @@ moved signing code on memory, local disk and versitygw.
 
 **Checklist:** D9.
 
-**Design.** A crate `voidfs-cli` with the binary `voidfs`, on the SDK:
-- `voidfs drives [--json]`: alias, id, created, size (describe for each, a few at a time).
-- `voidfs drive create <name> [--display-name] [--json]`, `drive delete <name> [--hard] [-y]`
+**Status (1 October 2026): done**, as designed below, with the decisions after it. What was built:
+- `crates/voidfs-cli`, whose binary is **`void`**, on the SDK. The user chose the name on 1 October:
+  the command is `void`, while the project, the crates and the server keep `voidfs`.
+  - `void drives` (also `ls`), `void drive create|show|delete|undelete` and `void fork`;
+  - `void history`, `void show` and `void restore`, for a file or a folder;
+  - `void upload`, in the foreground;
+  - `void version` and `void keys generate`.
+- `--json` on every command, errors as JSON on stderr, and exit statuses: 1 for an error, 2 for a
+  usage error.
+- In the SDK: errors of `client.s3()`'s calls convert into `voidfs_sdk::Error` with `?`, and the
+  crate re-exports `aws_sdk_s3`, for the types of those calls.
+- In the server, a fix the CLI needed: the recently-deleted listing (protocol §4.10) missed an
+  object whose key was the whole `prefix`. Its range started at the prefix paired with the id
+  `root`, which sorts after every `o-…` id, so it began past that key's rows.
+
+**Design.** A crate `voidfs-cli` with the binary `void`, on the SDK:
+- `void drives [--json]`: alias, id, created, size (describe for each, a few at a time).
+- `void drive create <name> [--display-name] [--json]`, `drive delete <name> [--hard] [-y]`
   (asks for the name unless `-y`, as SpaceFS's does), `drive undelete <name>`, `drive show
   <name> [--json]`. SpaceFS's `drive rename` renames a display name, which voidfs doesn't store
   yet (PARITY §3, S3), so it waits for that.
-- `voidfs fork <source> <name> [--json]`: SpaceFS has no command for it, but forks need no
+- `void fork <source> <name> [--json]`: SpaceFS has no command for it, but forks need no
   account, and agents use them.
-- `voidfs history <drive> <path> [--all] [--json]`, `voidfs show <drive> <path> [--at <time> |
-  --version <id>] [-o file]` (to stdout by default, streamed), `voidfs restore <drive> <path>
+- `void history <drive> <path> [--all] [--json]`, `void show <drive> <path> [--at <time> |
+  --version <id>] [-o file]` (to stdout by default, streamed), `void restore <drive> <path>
   [--at <time> | --version <id>] [--json]`. `--at` takes RFC 3339 or Unix seconds, as SpaceFS's
   does. A drive is named by alias or id everywhere, where SpaceFS's three take only the id.
-- `voidfs upload <paths…> <drive>:[/folder]`: in this item it runs in the foreground (multipart
-  through `client.s3()` above 64 MiB), with progress on stderr and a JSON summary with `--json`;
+- `void upload <paths…> <drive>:[/folder]`: in this item it runs in the foreground (multipart
+  through `client.s3()` from 64 MiB), with progress on stderr and a JSON summary with `--json`;
   item 4 hands it to the daemon.
-- `voidfs version [--json]`; `voidfs keys generate [--scope read|write|admin] [--format
+- `void version [--json]`; `void keys generate [--scope read|write|admin] [--format
   text|env|json]`, which makes a key for `voidfs-server --key`: the self-hosted counterpart of
   `keys create`, which needs no account.
 - Configuration from the SDK's environment variables, or `--endpoint` and a key file. `--json`
   prints one JSON document on stdout and errors as JSON on stderr, with the exit status set.
 
+**Decisions taken while building it:**
+- **Configuration.** `--endpoint`, `--access-key-id`, `--secret-access-key` and `--key-file` (or
+  `VOIDFS_KEY_FILE`), on every command. A key file is what `keys generate --format json` or
+  `--format env` prints. A flag wins over the key file, which wins over `VOIDFS_ACCESS_KEY_ID` and
+  `VOIDFS_SECRET_ACCESS_KEY`. `VOIDFS_REGION` is read as the SDK reads it. `version` and `keys
+  generate` need none of it.
+- **Output.** `--json` gives one JSON document on stdout, pretty-printed. An error is
+  `{"error": {"code", "status", "message", "requestId", …}}` on stderr: the code is the server's
+  S3 code, or one of the CLI's own (`Usage`, `NoCredentials`, `InvalidArgument`, `RequestFailed`,
+  `UnexpectedResponse`, `LocalFileError`, `NotConfirmed`). A `412` adds `currentVersionId`, a
+  transport failure `sent`. Usage errors are JSON as well when `--json` is on the command line.
+  A stdout closed early (`| head`) ends the command quietly, with status 0.
+- **`drives`** describes each drive, 8 at once. Its JSON is `{"drives": […]}`, each as `drive
+  show --json` gives it. A drive deleted between the listing and its description is left out. A
+  fork's source is shown by name when the key reaches it.
+- **`drive delete`** reads the drive's name back on stdin unless `-y`; no answer is no. With
+  `--json` the question isn't printed, so that stderr holds only JSON, but the name is still
+  read. **`drive undelete`** takes the alias: the server finds deleted drives by alias only.
+  `--display-name` is sent, and the server ignores it for now (PARITY §3, S3).
+- **`history` of a folder**, named with or without its `/`, lists every version of every file in
+  it, oldest first. Each time is one `restore --at` takes. It comes from each file's
+  `?x-voidfs-versions`, 8 at once, not from `ListObjectVersions`: the times that gives have
+  milliseconds only, so one passed to `--at` could fall before the version it names. Files
+  deleted since aren't listed.
+- **A deleted file or folder.** `history`, `show` and `restore --at` say when it was deleted, and
+  give the command that brings it back: `void restore <drive> <path> --version <lastVersionId>`
+  (protocol §4.10), quoted for a shell. Its JSON error carries the `deleted` entry.
+- **`show`**: `--at` is sent as RFC 3339 in UTC with microseconds, and a time before the file
+  existed says so. `-o` fills a file beside the target and renames it into place, so a failed read
+  leaves the target as it was; `-o -` is stdout. `--json` needs `-o`, since otherwise the content
+  is what goes to stdout; it then prints what was written.
+- **`restore`** needs `--at` or `--version`. A folder named without its `/` is found. `--version`
+  also brings back a deleted file or folder (§4.10).
+- **`upload`**:
+  - a folder goes up under its name, with everything under it; files keep their modification time
+    and permission bits (`x-voidfs-mtime` and `x-voidfs-mode`, on a multipart upload's first
+    request); empty folders are made; symbolic links inside folders are skipped, with a warning;
+  - one put below 64 MiB; from 64 MiB, a multipart upload in 16 MiB parts (larger past 156 GiB, to
+    stay within 10,000 parts), 4 parts of a file at once;
+  - 16 files at once (SpaceFS's daemon's figure), within 128 MiB held in memory: each put and each
+    part waits for its share, and runs as its own task once it has it;
+  - it stops starting files at the first failure, aborts a multipart upload that failed, and
+    reports what was uploaded, skipped, failed and not attempted, then exits 1. Each file is its
+    own version, so running it again uploads everything again;
+  - progress is one line on stderr, rewritten, when stderr is a terminal.
+- **`keys generate`**: `--scope` (or `--access`, SpaceFS's name), `write` by default as SpaceFS's;
+  `--format text|env|json`, and `--json` means `--format json`. The id and secret are drawn as the
+  server draws its own. The text gives the `--key id:secret:scope` value, `env` prints quoted
+  `export` lines, and the JSON carries `serverKey`.
+- **`version`** prints `void 0.0.0 (<commit>, <date>)`, as SpaceFS's prints `space 0.2.333
+  (8bebbc8, 2026-09-30)`, from git at build time (`unknown` without git); `-V` says the same.
+  `--json` adds the protocol version, 1.
+
+**Where it differs from SpaceFS's CLI, and why:**
+- A drive is named by alias or id everywhere. `history`, `show` and `restore` also take SpaceFS's
+  `--bucket <drive> <path>`; `--root-group` has no counterpart.
+- `fork` exists; SpaceFS has none.
+- `--json` is on every command, `show` (with `-o`), `restore`, `fork` and `version` included, and
+  errors are JSON with it. SpaceFS's errors are text even with `--json` (observed, 1 October), and
+  its `version`, `show` and `restore` have no `--json`.
+- `keys generate` makes a key on this machine for `voidfs-server --key`, where SpaceFS's `keys
+  create` asks the account. It has no `--drive` or `--label`: the server has no flag for a drive
+  allowlist yet (PARITY §3, C3). `keys list|revoke` wait for accounts.
+- `upload` runs in the foreground, without `--detach`, until the daemon (item 4).
+- `drive create` has no `--backend`: a deployment has one pool.
+- Not here: `drive rename` (display names, above); `login`, `logout`, `whoami`, `workspace`,
+  `use` and `keys list|revoke` (step 6); `update` (D10); `mount`, `unmount`, `mounts`, `uploads`,
+  `status` and `daemon` (item 4, step 5).
+
+**What it showed about the server, for later** (not changed here: each changes what replay derives
+and checkpoints store, so it is the user's to decide):
+- **A folder restore** (§4.6) gives each file it restores the folder's new version, but a
+  transaction writes one history row, for its target, so the files' histories don't list that
+  version: `isLatest` marks an older row, and `show --version` with the file's current version
+  answers `404 NoSuchVersion`. The folder's own HEAD keeps its old version, while its history
+  lists the restore. Format §8.2 says `history` holds every version of every object.
+- **`lastVersionId`** (§4.10) of an object that a folder restore removes, or that a rename with
+  `x-voidfs-replace` replaces, is the head of the transaction's target, not the object's own
+  (`state.rs`, `remove`, takes `prior_head`): bringing it back with that id fails, or brings back
+  the wrong object. The value is stored in checkpoints; the fix is to use the object's own head.
+- `ListObjectVersions` gives times in milliseconds (above), and `undelete` finds deleted drives
+  by alias only.
+
 **Out of scope:** `login`, `logout`, `whoami`, `workspace`, `use`, `keys list|revoke` (accounts,
 step 6); `update` (self-update, D10).
 
 **Checked by:** the binary run against the in-process server in integration tests, for each
-command in text and JSON, and the README's commands run by hand.
+command in text and JSON and its errors, each test seen to fail with the code it guards broken;
+and the README's commands run by hand against a server.
 
 ### Item 3. The client core
 
@@ -295,19 +394,19 @@ relist.
 
 **Checklist:** D1, D9.
 
-**Design.** The `voidfs` binary also runs as the per-user agent (`voidfs daemon run`), as
+**Design.** The `void` binary also runs as the per-user agent (`void daemon run`), as
 `spacefs-fskitd` is both; the spike decided on a per-user agent for the Rust core (spike §4.1).
 - A Unix socket in the state directory, HTTP with JSON over it (the Mac app will speak the same).
   Requests: status, uploads (list, watch, pause, resume, cancel, limit), upload (enqueue a batch),
   mounts (the table and the remembered mounts), info (build, and the journal's unpublished bytes).
-- `voidfs daemon start|stop|restart|status|info|install|uninstall`: `install` writes a launchd
+- `void daemon start|stop|restart|status|info|install|uninstall`: `install` writes a launchd
   agent on macOS (a systemd user unit in step 9), so that the daemon and remembered mounts come
   back at login.
-- `voidfs upload … [--detach]` enqueues through the daemon; `voidfs uploads [--watch] [--json]
-  [pause|resume|cancel|limit]`; `voidfs status [--json]`: daemon, mounts, uploads, the feed, the
+- `void upload … [--detach]` enqueues through the daemon; `void uploads [--watch] [--json]
+  [pause|resume|cancel|limit]`; `void status [--json]`: daemon, mounts, uploads, the feed, the
   connection, on one page. Unlike SpaceFS's, it sees every mount the daemon serves, whatever the
   adapter (SpaceFS's misses its own SMB mount, §1.2).
-- `voidfs mount|unmount|mounts`: the table and the remembered mounts land here; mounting itself
+- `void mount|unmount|mounts`: the table and the remembered mounts land here; mounting itself
   comes with step 5's adapter.
 
 **Checked by:** the daemon started in tests on a socket of its own, with the CLI against it;
@@ -379,4 +478,10 @@ for first); a cold read through the bucket against one through the API.
   same process, 10 through the fault proxy) each failed with the code it guards broken, 37 breaks
   in all, each run alone with a timeout. The conformance suite passes through the moved signing
   code on memory, local disk and versitygw, both addressing styles.
-- Items 2–6: not started. Next: the CLI (item 2).
+- Item 2, the CLI (`void`): **done** (1 October). Its 29 tests (12 unit, and 17 that run the
+  binary against a server in the same process, every command in text and JSON and its errors)
+  each failed with the code it guards broken, 63 breaks in all, each run alone with a timeout;
+  two of them break the core fix and the SDK change it brought. The conformance suite passes on
+  memory, local disk and versitygw, and the README's commands were run by hand. Two server issues
+  it found wait for the user (item 2, above).
+- Items 3–6: not started. Next: the client core (item 3).
