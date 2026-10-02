@@ -153,14 +153,13 @@ impl DriveState {
         if txn.changes.is_empty() {
             return Err(StateError::EmptyTxn);
         }
-        let prior_head = self.objects.get(&txn.target).map(|r| r.head);
         let mut touched: Vec<ObjectId> = Vec::new();
         for change in &txn.changes {
             let oid = match change {
                 Change::Create(c) => self.create(c, v, time)?,
                 Change::Set(c) => self.set(c)?,
                 Change::Move(c) => self.move_(c)?,
-                Change::Remove(c) => self.remove(c, v, time, prior_head)?,
+                Change::Remove(c) => self.remove(c, v, time)?,
             };
             if !touched.contains(&oid) {
                 touched.push(oid);
@@ -288,7 +287,7 @@ impl DriveState {
         Ok(c.oid.clone())
     }
 
-    fn remove(&mut self, c: &RemoveChange, v: VersionId, time: Timestamp, prior_head: Option<VersionId>) -> Result<ObjectId, StateError> {
+    fn remove(&mut self, c: &RemoveChange, v: VersionId, time: Timestamp) -> Result<ObjectId, StateError> {
         if c.oid.is_root() {
             return Err(StateError::Root);
         }
@@ -307,7 +306,9 @@ impl DriveState {
             key: key.clone(),
             oid: c.oid.clone(),
             version: v,
-            last_version: prior_head.unwrap_or(r.head),
+            // The object's own head, not the target's: a folder restore or a rename that
+            // replaces its destination removes objects other than its target.
+            last_version: r.head,
             time,
             kind: r.kind,
             size: r.size,

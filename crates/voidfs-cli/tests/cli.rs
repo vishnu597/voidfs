@@ -450,6 +450,22 @@ fn deleted_files_say_how_to_bring_them_back() {
 }
 
 #[test]
+fn files_a_folder_restore_took_out_come_back_with_the_hint() {
+    let f = Fixture::new("restored-away");
+    f.drive("footage");
+    f.put("footage", "cuts/a.txt", "one");
+    let at = f.block(f.client.list_versions("footage", "cuts/a.txt", false)).unwrap()[0].last_modified.clone();
+    f.put("footage", "cuts/new.txt", "new");
+    let last = f.put("footage", "cuts/new.txt", "newer");
+    f.void(&["restore", "footage", "cuts", "--at", &at]).ok();
+    let r = f.void(&["history", "footage", "cuts/new.txt"]).fails(1);
+    let command = r.stderr.split('`').nth(1).unwrap_or_else(|| panic!("{}", r.stderr)).to_owned();
+    assert_eq!(command, format!("void restore footage cuts/new.txt --version {last}"));
+    f.void(&command.split(' ').skip(1).collect::<Vec<_>>()).ok();
+    assert_eq!(f.text("footage", "cuts/new.txt"), "newer");
+}
+
+#[test]
 fn show_prints_a_file_as_it_was() {
     let f = Fixture::new("show");
     f.drive("footage");
@@ -464,7 +480,8 @@ fn show_prints_a_file_as_it_was() {
     let history = f.block(f.client.list_versions("footage", "a.txt", false)).unwrap();
     assert_eq!(f.void(&["show", "footage", "a.txt", "--at", &history[0].last_modified]).ok().out(), "first", "a time from the history");
     assert_eq!(f.void(&["show", "footage", "a.txt", "--at", &between]).ok().out(), "first", "Unix seconds");
-    assert!(f.void(&["show", "footage", "a.txt", "--at", &chrono::Utc::now().timestamp().to_string()]).ok().stdout == body);
+    // A second past now: whole seconds round down, to before a write made in this second.
+    assert!(f.void(&["show", "footage", "a.txt", "--at", &(chrono::Utc::now().timestamp() + 1).to_string()]).ok().stdout == body);
     let r = f.void(&["show", "footage", "a.txt", "--at", "1"]).fails(1);
     assert_eq!(r.stderr.trim(), "error: a.txt did not exist at 1970-01-01T00:00:01.000000Z");
     let r = f.void(&["show", "footage", "a.txt", "--at", "1", "--json", "-o", "x"]).fails(1);
