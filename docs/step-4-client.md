@@ -111,6 +111,127 @@ client. JSON output everywhere, as SpaceFS's CLI has.
   writes `.DS_Store` into it), the menu-bar popover, and any offline state (the network was left
   alone).
 
+### 1.4 Uploads and a folder restore (observed through computer use, 2 October, 0.2.333)
+
+*In `void-probe/` on the trial drive, the one folder the user approved for these two
+observations; it stays there. Measured from Bash: the mount's own SQLite state, read only, sampled
+every second, and the Mac's bytes out on every interface but loopback. Times are UTC. The raw log
+is not in the repository.*
+
+**Two ways in, one queue (observed).**
+- Writing through the SMB mount (`cp` into `/tmp/Space/void-probe/upload/`): a 512 MiB copy
+  returned in 3 s, and 768 MiB in 4–6 s. The bytes land in the mount's local journal, and the file
+  publishes in the background: the `pending` table holds it until its `publications` row is done.
+- The app's own upload: the launcher's Upload Files (⌘N) searches indexed files only ("No files
+  match" for a path under `/private/tmp`), then asks "Choose a drive for app-probe-1.bin…", then
+  for a folder ("Search folders"), and ends with "Upload into upload ⏎". The app remembers the
+  folder (`uploads.lastDestination` in its defaults). Uploads also start by dropping files on the
+  menu-bar icon or the Settings window (1 October).
+- An app upload is an import into the same journal, logged in `…-data-imports/operations.jsonl`
+  (one JSON line with a SHA-256 per operation): a `Batch` with a conflict policy (`files:
+  KeepBoth`, `merge_folders: false`; the app's strings offer Keep Both, Skip, Replace All Existing
+  and Skip Identical Items), then each entry `Placing` → `Copying` → `AwaitingCloud` → `Done` or
+  `Cancelled`, then `Covered` and `Finished` with the batch's totals. A 768 MiB file was in the
+  journal within about a second, and then waited for the publisher like an SMB write. (Inferred:
+  one publisher for both; an import is a local copy first.)
+
+**The uploads view (observed).**
+- Settings → Uploads: In Progress ("1 file · 53% · 27.2 MB/s · 9 sec left") with a row per file
+  (name, size, drive, and "Saving…" or "Queued"), and Recent with a row per batch ("h2h · 11005
+  files · Space · 1.07 GB", "app-probe-1.bin · 1 file · Space · 805.3 MB", "Cancelled"), each with
+  a remove button, and Clear. SMB writes show in In Progress but never in Recent.
+- While anything uploads, the menu-bar menu has a line for it ("2 files · 66% · 4.8 MB/s · 1 min
+  left") and Open Uploads. The launcher's uploads view has the same rows, a search field, and an
+  actions menu: Upload Files, Clear Recent, Upload Bandwidth, Report Bug.
+- Two files copied in over SMB were first "Saving…" and "Queued", then both "Saving…".
+
+**Pause and resume (observed).**
+- Only app uploads can be paused, one at a time: the selected row's default action is "Pause ⏎",
+  and its actions (⌘K) are Pause, Open Space, Show in Finder, Copy Name and Cancel Upload. An SMB
+  write's actions are only Open Space, Show in Finder and Copy Name. The app's strings also have
+  "Pause All Uploads" and "Resume All Uploads" in the menu (`pauseAllUploadsFromMenu`), which the
+  menu didn't show while SMB writes uploaded (inferred: offered while an app upload runs).
+- Pausing stopped the bytes within 2 s: a toast ("Paused "app-probe-1.bin""), a Paused section,
+  and "Resume ⏎". 713 MB of the 805 MB had gone out. Resuming ("Resuming …", the row back at 64%)
+  took 191 MB more: it continued, sending about 100 MB again (inferred: the chunks in flight).
+- Settings says uploads to an SMB drive pause while it is ejected, including when Space quits.
+
+**Cancel (observed).** Cancel Upload asks: "Cancel uploading "app-probe-2.bin"? Files that haven't
+finished uploading are removed from the drive. Anything already uploaded stays." After it, the file
+left the folder at once and the row said Cancelled, but the transfer went on: the whole file went
+out (900 MB over the next 30 s), it was published as a version, and then its removal was
+published. The import log says `files_cancelled: 1`, `bytes_transferred: 0`. (Inferred: cancel
+removes the file from the mount's tree, and the publisher publishes that like a delete, after
+whatever it already had in flight.)
+
+**Quitting mid-upload (observed).**
+- `osascript -e 'tell application id "com.spacefs.launcher" to quit'` is refused ("User canceled",
+  -128): Space stays running and mounted, and closes its windows.
+- Quit Space in the menu-bar menu asks nothing. The SMB mount was gone within a second, with 430 MB
+  of an 805 MB file sent. Opened again, Space remounted `/tmp/Space` by itself in 6–8 s and
+  finished the file with 507 MB more: it continued from the journal (inferred from the bytes; a
+  restart would send at least 805 MB). The app stayed 0.2.333 (0.2.343 was waiting on "Restart to
+  Update").
+
+**Upload Bandwidth (observed).**
+- The slider runs from Default ("Space adjusts upload speed to your connection automatically")
+  through caps from 24 MiB/s ("Space keeps uploads near this rate, leaving headroom for the rest
+  of your network") to Unlimited. A cap is saved at once (`uploadBandwidthTargetBps = 25165824`
+  in the app's defaults; Default is the key's absence) and applies "when Space's file system
+  service next starts": the next mount ran with `--retained-upload-bandwidth-bps 25165824`.
+- Its effect couldn't be measured here: its lowest cap is above what this connection sustained
+  uncapped (7–36 MB/s on average). Under the 24 MiB/s cap, a 768 MiB file went at 9.1 MB/s on
+  average, with single seconds up to 44 MB/s (inferred: the cap is an average, not a limit on each
+  second). The slider is back on Default and Space was restarted, so the mount runs uncapped again.
+
+**Throughput and shape (observed).** A file published at 27–36 MB/s at best and 7–11 MB/s at worst
+on this connection, with 12–14% more bytes out than the file (TLS, HTTP, and the re-sends above).
+The mount records a published file as `remote_ranges` of about 7 MB each (78 for 512 MiB, 110 for
+768 MiB), and each object's `remote_ref` as `{"group": "root-native", "record": <uuid>, "version":
+<uuid>}`: a version id per object revision. A file `cp` wrote got two versions (inferred: the
+content, then the modification time `cp` sets after it).
+
+**Folder restore (observed, in part).** In `void-probe/restore/`: `a.txt`, `b.txt`, `c.txt` and
+`sub/d.txt` written at 14:04:48 (published 14:04:56); at 14:05:39 `a.txt` and `sub/d.txt` changed,
+`e.txt` added and `c.txt` deleted (published 14:05:44). The restore point was 14:05:24.
+- The app has no history or restore view: neither its windows nor its strings have one, and the
+  Finder extension only pins and unpins. The CLI's `restore --at` (which "rolls the whole subtree
+  back" for a folder) needs `space login`, which didn't work for the user, and it ignores an
+  access key in the environment ("no config … run `space login` first"). So the subtree rollback
+  was **not observed**.
+- With an access key the user minted in the web app, through the S3 API: histories are per
+  object, oldest first, with milliseconds (`a.txt`: `put` then `write`, the second `isLatest`),
+  and a deleted file has none (`c.txt` answers `404 NoSuchKey`; there is no recently-deleted
+  listing). Each object's version ids are the ones in the mount's `remote_ref`, and the ETag is
+  `"v-<versionId>"`: from the version, not the content.
+- `POST …/void-probe/restore/?x-s3sdk-restore` with `x-s3sdk-as-of` is `400 InvalidArgument`,
+  "versionId is required": the API restores by version only.
+- `POST …/void-probe/restore/?x-s3sdk-restore&versionId=<the folder's put>` answered `200` with a
+  new version of the folder (`restore`, `restoredFrom` the put, size 0) and changed nothing in it:
+  `a.txt` and `sub/d.txt` kept their writes, `e.txt` stayed, `c.txt` stayed deleted. Restoring a
+  folder by version restores the folder object alone, as voidfs's does.
+- The folder's version in the mount's state after its entries changed (`eab883e3…`) is not in the
+  API's history of the folder, even with `x-s3sdk-all=true` (unexplained).
+- Inferred from the CLI's strings: its folder restore works on Space's engine directly
+  (`RESTORE`, `GROUP_MOVE_IN`, `GROUP_MOVE_OUT`, `restore_from_version`, transactions with a
+  `txn_key`), with the signed-in session's credentials, not through the S3 API.
+
+**For the client core (item 3)**, where these differ from item 3's design:
+- One queue behind two ways in, as Space has: the journal's publisher, and imports that a client
+  hands it. Item 3 already designs it so.
+- Space pauses and cancels app uploads one at a time, and SMB writes not at all (but by ejecting).
+  voidfs keeps pause and resume globally, per drive, per batch and per item, for writes and
+  imports alike.
+- Space's cancel removes the file and lets the upload finish. voidfs's cancel aborts the transfer
+  and never publishes the file: no upload is wasted and no stray version made. An import that has
+  not published leaves nothing in the drive.
+- Space's cap applies at the next mount and starts at 24 MiB/s. voidfs's token bucket applies at
+  once and takes any rate.
+- Space resumes after a quit from its journal, as item 3 designs voidfs's queue to.
+- Space's imports have a conflict policy (Keep Both by default). The CLI's `upload` makes a new
+  version of a file that exists instead, since every version is kept; the queue keeps that, and a
+  policy can come with item 4's `upload` if it is wanted.
+
 ## 2. What voidfs has
 
 - **The protocol**, all of it served by `voidfs-server` but direct upload (§4.11, not
