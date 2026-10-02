@@ -3025,15 +3025,17 @@ mod tests {
         let d = pool.create_drive("d", None).await.unwrap();
         let one = held(b"one");
         let writes = slow_log(&mem, Duration::from_millis(20));
-        let mut waited = Duration::ZERO;
+        let mut waited = Vec::new();
         for i in 0..20 {
             let sent = Instant::now();
             pool.commit(&d, put_plan(&format!("k{i}"), &one, Precondition::default(), &Arc::default())).await.unwrap();
-            waited += writes.done.lock().unwrap().last().unwrap().0 - sent;
+            waited.push(writes.done.lock().unwrap().last().unwrap().0 - sent);
             think(Duration::from_micros(300)).await;
         }
-        // Held for more, each write would wait a millisecond at least.
-        assert!(waited < Duration::from_millis(10), "waited {waited:?} in all before its entry was written");
+        // Held for more, each write would wait a millisecond at least. A busy machine delays a few
+        // of them as much, so the middle one is what counts.
+        waited.sort();
+        assert!(waited[10] < Duration::from_millis(1), "waits before its entries were written: {waited:?}");
     }
 
     /// When the clients an entry answered do not come back, the next entry waits at most the

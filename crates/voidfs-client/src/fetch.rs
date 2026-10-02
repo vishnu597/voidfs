@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use voidfs_sdk::{ObjectMeta, ReadOptions};
 
+use crate::connectivity::Connectivity;
 use crate::error::{Error, Result};
 
 /// One version of a file: what the cache reads and keys its blocks by. An ETag names one
@@ -40,17 +41,27 @@ pub trait Fetch: Send + Sync + 'static {
 /// Reads through the API: `GET ?versionId=` with a range, which the SDK retries as it may.
 pub struct ApiFetcher {
     client: voidfs_sdk::Client,
+    conn: Option<Connectivity>,
 }
 
 impl ApiFetcher {
     pub fn new(client: voidfs_sdk::Client) -> ApiFetcher {
-        ApiFetcher { client }
+        ApiFetcher { client, conn: None }
+    }
+
+    /// Fails at once with [`Error::Offline`] while `conn` says the server can't be reached.
+    pub fn with_connectivity(mut self, conn: Connectivity) -> ApiFetcher {
+        self.conn = Some(conn);
+        self
     }
 }
 
 impl Fetch for ApiFetcher {
     fn fetch<'a>(&'a self, c: &'a Content, offset: u64, len: u64) -> BoxFuture<'a, Result<Bytes>> {
         Box::pin(async move {
+            if let Some(conn) = &self.conn {
+                conn.check()?;
+            }
             let opts = ReadOptions { version_id: (!c.version_id.is_empty()).then(|| c.version_id.clone()), ..Default::default() };
             let r = self.client.get_range(&c.drive, &c.key, offset, Some(len), opts).await?;
             let changed = |got: &str| Error::Changed { key: c.key.clone(), expected: c.etag.clone(), got: got.to_owned() };

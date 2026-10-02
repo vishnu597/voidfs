@@ -46,6 +46,7 @@
 //! make them safe to retry; the second attempt of one that landed then fails with `412`. A `412`
 //! is never retried.
 
+pub mod bandwidth;
 mod client;
 mod error;
 mod feed;
@@ -55,7 +56,8 @@ mod types;
 
 /// The AWS SDK for S3 this crate is built on, for the types of [`Client::s3`]'s calls.
 pub use aws_sdk_s3;
-pub use client::{Client, Config, DEFAULT_ENDPOINT, DEFAULT_REGION, ObjectStream};
+pub use bandwidth::Bandwidth;
+pub use client::{Client, Config, DEFAULT_ENDPOINT, DEFAULT_REGION, ObjectStream, Observation, Observe};
 pub use error::{Error, Result, ServiceError};
 pub use feed::ChangeWatch;
 pub use types::*;

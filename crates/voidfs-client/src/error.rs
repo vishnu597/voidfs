@@ -20,6 +20,10 @@ pub enum Error {
     Io(Arc<std::io::Error>),
     #[error("state database: {0}")]
     Db(Arc<rusqlite::Error>),
+    /// The server can't be reached now ([`crate::Connectivity`]): failed at once rather than
+    /// after timeouts.
+    #[error("the server can't be reached")]
+    Offline,
     /// Another process has the state directory.
     #[error("{0} is in use by another process")]
     Locked(String),
