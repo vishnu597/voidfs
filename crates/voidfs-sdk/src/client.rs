@@ -460,13 +460,23 @@ impl Client {
 
     /// Reads `length` bytes from `offset`, or to the end with `None`; fewer where the object ends.
     pub async fn read_range(&self, drive: &str, key: &str, offset: u64, length: Option<u64>, opts: ReadOptions) -> Result<Bytes> {
+        if length == Some(0) {
+            return Ok(Bytes::new());
+        }
+        Ok(self.get_range(drive, key, offset, length, opts).await?.body)
+    }
+
+    /// [`Client::read_range`] with the headers of the version read: its id and ETag, and in
+    /// `size` the whole object's size. A cache checks that the bytes are of the version it asked
+    /// for this way.
+    pub async fn get_range(&self, drive: &str, key: &str, offset: u64, length: Option<u64>, opts: ReadOptions) -> Result<Object> {
         let range = match length {
-            Some(0) => return Ok(Bytes::new()),
+            Some(0) => return Err(Error::Invalid("an empty range".into())),
             Some(n) => format!("bytes={offset}-{}", offset.saturating_add(n - 1)),
             None => format!("bytes={offset}-"),
         };
         let r = self.execute(self.read_req(Method::GET, drive, key, &opts)?.header("range", range)).await?;
-        Ok(r.body)
+        Ok(Object { meta: object_meta(r.status, &r.headers)?, body: r.body })
     }
 
     /// Deletes an object; its history stays. The version the delete made, if there was an object.
