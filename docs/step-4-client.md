@@ -487,8 +487,8 @@ and the README's commands run by hand against a server.
 
 **Checklist:** D1 (with D6's cache and D8's pins started).
 
-**Status (2 October 2026): in progress**, in three pull requests: the cache and fetcher, then the
-journal and upload queue (both built), then the change-feed client. What the first built:
+**Status (2 October 2026): done**, in three pull requests: the cache and fetcher, the journal and
+upload queue, and the change-feed client and connectivity. What the first built:
 - `crates/voidfs-client`, with `Store` (the per-user `state.sqlite`), `Cache`, `Reader` and the
   `Fetch` trait with `ApiFetcher`, as designed below.
 - In the SDK, `get_range`: a ranged read that also returns the version's headers, so that the
@@ -587,6 +587,33 @@ What the second built (the journal and the upload queue):
 - **Restart safe** (Space's `daemon info`): every change is synced before its call returns, so
   nothing unpublished is only in memory; `status` reports what is unpublished and its bytes, for
   the daemon's `info` (item 4).
+
+What the third built (the change-feed client and connectivity):
+- `FeedWatch`: a drive watched from a listing's position, its changes as `Invalidation`s.
+- `Connectivity`: online, degraded or offline, with `check`, `watch` and `probe`.
+- In the SDK, `Config::observer`: an `Observe` that is told what every attempt of the SDK's own
+  requests came to (the status, or none, and whether it may have been sent).
+
+**Decisions taken while building the third:**
+- **What a change makes stale:** an `Object` (its attributes and content, and its entry in its
+  folder's listing) for each key a change names, a rename's source too; a `Subtree` as well for a
+  folder renamed, deleted or restored, which the feed reports as one change for the folder
+  (protocol §5.6); and `All` after a relisting. The block cache needs none of it: its blocks are
+  keyed by ETag. Under RFC 0004 a folder restore will also report each object it changes; the
+  subtree stays stale all the same.
+- **Positions:** a watch starts from the `seq` of the listing its caller holds. The SDK reconnects
+  a broken stream from the last position it delivered (with `since`; the server ignores
+  `Last-Event-ID`, item 1). On `410 ChangesExpired` the watcher relists only the root's first page,
+  for a current position, says `All`, and watches on from there: the mount relists what it shows,
+  as it is asked for, rather than the whole drive at once.
+- **Connectivity from what requests get:** three requests in a row without an answer (refused,
+  reset or timed out) make the link offline; any answer makes it online; three server errors
+  (`5xx`, `429`) or answers slower than 10 s within 30 s make it degraded. The feed's stream counts
+  too. It doesn't read the operating system's network state; the Mac app can add that in step 5.
+- **Offline:** a block the cache doesn't have fails at once with `Error::Offline` (cached blocks
+  are still read), and the queue holds its publishes. A probe (`ListBuckets`, 2 s after going
+  offline, then twice as long each time up to 30 s) finds the server again, and the queue goes
+  on.
 
 **Design.** A crate `voidfs-client`, which the daemon (item 4) and the mount (step 5) run. One
 SQLite database per user (`state.sqlite`, WAL, in the platform's application-support or state
@@ -720,11 +747,16 @@ for first); a cold read through the bucket against one through the API.
   two of them break the core fix and the SDK change it brought. The conformance suite passes on
   memory, local disk and versitygw, and the README's commands were run by hand. Two server issues
   it found wait for the user (item 2, above).
-- Item 3, the client core: **in progress** (2 October). The cache and fetcher are built: their 13
+- Item 3, the client core: **done** (2 October). The cache and fetcher are built: their 13
   tests (9 unit, 4 against a server in the same process and through the fault proxy) each failed
   with the code they guard broken, measured as
   [bench/results/client-cache](../bench/results/client-cache/README.md) says. The write journal and
   the upload queue are built: their 13 tests (12 against a server in the same process and through
   the fault proxy, 1 unit), and the SDK's 3 for its bandwidth limit and multipart calls, each
-  failed with the code they guard broken, 35 breaks in all. Next: the change-feed client.
+  failed with the code they guard broken, 35 breaks in all. The change-feed client and
+  connectivity are built: their 7 tests (3 unit, 4 against a server in the same process and
+  through the fault proxy), and the SDK's 1 for its observer, each failed with the code they guard
+  broken, 16 breaks in all.
+- Next: the daemon and the CLI's daemon commands (item 4), and RFC 0004's implementation, which
+  the user accepted on 2 October.
 - Items 4–6: not started.

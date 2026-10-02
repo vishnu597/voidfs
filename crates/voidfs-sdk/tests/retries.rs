@@ -6,7 +6,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Fault, Proxy, client_for};
+use common::{Fault, Proxy, client_for, server};
 use voidfs_sdk::*;
 use voidfs_server::test_server::TestServer;
 
@@ -170,4 +170,33 @@ async fn a_watch_resumes_after_its_stream_breaks() {
     let streams: Vec<String> = p.seen().into_iter().filter(|r| r.contains("x-voidfs-changes")).collect();
     assert_eq!(streams.len(), 2, "{streams:?}");
     assert!(streams[1].contains(&format!("since={} last-event-id={}", first.seq, first.seq)), "{streams:?}");
+}
+
+#[derive(Default)]
+struct Seen(std::sync::Mutex<Vec<(Option<u16>, bool)>>);
+
+impl Observe for Seen {
+    fn observe(&self, o: &Observation) {
+        self.0.lock().unwrap().push((o.status, o.sent));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_attempt_is_observed() {
+    let s = server().await;
+    let p = Proxy::start(&s.endpoint).await;
+    let seen = std::sync::Arc::new(Seen::default());
+    let c = client_for(&p.endpoint, Config { observer: Some(seen.clone()), ..Default::default() });
+    c.create_drive("drv", Default::default()).await.unwrap();
+    p.fault(Fault::Status(503));
+    c.put_object("drv", "k", "x", Default::default()).await.unwrap();
+    assert!(c.get_object("drv", "missing", Default::default()).await.is_err());
+    assert_eq!(seen.0.lock().unwrap()[1..], [(Some(503), true), (Some(200), true), (Some(404), true)], "the drive, the put twice, the read");
+    // Nothing listening: no answer, and nothing sent.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = closed.local_addr().unwrap();
+    drop(closed);
+    let gone = client_for(&format!("http://{addr}"), Config { observer: Some(seen.clone()), max_attempts: 1, ..Default::default() });
+    assert!(gone.get_object("drv", "k", Default::default()).await.is_err());
+    assert_eq!(seen.0.lock().unwrap().last(), Some(&(None, false)));
 }

@@ -26,6 +26,7 @@ use serde::Serialize;
 use tokio::sync::{Notify, Semaphore};
 use voidfs_sdk::{Bandwidth, Client};
 
+use crate::connectivity::{Connectivity, Link};
 use crate::error::Result;
 use crate::journal::{self, Attrs, Base, BatchId, Entry, EntryId, Op, Stamp, State, StoredBase};
 use crate::publish::{self, Ctx, Guard, Outcome, Stop, Why};
@@ -46,11 +47,22 @@ pub struct QueueConfig {
     pub memory_bytes: u64,
     /// The longest wait before a failed publish is tried again.
     pub retry_max: Duration,
+    /// While it says the server can't be reached, nothing is published; the queue goes on once
+    /// it can be.
+    pub connectivity: Option<Connectivity>,
 }
 
 impl Default for QueueConfig {
     fn default() -> QueueConfig {
-        QueueConfig { uploads: 16, part_size: 16 * MIB, multipart_from: 64 * MIB, parts_at_once: 4, memory_bytes: 256 * MIB, retry_max: Duration::from_secs(60) }
+        QueueConfig {
+            uploads: 16,
+            part_size: 16 * MIB,
+            multipart_from: 64 * MIB,
+            parts_at_once: 4,
+            memory_bytes: 256 * MIB,
+            retry_max: Duration::from_secs(60),
+            connectivity: None,
+        }
     }
 }
 
@@ -146,6 +158,8 @@ struct QState {
     cancelled: HashSet<EntryId>,
     /// The publisher found nothing to start and nothing to retry, and nothing is running.
     idle: bool,
+    /// ... because the server couldn't be reached.
+    idle_offline: bool,
     closed: bool,
 }
 
@@ -244,6 +258,19 @@ impl Queue {
             stopped: Arc::new((Mutex::new(false), Notify::new())),
         };
         let q = Queue(Arc::new(inner));
+        if let Some(conn) = &q.0.cfg.connectivity {
+            // The publisher looks again whenever the link changes; this lets go with the queue.
+            let mut rx = conn.watch();
+            let weak = Arc::downgrade(&q.0);
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    match weak.upgrade() {
+                        Some(inner) => inner.wake.notify_one(),
+                        None => return,
+                    }
+                }
+            });
+        }
         let (q2, stopped) = (q.clone(), q.0.stopped.clone());
         tokio::spawn(async move {
             q2.publisher().await;
@@ -590,8 +617,13 @@ impl Queue {
     pub async fn settle(&self) {
         loop {
             let n = self.0.changed.notified();
-            if self.st().idle {
-                return;
+            let online = self.0.cfg.connectivity.as_ref().is_none_or(|c| c.link() != Link::Offline);
+            {
+                let st = self.st();
+                // Idle because offline is idle no longer once the server is back.
+                if st.idle && !(st.idle_offline && online) {
+                    return;
+                }
             }
             n.await;
         }
@@ -632,8 +664,10 @@ impl Queue {
                 if st.closed && st.runs == 0 {
                     break;
                 }
-                let (runs, wait) = if st.closed { (Vec::new(), None) } else { self.select(&mut st) };
+                let offline = self.0.cfg.connectivity.as_ref().is_some_and(|c| c.link() == Link::Offline);
+                let (runs, wait) = if st.closed || offline { (Vec::new(), None) } else { self.select(&mut st) };
                 st.idle = st.runs == 0 && runs.is_empty() && wait.is_none();
+                st.idle_offline = offline;
                 if st.idle {
                     self.0.changed.notify_waiters();
                 }

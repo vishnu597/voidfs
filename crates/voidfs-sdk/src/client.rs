@@ -42,6 +42,25 @@ pub struct Config {
     /// A limit on how fast this client's request bodies go out, which clients may share. It
     /// covers the SDK's own requests, not [`Client::s3`]'s.
     pub upload_bandwidth: Option<Arc<Bandwidth>>,
+    /// Told what each attempt of the SDK's own requests came to (not [`Client::s3`]'s).
+    pub observer: Option<Arc<dyn Observe>>,
+}
+
+/// What one attempt of a request came to.
+#[derive(Clone, Debug)]
+pub struct Observation {
+    /// The status the server answered with; `None` when no answer came.
+    pub status: Option<u16>,
+    /// For an attempt without an answer: whether it may have reached the server.
+    pub sent: bool,
+    /// Until the answer's headers, or the failure.
+    pub elapsed: Duration,
+}
+
+/// Watches a client's requests, for a view of the link to the server (the client core's
+/// connectivity).
+pub trait Observe: Send + Sync + 'static {
+    fn observe(&self, o: &Observation);
 }
 
 impl Default for Config {
@@ -55,6 +74,7 @@ impl Default for Config {
             connect_timeout: Duration::from_secs(10),
             max_attempts: 3,
             upload_bandwidth: None,
+            observer: None,
         }
     }
 }
@@ -69,6 +89,7 @@ impl fmt::Debug for Config {
             .field("connect_timeout", &self.connect_timeout)
             .field("max_attempts", &self.max_attempts)
             .field("upload_bandwidth", &self.upload_bandwidth.as_ref().map(|b| b.get()))
+            .field("observer", &self.observer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -344,7 +365,16 @@ impl Client {
             }
             Patience::Stream => &self.0.http_wait,
         };
-        let resp = http.execute(request).await?;
+        let started = std::time::Instant::now();
+        let resp = http.execute(request).await;
+        if let Some(o) = &self.0.config.observer {
+            let (status, sent) = match &resp {
+                Ok(r) => (Some(r.status().as_u16()), true),
+                Err(e) => (None, !e.is_connect()),
+            };
+            o.observe(&Observation { status, sent, elapsed: started.elapsed() });
+        }
+        let resp = resp?;
         let status = resp.status().as_u16();
         if status >= 300 {
             let headers = resp.headers().clone();
