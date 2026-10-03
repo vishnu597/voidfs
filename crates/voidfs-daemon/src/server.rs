@@ -16,6 +16,8 @@ use chrono::{SecondsFormat, Utc};
 use tokio::sync::watch;
 use voidfs_client::{ApiFetcher, Cache, CacheConfig, Connectivity, ConnectivityConfig, Queue, QueueConfig, Store};
 
+use crate::mounts::{Adapter, Core, Mounts};
+
 use crate::api::{self, ApiError, Build, ErrorBody};
 
 /// Why a daemon didn't start.
@@ -46,7 +48,7 @@ impl From<voidfs_client::Error> for Error {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DaemonConfig {
     pub state_dir: PathBuf,
     /// `None` is `<state>/daemon.sock`.
@@ -57,6 +59,10 @@ pub struct DaemonConfig {
     pub queue: QueueConfig,
     pub cache: CacheConfig,
     pub connectivity: ConnectivityConfig,
+    /// What mounts drives; the first is the default. None yet in `void` (step 5).
+    pub adapters: Vec<Arc<dyn Adapter>>,
+    /// Where a drive mounts when no mountpoint is named, as `<root>/<drive>`: `~/voidfs`.
+    pub mount_root: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -69,6 +75,8 @@ impl DaemonConfig {
             queue: QueueConfig::default(),
             cache: CacheConfig::default(),
             connectivity: ConnectivityConfig::default(),
+            adapters: Vec::new(),
+            mount_root: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join("voidfs")),
         }
     }
 }
@@ -87,6 +95,8 @@ pub(crate) struct Shared {
     pub(crate) queue: Queue,
     cache: Cache,
     conn: Connectivity,
+    pub(crate) store: Arc<Store>,
+    pub(crate) mounts: Mounts,
     /// Set when a client asks the daemon to stop.
     stop_asked: watch::Sender<bool>,
     /// Set when the daemon starts stopping: streams end.
@@ -182,6 +192,8 @@ impl Daemon {
             queue,
             cache,
             conn,
+            store: store.clone(),
+            mounts: Mounts::new(cfg.adapters.clone(), cfg.mount_root.clone()),
             stop_asked: watch::Sender::new(false),
             closing: watch::Sender::new(false),
             samples: Mutex::new(VecDeque::new()),
@@ -211,6 +223,8 @@ impl Daemon {
             .route("/v1/uploads/cancel", post(crate::uploads::cancel))
             .route("/v1/uploads/limit", put(crate::uploads::limit))
             .route("/v1/uploads/clear", post(crate::uploads::clear))
+            .route("/v1/mounts", get(crate::mounts::list).post(crate::mounts::mount))
+            .route("/v1/mounts/unmount", post(crate::mounts::unmount))
             .fallback(not_found)
             .with_state(shared.clone());
         let (shutdown, mut rx) = watch::channel(false);
@@ -221,6 +235,9 @@ impl Daemon {
                 })
                 .await;
         });
+        let s2 = store.clone();
+        let remembered = tokio::task::spawn_blocking(move || crate::mounts::stored(&s2)).await.map_err(voidfs_client::Error::from)?;
+        Mounts::restore(&shared, remembered?);
         Ok(Daemon { shared, store, server, probe, sampler, shutdown })
     }
 
@@ -260,6 +277,7 @@ impl Daemon {
             server.abort();
             let _ = server.await;
         }
+        shared.mounts.detach_all().await;
         shared.queue.close().await;
         shared.cache.settle().await;
         probe.abort();
@@ -309,6 +327,15 @@ async fn not_found(method: Method, uri: Uri) -> Failure {
 }
 
 impl Shared {
+    /// The client core, for an adapter.
+    pub(crate) fn core(&self) -> Core {
+        Core { client: self.client.clone(), cache: self.cache.clone(), queue: self.queue.clone(), connectivity: self.conn.clone() }
+    }
+
+    pub(crate) fn connectivity(&self) -> &Connectivity {
+        &self.conn
+    }
+
     /// Bytes a second the queue sent, from the oldest sample to now, over a second at least.
     pub(crate) fn rate(&self) -> u64 {
         let now = (Instant::now(), self.queue.bytes_sent());
@@ -342,6 +369,7 @@ async fn status(State(s): State<Arc<Shared>>) -> Answer<api::Status> {
         connection: api::Connection { endpoint: s.endpoint.clone(), link: s.conn.link().into() },
         uploads: api::Uploads { rate: s.rate(), ..api::Uploads::of(&q) },
         cache: api::Cache { disk_bytes: usage.disk_bytes, max_bytes: cfg.max_bytes, pinned_bytes: usage.pinned_bytes, memory_bytes: usage.memory_bytes, memory_max_bytes: cfg.memory_bytes },
+        mounts: s.mounts.table(),
     }))
 }
 
@@ -356,6 +384,7 @@ async fn info(State(s): State<Arc<Shared>>) -> Answer<api::Info> {
         socket: s.socket.display().to_string(),
         state_dir: s.state_dir.display().to_string(),
         restart_safe: memory_only_bytes == 0,
+        mounts: s.mounts.table().len() as u64,
         memory_only_bytes,
         journal: api::Journal::of(&q),
     }))

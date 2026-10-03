@@ -8,9 +8,11 @@
 //! - [`api`]: what the socket speaks, which the Mac app speaks too.
 //! - [`DaemonClient`]: a client for the socket, which `void` uses.
 //! - [`Settings`]: the connection `void daemon start` leaves for the daemon in `daemon.json`.
+//! - [`Adapter`]: what mounts a drive (step 5); the daemon keeps the mount table.
 
 pub mod api;
 mod client;
+mod mounts;
 mod server;
 mod settings;
 mod uploads;
@@ -18,6 +20,7 @@ mod uploads;
 use std::path::{Path, PathBuf};
 
 pub use client::{ClientError, DaemonClient, UploadWatch};
+pub use mounts::{Adapter, Core, MountSpec, Mounted};
 pub use server::{Daemon, DaemonConfig, Error};
 pub use settings::Settings;
 

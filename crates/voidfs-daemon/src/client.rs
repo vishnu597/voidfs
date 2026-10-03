@@ -155,6 +155,21 @@ impl DaemonClient {
     pub async fn clear(&self) -> Result<api::Cleared, ClientError> {
         self.post("/v1/uploads/clear", &serde_json::json!({})).await
     }
+
+    /// The mount table and the remembered mounts.
+    pub async fn mounts(&self) -> Result<api::Mounts, ClientError> {
+        self.get("/v1/mounts").await
+    }
+
+    /// Mounts a drive and remembers it.
+    pub async fn mount(&self, m: &api::NewMount) -> Result<api::Mount, ClientError> {
+        self.post("/v1/mounts", m).await
+    }
+
+    /// Unmounts and forgets a mountpoint, or every mount of a drive.
+    pub async fn unmount(&self, target: &str) -> Result<api::Unmounted, ClientError> {
+        self.post("/v1/mounts/unmount", &api::Unmount { target: target.into() }).await
+    }
 }
 
 /// The upload queue each second, from `DaemonClient::watch_uploads`.
