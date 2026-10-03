@@ -85,19 +85,25 @@ void drive delete footage-try                 # asks for the name; recoverable f
   `{"error": {"code", "status", "message", …}}`, with exit status 1 (2 for a usage error).
 - `void keys generate --scope read|write|admin` makes more keys: give each to the server as
   `--key <id>:<secret>:<scope>`.
-- `void upload` runs in the foreground for now. Background uploads through the daemon, and the
-  mount table, come next ([step 4's plan](docs/step-4-client.md)).
-
 The daemon is the per-user agent that owns the client core: the upload queue, the block cache and
 the link to the server. It answers on a socket in the state directory
-(`~/Library/Application Support/voidfs`, or `VOIDFS_STATE_DIR`), in HTTP and JSON.
+(`~/Library/Application Support/voidfs`, or `VOIDFS_STATE_DIR`), in HTTP and JSON. With it,
+uploads go on when the command that started them stops, and survive the daemon's restart.
 
 ```bash
-void daemon start     # in the background; it keeps the server and key it was given, for you only
-void status           # the daemon, the server and the link to it, uploads and the cache, on one page
-void daemon info      # its build, what its journal holds unpublished, and whether a restart is safe
-void daemon restart   # stop, then start; `void daemon stop` waits until it has stopped
+void daemon start                     # in the background; it keeps the server and key it was given, for you only
+void upload --detach renders/ footage:/cuts   # hand it the batch and return
+void uploads --watch                  # what is uploading, the batches, the rate and the time left
+void uploads pause --all              # also: resume, cancel, by id, --batch or --drive
+void uploads limit 10MiB              # at once; `unlimited` lifts it
+void status                           # the daemon, the server and the link to it, uploads and the cache
+void daemon info                      # its build, what its journal holds unpublished, and whether a restart is safe
 ```
+
+- `void upload` without `--detach` hands the batch to the daemon and follows it until it is up;
+  Ctrl-C leaves it uploading. With no daemon running it uploads in the foreground, and
+  `--detach` starts one.
+- The mount table comes next ([step 4's plan](docs/step-4-client.md)).
 
 ### The Rust SDK
 

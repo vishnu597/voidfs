@@ -759,6 +759,57 @@ uploads through it, and the mount table with the launchd agent. What the first b
   is dropped. Before, its next line panicked, and the daemon died leaving its socket; `daemon
   stop` also takes a state directory nothing holds as stopped, socket or not.
 
+What the second built (uploads through the daemon):
+- On the socket: `POST /v1/uploads` (a batch), `GET /v1/uploads` (what is unfinished, or `all`,
+  and the batches, or one), `GET /v1/uploads/watch` (the same, one JSON document a line, each
+  second, until the daemon stops), `POST /v1/uploads/pause|resume|cancel` (with `"all"`,
+  `{"drive"}`, `{"batch"}` or `{"entry"}`), `PUT /v1/uploads/limit` and `POST /v1/uploads/clear`.
+- `void upload … [--detach]` through the daemon, and `void uploads [--watch] [--json] [--all]`
+  with `pause|resume|cancel`, `limit` and `clear`.
+- In the client core, `Queue::import` takes a folder (an empty one, with its attributes),
+  `Queue::bytes_sent`, and `queue::unpublished`, which reads the journal without opening the
+  queue. In the SDK, `Bandwidth::taken`, the bytes it has let go.
+
+**Decisions taken while building the second:**
+- **`upload` with a daemon** hands the batch to it. The CLI walks the sources as the foreground
+  upload does and sends absolute paths; the daemon imports them into the queue as one batch,
+  named for its first source (`clip.mov`, or `clip.mov and 2 more`), as Space names its batches.
+  Without `--detach` it follows the batch until nothing of it is queued or uploading, printing
+  each file as it lands and the foreground upload's summary, with the batch's id; Ctrl-C leaves
+  the batch to the daemon, and a daemon that restarts meanwhile is waited for, 30 s at most. While
+  the batch is paused, it waits. A failed file makes it exit 1, saying `void uploads resume
+  --batch <id>` tries it again. With `--detach` it returns at once, with the batch's id.
+- **With no daemon running,** `upload` runs in the foreground, as before: scripts and CI need no
+  state directory and no daemon for it. `upload --detach` starts the daemon first, as `daemon
+  start` does. Space's `upload` needs a mounted drive and starts no daemon (§1.2); voidfs's
+  imports go into the queue, mount or not.
+- **The drive is checked** when the batch arrives, by describing it: a typo fails at once
+  (`NoSuchBucket`) rather than as one failed upload per file. The batch is queued under the
+  drive's alias, so that a pause by drive finds it whether the drive is named by alias or id.
+  With the server out of reach the drive is taken as given, and the batch waits for it.
+- **One connection:** the daemon uploads with its own. An endpoint or key given to `upload` that
+  isn't the daemon's is refused (`DaemonMismatch`, with `void daemon restart` to switch) rather
+  than ignored; given none, `upload` uses the daemon's.
+- **Paths:** the daemon needs absolute paths (its working directory isn't the caller's), and
+  checks each exists and is a file or folder; files are read where they are when they go up, as
+  imports are (item 3), so they must stay there until then.
+- **The rate:** the SDK's bandwidth bucket counts every byte it lets go, limited or not; the
+  daemon samples that each second, and the rate is the bytes since the oldest of the last five
+  samples over the time since, a second at least. The time left is what is unpublished at that
+  rate. An item's progress counts its finished parts (item 3), so the four parts of a file that
+  share a capped link show their progress as they finish, while the rate moves.
+- **`void uploads`** prints what is unfinished (id, drive, key, size, sent, state), the batches,
+  newest first (items, done, failed, size, state), and a line of totals: what is queued and
+  uploading, the bytes to send, the rate, the time left, the pause and the limit. `--all` lists
+  finished uploads too, `--watch` redraws each second (with `--json`, a document a line), and
+  `clear` forgets finished ones (Space's Clear). `pause`, `resume` and `cancel` take an id,
+  `--batch`, `--drive` or `--all`, and say how many unfinished uploads they applied to. Space's
+  CLI has `cancel` only; its app pauses one upload at a time (§1.4).
+- **`limit <rate>`:** `10MiB`, `500K`, `2MB/s` or `unlimited`, in bytes a second; K, M and G are
+  binary, KB, MB and GB decimal. It applies at once and is kept across restarts (item 3).
+- **`status` with no daemon** reads the journal, when nothing holds the state directory, and says
+  what waits in it for the daemon: an upload outlives the daemon that had it.
+
 **Design.** The `void` binary also runs as the per-user agent (`void daemon run`), as
 `spacefs-fskitd` is both; the spike decided on a per-user agent for the Rust core (spike §4.1).
 - A Unix socket in the state directory, HTTP with JSON over it (the Mac app will speak the same).
@@ -865,6 +916,9 @@ for first); a cold read through the bucket against one through the API.
   its socket are built, with `void daemon run|start|stop|restart|status|info` and `void status`:
   their 12 tests (2 unit, 3 with the daemon in the test's own process, and 7 that run the binary
   against a server in the same process) each failed with the code they guard broken, 27 breaks
-  in all, each run alone with a timeout. Space's daemon was observed running (§1.2). Next:
-  uploads through the daemon, then the mount table and the launchd agent.
+  in all, each run alone with a timeout. Space's daemon was observed running (§1.2). Uploads go
+  through the daemon (`void upload [--detach]`, `void uploads`), and survive its restart and its
+  crash: their 11 tests (1 unit, 1 in the client core, 1 in the SDK, 2 with the daemon in the
+  test's own process, and 6 that run the binary) each failed with the code they guard broken,
+  33 breaks in all, each run alone with a timeout. Next: the mount table and the launchd agent.
 - Items 5–6: not started.
