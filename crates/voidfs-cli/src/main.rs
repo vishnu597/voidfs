@@ -9,6 +9,8 @@ mod daemon;
 mod drives;
 mod history;
 mod keys;
+mod launchd;
+mod mounts;
 mod output;
 mod upload;
 mod uploads;
@@ -96,6 +98,15 @@ enum Command {
     Upload(upload::UploadArgs),
     /// The daemon's uploads: a table, `--watch` for a live view, or pause, resume, cancel and limit
     Uploads(uploads::UploadsArgs),
+    /// Mount a drive as a folder, through the daemon, which mounts it again when it starts
+    Mount(mounts::MountArgs),
+    /// Unmount a drive, by its mountpoint, or every mount of a drive by its alias or id, and forget it
+    Unmount {
+        /// A mountpoint, or a drive by alias or id
+        target: String,
+    },
+    /// The drives mounted now, and the mounts the daemon remembers
+    Mounts,
     /// One page: the daemon, the server and the link to it, uploads and the cache
     Status,
     /// The per-user daemon, which owns the state directory: uploads, the cache, and mounts
@@ -158,6 +169,11 @@ enum DaemonCommand {
     /// The running daemon's build, what its journal holds unpublished, and whether a restart is
     /// safe
     Info,
+    /// Install a launchd agent (macOS), so that the daemon and its remembered mounts come back at
+    /// login. The connection it is given is kept for it, readable by you only
+    Install,
+    /// Remove the launchd agent; the daemon it started stops
+    Uninstall,
 }
 
 #[derive(Subcommand, Debug)]
@@ -190,6 +206,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Daemon(DaemonCommand::Restart(o)) => daemon::restart(&cli.connection, o, out).await,
         Command::Daemon(DaemonCommand::Status) => daemon::daemon_status(out).await,
         Command::Daemon(DaemonCommand::Info) => daemon::info(out).await,
+        Command::Daemon(DaemonCommand::Install) => launchd::install(&cli.connection, out).await,
+        Command::Daemon(DaemonCommand::Uninstall) => launchd::uninstall(out).await,
+        Command::Mount(args) => mounts::mount(&cli.connection, out, args).await,
+        Command::Unmount { target } => mounts::unmount(out, target).await,
+        Command::Mounts => mounts::mounts(out).await,
         Command::Drives => drives::list(&client()?, out).await,
         Command::Drive(DriveCommand::Create { name, display_name }) => drives::create(&client()?, out, name, display_name.clone()).await,
         Command::Drive(DriveCommand::Show { drive }) => drives::show(&client()?, out, drive).await,
