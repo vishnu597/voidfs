@@ -35,6 +35,9 @@ const MIGRATIONS: &[&str] = &[
      CREATE TABLE parts(entry INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE, number INTEGER NOT NULL,
          etag TEXT NOT NULL, size INTEGER NOT NULL, PRIMARY KEY(entry, number)) WITHOUT ROWID;
      CREATE TABLE paused_drives(drive TEXT PRIMARY KEY) WITHOUT ROWID;",
+    // 3: the remembered mounts (mounts.rs).
+    "CREATE TABLE mounts(mountpoint TEXT PRIMARY KEY, drive TEXT NOT NULL, adapter TEXT NOT NULL,
+         read_only INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL) WITHOUT ROWID;",
 ];
 
 pub struct Store {
