@@ -13,10 +13,11 @@ pub mod api;
 mod client;
 mod server;
 mod settings;
+mod uploads;
 
 use std::path::{Path, PathBuf};
 
-pub use client::{ClientError, DaemonClient};
+pub use client::{ClientError, DaemonClient, UploadWatch};
 pub use server::{Daemon, DaemonConfig, Error};
 pub use settings::Settings;
 
