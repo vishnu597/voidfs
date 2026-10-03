@@ -11,6 +11,7 @@ mod history;
 mod keys;
 mod output;
 mod upload;
+mod uploads;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -90,8 +91,11 @@ enum Command {
         #[arg(long, value_name = "ID")]
         version: Option<String>,
     },
-    /// Upload local files or folders into a drive, in the foreground
+    /// Upload local files or folders into a drive: through the daemon, which goes on if this
+    /// command stops, or in the foreground when no daemon runs
     Upload(upload::UploadArgs),
+    /// The daemon's uploads: a table, `--watch` for a live view, or pause, resume, cancel and limit
+    Uploads(uploads::UploadsArgs),
     /// One page: the daemon, the server and the link to it, uploads and the cache
     Status,
     /// The per-user daemon, which owns the state directory: uploads, the cache, and mounts
@@ -140,15 +144,15 @@ enum DriveCommand {
 #[derive(Subcommand, Debug)]
 enum DaemonCommand {
     /// Run the daemon in the foreground, until it is stopped (launchd runs this)
-    Run,
+    Run(daemon::DaemonOptions),
     /// Start the daemon in the background, if it isn't running. The connection it is given is
     /// kept, readable by you only, for when it starts again
-    Start,
+    Start(daemon::DaemonOptions),
     /// Stop the daemon. What is uploading stops, and goes on from where it was when the daemon
     /// starts again
     Stop,
     /// Stop the daemon, then start it
-    Restart,
+    Restart(daemon::DaemonOptions),
     /// Whether the daemon is running, its process, uptime and socket
     Status,
     /// The running daemon's build, what its journal holds unpublished, and whether a restart is
@@ -180,10 +184,10 @@ async fn run(cli: Cli) -> Result<()> {
         ),
         Command::Keys(KeysCommand::Generate { scope, format }) => keys::generate(out, *scope, *format),
         Command::Status => daemon::status(out).await,
-        Command::Daemon(DaemonCommand::Run) => daemon::run(&cli.connection).await,
-        Command::Daemon(DaemonCommand::Start) => daemon::start(&cli.connection, out).await,
+        Command::Daemon(DaemonCommand::Run(o)) => daemon::run(&cli.connection, o).await,
+        Command::Daemon(DaemonCommand::Start(o)) => daemon::start(&cli.connection, o, out).await,
         Command::Daemon(DaemonCommand::Stop) => daemon::stop(out).await,
-        Command::Daemon(DaemonCommand::Restart) => daemon::restart(&cli.connection, out).await,
+        Command::Daemon(DaemonCommand::Restart(o)) => daemon::restart(&cli.connection, o, out).await,
         Command::Daemon(DaemonCommand::Status) => daemon::daemon_status(out).await,
         Command::Daemon(DaemonCommand::Info) => daemon::info(out).await,
         Command::Drives => drives::list(&client()?, out).await,
@@ -195,7 +199,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::History { target, all } => history::history(&client()?, out, target, *all).await,
         Command::Show { target, at, version, output } => history::show(&client()?, out, target, at.as_deref(), version.as_deref(), output.as_deref()).await,
         Command::Restore { target, at, version } => history::restore(&client()?, out, target, at.as_deref(), version.as_deref()).await,
-        Command::Upload(args) => upload::upload(&client()?, out, args).await,
+        Command::Upload(args) => upload::upload(&cli.connection, out, args).await,
+        Command::Uploads(args) => uploads::run(out, args).await,
     }
 }
 

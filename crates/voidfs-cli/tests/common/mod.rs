@@ -165,3 +165,43 @@ pub fn lines(s: &str) -> Vec<String> {
     s.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect()
 }
 
+/// A state directory for a daemon, short enough for its socket's path, and the environment that
+/// points `void` at it. Dropped, it stops the daemon and removes the directory.
+pub struct State {
+    pub dir: PathBuf,
+    pub env: Vec<(&'static str, String)>,
+}
+
+impl State {
+    pub fn new(f: &Fixture, tag: &str) -> State {
+        let dir = std::env::temp_dir().join(format!("vd{}{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut env = f.env();
+        env.push(("VOIDFS_STATE_DIR", dir.display().to_string()));
+        State { dir, env }
+    }
+
+    /// Only the state directory: no connection.
+    pub fn bare(&self) -> Vec<(&'static str, String)> {
+        vec![("VOIDFS_STATE_DIR", self.dir.display().to_string())]
+    }
+
+    pub fn void(&self, args: &[&str]) -> Run {
+        run(args, &self.env, None)
+    }
+
+    pub fn socket(&self) -> PathBuf {
+        self.dir.join("daemon.sock")
+    }
+
+    pub fn pid(&self) -> u64 {
+        self.void(&["daemon", "status", "--json"]).ok().json()["pid"].as_u64().expect("a pid")
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        let _ = run(&["daemon", "stop"], &self.bare(), None);
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
