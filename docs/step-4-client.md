@@ -703,8 +703,9 @@ relist.
 
 **Checklist:** D1, D9.
 
-**Status (3 October 2026): in progress**, in three pull requests: the daemon and its socket,
-uploads through it, and the mount table with the launchd agent. What the first built:
+**Status (3 October 2026): done**, in three pull requests: the daemon and its socket, uploads
+through it, and the mount table with the launchd agent. Mounting itself comes with step 5's
+adapters. What the first built:
 - `crates/voidfs-daemon`: `Daemon`, which owns the state directory (the `Store`, the cache, the
   upload queue and connectivity) and answers on its socket; `api`, what the socket speaks;
   `DaemonClient`, a client for it; and `Settings`, the connection a daemon is left with.
@@ -810,6 +811,57 @@ What the second built (uploads through the daemon):
 - **`status` with no daemon** reads the journal, when nothing holds the state directory, and says
   what waits in it for the daemon: an upload outlives the daemon that had it.
 
+What the third built (the mount table and the launchd agent):
+- In `voidfs-daemon`, `Adapter` and `Mounted`, which step 5's adapters implement, and the mount
+  table; in the client core, the remembered mounts (`mounts`, a third migration of
+  `state.sqlite`).
+- On the socket: `GET /v1/mounts` (the table and the remembered mounts), `POST /v1/mounts` and
+  `POST /v1/mounts/unmount`; `status` and `info` count the mounts.
+- `void mount|unmount|mounts`, and `void daemon install|uninstall`.
+
+**Decisions taken while building the third:**
+- **Mounting is an adapter's, the table the daemon's.** An adapter gets the drive, the mountpoint
+  and the client core (`Core`: the client, the cache, the queue and connectivity), and gives back
+  a `Mounted`, which the daemon tells what the drive's change feed made stale (`invalidate`) and
+  unmounts. `void` has no adapter until step 5, so `void mount` answers `NoAdapter` (`501`) and
+  remembers nothing. The tests mount with a fake adapter, in a daemon started in their own
+  process with the binary against it.
+- **A feed watch per mounted drive,** from the position of a listing taken as it mounts. The
+  table shows each mount's state, adapter, since when, and its feed: the position it has seen,
+  the batches of changes since it mounted, and the last one's time.
+- **Remembered mounts** (mountpoint, the drive's alias, adapter, read-only) are kept when a mount
+  succeeds and forgotten by `unmount`. `daemon stop` unmounts everything and keeps what is
+  remembered; a daemon that starts mounts it again, in the background, as Space's does
+  ("remembered drives restore on next start"). One that can't come back (no such adapter) stays
+  in the table as failed, with why, until it is mounted again or unmounted.
+- **Offline at start:** a drive the server gives no answer about mounts all the same, and its
+  feed starts from the beginning once the server answers; a mount the server refuses (a drive
+  deleted since) fails.
+- **`mount <drive> [mountpoint]`:** the drive by alias or id, kept by alias; the mountpoint
+  `~/voidfs/<drive>` by default (Space's is `~/Space/<Drive Name>`), made if missing;
+  `--read-only`; `--adapter`, the daemon's first by default. It starts the daemon, as Space's
+  does ("or just `space mount ...`"). A mountpoint in use is refused (`AlreadyMounted`).
+- **`unmount <mountpoint | drive>`,** as Space's takes a mountpoint or a drive (every mount of it,
+  by alias or id), unmounts and forgets; `NoSuchMount` when nothing is mounted or remembered
+  there.
+- **`mounts [--json]`:** `{"daemon": {"running", "socket"}, "mounts": […], "remembered": […]}`,
+  the same shape whether the daemon runs or not (Space's is `[]` while it runs, an object while it
+  doesn't); with no daemon, the remembered mounts are read from the state.
+- **`daemon install`** (macOS) writes `~/Library/LaunchAgents/dev.voidfs.daemon.plist`: `void
+  daemon run` at login, kept alive after a crash but not after `daemon stop` (`KeepAlive` with
+  `SuccessfulExit` false), its output to the state directory's log, and `VOIDFS_STATE_DIR` when
+  one is set. It keeps the connection in `daemon.json`, so that the plist holds no secret, stops
+  a daemon started otherwise, and loads the agent (`launchctl bootout`, then `bootstrap
+  gui/<uid>`), which starts the daemon. `uninstall` unloads it (`bootout`, which stops its daemon)
+  and removes the plist. With the agent installed, `daemon start` asks launchd (`kickstart`), so
+  that launchd keeps the daemon it starts. On Linux, `install` says the systemd user unit comes
+  with step 9. Space 0.2.343's `daemon install` is Linux-only; on macOS its app brings the daemon
+  back (§1.2).
+- **launchd in the tests:** `VOIDFS_LAUNCH_AGENTS_DIR` and `VOIDFS_LAUNCHCTL` put the plist, and
+  the `launchctl` the CLI runs, elsewhere. The tests use a stand-in that logs what it is asked and
+  runs the daemon as launchd would, and check the plist with `plutil -lint`; nothing was written
+  to `~/Library/LaunchAgents`, and launchd was asked nothing, while building it.
+
 **Design.** The `void` binary also runs as the per-user agent (`void daemon run`), as
 `spacefs-fskitd` is both; the spike decided on a per-user agent for the Rust core (spike §4.1).
 - A Unix socket in the state directory, HTTP with JSON over it (the Mac app will speak the same).
@@ -912,13 +964,20 @@ for first); a cold read through the bucket against one through the API.
   broken, 16 breaks in all.
 - RFC 0004, which the user accepted on 2 October, is implemented: folder restores are in every
   restored file's history in a pool with `multi-object-versions` (item 2, above).
-- Item 4, the daemon and the CLI's daemon commands: **in progress** (3 October). The daemon and
-  its socket are built, with `void daemon run|start|stop|restart|status|info` and `void status`:
-  their 12 tests (2 unit, 3 with the daemon in the test's own process, and 7 that run the binary
-  against a server in the same process) each failed with the code they guard broken, 27 breaks
-  in all, each run alone with a timeout. Space's daemon was observed running (§1.2). Uploads go
-  through the daemon (`void upload [--detach]`, `void uploads`), and survive its restart and its
-  crash: their 11 tests (1 unit, 1 in the client core, 1 in the SDK, 2 with the daemon in the
-  test's own process, and 6 that run the binary) each failed with the code they guard broken,
-  33 breaks in all, each run alone with a timeout. Next: the mount table and the launchd agent.
+- Item 4, the daemon and the CLI's daemon commands: **done** (3 October), in three pull
+  requests, each test seen to fail with the code it guards broken, each break run alone with a
+  timeout (the timing-sensitive ones three times):
+  - the daemon and its socket, `void daemon run|start|stop|restart|status|info` and `void
+    status`: 12 tests (2 unit, 3 with the daemon in the test's own process, 7 that run the binary
+    against a server in the same process), 27 breaks;
+  - uploads through the daemon (`void upload [--detach]`, `void uploads`), which survive its
+    restart and its crash: 11 tests (1 unit, 1 in the client core, 1 in the SDK, 2 with the
+    daemon in the test's own process, 6 that run the binary), 33 breaks;
+  - the mount table (`void mount|unmount|mounts`) and the launchd agent (`void daemon
+    install|uninstall`): 7 tests on each platform (2 unit, 2 with the daemon in the test's own
+    process and a fake adapter, 3 that run the binary, one against such a daemon; the launchd
+    one runs on macOS, and its Linux twin checks that `install` refuses), 27 breaks.
+
+  Space's daemon was observed running (§1.2). Mounting itself comes with step 5's adapters.
+- Next: direct uploads (item 5).
 - Items 5–6: not started.
