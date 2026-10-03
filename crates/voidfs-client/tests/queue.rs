@@ -289,6 +289,34 @@ async fn imports_keep_their_modification_time_mode_and_extended_attributes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn imports_make_folders_and_what_waits_is_counted_without_the_queue() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_s, _p, direct, c) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let file = dir.path().join("f.txt");
+    std::fs::write(&file, "twelve bytes").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(state.path()).unwrap());
+    let q = Queue::open(store.clone(), c.clone(), config()).await.unwrap();
+    q.pause(Scope::All).await.unwrap();
+    let files = vec![Import { path: empty.clone(), drive: "drv".into(), key: "up/empty".into() }, Import { path: file, drive: "drv".into(), key: "up/f.txt".into() }];
+    let batch = q.import("two", files).await.unwrap();
+    assert_eq!(voidfs_client::queue::unpublished(&store).unwrap(), (2, 12), "a folder and a file, read from the journal alone");
+    let st = q.status().await.unwrap();
+    assert_eq!(st.items.iter().map(|i| (i.op, i.key.as_str(), i.batch)).collect::<Vec<_>>(), [(Op::Folder, "up/empty/", Some(batch)), (Op::Put, "up/f.txt", Some(batch))]);
+    q.resume(Scope::All).await.unwrap();
+    q.settle().await;
+    assert_eq!(voidfs_client::queue::unpublished(&store).unwrap(), (0, 0));
+    let h = direct.head_object("drv", "up/empty/", ReadOptions::default()).await.unwrap();
+    assert_eq!((h.size, h.mode.as_deref()), (0, Some("0750")), "the folder, with its mode");
+    assert_eq!(text(&direct, "up/f.txt").await.as_deref(), Some("twelve bytes"));
+    assert!(q.bytes_sent() >= 12, "what went out is counted, for a rate");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sixteen_go_at_once_and_one_keys_changes_wait_for_each_other() {
     let (_s, p, direct, c) = setup().await;
     let dir = tempfile::tempdir().unwrap();

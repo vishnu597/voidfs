@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `upload <paths…> <drive>:[/folder]`, in the foreground: whole puts, and multipart uploads
-//! through the AWS client for large files.
+//! `upload <paths…> <drive>:[/folder] [--detach]`: handed to the daemon when one runs (or with
+//! `--detach`, which starts one), and followed until it is up unless detached; else in the
+//! foreground, with whole puts and multipart uploads through the AWS client for large files.
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -16,10 +17,13 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use voidfs_daemon::api;
 use voidfs_sdk::aws_sdk_s3::primitives::ByteStream;
 use voidfs_sdk::aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use voidfs_sdk::{Client, PutOptions};
 
+use crate::config::Connection;
+use crate::daemon::{self, DaemonOptions, Place};
 use crate::output::{Failure, Out, Result, count, size, stdout, warn};
 
 const MIB: u64 = 1 << 20;
@@ -45,6 +49,10 @@ pub struct UploadArgs {
     /// everything under it
     #[arg(required = true, num_args = 2.., value_name = "PATHS")]
     pub paths: Vec<PathBuf>,
+    /// Hand the batch to the daemon and return at once, instead of following it until it is up
+    /// (`void uploads` follows it from there). Starts the daemon if it isn't running
+    #[arg(long)]
+    pub detach: bool,
     /// Files of this many MiB and more go up in parts
     #[arg(long, hide = true, value_name = "MIB", default_value_t = MULTIPART_THRESHOLD / MIB)]
     pub multipart_threshold: u64,
@@ -75,12 +83,18 @@ struct Job {
     mode: Option<u32>,
 }
 
+/// An empty folder, which no file's key would make.
+#[derive(Debug, Clone)]
+struct Folder {
+    local: PathBuf,
+    key: String,
+}
+
 /// What a walk of the sources found.
 #[derive(Debug, Default)]
 struct Plan {
     files: Vec<Job>,
-    /// Empty folders, which no file's key would make.
-    folders: Vec<String>,
+    folders: Vec<Folder>,
     skipped: Vec<Skipped>,
 }
 
@@ -133,7 +147,7 @@ fn walk(plan: &mut Plan, dir: &Path, prefix: &str) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir).and_then(|r| r.collect::<std::io::Result<Vec<_>>>()).map_err(|e| Failure::local(dir, e))?;
     entries.sort_by_key(|e| e.file_name());
     if entries.is_empty() {
-        plan.folders.push(prefix.to_owned());
+        plan.folders.push(Folder { local: dir.to_owned(), key: prefix.to_owned() });
     }
     for e in entries {
         let path = e.path();
@@ -322,7 +336,8 @@ async fn upload_one(s: &Shared, job: &Job) -> Result<Uploaded> {
     r.map_err(|e| e.context(format!("{} -> {}:{}", job.local.display(), s.drive, job.key)))
 }
 
-pub async fn upload(client: &Client, out: Out, args: &UploadArgs) -> Result<()> {
+/// In the foreground, in this process.
+pub async fn foreground(client: &Client, out: Out, args: &UploadArgs) -> Result<()> {
     let (dest, sources) = args.paths.split_last().expect("clap requires two paths");
     let (drive, folder) = parse_destination(&dest.to_string_lossy())?;
     if args.part_size < MIN_PART_SIZE / MIB {
@@ -378,7 +393,7 @@ pub async fn upload(client: &Client, out: Out, args: &UploadArgs) -> Result<()> 
         }
     }
     let mut folders = Vec::new();
-    for key in &plan.folders {
+    for key in plan.folders.iter().map(|f| &f.key) {
         if !failed.is_empty() {
             not_attempted += 1;
             continue;
@@ -412,6 +427,167 @@ pub async fn upload(client: &Client, out: Out, args: &UploadArgs) -> Result<()> 
             let message = format!("{} of {} failed; the first: {}", failed_json.len(), plan.files.len() + plan.folders.len(), first.message);
             Err(Failure { message, ..first })
         }
+    }
+}
+
+/// Hands the upload to the daemon if one runs, or with `--detach` (starting one); else uploads in
+/// the foreground.
+pub async fn upload(conn: &Connection, out: Out, args: &UploadArgs) -> Result<()> {
+    let place = Place::new();
+    let running = match &place {
+        Ok(p) => p.status().await?,
+        Err(_) => None,
+    };
+    match running {
+        Some(s) => through_daemon(conn, out, args, &place?, &s).await,
+        None if args.detach => {
+            let place = place?;
+            let (s, _) = daemon::ensure_started(conn, &DaemonOptions::default(), &place).await?;
+            through_daemon(conn, out, args, &place, &s).await
+        }
+        None => foreground(&conn.client(|n| std::env::var(n).ok())?, out, args).await,
+    }
+}
+
+/// The name a batch goes by: its first source's, as Space names one.
+fn label(sources: &[PathBuf]) -> String {
+    let name = |p: &PathBuf| std::fs::canonicalize(p).ok().and_then(|c| c.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| p.display().to_string());
+    match sources {
+        [one] => name(one),
+        [first, rest @ ..] => format!("{} and {} more", name(first), rest.len()),
+        [] => String::new(),
+    }
+}
+
+async fn through_daemon(conn: &Connection, out: Out, args: &UploadArgs, place: &Place, status: &api::Status) -> Result<()> {
+    // The daemon uploads with the connection it was started with: one given here must be it.
+    if let Some(c) = conn.config(|n| std::env::var(n).ok())? {
+        let d = &status.daemon;
+        if c.endpoint.trim_end_matches('/') != d.endpoint.trim_end_matches('/') || c.access_key_id != d.access_key_id {
+            return Err(Failure::new(
+                "DaemonMismatch",
+                format!(
+                    "the daemon uploads to {} with key {}, not to {} with key {}: `void daemon restart` with this connection switches it",
+                    d.endpoint, d.access_key_id, c.endpoint, c.access_key_id
+                ),
+            ));
+        }
+    }
+    let (dest, sources) = args.paths.split_last().expect("clap requires two paths");
+    let (drive, folder) = parse_destination(&dest.to_string_lossy())?;
+    let plan = plan(sources, &folder)?;
+    for s in &plan.skipped {
+        if !out.json {
+            warn(&format!("skipped {}: {}", s.path.display(), s.reason));
+        }
+    }
+    let absolute = |p: &Path| std::path::absolute(p).map_err(|e| Failure::local(p, e));
+    let mut files = Vec::new();
+    let mut local: HashMap<String, PathBuf> = HashMap::new();
+    for (path, key) in plan.files.iter().map(|j| (&j.local, &j.key)).chain(plan.folders.iter().map(|f| (&f.local, &f.key))) {
+        let path = absolute(path)?;
+        local.insert(key.clone(), path.clone());
+        files.push(api::NewFile { path: path.display().to_string(), key: key.clone() });
+    }
+    if files.is_empty() {
+        return Err(Failure::invalid("nothing to upload"));
+    }
+    let q = place.client.enqueue(&api::NewBatch { label: label(sources), drive, files }).await.map_err(daemon::failure)?;
+    if args.detach {
+        let n = plan.files.len();
+        return out.emit(
+            &json!({ "batch": q.batch, "drive": q.drive, "folder": folder, "items": q.items, "bytes": q.bytes, "skipped": plan.skipped, "detached": true }),
+            || format!("Queued {} ({}) to {}:{folder} as batch {}: `void uploads --watch` follows it.", count(n, "file"), size(q.bytes), q.drive, q.batch),
+        );
+    }
+    follow(place, out, &q, &folder, &plan.skipped, &local).await
+}
+
+/// How long a batch is followed while the daemon doesn't answer (it may be restarting).
+const DAEMON_GONE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Follows a batch the daemon has until nothing of it is queued or uploading.
+async fn follow(place: &Place, out: Out, q: &api::Queued, folder: &str, skipped: &[Skipped], local: &HashMap<String, PathBuf>) -> Result<()> {
+    use voidfs_client::{Op, State};
+    let started = Instant::now();
+    let tty = std::io::stderr().is_terminal();
+    let mut gone: Option<Instant> = None;
+    let mut said = std::collections::HashSet::new();
+    let list = loop {
+        let list = match place.client.uploads(true, Some(q.batch)).await {
+            Ok(l) => l,
+            Err(voidfs_daemon::ClientError::NotRunning { .. }) if gone.get_or_insert_with(Instant::now).elapsed() < DAEMON_GONE_WAIT => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
+            Err(e) => {
+                return Err(daemon::failure(e).context(format!("batch {} waits in the daemon's journal, and goes on when it starts again", q.batch)));
+            }
+        };
+        gone = None;
+        let items = &list.queue.items;
+        for i in items.iter().filter(|i| i.state == State::Done && i.op == Op::Put) {
+            if !out.json && said.insert(i.id) {
+                clear_line(tty);
+                let from = local.get(&i.key).map_or_else(|| i.key.clone(), |p| p.display().to_string());
+                stdout(&format!("uploaded {from} -> {}:{} ({})", i.drive, i.key, size(i.size)))?;
+            }
+        }
+        let open = items.iter().filter(|i| matches!(i.state, State::Queued | State::Uploading)).count();
+        if open == 0 {
+            break list;
+        }
+        if tty && !out.json {
+            let (bytes, sent) = items.iter().fold((0, 0), |(b, s), i| (b + i.size, s + if i.state == State::Done { i.size } else { i.sent }));
+            let paused = if items.iter().any(|i| i.paused && !i.state.finished()) { " · paused: `void uploads resume`" } else { "" };
+            let pct = (sent * 100).checked_div(bytes).unwrap_or(100);
+            eprint!("\r\x1b[2K{} of {} up · {pct}% · {}/s{paused}", items.len() - open, count(items.len(), "item"), size(list.rate));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    clear_line(tty);
+    let items = &list.queue.items;
+    let file = |i: &voidfs_client::Item| json!({ "path": local.get(&i.key), "key": i.key, "size": i.size, "versionId": i.version, "conflict": i.conflict });
+    let files: Vec<_> = items.iter().filter(|i| i.state == State::Done && i.op == Op::Put).map(file).collect();
+    let folders: Vec<_> = items.iter().filter(|i| i.state == State::Done && i.op == Op::Folder).map(|i| json!({ "key": i.key, "versionId": i.version })).collect();
+    let failed: Vec<_> = items.iter().filter(|i| i.state == State::Failed).map(|i| json!({ "path": local.get(&i.key), "key": i.key, "error": i.error })).collect();
+    let cancelled = items.iter().filter(|i| i.state == State::Cancelled).count();
+    let bytes: u64 = items.iter().filter(|i| i.state == State::Done && i.op == Op::Put).map(|i| i.size).sum();
+    let summary = json!({
+        "batch": q.batch, "drive": q.drive, "folder": folder, "files": files, "folders": folders, "bytes": bytes,
+        "skipped": skipped, "failed": failed, "cancelled": cancelled,
+    });
+    let elapsed = started.elapsed().as_secs_f64();
+    out.emit(&summary, || {
+        let mut line = format!("Uploaded {} ({})", count(files.len(), "file"), size(bytes));
+        if !folders.is_empty() {
+            line.push_str(&format!(" and {}", count(folders.len(), "empty folder")));
+        }
+        line.push_str(&format!(" to {}:{folder} in {elapsed:.1} s, as batch {}.", q.drive, q.batch));
+        if cancelled > 0 {
+            line.push_str(&format!(" {cancelled} cancelled."));
+        }
+        line
+    })?;
+    match items.iter().find(|i| i.state == State::Failed) {
+        None => Ok(()),
+        Some(first) => Err(Failure::new(
+            "UploadFailed",
+            format!(
+                "{} of {} failed, and wait in the daemon (`void uploads resume --batch {}` tries them again); the first, {}: {}",
+                failed.len(),
+                items.len(),
+                q.batch,
+                first.key,
+                first.error.as_deref().unwrap_or("failed")
+            ),
+        )),
+    }
+}
+
+fn clear_line(tty: bool) {
+    if tty {
+        eprint!("\r\x1b[2K");
     }
 }
 
@@ -451,7 +627,8 @@ mod tests {
         let p = plan(&[root.join("clip.mov"), root.join("renders/")], "cuts/").unwrap();
         let keys: Vec<&str> = p.files.iter().map(|j| j.key.as_str()).collect();
         assert_eq!(keys, ["cuts/clip.mov", "cuts/renders/a/1.txt"]);
-        assert_eq!(p.folders, ["cuts/renders/empty/"]);
+        assert_eq!(p.folders.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(), ["cuts/renders/empty/"]);
+        assert_eq!(p.folders[0].local, root.join("renders/empty"));
         #[cfg(unix)]
         assert_eq!(p.skipped.iter().map(|s| s.reason).collect::<Vec<_>>(), ["a symbolic link"]);
         assert_eq!(p.files[0].size, 4);

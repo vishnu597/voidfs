@@ -4,6 +4,7 @@
 //! moment, and the next piece goes at the new rate.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// How much of a body is sent per draw on the bucket.
@@ -13,6 +14,8 @@ pub const PIECE: usize = 64 * 1024;
 #[derive(Debug)]
 pub struct Bandwidth {
     state: Mutex<State>,
+    /// Bytes let go since it was made, limited or not.
+    taken: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -25,7 +28,7 @@ struct State {
 
 impl Bandwidth {
     pub fn new(bytes_per_second: Option<u64>) -> Bandwidth {
-        Bandwidth { state: Mutex::new(State { rate: bytes_per_second.filter(|r| *r > 0), tokens: 0.0, last: Instant::now() }) }
+        Bandwidth { state: Mutex::new(State { rate: bytes_per_second.filter(|r| *r > 0), tokens: 0.0, last: Instant::now() }), taken: AtomicU64::new(0) }
     }
 
     /// The limit, in bytes a second; `None` or `Some(0)` lifts it.
@@ -45,8 +48,19 @@ impl Bandwidth {
         rate.map_or(f64::MAX, |r| (r as f64 / 4.0).max(PIECE as f64))
     }
 
+    /// Bytes the clients that share it have sent through it: what their uploads have sent, for a
+    /// rate.
+    pub fn taken(&self) -> u64 {
+        self.taken.load(Ordering::Relaxed)
+    }
+
     /// Waits until `n` bytes may go.
     pub async fn take(&self, n: usize) {
+        self.wait(n).await;
+        self.taken.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    async fn wait(&self, n: usize) {
         loop {
             let wait = {
                 let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -94,5 +108,6 @@ mod tests {
         }
         assert!(t.elapsed() < Duration::from_millis(50), "unlimited");
         assert_eq!(bw.get(), None);
+        assert_eq!(bw.taken(), (64 + 1000) * PIECE as u64, "every piece counts, limited or not");
     }
 }

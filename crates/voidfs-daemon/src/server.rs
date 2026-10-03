@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The daemon: the client core, and the socket it answers on.
 
+use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
 use tokio::sync::watch;
@@ -73,7 +74,7 @@ impl DaemonConfig {
 }
 
 /// What the handlers share.
-struct Shared {
+pub(crate) struct Shared {
     build: Build,
     pid: u32,
     started: Instant,
@@ -82,11 +83,16 @@ struct Shared {
     state_dir: PathBuf,
     endpoint: String,
     access_key_id: String,
-    queue: Queue,
+    pub(crate) client: voidfs_sdk::Client,
+    pub(crate) queue: Queue,
     cache: Cache,
     conn: Connectivity,
     /// Set when a client asks the daemon to stop.
     stop_asked: watch::Sender<bool>,
+    /// Set when the daemon starts stopping: streams end.
+    pub(crate) closing: watch::Sender<bool>,
+    /// The queue's bytes sent, sampled each second, for a rate.
+    samples: Mutex<VecDeque<(Instant, u64)>>,
 }
 
 /// A running daemon. Stop it with [`Daemon::stop`]: dropped, its tasks go on.
@@ -95,6 +101,7 @@ pub struct Daemon {
     store: Arc<Store>,
     server: tokio::task::JoinHandle<()>,
     probe: tokio::task::JoinHandle<()>,
+    sampler: tokio::task::JoinHandle<()>,
     /// Tells the server to stop answering.
     shutdown: watch::Sender<bool>,
 }
@@ -103,6 +110,8 @@ pub struct Daemon {
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 /// How long `stop` waits for requests in progress to finish.
 const DRAIN_WAIT: Duration = Duration::from_secs(5);
+/// The rate is over this many of the last samples, a second apart.
+const RATE_SAMPLES: usize = 5;
 
 async fn open_store(dir: &Path) -> Result<Arc<Store>, Error> {
     let deadline = Instant::now() + LOCK_WAIT;
@@ -159,7 +168,7 @@ impl Daemon {
                 return Err(e);
             }
         };
-        let probe = conn.probe(client);
+        let probe = conn.probe(client.clone());
         let shared = Arc::new(Shared {
             build: cfg.build.clone(),
             pid: std::process::id(),
@@ -169,15 +178,39 @@ impl Daemon {
             state_dir: dir,
             endpoint: cfg.client.endpoint.clone(),
             access_key_id: cfg.client.access_key_id.clone(),
+            client,
             queue,
             cache,
             conn,
             stop_asked: watch::Sender::new(false),
+            closing: watch::Sender::new(false),
+            samples: Mutex::new(VecDeque::new()),
+        });
+        let sampler = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    let mut s = shared.samples.lock().unwrap_or_else(|p| p.into_inner());
+                    s.push_back((Instant::now(), shared.queue.bytes_sent()));
+                    while s.len() > RATE_SAMPLES {
+                        s.pop_front();
+                    }
+                }
+            }
         });
         let app = Router::new()
             .route("/v1/status", get(status))
             .route("/v1/info", get(info))
             .route("/v1/stop", post(stop))
+            .route("/v1/uploads", get(crate::uploads::list).post(crate::uploads::enqueue))
+            .route("/v1/uploads/watch", get(crate::uploads::watch))
+            .route("/v1/uploads/pause", post(crate::uploads::pause))
+            .route("/v1/uploads/resume", post(crate::uploads::resume))
+            .route("/v1/uploads/cancel", post(crate::uploads::cancel))
+            .route("/v1/uploads/limit", put(crate::uploads::limit))
+            .route("/v1/uploads/clear", post(crate::uploads::clear))
             .fallback(not_found)
             .with_state(shared.clone());
         let (shutdown, mut rx) = watch::channel(false);
@@ -188,7 +221,7 @@ impl Daemon {
                 })
                 .await;
         });
-        Ok(Daemon { shared, store, server, probe, shutdown })
+        Ok(Daemon { shared, store, server, probe, sampler, shutdown })
     }
 
     async fn open_core(cfg: &DaemonConfig, store: &Arc<Store>) -> Result<(Queue, Cache, Connectivity, voidfs_sdk::Client), Error> {
@@ -218,7 +251,10 @@ impl Daemon {
     /// its next request), the socket goes, and then the state directory is let go, so that
     /// another daemon may take it.
     pub async fn stop(self) {
-        let Daemon { shared, store, mut server, probe, shutdown } = self;
+        let Daemon { shared, store, mut server, probe, sampler, shutdown } = self;
+        shared.closing.send_replace(true);
+        sampler.abort();
+        let _ = sampler.await;
         let _ = shutdown.send(true);
         if tokio::time::timeout(DRAIN_WAIT, &mut server).await.is_err() {
             server.abort();
@@ -236,27 +272,52 @@ impl Daemon {
     }
 }
 
-struct Failure(StatusCode, &'static str, String);
+pub(crate) struct Failure(pub StatusCode, pub String, pub String);
+
+impl Failure {
+    pub(crate) fn new(status: StatusCode, code: &str, message: impl Into<String>) -> Failure {
+        Failure(status, code.into(), message.into())
+    }
+}
 
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
-        (self.0, Json(ErrorBody { error: ApiError { code: self.1.into(), message: self.2 } })).into_response()
+        (self.0, Json(ErrorBody { error: ApiError { code: self.1, message: self.2 } })).into_response()
     }
 }
 
 impl From<voidfs_client::Error> for Failure {
     fn from(e: voidfs_client::Error) -> Failure {
-        Failure(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", e.to_string())
+        Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", e.to_string())
     }
 }
 
-type Answer<T> = Result<Json<T>, Failure>;
+/// What the server said, passed on; `502` when it couldn't be reached.
+impl From<voidfs_sdk::Error> for Failure {
+    fn from(e: voidfs_sdk::Error) -> Failure {
+        match (e.status(), e.code()) {
+            (Some(status), Some(code)) => Failure::new(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), code, e.to_string()),
+            _ => Failure::new(StatusCode::BAD_GATEWAY, "RequestFailed", e.to_string()),
+        }
+    }
+}
+
+pub(crate) type Answer<T> = Result<Json<T>, Failure>;
 
 async fn not_found(method: Method, uri: Uri) -> Failure {
-    Failure(StatusCode::NOT_FOUND, "NotFound", format!("no such request: {method} {}", uri.path()))
+    Failure::new(StatusCode::NOT_FOUND, "NotFound", format!("no such request: {method} {}", uri.path()))
 }
 
 impl Shared {
+    /// Bytes a second the queue sent, from the oldest sample to now, over a second at least.
+    pub(crate) fn rate(&self) -> u64 {
+        let now = (Instant::now(), self.queue.bytes_sent());
+        let s = self.samples.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(first) = s.front() else { return 0 };
+        let secs = now.0.duration_since(first.0).as_secs_f64().max(1.0);
+        (now.1.saturating_sub(first.1) as f64 / secs) as u64
+    }
+
     fn daemon(&self) -> api::Daemon {
         api::Daemon {
             running: true,
@@ -279,7 +340,7 @@ async fn status(State(s): State<Arc<Shared>>) -> Answer<api::Status> {
     Ok(Json(api::Status {
         daemon: s.daemon(),
         connection: api::Connection { endpoint: s.endpoint.clone(), link: s.conn.link().into() },
-        uploads: api::Uploads::of(&q),
+        uploads: api::Uploads { rate: s.rate(), ..api::Uploads::of(&q) },
         cache: api::Cache { disk_bytes: usage.disk_bytes, max_bytes: cfg.max_bytes, pinned_bytes: usage.pinned_bytes, memory_bytes: usage.memory_bytes, memory_max_bytes: cfg.memory_bytes },
     }))
 }

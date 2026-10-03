@@ -3,7 +3,7 @@
 //! directory of the test's own, against a server in this process.
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -12,47 +12,6 @@ use voidfs_server::test_server::ADMIN_KEY_ID;
 
 mod common;
 use common::*;
-
-/// A state directory for a daemon, short enough for its socket's path, and the environment that
-/// points `void` at it. Dropped, it stops the daemon and removes the directory.
-struct State {
-    dir: PathBuf,
-    env: Vec<(&'static str, String)>,
-}
-
-impl State {
-    fn new(f: &Fixture, tag: &str) -> State {
-        let dir = std::env::temp_dir().join(format!("vd{}{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut env = f.env();
-        env.push(("VOIDFS_STATE_DIR", dir.display().to_string()));
-        State { dir, env }
-    }
-
-    /// Only the state directory: no connection.
-    fn bare(&self) -> Vec<(&'static str, String)> {
-        vec![("VOIDFS_STATE_DIR", self.dir.display().to_string())]
-    }
-
-    fn void(&self, args: &[&str]) -> Run {
-        run(args, &self.env, None)
-    }
-
-    fn socket(&self) -> PathBuf {
-        self.dir.join("daemon.sock")
-    }
-
-    fn pid(&self) -> u64 {
-        self.void(&["daemon", "status", "--json"]).ok().json()["pid"].as_u64().expect("a pid")
-    }
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        let _ = run(&["daemon", "stop"], &self.bare(), None);
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
 
 fn mode(p: &Path) -> u32 {
     std::fs::metadata(p).unwrap().permissions().mode() & 0o777

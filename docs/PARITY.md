@@ -117,7 +117,7 @@ Every item of the plan's checklist (§3, 65 items, including the Finder integrat
 | Storage backends (B1–B8) | 2 | 0 | 6 | Local disk, AWS S3, Cloudflare R2, MinIO (built from source in CI) and versitygw work, and rclone works against the server. A capability probe checks the bucket at start. No other providers tried, no short-lived storage credentials, no stored bucket credentials, no adopt or export |
 | Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed (long poll and SSE), on one node. Missing: direct upload and storage credentials, a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
-| Clients (D1–D12) | 0 | 5 | 7 | A read-only macOS mount and its menu-bar shell (the spike), the CLI on the protocol, `void` (step 4, item 2), the client core (item 3): block cache, write journal and upload queue, change-feed client, and the daemon that runs it (item 4, in progress). No background uploads through the daemon yet, no mount table, Finder integration, Linux or Windows |
+| Clients (D1–D12) | 0 | 5 | 7 | A read-only macOS mount and its menu-bar shell (the spike), the CLI on the protocol, `void` (step 4, item 2), the client core (item 3): block cache, write journal and upload queue, change-feed client, and the daemon that runs it, with uploads handed to it (item 4, in progress). No mount table yet, no Finder integration, Linux or Windows |
 | SDKs, agents, search (A1–A7) | 0 | 1 | 6 | A Rust SDK on the official AWS SDK, with a typed call for every extension (step 4, item 1). Stock S3 SDKs, boto3, rclone and curl work. No TypeScript, Python or Go SDK, MCP server or search |
 | Operations (O1–O6) | 1 | 2 | 3 | One binary, with a Compose file. Health checks and Prometheus metrics on a port of their own. A benchmark harness run locally, against R2 and AWS S3 for the small objects, and in CI, not yet in SpaceFS's setup. No tracing, Helm chart, fuzzing or audit |
 | **Total** | **15** | **13** | **37** | Of the 28 P0 items: 14 done, 9 partly, 5 missing |
@@ -138,13 +138,14 @@ runs since 3 October (item 4).
   the drive allowlist exists in the code but no flag sets it.
 - D1 has the client core (step 4, item 3): the block cache with read-ahead, the write journal and
   upload queue, and the change-feed client with connectivity; and the per-user daemon that runs
-  it on a socket (item 4, in progress since 3 October). Not yet uploads handed to the daemon, the
-  mount lifecycle (step 5) or remembered mounts.
+  it on a socket, with uploads handed to it that outlive it (item 4, in progress since 3 October).
+  Not yet the mount lifecycle (step 5) or remembered mounts.
 - D3 is read-only, D6 relies on the kernel's read-ahead only (the client core's cache and
   read-ahead reach the mount in step 5), and D11 is the spike's shell.
 - D9 has the commands that need no account (`void`, step 4, item 2), and since 3 October `void
-  daemon run|start|stop|restart|status|info` and `void status` (item 4): not yet login,
-  workspaces, minting keys, mounts, background uploads or self-update.
+  daemon run|start|stop|restart|status|info`, `void status`, `void upload --detach` and `void
+  uploads` with pause, resume, cancel and a limit (item 4): not yet login, workspaces, minting
+  keys, mounts or self-update.
 - A1 has the Rust SDK; TypeScript (P0) waits for step 7, with Python and Go (P1).
 - O4 has health checks and metrics, not tracing or structured logs. O5 has run locally, against R2
   and AWS S3 (the 23 small-object scenarios) and in CI, not yet in SpaceFS's setup.
@@ -766,7 +767,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - The daemon, and the CLI's commands on it: daemon, upload, uploads, status, and the mount table
      that mount, unmount and mounts use (mounting comes with step 5). **In progress** (3 October):
      the daemon on its socket (HTTP and JSON), `void daemon run|start|stop|restart|status|info`
-     and `void status`.
+     and `void status`; uploads through it (`void upload --detach`, `void uploads`), which survive
+     its restart.
    - Direct uploads (E10, §4.11), server and client.
    - Short-lived storage credentials (B4, §5.5): AWS STS, R2, MinIO. Presigned URLs as a fallback,
      and an object's shard list for the API path, would be protocol additions (RFC first).

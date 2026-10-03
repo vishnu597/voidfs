@@ -22,6 +22,30 @@ const LOG_MAX: u64 = 8 << 20;
 /// The connection variables a daemon `start` launches must not see: it reads `daemon.json`.
 const CONNECTION_VARS: [&str; 5] = ["VOIDFS_ENDPOINT", "VOIDFS_ACCESS_KEY_ID", "VOIDFS_SECRET_ACCESS_KEY", "VOIDFS_KEY_FILE", "VOIDFS_REGION"];
 
+/// How the daemon's queue cuts large files, for tests (hidden flags of `daemon run|start|restart`).
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct DaemonOptions {
+    /// Files of this many MiB and more go up in parts
+    #[arg(long, hide = true, value_name = "MIB")]
+    pub multipart_threshold: Option<u64>,
+    /// The size of each part, in MiB (at least 5)
+    #[arg(long, hide = true, value_name = "MIB")]
+    pub part_size: Option<u64>,
+}
+
+impl DaemonOptions {
+    fn args(&self) -> Vec<String> {
+        let mut a = Vec::new();
+        if let Some(t) = self.multipart_threshold {
+            a.extend(["--multipart-threshold".into(), t.to_string()]);
+        }
+        if let Some(p) = self.part_size {
+            a.extend(["--part-size".into(), p.to_string()]);
+        }
+        a
+    }
+}
+
 pub fn build() -> Build {
     Build { version: env!("CARGO_PKG_VERSION").into(), commit: env!("VOID_COMMIT").into(), commit_date: env!("VOID_COMMIT_DATE").into() }
 }
@@ -85,14 +109,21 @@ fn connection(conn: &Connection, dir: &Path) -> Result<voidfs_sdk::Config> {
 }
 
 /// `daemon run`: the daemon in the foreground, until a client or a signal stops it.
-pub async fn run(conn: &Connection) -> Result<()> {
+pub async fn run(conn: &Connection, opts: &DaemonOptions) -> Result<()> {
     let place = Place::new()?;
     if let Some(s) = place.status().await? {
         return Err(Failure::new("DaemonRunning", format!("a daemon is already running on {} (pid {})", place.dir.display(), s.daemon.pid)));
     }
     let config = connection(conn, &place.dir)?;
     let endpoint = config.endpoint.clone();
-    let daemon = Daemon::start(DaemonConfig::new(&place.dir, config, build())).await.map_err(|e| match e {
+    let mut cfg = DaemonConfig::new(&place.dir, config, build());
+    if let Some(t) = opts.multipart_threshold {
+        cfg.queue.multipart_from = t << 20;
+    }
+    if let Some(p) = opts.part_size {
+        cfg.queue.part_size = p.max(5) << 20;
+    }
+    let daemon = Daemon::start(cfg).await.map_err(|e| match e {
         voidfs_daemon::Error::Locked(_) => Failure::new("DaemonRunning", format!("{e}: `void daemon status` says which")),
         voidfs_daemon::Error::Socket(m) => Failure::new("SocketError", m),
         voidfs_daemon::Error::Client(e) => Failure::new("StateError", e.to_string()),
@@ -137,7 +168,7 @@ fn log_tail(dir: &Path) -> String {
 
 /// Starts a daemon in the background unless one answers; returns its status, and whether it was
 /// started now.
-pub async fn ensure_started(conn: &Connection, place: &Place) -> Result<(api::Status, bool)> {
+pub async fn ensure_started(conn: &Connection, opts: &DaemonOptions, place: &Place) -> Result<(api::Status, bool)> {
     if let Some(s) = place.status().await? {
         return Ok((s, false));
     }
@@ -146,7 +177,7 @@ pub async fn ensure_started(conn: &Connection, place: &Place) -> Result<(api::St
     let log = open_log(&place.dir)?;
     let exe = std::env::current_exe().map_err(|e| Failure::new("InternalError", format!("finding the void binary: {e}")))?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["daemon", "run"]).stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e| Failure::local(&place.dir, e))?).stderr(log);
+    cmd.args(["daemon", "run"]).args(opts.args()).stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e| Failure::local(&place.dir, e))?).stderr(log);
     // Its own process group, so that the terminal's Ctrl-C doesn't reach it.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     for v in CONNECTION_VARS {
@@ -168,9 +199,9 @@ pub async fn ensure_started(conn: &Connection, place: &Place) -> Result<(api::St
     }
 }
 
-pub async fn start(conn: &Connection, out: Out) -> Result<()> {
+pub async fn start(conn: &Connection, opts: &DaemonOptions, out: Out) -> Result<()> {
     let place = Place::new()?;
-    let (s, started) = ensure_started(conn, &place).await?;
+    let (s, started) = ensure_started(conn, opts, &place).await?;
     let d = &s.daemon;
     let word = if started { "started" } else { "already running" };
     out.emit(&json!({ "running": true, "started": started, "pid": d.pid, "socket": d.socket }), || format!("daemon {word} (pid {}, socket {})", d.pid, d.socket))
@@ -217,10 +248,10 @@ pub async fn stop(out: Out) -> Result<()> {
     }
 }
 
-pub async fn restart(conn: &Connection, out: Out) -> Result<()> {
+pub async fn restart(conn: &Connection, opts: &DaemonOptions, out: Out) -> Result<()> {
     let place = Place::new()?;
     let old = stop_daemon(&place).await?;
-    let (s, _) = ensure_started(conn, &place).await?;
+    let (s, _) = ensure_started(conn, opts, &place).await?;
     let d = &s.daemon;
     out.emit(&json!({ "running": true, "stoppedPid": old, "pid": d.pid, "socket": d.socket }), || format!("daemon restarted (pid {}, socket {})", d.pid, d.socket))
 }
@@ -267,6 +298,15 @@ pub async fn info(out: Out) -> Result<()> {
     })
 }
 
+/// What the journal holds unpublished while no daemon runs, if its state can be read.
+fn waiting(dir: &Path) -> Option<(u64, u64)> {
+    if !dir.join("state.sqlite").exists() {
+        return None;
+    }
+    let store = voidfs_client::Store::open(dir).ok()?;
+    voidfs_client::queue::unpublished(&store).ok()
+}
+
 /// The uploads line of `status`.
 fn uploads_line(u: &api::Uploads) -> String {
     if u.unpublished == 0 {
@@ -279,6 +319,9 @@ fn uploads_line(u: &api::Uploads) -> String {
         }
     }
     let mut line = format!("{} · {} to send", parts.join(", "), size(u.unpublished_bytes));
+    if u.rate > 0 {
+        line.push_str(&format!(" · {}/s", size(u.rate)));
+    }
     if u.paused {
         line.push_str(" · paused");
     } else if u.paused_items > 0 {
@@ -297,8 +340,17 @@ pub async fn status(out: Out) -> Result<()> {
     let place = Place::new()?;
     let Some(s) = place.status().await? else {
         let socket = place.socket().display();
-        return out.emit(&json!({ "daemon": { "running": false, "socket": place.socket() } }), || {
-            format!("daemon    not running (socket {socket})\n          start it with `void daemon start`")
+        let waiting = waiting(&place.dir);
+        let mut v = json!({ "daemon": { "running": false, "socket": place.socket() } });
+        if let Some((n, bytes)) = waiting {
+            v["uploads"] = json!({ "unpublished": n, "unpublishedBytes": bytes });
+        }
+        return out.emit(&v, || {
+            let mut text = format!("daemon    not running (socket {socket})\n          start it with `void daemon start`");
+            if let Some((n, bytes)) = waiting.filter(|(n, _)| *n > 0) {
+                text.push_str(&format!("\nuploads   {} ({}) wait in the journal, for the daemon to start", count(n as usize, "change"), size(bytes)));
+            }
+            text
         });
     };
     out.emit(&s, || {

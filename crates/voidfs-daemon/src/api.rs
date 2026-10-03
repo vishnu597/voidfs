@@ -7,6 +7,15 @@
 //!   is safe, as SpaceFS's `daemon info` reports.
 //! - `POST /v1/stop`: answers `202` and stops: what is uploading stops at its next request, and
 //!   goes on from the journal when the daemon starts again.
+//! - `POST /v1/uploads`: [`NewBatch`], files and folders of the user's to upload as one batch;
+//!   answers [`Queued`].
+//! - `GET /v1/uploads[?all=true][&batch=<id>]`: [`UploadList`], what is not yet published (or
+//!   everything, with `all`), and every batch (or one).
+//! - `GET /v1/uploads/watch[?all=true][&batch=<id>]`: the same as a stream, one JSON document a
+//!   line, each second.
+//! - `POST /v1/uploads/pause`, `…/resume` and `…/cancel`: a [`Scope`]; answer [`Affected`].
+//! - `PUT /v1/uploads/limit`: [`Limit`], the upload bandwidth limit, at once.
+//! - `POST /v1/uploads/clear`: forgets finished uploads; answers [`Cleared`].
 //!
 //! An error is `{"error": {"code", "message"}}`, with a 4xx or 5xx status.
 
@@ -91,6 +100,9 @@ pub struct Uploads {
     pub paused_drives: Vec<String>,
     /// Bytes a second; `None` is unlimited.
     pub bandwidth: Option<u64>,
+    /// Bytes a second the uploads went at, over the last few seconds.
+    #[serde(default)]
+    pub rate: u64,
 }
 
 impl Uploads {
@@ -108,6 +120,7 @@ impl Uploads {
             paused: s.paused,
             paused_drives: s.paused_drives.clone(),
             bandwidth: s.bandwidth,
+            rate: 0,
         }
     }
 }
@@ -175,6 +188,80 @@ impl Journal {
             imports: open().filter(|i| i.batch.is_some()).count() as u64,
         }
     }
+}
+
+/// A file or folder to upload: where it is, by absolute path, and the key it goes to. A folder
+/// is made, with its attributes; what is in it is named by files of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewFile {
+    pub path: String,
+    pub key: String,
+}
+
+/// `POST /v1/uploads`: one batch, into one drive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewBatch {
+    pub label: String,
+    /// By alias or id.
+    pub drive: String,
+    pub files: Vec<NewFile>,
+}
+
+/// What `POST /v1/uploads` queued.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Queued {
+    pub batch: i64,
+    /// The drive's alias, as the server names it.
+    pub drive: String,
+    pub items: u64,
+    pub bytes: u64,
+}
+
+/// `GET /v1/uploads`: the queue's items and batches, with how fast it goes. `unpublished` and
+/// the rate are the whole queue's, whatever the filter.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadList {
+    #[serde(flatten)]
+    pub queue: voidfs_client::Status,
+    /// Bytes a second, over the last few seconds.
+    pub rate: u64,
+    /// Seconds until what is unpublished is sent, at that rate.
+    pub eta_secs: Option<u64>,
+}
+
+/// What a pause, a resume or a cancel applies to: `"all"`, `{"drive": …}`, `{"batch": …}` or
+/// `{"entry": …}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Scope {
+    All,
+    Drive(String),
+    Batch(i64),
+    Entry(i64),
+}
+
+/// How many unfinished uploads a pause, a resume or a cancel applied to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Affected {
+    pub items: u64,
+}
+
+/// `PUT /v1/uploads/limit`, and its answer: bytes a second, `None` (or 0) for unlimited.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Limit {
+    pub bytes_per_second: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cleared {
+    pub cleared: u64,
 }
 
 /// `POST /v1/stop`.

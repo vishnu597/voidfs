@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore};
 use voidfs_sdk::{Bandwidth, Client};
 
@@ -75,7 +75,8 @@ pub enum Scope {
     Entry(EntryId),
 }
 
-/// A file of the user's to upload.
+/// A file of the user's to upload, or a folder to make (an empty one, which no file's key would
+/// make), with the folder's attributes.
 #[derive(Clone, Debug)]
 pub struct Import {
     pub path: PathBuf,
@@ -83,7 +84,7 @@ pub struct Import {
     pub key: String,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Item {
     pub id: EntryId,
@@ -107,7 +108,7 @@ pub struct Item {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchStatus {
     pub id: BatchId,
@@ -121,7 +122,7 @@ pub struct BatchStatus {
     pub paused: bool,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub items: Vec<Item>,
@@ -192,6 +193,13 @@ pub struct Queue(Arc<Inner>);
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f).await?
+}
+
+/// What the journal in `store` holds unpublished, and the bytes it has left to send, without
+/// opening the queue: for a status while no daemon runs.
+pub fn unpublished(store: &Store) -> Result<(u64, u64)> {
+    let entries = store.with(|c| journal::unfinished(c))?;
+    Ok((entries.len() as u64, entries.iter().map(|e| e.size.saturating_sub(e.sent)).sum()))
 }
 
 /// Is `key` the folder `prefix` (ending in `/`) or inside it?
@@ -385,6 +393,13 @@ impl Queue {
             let mut entries = Vec::with_capacity(files.len());
             for f in &files {
                 let meta = std::fs::metadata(&f.path)?;
+                if meta.is_dir() {
+                    let key = if f.key.ends_with('/') { f.key.clone() } else { format!("{}/", f.key) };
+                    let mut e = Entry::new(&f.drive, &key, Op::Folder, StoredBase::Any);
+                    e.attrs = attrs_of(&f.path, &meta);
+                    entries.push(e);
+                    continue;
+                }
                 let mut e = Entry::new(&f.drive, &f.key, Op::Put, StoredBase::Any);
                 e.source = Some(f.path.clone());
                 e.stamp = Some(Stamp::of(&meta));
@@ -540,6 +555,11 @@ impl Queue {
         self.0.bandwidth.set(bytes_per_second);
         let store = self.0.store.clone();
         blocking(move || store.set_meta("bandwidth", &bytes_per_second.unwrap_or(0).to_string())).await
+    }
+
+    /// Bytes the queue's requests have sent since it opened, sent again or not: for a rate.
+    pub fn bytes_sent(&self) -> u64 {
+        self.0.bandwidth.taken()
     }
 
     /// Forgets entries that are done or cancelled (SpaceFS's Clear, for Recent).
