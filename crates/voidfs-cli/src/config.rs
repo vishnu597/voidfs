@@ -29,6 +29,17 @@ pub struct Connection {
 impl Connection {
     /// The client these flags and `env` describe.
     pub fn client(&self, env: impl Fn(&str) -> Option<String>) -> Result<Client> {
+        let config = self.config(env)?.ok_or_else(|| {
+            Failure::new(
+                "NoCredentials",
+                "no access key: set VOIDFS_ACCESS_KEY_ID and VOIDFS_SECRET_ACCESS_KEY, or pass --key-file (`void keys generate --format env` makes a key)",
+            )
+        })?;
+        Ok(Client::new(config)?)
+    }
+
+    /// The configuration these flags and `env` describe, or `None` if they give no key.
+    pub fn config(&self, env: impl Fn(&str) -> Option<String>) -> Result<Option<Config>> {
         let env = |n: &str| env(n).filter(|v| !v.is_empty());
         let file = match self.key_file.clone().or_else(|| env("VOIDFS_KEY_FILE").map(PathBuf::from)) {
             Some(p) => Some(read_key_file(&p)?),
@@ -38,10 +49,7 @@ impl Connection {
         let id = self.access_key_id.clone().or(file_id).or_else(|| env("VOIDFS_ACCESS_KEY_ID"));
         let secret = self.secret_access_key.clone().or(file_secret).or_else(|| env("VOIDFS_SECRET_ACCESS_KEY"));
         let (Some(access_key_id), Some(secret_access_key)) = (id, secret) else {
-            return Err(Failure::new(
-                "NoCredentials",
-                "no access key: set VOIDFS_ACCESS_KEY_ID and VOIDFS_SECRET_ACCESS_KEY, or pass --key-file (`void keys generate --format env` makes a key)",
-            ));
+            return Ok(None);
         };
         let mut config = Config { access_key_id, secret_access_key, ..Config::default() };
         if let Some(e) = self.endpoint.clone().or_else(|| env("VOIDFS_ENDPOINT")) {
@@ -50,7 +58,7 @@ impl Connection {
         if let Some(r) = env("VOIDFS_REGION") {
             config.region = r;
         }
-        Ok(Client::new(config)?)
+        Ok(Some(config))
     }
 }
 
