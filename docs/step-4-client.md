@@ -39,7 +39,7 @@ client. JSON output everywhere, as SpaceFS's CLI has.
   prefix, with `canWrite`, `accessGeneration`, a `storageBudget` the writer enforces, and a
   `backend` (for example `r2`); `501` where the deployment can't mint them.
 
-### 1.2 The CLI (read: `spacefs --help` and every subcommand's, 0.2.333; observed: the read-only commands)
+### 1.2 The CLI (read: `spacefs --help` and every subcommand's, 0.2.333; observed: the read-only commands, and the daemon running in 0.2.343)
 
 - `space 0.2.333 (8bebbc8, 2026-09-30)`: the app updated itself from 0.2.300 since the last
   stocktake. The CLI is `spacefs-fskitd`, which is also the mount daemon.
@@ -77,6 +77,48 @@ client. JSON output everywhere, as SpaceFS's CLI has.
 - The daemon's requests (inferred from strings): `uploads_pause`, `uploads_resume`,
   `uploads_cancel`, `uploads_status`, `list_upload_queue`, a bandwidth setter, `set_cache_dir`,
   `set_cache_limit`, `set_readahead`, and `set_pinned`, `pin_state`, `pins_changed`.
+
+**The daemon, running (observed, 3 October, 0.2.343 (`403cbab`, 2 October), to which the app had
+updated itself).** The app wasn't running and nothing was mounted; the CLI was signed in.
+- `daemon start` took 0.1 s: it spawned `spacefs-fskitd --socket <state>/fskitd.sock --log-file
+  <state>/spacefs-fskitd.log`, detached (its parent launchd, in a process group of its own), and
+  said "daemon started (socket …)". Its help still says it spawns `spacefs-fused`. Run again, it
+  says "daemon already running (socket …)", with status 0.
+- The state directory (`~/Library/Application Support/spacefs`) became `0700`, the socket is
+  `0600`, and `fskitd.sock.lock` holds the daemon's pid. The log is JSON lines: the build, the
+  process (pid, parent, user, working directory), the disk cache
+  (`~/Library/Caches/spacefs/blocks2`, at most 20,480 MB), and a diagnostic of the host (macOS
+  version, SIP, the code signature, Gatekeeper's verdict, file limits) that took 328 ms.
+- `daemon status`: "daemon running · up 5s · 0 drive(s) mounted · socket …".
+- `daemon info`, text only: version, pid, uptime, socket, mounts, `restart safe YES`, and the
+  counters behind it: `writeback` ("0 cached bytes, 0 pinned"), `dirty handles` (handles,
+  bytes), `in flight` ("0 non-resumable, 0 total, 0 metadata"), `upload queue` (shards, bytes
+  remaining) and `resumable` ("0 import(s) (source on disk + journaled)"). (Inferred: restart
+  safe turns NO while write-back bytes or non-resumable requests are in flight.)
+- `status --json` is `{"daemon": {"running", "socket", "uptime_secs"}, "mounts": [], "uploads":
+  {…}}`, where `uploads` is the daemon's `uploads_status` answer, as `uploads --json` prints it:
+  `uploads`, `batches`, `results`, `total_files`, `files_placing`, `files_preparing`,
+  `remaining_bytes`, `queue_depth`, `workers_busy`, `workers_total` and `bandwidth_boosted`. As
+  text: "daemon running · up 5s · socket …", "drives none mounted", "uploads idle". `uploads`
+  says "no uploads in flight".
+- `mounts --json` is `[]` while the daemon runs, and the object above while it doesn't.
+- The socket doesn't speak HTTP (a `GET` gets an empty answer), and neither one JSON line nor a
+  length-prefixed JSON message got an answer. (Inferred from strings: tagged JSON requests such
+  as `ping`, `hello`, `daemon_info`, `list_mounts`, `mount`, `unmount`, `uploads_status`,
+  `uploads_pause`, `uploads_resume`, `uploads_cancel`, `list_pending_uploads`,
+  `set_upload_bandwidth`, `set_cache_limit`, `pins_status` and `shutdown`.)
+- `daemon restart` took 0.4 s. `daemon stop` returns at once (8 ms) with "daemon stopping (volumes
+  detach; remembered drives restore on next start)", without waiting for it, and leaves the
+  socket and its lock file behind. Run again: "daemon not running", status 0.
+- **`upload` needs a mounted drive, and doesn't start the daemon.** With the daemon running and
+  nothing mounted, `upload --detach <file> <drive>:/void-probe/daemon` failed at once: "import
+  failed — is <drive> mounted? (`space mounts`, then `space mount --bucket <drive>
+  <mountpoint>`)", caused by "unknown session (the daemon restarted; remount required)". With the
+  daemon stopped, it failed the same way, the daemon "not reachable" (the connection refused on
+  the socket left behind), and started none. Nothing was uploaded; mounting the drive was
+  outside what was approved, so not tried.
+- `daemon install|uninstall` write a systemd user unit, "Linux only": on macOS, the app is what
+  brings the daemon back.
 
 ### 1.3 The Mac app (observed through computer use, 1 October, 0.2.333)
 
@@ -661,6 +703,62 @@ relist.
 
 **Checklist:** D1, D9.
 
+**Status (3 October 2026): in progress**, in three pull requests: the daemon and its socket,
+uploads through it, and the mount table with the launchd agent. What the first built:
+- `crates/voidfs-daemon`: `Daemon`, which owns the state directory (the `Store`, the cache, the
+  upload queue and connectivity) and answers on its socket; `api`, what the socket speaks;
+  `DaemonClient`, a client for it; and `Settings`, the connection a daemon is left with.
+- `void daemon run|start|stop|restart|status|info` and `void status`.
+
+**Decisions taken while building the first:**
+- **A crate of its own,** `voidfs-daemon`, which the `void` binary runs (`void daemon run`), as
+  `spacefs-fskitd` is both Space's CLI and its daemon. The CLI talks to it through its
+  `DaemonClient`; the tests start it in their own process as well as through the binary. The
+  feed watches come with the mounts they serve (the third pull request).
+- **The socket:** `<state>/daemon.sock`, HTTP/1.1 with JSON under `/v1/` (axum 0.8 serves a
+  `tokio::net::UnixListener`; the client is reqwest 0.13's `unix_socket`): `GET /v1/status`,
+  `GET /v1/info`, `POST /v1/stop`, and errors as `{"error": {"code", "message"}}`. Space's
+  socket isn't HTTP (§1.2); voidfs's is, so that the Mac app and `curl --unix-socket` speak it
+  too. Only its user may use it (`0600`), and the state directory is made `0700`, since it holds
+  copies of the user's bytes and the daemon's key: Space does the same.
+- **One daemon per state directory:** it holds the store's lock. A socket nothing answers on was
+  left by a daemon that died, and is replaced once the lock is held. Stopping removes the socket
+  and only then lets go of the lock, so that a daemon starting meanwhile keeps its own socket; a
+  daemon that starts waits up to 2 s for one that is stopping.
+- **The path's length:** a Unix socket's path may have 103 bytes on macOS (107 on Linux). The
+  default, `~/Library/Application Support/voidfs/daemon.sock`, is about 60; a longer one is
+  refused with what to do (set `VOIDFS_STATE_DIR` to a shorter directory).
+- **The daemon's connection:** `daemon start` takes the server and key as every command does
+  (flags, key file, environment), keeps them in `<state>/daemon.json`, readable by the user only,
+  and launches the daemon with the connection variables taken out of its environment, so that it
+  reads that file. A daemon launchd starts at login then needs no secret in its plist. `daemon
+  run` uses a connection it is given, else the file. Space's daemon uses the session `space
+  login` keeps in its `config.json`; the Keychain can hold the key once accounts exist (step 6).
+- **`daemon start`** launches `void daemon run` in its own process group, so that the terminal's
+  Ctrl-C doesn't reach it (it ignores SIGHUP too), with its output in `<state>/daemon.log`
+  (moved to `daemon.log.1` past 8 MiB), and returns once the socket answers, or with the log's
+  last lines if the daemon exits. Run while one is running, it says so, with status 0, as
+  Space's. `daemon run` refuses at once when a daemon answers.
+- **`daemon stop` waits** until the daemon has stopped and let go of the state directory, at most
+  a minute, so that `restart` and scripts can count on it; Space's returns at once and leaves
+  its socket behind. What is uploading stops at its next request, and goes on from the journal
+  when the daemon starts again. SIGTERM and SIGINT stop it the same way.
+- **Restart safe** (`daemon info`) is yes while no change is held only in memory. The journal
+  syncs every change before its call returns, so it is yes today; `memoryOnlyBytes` is where
+  step 5's mount will count writes it holds before journaling them. `info` also says what a
+  restart costs: the entries uploading now are sent again (a large file from its last finished
+  part), and imports are read from where they are, so they must stay there. Space counts
+  write-back bytes, dirty handles, requests in flight and resumable imports (§1.2). Unlike
+  Space's, `info` has `--json`, and with no daemon it fails (`DaemonNotRunning`, status 1),
+  where Space's prints "daemon not running" with status 0.
+- **`status`:** the daemon, the server and the link to it (online, degraded or offline), the
+  upload queue counted, and the cache. With no daemon it is `{"daemon": {"running": false,
+  "socket": …}}`, as Space's. The mounts and their feeds join it with the mount table.
+- The daemon's log is lines with times on its stderr: its start, its stop and why. A stderr that
+  went away (the terminal that ran `void daemon run`, closed) doesn't stop it: a write that fails
+  is dropped. Before, its next line panicked, and the daemon died leaving its socket; `daemon
+  stop` also takes a state directory nothing holds as stopped, socket or not.
+
 **Design.** The `void` binary also runs as the per-user agent (`void daemon run`), as
 `spacefs-fskitd` is both; the spike decided on a per-user agent for the Rust core (spike §4.1).
 - A Unix socket in the state directory, HTTP with JSON over it (the Mac app will speak the same).
@@ -763,5 +861,10 @@ for first); a cold read through the bucket against one through the API.
   broken, 16 breaks in all.
 - RFC 0004, which the user accepted on 2 October, is implemented: folder restores are in every
   restored file's history in a pool with `multi-object-versions` (item 2, above).
-- Next: the daemon and the CLI's daemon commands (item 4).
-- Items 4–6: not started.
+- Item 4, the daemon and the CLI's daemon commands: **in progress** (3 October). The daemon and
+  its socket are built, with `void daemon run|start|stop|restart|status|info` and `void status`:
+  their 12 tests (2 unit, 3 with the daemon in the test's own process, and 7 that run the binary
+  against a server in the same process) each failed with the code they guard broken, 27 breaks
+  in all, each run alone with a timeout. Space's daemon was observed running (§1.2). Next:
+  uploads through the daemon, then the mount table and the launchd agent.
+- Items 5–6: not started.

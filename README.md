@@ -85,8 +85,19 @@ void drive delete footage-try                 # asks for the name; recoverable f
   `{"error": {"code", "status", "message", …}}`, with exit status 1 (2 for a usage error).
 - `void keys generate --scope read|write|admin` makes more keys: give each to the server as
   `--key <id>:<secret>:<scope>`.
-- `void upload` runs in the foreground for now. Background uploads, mounts and the daemon come
-  next ([step 4's plan](docs/step-4-client.md)).
+- `void upload` runs in the foreground for now. Background uploads through the daemon, and the
+  mount table, come next ([step 4's plan](docs/step-4-client.md)).
+
+The daemon is the per-user agent that owns the client core: the upload queue, the block cache and
+the link to the server. It answers on a socket in the state directory
+(`~/Library/Application Support/voidfs`, or `VOIDFS_STATE_DIR`), in HTTP and JSON.
+
+```bash
+void daemon start     # in the background; it keeps the server and key it was given, for you only
+void status           # the daemon, the server and the link to it, uploads and the cache, on one page
+void daemon info      # its build, what its journal holds unpublished, and whether a restart is safe
+void daemon restart   # stop, then start; `void daemon stop` waits until it has stopped
+```
 
 ### The Rust SDK
 
@@ -285,7 +296,8 @@ nothing on either port does. The drives' state, which the server serves from, st
 | [`crates/voidfs-server`](crates/voidfs-server/) | The S3 server: storage backends, commit log, checkpoints, forks, SigV4, change feed |
 | [`crates/voidfs-sdk`](crates/voidfs-sdk/) | The Rust SDK: the AWS SDK for S3 plus typed calls for the extensions |
 | [`crates/voidfs-cli`](crates/voidfs-cli/) | `void`, the command line, on the SDK |
-| [`crates/voidfs-client`](crates/voidfs-client/) | The client core the daemon and the mount will run: the block cache with read-ahead, the write journal and upload queue, and the change-feed client with connectivity, on the SDK |
+| [`crates/voidfs-client`](crates/voidfs-client/) | The client core the daemon runs, and the mount will: the block cache with read-ahead, the write journal and upload queue, and the change-feed client with connectivity, on the SDK |
+| [`crates/voidfs-daemon`](crates/voidfs-daemon/) | The per-user daemon `void daemon run` runs: the client core behind a Unix socket, with HTTP and JSON over it |
 | [`crates/voidfs-conformance`](crates/voidfs-conformance/) | Runs the conformance suite against any endpoint |
 | [`crates/voidfs-bench`](crates/voidfs-bench/), [`bench/`](bench/) | SpaceFS's 49 benchmark scenarios, run through voidfs and against the bare bucket; scripts and results |
 | [`tests/interop/`](tests/interop/) | Checks with stock S3 clients (boto3, rclone); `run.sh` runs them and the conformance suite over each kind of store |
