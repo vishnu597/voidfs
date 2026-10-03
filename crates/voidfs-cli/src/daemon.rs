@@ -94,7 +94,7 @@ fn log(msg: &str) {
 }
 
 /// The connection the daemon should use: the one given, else what `daemon.json` holds.
-fn connection(conn: &Connection, dir: &Path) -> Result<voidfs_sdk::Config> {
+pub fn connection(conn: &Connection, dir: &Path) -> Result<voidfs_sdk::Config> {
     if let Some(c) = conn.config(|n| std::env::var(n).ok())? {
         return Ok(c);
     }
@@ -174,6 +174,19 @@ pub async fn ensure_started(conn: &Connection, opts: &DaemonOptions, place: &Pla
     }
     let config = connection(conn, &place.dir)?;
     Settings::of(&config).save(&place.dir).map_err(|e| Failure::local(&Settings::path(&place.dir), e))?;
+    // The launchd agent, when it is installed, so that launchd keeps the daemon it starts.
+    if crate::launchd::installed() && crate::launchd::kickstart() {
+        let deadline = Instant::now() + START_WAIT;
+        loop {
+            if let Some(s) = place.status().await? {
+                return Ok((s, true));
+            }
+            if Instant::now() > deadline {
+                return Err(Failure::new("DaemonFailed", format!("launchd started {}, but its daemon didn't answer within {} s; its log:\n{}", crate::launchd::LABEL, START_WAIT.as_secs(), log_tail(&place.dir))));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
     let log = open_log(&place.dir)?;
     let exe = std::env::current_exe().map_err(|e| Failure::new("InternalError", format!("finding the void binary: {e}")))?;
     let mut cmd = std::process::Command::new(exe);
@@ -217,7 +230,7 @@ fn free(dir: &Path) -> bool {
 
 /// Asks the daemon to stop and waits until it has let go of the state directory. `None` if none
 /// was running.
-async fn stop_daemon(place: &Place) -> Result<Option<u32>> {
+pub async fn stop_daemon(place: &Place) -> Result<Option<u32>> {
     let pid = match place.client.stop().await {
         Ok(s) => s.pid,
         Err(ClientError::NotRunning { .. }) => return Ok(None),
@@ -272,7 +285,7 @@ pub async fn daemon_status(out: Out) -> Result<()> {
     match place.status().await? {
         Some(s) => {
             let d = &s.daemon;
-            out.emit(d, || format!("daemon running · pid {} · up {} · socket {}", d.pid, uptime(d.uptime_secs), d.socket))
+            out.emit(d, || format!("daemon running · pid {} · up {} · {} · socket {}", d.pid, uptime(d.uptime_secs), count(s.mounts.len(), "mount"), d.socket))
         }
         None => out.emit(&json!({ "running": false, "socket": place.socket() }), || format!("daemon not running (socket {})", place.socket().display())),
     }
@@ -289,6 +302,7 @@ pub async fn info(out: Out) -> Result<()> {
             ("uptime", uptime(i.uptime_secs)),
             ("socket", i.socket.clone()),
             ("state", i.state_dir.clone()),
+            ("mounts", i.mounts.to_string()),
             ("restart safe", if i.restart_safe { "yes".into() } else { format!("NO: {} only in memory", size(i.memory_only_bytes)) }),
             ("journal", format!("{} unpublished, {} to send, all of it on disk", count(j.unpublished as usize, "change"), size(j.unpublished_bytes))),
             ("uploading", format!("{} now: a restart sends a file again, or a large one from its last part", j.uploading)),
@@ -367,7 +381,14 @@ pub async fn status(out: Out) -> Result<()> {
             ("uploads", uploads_line(&s.uploads)),
             ("cache", format!("{} of {} on disk · {} of {} in memory", size(c.disk_bytes), size(c.max_bytes), size(c.memory_bytes), size(c.memory_max_bytes))),
         ];
-        rows.iter().map(|(k, v)| format!("{k:<10}{v}")).collect::<Vec<_>>().join("\n")
+        let mut lines: Vec<String> = rows.iter().map(|(k, v)| format!("{k:<10}{v}")).collect();
+        if s.mounts.is_empty() {
+            lines.push(format!("{:<10}none", "mounts"));
+        }
+        for (i, m) in s.mounts.iter().enumerate() {
+            lines.push(format!("{:<10}{}", if i == 0 { "mounts" } else { "" }, crate::mounts::line(m)));
+        }
+        lines.join("\n")
     })
 }
 

@@ -16,6 +16,10 @@
 //! - `POST /v1/uploads/pause`, `…/resume` and `…/cancel`: a [`Scope`]; answer [`Affected`].
 //! - `PUT /v1/uploads/limit`: [`Limit`], the upload bandwidth limit, at once.
 //! - `POST /v1/uploads/clear`: forgets finished uploads; answers [`Cleared`].
+//! - `GET /v1/mounts`: [`Mounts`], the mount table and the remembered mounts.
+//! - `POST /v1/mounts`: [`NewMount`]; mounts a drive with an adapter and remembers it; answers
+//!   [`Mount`].
+//! - `POST /v1/mounts/unmount`: [`Unmount`]; unmounts and forgets; answers [`Unmounted`].
 //!
 //! An error is `{"error": {"code", "message"}}`, with a 4xx or 5xx status.
 
@@ -144,6 +148,74 @@ pub struct Status {
     pub connection: Connection,
     pub uploads: Uploads,
     pub cache: Cache,
+    #[serde(default)]
+    pub mounts: Vec<Mount>,
+}
+
+/// A drive's change feed, as a mount follows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Feed {
+    /// The position the mount has seen up to.
+    pub seq: u64,
+    /// Batches of changes since it was mounted.
+    pub events: u64,
+    /// RFC 3339.
+    pub last_event: Option<String>,
+}
+
+/// One entry of the mount table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mount {
+    /// The drive's alias.
+    pub drive: String,
+    pub mountpoint: String,
+    pub adapter: String,
+    pub read_only: bool,
+    /// `mounting`, `mounted` or `failed`.
+    pub state: String,
+    pub error: Option<String>,
+    /// RFC 3339.
+    pub since: String,
+    /// While mounted.
+    pub feed: Option<Feed>,
+}
+
+/// `GET /v1/mounts`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mounts {
+    pub mounts: Vec<Mount>,
+    /// What the daemon mounts again when it starts.
+    pub remembered: Vec<voidfs_client::Remembered>,
+}
+
+/// `POST /v1/mounts`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewMount {
+    /// By alias or id.
+    pub drive: String,
+    /// Absolute; `None` is `~/voidfs/<drive>`.
+    pub mountpoint: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
+    /// `None` is the first the daemon has.
+    pub adapter: Option<String>,
+}
+
+/// `POST /v1/mounts/unmount`: a mountpoint, or a drive by alias or id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unmount {
+    pub target: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unmounted {
+    pub unmounted: Vec<String>,
 }
 
 /// The journal, for a restart.
@@ -172,6 +244,9 @@ pub struct Info {
     pub state_dir: String,
     /// Nothing would be lost by restarting now: no change is held only in memory.
     pub restart_safe: bool,
+    /// Drives in the mount table.
+    #[serde(default)]
+    pub mounts: u64,
     /// Bytes of changes held only in memory. Every change the journal takes is on disk before
     /// its call returns; step 5's mount may hold writes before it journals them.
     pub memory_only_bytes: u64,

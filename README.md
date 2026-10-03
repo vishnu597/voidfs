@@ -103,7 +103,11 @@ void daemon info                      # its build, what its journal holds unpubl
 - `void upload` without `--detach` hands the batch to the daemon and follows it until it is up;
   Ctrl-C leaves it uploading. With no daemon running it uploads in the foreground, and
   `--detach` starts one.
-- The mount table comes next ([step 4's plan](docs/step-4-client.md)).
+- `void mount <drive> [mountpoint]`, `void unmount` and `void mounts` keep the daemon's mount
+  table and the mounts it brings back when it starts; mounting itself comes with the Mac drive
+  (step 5), so for now `void mount` answers `NoAdapter`.
+- `void daemon install` (macOS) writes a launchd agent, so that the daemon and its remembered
+  mounts come back at login; `void daemon uninstall` removes it.
 
 ### The Rust SDK
 

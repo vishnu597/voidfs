@@ -51,7 +51,7 @@ impl Shared {
 
     /// The drive as the server names it, so that a pause by drive finds its uploads whichever
     /// name they were queued by. Offline, it is taken as given.
-    async fn drive(&self, name: &str) -> Result<String, Failure> {
+    pub(crate) async fn drive(&self, name: &str) -> Result<String, Failure> {
         match self.client.describe_drive(name).await {
             Ok(d) => Ok(d.alias),
             Err(e) if e.status().is_some() => Err(e.into()),

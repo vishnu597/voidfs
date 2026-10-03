@@ -54,7 +54,8 @@ fn a_daemon_starts_answers_and_stops() {
     assert_eq!((st["uploads"]["unpublished"].as_u64(), st["uploads"]["bandwidth"].clone()), (Some(0), Value::Null));
     assert_eq!(st["cache"]["maxBytes"].as_u64(), Some(20 << 30));
     let page = lines(&s.void(&["status"]).ok().out());
-    assert_eq!(page.iter().map(|l| l.split(' ').next().unwrap()).collect::<Vec<_>>(), ["daemon", "server", "uploads", "cache"], "{page:?}");
+    assert_eq!(page.iter().map(|l| l.split(' ').next().unwrap()).collect::<Vec<_>>(), ["daemon", "server", "uploads", "cache", "mounts"], "{page:?}");
+    assert_eq!(page[4], "mounts none");
     assert_eq!(page[1], format!("server {} · online", f.endpoint));
     assert_eq!(page[2], "uploads idle");
 
