@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `void`, the voidfs command line: drives, forks, history, show, restore and upload, on the
-//! protocol through `voidfs-sdk`. With `--json`, every command prints one JSON document on stdout,
-//! and errors as JSON on stderr, with a nonzero exit status.
+//! protocol through `voidfs-sdk`; and the per-user daemon (`void daemon run`), which owns the
+//! client core and answers on a socket in the state directory. With `--json`, every command prints
+//! one JSON document on stdout, and errors as JSON on stderr, with a nonzero exit status.
 
 mod config;
+mod daemon;
 mod drives;
 mod history;
 mod keys;
@@ -90,6 +92,11 @@ enum Command {
     },
     /// Upload local files or folders into a drive, in the foreground
     Upload(upload::UploadArgs),
+    /// One page: the daemon, the server and the link to it, uploads and the cache
+    Status,
+    /// The per-user daemon, which owns the state directory: uploads, the cache, and mounts
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
     /// Print the version and the revision it was built from
     Version,
     /// Access keys for voidfs-server
@@ -131,6 +138,25 @@ enum DriveCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    /// Run the daemon in the foreground, until it is stopped (launchd runs this)
+    Run,
+    /// Start the daemon in the background, if it isn't running. The connection it is given is
+    /// kept, readable by you only, for when it starts again
+    Start,
+    /// Stop the daemon. What is uploading stops, and goes on from where it was when the daemon
+    /// starts again
+    Stop,
+    /// Stop the daemon, then start it
+    Restart,
+    /// Whether the daemon is running, its process, uptime and socket
+    Status,
+    /// The running daemon's build, what its journal holds unpublished, and whether a restart is
+    /// safe
+    Info,
+}
+
+#[derive(Subcommand, Debug)]
 enum KeysCommand {
     /// Make a key for `voidfs-server --key`. The secret is printed once; the server keeps no copy
     /// until you give it one
@@ -153,6 +179,13 @@ async fn run(cli: Cli) -> Result<()> {
             || format!("void {VERSION}"),
         ),
         Command::Keys(KeysCommand::Generate { scope, format }) => keys::generate(out, *scope, *format),
+        Command::Status => daemon::status(out).await,
+        Command::Daemon(DaemonCommand::Run) => daemon::run(&cli.connection).await,
+        Command::Daemon(DaemonCommand::Start) => daemon::start(&cli.connection, out).await,
+        Command::Daemon(DaemonCommand::Stop) => daemon::stop(out).await,
+        Command::Daemon(DaemonCommand::Restart) => daemon::restart(&cli.connection, out).await,
+        Command::Daemon(DaemonCommand::Status) => daemon::daemon_status(out).await,
+        Command::Daemon(DaemonCommand::Info) => daemon::info(out).await,
         Command::Drives => drives::list(&client()?, out).await,
         Command::Drive(DriveCommand::Create { name, display_name }) => drives::create(&client()?, out, name, display_name.clone()).await,
         Command::Drive(DriveCommand::Show { drive }) => drives::show(&client()?, out, drive).await,

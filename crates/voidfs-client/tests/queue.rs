@@ -161,20 +161,27 @@ async fn a_pause_stops_an_upload_and_a_resume_goes_on_from_its_parts() {
     let q = open(dir.path(), &c, QueueConfig { parts_at_once: 2, ..config() }).await;
     q.set_bandwidth(Some(10 * MIB)).await.unwrap();
     let batch = q.import("big", vec![Import { path: src.clone(), drive: "drv".into(), key: "big.bin".into() }]).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1600)).await;
+    // Paused once a part is up, however fast the machine is.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while q.status().await.unwrap().batches[0].sent < 5 * MIB {
+        assert!(Instant::now() < deadline, "no part went up");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     q.pause(Scope::Batch(batch)).await.unwrap();
     q.settle().await;
     let st = q.status().await.unwrap();
     let b = &st.batches[0];
     assert!(b.paused && b.done == 0 && b.sent >= 5 * MIB && b.sent < 30 * MIB, "{b:?}");
+    // Progress counts finished parts, of 5 MiB each.
+    let finished = b.sent / (5 * MIB);
     let before = count(&p, "PUT", "partNumber=");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(count(&p, "PUT", "partNumber="), before, "nothing goes while paused");
     q.set_bandwidth(None).await.unwrap();
     q.resume(Scope::Batch(batch)).await.unwrap();
     q.settle().await;
-    let parts = count(&p, "PUT", "partNumber=");
-    assert!(parts <= 6 + 2, "the parts it had were not sent again: {parts} part requests for 6 parts");
+    let parts = count(&p, "PUT", "partNumber=") - before;
+    assert!(parts <= 6 - finished as usize, "the {finished} parts it had were not sent again: {parts} part requests after the resume, for 6 parts");
     assert!(direct.get_object("drv", "big.bin", ReadOptions::default()).await.unwrap().body == body);
     assert_eq!(q.status().await.unwrap().batches[0].done, 1);
 }
