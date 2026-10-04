@@ -34,6 +34,10 @@
 //! # Ok(()) }
 //! ```
 //!
+//! **Direct uploads** (protocol §4.11): [`Client::put_object_direct`] sends only the shards of a
+//! body the drive's pool lacks, straight to the bucket, and falls back to a put; opt-in, as
+//! SpaceFS's Rust SDK's are, or for every large `put_object` with [`Config::direct_uploads`].
+//!
 //! **Errors.** Every call fails with [`Error`]: [`Error::status`], [`Error::code`] and, on a
 //! `412`, [`Error::current_version_id`], the version to re-read from before retrying. The errors
 //! of [`Client::s3`]'s calls convert into it, with `?`.
@@ -47,6 +51,7 @@
 //! is never retried.
 
 pub mod bandwidth;
+pub mod direct;
 mod client;
 mod error;
 mod feed;
@@ -58,6 +63,7 @@ mod types;
 pub use aws_sdk_s3;
 pub use bandwidth::Bandwidth;
 pub use client::{Client, Config, DEFAULT_ENDPOINT, DEFAULT_REGION, ObjectStream, Observation, Observe};
+pub use direct::{DIRECT_MIN_BYTES, PlannedShard, UploadPlan};
 pub use error::{Error, Result, ServiceError};
 pub use feed::ChangeWatch;
 pub use types::*;
