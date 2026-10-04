@@ -460,14 +460,16 @@ server carries no content bytes.
 { "driveId": "d-…", "accessGeneration": 3,
   "storage": { "backend": "s3", "bucket": "…", "root": "voidfs/", "region": "…", "endpoint": "https://…",
                "forcePathStyle": false,
-               "readable": ["shards/", "pages/", "drives/d-…/"],
+               "readable": ["voidfs.json", "shards/", "pages/", "drives/d-…/"],
                "credentials": { "accessKeyId": "…", "secretAccessKey": "…", "sessionToken": "…",
                                 "expiresAt": "…" } },
   "storageBudget": { "limitBytes": 10995116277760, "usedBytes": 1048576 } }
 ```
 
-- The credentials can read only the listed prefixes under `root`. Writes always go through the
-  API or direct-upload URLs (§4.11).
+- The credentials can read only the listed paths under `root`, and list the drive's prefix. An
+  entry ending in `/` is a prefix. `voidfs.json` is there because a reader checks the pool's
+  format and features before anything else ([format §3.1](format.md#31-feature-flags)). Writes
+  always go through the API or direct-upload URLs (§4.11).
 - They expire at `expiresAt`, typically within an hour. A long-running client asks again before
   then. Revoking the access key stops the next exchange; it does not revoke credentials already
   issued.

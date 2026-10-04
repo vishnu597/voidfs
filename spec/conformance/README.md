@@ -59,12 +59,12 @@ in Phase 1.
   "expect":  { "status": 200, "headers": {}, "body": {} } }
 ```
 
-A step has a `request` or an `upload`, and an `expect`. Optionally:
+A step has one of a `request`, an `upload` and a `bucket` request, and an `expect`. Optionally:
 
 | Member | Meaning |
 |---|---|
 | `name` | Words for a reader; the runner ignores it |
-| `skip_if` | `{ "status": s, "reason": "…" }`: if the response has status `s`, the case ends here as skipped with that reason, before `expect` is checked. For optional extensions such as direct uploads (protocol §4.11), which a server answers `501` without |
+| `skip_if` | `{ "status": s, "reason": "…" }`: if the response has status `s`, the case ends here as skipped with that reason, before `expect` is checked. For optional extensions such as direct uploads (protocol §4.11) and storage credentials (§5.5), which a server answers `501` without |
 
 **`upload`** PUTs the shards of a direct upload's plan to the URLs it gave (protocol §4.11), each
 with exactly the headers listed for it and no signature, and checks every answer's status against
@@ -76,6 +76,20 @@ with exactly the headers listed for it and no signature, and checks every answer
 | `content` | The content the plan was made from, in the form below; each listed shard is cut from it |
 | `skip` | Positions in the list not to upload |
 | `corrupt` | `true`: send each shard with its last byte changed, which the store must refuse |
+
+**`bucket`** sends a request to the storage that the case's last storage credentials describe:
+the body of the last `200` answer to a request with `x-voidfs-credentials` (protocol §5.5). It
+goes path-style to their `endpoint` and `bucket`, signed with their credentials and session token
+for their `region`, with no headers of the case's. It has a `method` (`GET`, `HEAD`, `PUT` or
+`DELETE`), one of the targets below, and for a `PUT` an optional `text` or `bytes` body. A case
+needs an earlier step that asks for credentials, and a bucket request takes no `key` or
+`skip_if`.
+
+| Member | Meaning |
+|---|---|
+| `path` | An object, by its path under the credentials' `root` (format §2), for example `"drives/${driveId}/drive.json"` |
+| `shard` | The shard that holds exactly this content, in the form of the `bytes` body: `shards/<h0h1>/<h2h3>/<sha256>` under the root. The content must be smaller than a default `voidfs.json`'s minimum shard (256 KiB) and larger than 4 KiB, so that a server stores it as one shard |
+| `list` | A listing of this prefix under the root: ListObjectsV2 with `prefix` and `delimiter=/` |
 
 **`request`**
 

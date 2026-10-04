@@ -32,6 +32,8 @@ SPEC_REF_RE = re.compile(r"^(protocol|format) §\d+(\.\d+)*$")
 class Checker:
     def __init__(self):
         self.errors = []
+        # Whether a step of the case so far asked for storage credentials, which bucket requests use.
+        self.credentials_asked = False
 
     def err(self, where, msg):
         self.errors.append(f"{where}: {msg}")
@@ -141,7 +143,7 @@ class Checker:
         if not isinstance(step, dict):
             self.err(where, "step must be an object")
             return captures
-        unknown = set(step) - {"key", "request", "upload", "expect", "name", "skip_if"}
+        unknown = set(step) - {"key", "request", "upload", "bucket", "expect", "name", "skip_if"}
         if unknown:
             self.err(where, f"unknown members {sorted(unknown)}")
         key = step.get("key", "admin")
@@ -155,8 +157,40 @@ class Checker:
 
         req = step.get("request")
         upload = step.get("upload")
-        if (req is None) == (upload is None):
-            self.err(where, "a step has a request or an upload, not both")
+        bucket = step.get("bucket")
+        if sum(x is not None for x in (req, upload, bucket)) != 1:
+            self.err(where, "a step has one of a request, an upload and a bucket request")
+        if bucket is not None:
+            if not isinstance(bucket, dict) or set(bucket) - {"method", "path", "shard", "list", "body"}:
+                self.err(f"{where}.bucket", "must be {method} with one of path, shard and list, and an optional body")
+            else:
+                if bucket.get("method") not in {"GET", "HEAD", "PUT", "DELETE"}:
+                    self.err(f"{where}.bucket.method", "must be one of GET, HEAD, PUT and DELETE")
+                targets = [t for t in ("path", "shard", "list") if t in bucket]
+                if len(targets) != 1:
+                    self.err(f"{where}.bucket", "must name one of path, shard and list")
+                for t in ("path", "list"):
+                    if t in bucket:
+                        if not isinstance(bucket[t], str) or bucket[t].startswith("/"):
+                            self.err(f"{where}.bucket.{t}", "must be a string under the pool's root, without a leading /")
+                        self.use(f"{where}.bucket.{t}", bucket[t], defined)
+                if "shard" in bucket:
+                    self.check_content(f"{where}.bucket.shard", bucket["shard"])
+                if "list" in bucket and bucket.get("method") != "GET":
+                    self.err(f"{where}.bucket", "a listing is a GET")
+                if "body" in bucket:
+                    if not (isinstance(bucket["body"], dict) and len(bucket["body"]) == 1 and next(iter(bucket["body"])) in ("text", "bytes")):
+                        self.err(f"{where}.bucket.body", "must be text or bytes")
+                    else:
+                        self.check_body(f"{where}.bucket.body", bucket["body"], defined)
+                    if bucket.get("method") != "PUT":
+                        self.err(f"{where}.bucket", "only a PUT has a body")
+            if not self.credentials_asked:
+                self.err(where, "a bucket request needs an earlier step that asks for storage credentials (?x-voidfs-credentials)")
+            if "key" in step:
+                self.err(where, "a bucket request is signed with the storage credentials, not a key")
+            if "skip_if" in step:
+                self.err(where, "a bucket request can't skip the case")
         if upload is not None:
             if not isinstance(upload, dict) or set(upload) - {"list", "content", "skip", "corrupt"} or not {"list", "content"} <= set(upload):
                 self.err(f"{where}.upload", "must be {list, content} with optional skip and corrupt")
@@ -169,6 +203,8 @@ class Checker:
                     self.err(f"{where}.upload.skip", "must list positions in the upload list")
                 if not isinstance(upload.get("corrupt", False), bool):
                     self.err(f"{where}.upload.corrupt", "must be true or false")
+        elif bucket is not None:
+            pass
         elif not isinstance(req, dict):
             self.err(where, "request is required")
         else:
@@ -196,6 +232,8 @@ class Checker:
                     self.err(f"{where}.request.unsigned_headers", "must list names present in headers")
             if "body" in req:
                 self.check_body(f"{where}.request.body", req["body"], defined)
+            if isinstance(req.get("query"), dict) and "x-voidfs-credentials" in req["query"]:
+                self.credentials_asked = True
             if req.get("method") in ("GET", "HEAD") and "body" in req:
                 self.err(f"{where}.request", f"{req['method']} must not have a body")
 
@@ -274,6 +312,7 @@ class Checker:
                 self.err(where, "steps must be a non-empty list")
                 continue
             defined = set(BUILTIN_VARS)
+            self.credentials_asked = False
             for i, step in enumerate(steps):
                 defined |= self.check_step(f"{where} step {i}", step, defined, allowed_keys)
 

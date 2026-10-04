@@ -37,6 +37,9 @@ pub struct Step {
     /// PUTs to the URLs of a direct upload's plan (protocol §4.11), unsigned.
     #[serde(default)]
     pub upload: Option<Upload>,
+    /// A request to the bucket, with the case's last storage credentials (protocol §5.5).
+    #[serde(default)]
+    pub bucket: Option<BucketRequest>,
     pub expect: Expect,
     /// Ends the case, skipped, when the response has this status.
     #[serde(default)]
@@ -110,6 +113,27 @@ pub struct Upload {
     /// Send each shard with its last byte changed.
     #[serde(default)]
     pub corrupt: bool,
+}
+
+/// A request to the storage that the case's last storage credentials describe (protocol §5.5),
+/// path-style at its endpoint, signed with those credentials. It names one of `path`, `shard` and
+/// `list`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketRequest {
+    pub method: String,
+    /// An object, by its path under the pool's root (format §2).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The shard that holds exactly this content (format §4), which must be smaller than the
+    /// default `voidfs.json`'s minimum shard, so that it is one.
+    #[serde(default)]
+    pub shard: Option<Content>,
+    /// A listing (ListObjectsV2, delimited by `/`) of this prefix under the pool's root.
+    #[serde(default)]
+    pub list: Option<String>,
+    #[serde(default)]
+    pub body: Option<Body>,
 }
 
 fn admin() -> String {
