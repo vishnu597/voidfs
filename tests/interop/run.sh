@@ -133,6 +133,9 @@ wait_for "$VOIDFS_ENDPOINT/"
 # Whether the server offers direct uploads (protocol §4.11), and why: what the bucket's presigned
 # PUTs bind, which it checks at start.
 echo "== direct uploads ($store): $(grep -h -E 'presigned PUTs|direct uploads' "$work/voidfs.log" | sed -E 's/^.*(presigned PUTs|direct uploads)/\1/' | head -1)"
+# Whether it offers storage credentials (protocol §5.5), and why: what credentials its bucket's STS
+# mints reach, which it checks at start.
+echo "== storage credentials ($store): $(grep -h -E 'storage credentials' "$work/voidfs.log" | sed -E 's/^.*(storage credentials)/\1/' | head -1)"
 
 echo "== admin listener ($store)"
 "$root/tests/interop/admin.sh" "http://127.0.0.1:$admin_port"
