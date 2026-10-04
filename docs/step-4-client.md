@@ -884,6 +884,74 @@ uploads surviving a daemon restart.
 
 **Checklist:** E10 (protocol §4.11, as written).
 
+**Status (3 October 2026): in progress**, in two pull requests: the server, then the client (the
+SDK's `put_object_direct` and the upload queue). What the first built:
+- In `voidfs-server`: the plan (`POST /{drive}/{key}?x-voidfs-upload-plan`) and the commit (`PUT
+  …?x-voidfs-upload-commit`) in `s3/upload.rs`; `direct.rs`, with the token and the `Presign`
+  trait; presigned PUTs from the bucket's own signer (`probe::Bucket::presign_put`);
+  `Pool::find_shards`, for shards the server has no bytes of (format §12.4); and
+  `--direct-uploads on|off`.
+- `voidfs-server probe` reports what the bucket's presigned PUTs bind (`presigned PUTs`), and a
+  server checks it when it starts.
+- In the test server: `TestServer::with_direct_uploads` and `FakeBucket`, a stand-in for a bucket
+  that presigns PUTs and enforces what they bind, for the SDK's and the client's tests.
+- Seven conformance cases (`direct-upload-*`), with the runner's `plan`, `commit` and `bytes`
+  bodies, `upload` steps and `skip_if`, so that a server without the extension reports them
+  skipped.
+- In the protocol, the two additions the user approved on 3 October: `x-amz-meta-*` on the commit
+  (§4.11), and a §9 line on what a plan shows of a pool.
+
+**Decisions taken while building the first:**
+- **Presigning:** the server builds each PUT itself and signs it with the reqsign signer it already
+  uses for the bucket's configuration. reqsign signs every header of a presigned request, so
+  `x-amz-checksum-sha256` (the shard's hash in base64: a shard's name is the SHA-256 of its bytes)
+  and `If-None-Match: *` are in `X-Amz-SignedHeaders`. OpenDAL's presigning can't add a checksum
+  of bytes it doesn't have. URLs are path-style on the endpoint the server reaches the bucket at;
+  a client that can't reach it fails its PUT and falls back to a put.
+- **What the bucket enforces is checked, not assumed:** at start, four PUTs of a 36-byte shard at
+  its own path (`probe::PROBE_SHARD`, a valid shard that garbage collection removes): with its
+  checksum, which must be accepted; with another checksum, which must be refused (400); without
+  the signed checksum header (403); and with `If-None-Match: *`, now that it exists (412). Direct
+  uploads are offered only where the first three hold, and URLs bind `If-None-Match` only where
+  the fourth does. A bucket that ignores a binding stores nothing but that valid shard. versitygw
+  1.8.0 enforces all three (observed on this Mac); Backblaze B2 answers `If-None-Match` on a
+  presigned PUT with 501 (observed through Space's URLs, §1.5). Memory and local disk answer 501:
+  nothing presigns there, and their bytes would go through the server anyway.
+- **Held:** shards the key's head references (option 1 of format §12.4, no request), shards this
+  server checked recently (option 2: uploaded, read or HEADed since its last read of
+  `gc/pending.json`, and not proposed since), and shards a HEAD finds with their length. A
+  candidate of a waiting garbage-collection run is fetched, checked against its hash and
+  rewritten (option 3); one a run is deleting is not held. Deduplication is across the pool: Space
+  holds a shard only where the key's storage group has it, so the same content at another key is
+  often uploaded again (observed, §1.5). `held` counts distinct shards, and `upload` lists each
+  shard once, however often the content repeats it.
+- **Commit:** checks the token, that `size` is the shards' total, and that `contentSha256` is 64
+  hexadecimal digits: the server never sees the bytes, so it can't check that hash, and the bound
+  checksums vouch for each shard (Space doesn't check it either). It then asks the bucket about
+  every shard the key's head doesn't reference, a HEAD each for its length after a fresh read of
+  `gc/pending.json`, and commits a put of the shards through the ordinary path: preconditions,
+  `x-voidfs-content-type`, `x-amz-meta-*`, `x-voidfs-mtime` and `x-voidfs-mode`. Shards taken as
+  held because the head references them count only while it is the head: if another version
+  lands first, the commit checks again, as edits do. A shard missing, or of another length, is
+  `400 InvalidArgument`; one a run is deleting is `503 SlowDown`, from which clients fall back.
+- **Token:** `<expiry>.<HMAC>`, the HMAC-SHA256 over the drive's id, the key, the list's digest (each
+  hash and length, in order) and the expiry, under a key each process draws when it starts. A
+  commit recomputes it from its own drive, key and list, so a token for another key, another list
+  or another server is refused, and a restarted server refuses the plans it made before (clients
+  fall back). Space's token binds the key and its storage group but not the list: a commit of a
+  plan's shards in another order was accepted (observed, §1.5).
+- **Space reads shards back instead:** its URLs sign only `host`, and its bucket accepted other
+  bytes; its commit then reads every shard it doesn't hold and checks the hash (observed, §1.5).
+  §4.11 asks for the binding instead, so that no shard's bytes cross the server, and the commit
+  asks only for lengths.
+- **Limits:** at most 4,096 shards, each of 1 byte to 16 MiB (format §4), or `400` before the
+  bucket is asked anything. A plan of shards nobody has costs a HEAD each, 32 at once, so a key
+  that can write a drive can have the server ask the bucket 4,096 times per plan.
+- **Chunking:** clients cut with the format's default sizes, since the protocol gives them no way
+  to read `voidfs.json`'s. Every pool voidfs creates has them, and in another pool a plan only
+  holds less (format §4.1 allows any cut). Space cuts with the same FastCDC sizes (read, and
+  observed: §1.5).
+
 **Design.**
 - **Server.** Plan: up to 4,096 shards; which the pool holds safely (§12.4 of the format: present,
   and not proposed for deletion, or re-touched); presigned PUT URLs for the rest that bind the
@@ -979,5 +1047,11 @@ for first); a cold read through the bucket against one through the API.
     one runs on macOS, and its Linux twin checks that `install` refuses), 27 breaks.
 
   Space's daemon was observed running (§1.2). Mounting itself comes with step 5's adapters.
-- Next: direct uploads (item 5).
-- Items 5–6: not started.
+- Item 5, direct uploads: **in progress** (3 October). The server is built: its 14 tests (12 in
+  the server's own process against a stand-in bucket that binds what its URLs carry, 2 of the
+  token) each failed with the code they guard broken, 31 breaks in all, each run alone with a
+  timeout (the one that waits on a gate three times); its seven conformance cases pass on memory
+  and local disk (skipped there, but for the one that checks the `501`) and on versitygw, both
+  addressing styles, and each failed against a server with the code it guards broken, 8 breaks.
+  The client (the SDK's `put_object_direct` and the upload queue) is next.
+- Item 6: not started.
