@@ -124,12 +124,15 @@ if "$server" "${store_args[@]}" --listen "127.0.0.1:$voidfs_port" --admin-listen
 fi
 grep -q "would share the S3 port" "$work/same-port.log" || { cat "$work/same-port.log" >&2; exit 1; }
 # Names under localhost reach the loopback address without DNS (curl and these checks see to it).
-RUST_LOG=warn "$server" "${store_args[@]}" ${feature_args[@]+"${feature_args[@]}"} --listen "127.0.0.1:$voidfs_port" --virtual-host-domain s3.localhost \
+RUST_LOG=warn,voidfs_server=info "$server" "${store_args[@]}" ${feature_args[@]+"${feature_args[@]}"} --listen "127.0.0.1:$voidfs_port" --virtual-host-domain s3.localhost \
     --admin-listen "127.0.0.1:$admin_port" \
     --key "$VOIDFS_READ_ACCESS_KEY_ID:$VOIDFS_READ_SECRET_ACCESS_KEY:read" > "$work/voidfs.log" 2>&1 &
 server_pid=$!
 pids+=($server_pid)
 wait_for "$VOIDFS_ENDPOINT/"
+# Whether the server offers direct uploads (protocol §4.11), and why: what the bucket's presigned
+# PUTs bind, which it checks at start.
+echo "== direct uploads ($store): $(grep -h -E 'presigned PUTs|direct uploads' "$work/voidfs.log" | sed -E 's/^.*(presigned PUTs|direct uploads)/\1/' | head -1)"
 
 echo "== admin listener ($store)"
 "$root/tests/interop/admin.sh" "http://127.0.0.1:$admin_port"
