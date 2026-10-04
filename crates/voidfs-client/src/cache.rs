@@ -405,13 +405,15 @@ impl Cache {
             if let Ok(b) = &r {
                 this.remember(&k, b.clone());
             }
+            // Out of the map before anyone hears: a read that comes after the answer finds the
+            // block in memory, or fetches again rather than take a failure that was answered.
+            this.0.fills.lock().unwrap_or_else(|p| p.into_inner()).remove(&k);
             let _ = tx.send(r.clone());
             if let Ok(b) = r {
                 let this2 = this.clone();
                 let k2 = k.clone();
                 let _ = tokio::task::spawn_blocking(move || this2.store_block(&k2, &b)).await;
             }
-            this.0.fills.lock().unwrap_or_else(|p| p.into_inner()).remove(&k);
             // Let go of the cache, and so of the store, first: whoever settles and then drops the
             // cache can open the state directory again at once.
             drop(this);
@@ -813,6 +815,22 @@ mod tests {
                 Ok(all.slice(offset as usize..(offset + len) as usize))
             })
         }
+    }
+
+    /// A read after a failed fetch answered fetches again, however soon it comes: it never gets
+    /// the answered failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_after_a_failure_fetches_again() {
+        let fake = Arc::new(Fake::default());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = open(dir.path(), &fake, config()).await;
+        for i in 0..300 {
+            let c = fake.add(&format!("e{i}"), bytes_of(i, 4096));
+            fake.fail.store(1, Ordering::SeqCst);
+            assert!(cache.read(&c, 0, 4096).await.is_err());
+            assert_eq!(cache.read(&c, 0, 4096).await.unwrap(), bytes_of(i, 4096), "read {i} after a failure");
+        }
+        cache.settle().await;
     }
 
     fn plenty(_: &Path) -> io::Result<u64> {
