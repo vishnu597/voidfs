@@ -409,6 +409,11 @@ what SpaceFS does, is at the end of this section.
   docs (`docs.spacefs.com/llms-full.txt`, "Read a byte range") say it "Fetches only the shards the
   range touches", at a cost "proportional to the range, not the object": shard granularity, as
   voidfs does, served from their edge cache when it holds them.
+*Observed since (3 October, Space 0.2.343, [step 4 §1.8](../../../docs/step-4-client.md#18-the-mount-observed-3-october-02343)):
+a cold random 4 KiB read through Space's mount fetched about 8.4 MB, one 8 MiB block, and returned
+in 220–730 ms; another read in that block came back at once. Whatever pieces its strings name, its
+mount fills the block before it answers.*
+
 - **Its Mac client appears to read parts of shards, checked only for length.** Inferred from the
   strings of the Rust daemon in Space 0.2.300 (`spacefs-fskitd`), not from its code. Its read path
   logs two kinds of fetch:

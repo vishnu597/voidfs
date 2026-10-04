@@ -217,6 +217,15 @@ What voidfs takes from this:
 - New processes, `space-agent` and `space-computer-use`, belong to its AI features (inferred).
 - Its CLI's `status` and `mounts` report no daemon and no mounts while the SMB mount is up.
 
+**Seen on 3 October** (0.2.343, the trial's last day; [step 4 §1.5–§1.9](step-4-client.md#15-direct-uploads-observed-through-the-api-3-october-02343-protocol-1)):
+- The S3 API runs at Cloudflare's edge (Workers and Durable Objects); objects' bytes are in Backblaze
+  B2 and their metadata in R2, in 16 storage groups per drive, each owned by a worker under a lease;
+  the mount works through an engine on Railway and doesn't show objects written through the API.
+- Direct uploads presign URLs that sign only the host; the commit checks each new shard instead.
+- A cold random read through the mount fetches a whole 8 MiB block, over SMB and over FSKit; over
+  SMB, file modes and resource forks are lost, over FSKit they are kept.
+- Keys revoke at once (0.3 s, children too); pins download the whole file.
+
 ## 6. Performance
 
 ### What SpaceFS publishes
@@ -336,8 +345,9 @@ What the runs show:
 *1 October 2026, one Mac on home internet ([bench/results/mac-head-to-head](../bench/results/mac-head-to-head/README.md)).*
 SpaceFS's app 0.2.333 with its trial drive, mounted through its loopback SMB server, against the
 read-only FSKit spike with `voidfs-server` on the same Mac and the pool in Cloudflare R2 (location
-hint ENAM). Space's drive also appears to be in R2, with its service on Railway (inferred from the
-addresses its mount connects to; the bucket's location is not confirmed). The same 11,005 files and
+hint ENAM). Space's mount connects to Cloudflare and to Railway; the bytes of objects written
+through its S3 API are in Backblaze B2 (Canada East) and their metadata in R2 (observed on 3
+October, [step 4 §1.5–§1.8](step-4-client.md#15-direct-uploads-observed-through-the-api-3-october-02343-protocol-1)). The same 11,005 files and
 1 GiB file in each, runs alternated, every run cold, two runs each; on-screen steps were driven
 through computer use and timed from screen captures.
 
@@ -357,7 +367,8 @@ What it shows:
   `ls -l`, which pays the spike's FSKit upcalls per file.
 - Sequential reads are level when the kernel reads ahead (`dd`). Finder's copy is not: voidfs
   fetched its 452 shards one at a time. The Mac client needs its own read-ahead.
-- Space's random reads hit its 8 MiB blocks on disk most of the time (inferred); voidfs, with
+- Space's random reads hit its 8 MiB blocks on disk most of the time (inferred), and a cold one
+  fetches its whole 8 MiB block first (observed on 3 October); voidfs, with
   shards of about 2.4 MB and no cache on the Mac, went to the bucket for 205–210 of 300 reads.
 - Space's uploader dropped `tagged.txt`'s xattrs, and an xattr write moves a file's creation date
   on its SMB volume.
@@ -435,9 +446,10 @@ With coalesced shard fetches and shared read-ahead (1 October,
   faster), and the range read, on SpaceFS's ratio within a tenth of a millisecond.
 - Warm, at 12 ms without the cap, the geometric mean against `main` is 0.980 over the 49 rows.
 - A cold 64 KiB range still fetches its whole shard (about 3× the bare bucket's time), as SpaceFS's
-  S3 layer does by its docs ("Fetches only the shards the range touches"). Its Mac client appears to
-  read pieces of shards too, up to 1 MiB, checked only for length. **Decided:** the gateway stays as
-  it is, and the mount (step 5) revisits pieces; the evidence and options are in the results.
+  S3 layer does by its docs ("Fetches only the shards the range touches"). Its Mac client's strings
+  name pieces of shards of up to 1 MiB, but a cold random 4 KiB read through its mount fetches one
+  whole 8 MiB block and waits for it (observed on 3 October). **Decided:** the gateway stays as it
+  is, and the mount (step 5) revisits pieces; the evidence and options are in the results.
 
 With cold reads and S3's bandwidth (1 October,
 [bench/results/cold-reads](../bench/results/cold-reads/README.md)):
@@ -781,10 +793,11 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
    - Reads of pieces of shards, deferred here from step 3, item 6: bounded range GETs of up to
-     1 MiB, cached and coalesced apart from whole shards, as SpaceFS's client appears to do, so that
-     a cold random read does not wait for a whole shard. Decide then how a piece is checked: by its
-     length alone, as SpaceFS appears to, or by block hashes (a format change, so an RFC first).
-     Whole shards stay checked against their hash. Evidence and options:
+     1 MiB, cached and coalesced apart from whole shards, so that a cold random read does not wait
+     for a whole shard. SpaceFS's client doesn't: a cold random read through its mount fetches and
+     waits for an 8 MiB block (observed on 3 October), so pieces would put voidfs ahead, not level.
+     Decide then how a piece is checked: by its length alone, or by block hashes (a format change,
+     so an RFC first). Whole shards stay checked against their hash. Evidence and options:
      [bench/results/shard-fetch](../bench/results/shard-fetch/README.md#ranged-shard-reads-options-not-built).
    - A privileged helper that mounts into `/Volumes`, as SpaceFS does.
    - Finder Sync badges.
@@ -824,9 +837,14 @@ plain objects, file locking, offline pinning.
   the maintainer. The commands and scripts are in
   [bench/README.md](../bench/README.md#the-real-run). SpaceFS ran their layer on the client VM,
   so that topology is the like-for-like one; the plan's server in us-east-1 is a second run.
-- **Test data in the SpaceFS trial:** uploading the benchmark data into a trial drive needs the
-  account owner's go-ahead each time. **The trial ends on 4 October** (Settings → Plan & Storage,
-  observed 1 October); step 1's Mac comparison needs it, or a plan.
+- **The SpaceFS trial** runs out on 4 October ("Choose a plan to keep your files editable after the
+  trial"). On its last day, everything the remaining steps needed from it that the API, the CLI,
+  Finder and UI scripting could reach was observed: direct uploads, mount credentials and the format
+  behind them, keys and revocation, the mount's reads, pins and FSKit, and the settings ([step 4
+  §1.5–§1.9](step-4-client.md#15-direct-uploads-observed-through-the-api-3-october-02343-protocol-1)),
+  and the S3 layer from this Mac ([bench/results/space-endpoint](../bench/results/space-endpoint/README.md)).
+  Not observed: the web app (share links, previews, video review, audit), its launcher's search,
+  and forks and second drives, which its individual plan refuses.
 - **CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), added 2026-09-29): tests,
   clippy and the spec's cases; the conformance suite, boto3, rclone and the admin endpoints over
   memory, local disk, versitygw and MinIO; the Compose files; and on `main`, the release GC model
