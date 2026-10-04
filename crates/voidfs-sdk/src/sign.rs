@@ -24,6 +24,9 @@ pub struct Signer {
     authority: String,
     key_id: String,
     secret: String,
+    /// For temporary credentials, such as storage credentials (protocol §5.5): sent as
+    /// `x-amz-security-token`, and signed.
+    session_token: Option<String>,
     region: String,
     /// Send `/<drive>/<key>` as `/<key>` to host `<drive>.<domain>` (virtual-host addressing),
     /// still connecting to the endpoint. `/` goes to `<domain>` itself.
@@ -48,7 +51,13 @@ impl Signer {
             return Err(Error::Invalid(format!("endpoint {endpoint:?} has a path")));
         }
         let authority = url.authority().ok_or_else(|| Error::Invalid(format!("endpoint {endpoint:?} has no host")))?.to_string();
-        Ok(Signer { endpoint, authority, key_id: key_id.into(), secret: secret.into(), region: "us-east-1".into(), virtual_host: None })
+        Ok(Signer { endpoint, authority, key_id: key_id.into(), secret: secret.into(), session_token: None, region: "us-east-1".into(), virtual_host: None })
+    }
+
+    /// Signs with temporary credentials' session token too.
+    pub fn with_session_token(mut self, token: Option<&str>) -> Signer {
+        self.session_token = token.map(str::to_owned);
+        self
     }
 
     /// The region in the signing scope; servers accept any (protocol §2).
@@ -75,7 +84,7 @@ impl Signer {
         headers.push(("host".into(), host));
         let (signed, extra): (Vec<_>, Vec<_>) = headers.into_iter().partition(|(k, _)| !unsigned.iter().any(|u| u.eq_ignore_ascii_case(k)));
 
-        let identity = Credentials::new(&self.key_id, &self.secret, None, None, "voidfs").into();
+        let identity = Credentials::new(&self.key_id, &self.secret, self.session_token.clone(), None, "voidfs").into();
         let mut settings = SigningSettings::default();
         settings.percent_encoding_mode = PercentEncodingMode::Single;
         settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
