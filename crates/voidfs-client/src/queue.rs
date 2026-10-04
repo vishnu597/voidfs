@@ -10,7 +10,9 @@
 //! - each guarded by the version it was based on, with the `412` rule ([`crate::publish`]);
 //! - pausable and cancellable for everything, a drive, a batch or one entry, and resumed after a
 //!   restart, a multipart upload with the parts it had;
-//! - within an upload bandwidth limit that applies at once ([`Queue::set_bandwidth`]).
+//! - within an upload bandwidth limit that applies at once ([`Queue::set_bandwidth`]);
+//! - a large file that replaces a version the drive holds most of as a direct upload, which
+//!   sends only the shards the pool lacks, straight to the bucket (protocol §4.11).
 //!
 //! Imports ([`Queue::import`]) are files of the user's, read where they are when they publish,
 //! with their modification time, permission bits and extended attributes.
@@ -43,6 +45,10 @@ pub struct QueueConfig {
     pub multipart_from: u64,
     /// Parts of one file at once.
     pub parts_at_once: usize,
+    /// Files from this size that replace a version of the drive's are planned as direct uploads
+    /// (protocol §4.11), and sent that way if the drive holds at least half of them already.
+    /// `u64::MAX` turns direct uploads off.
+    pub direct_from: u64,
     /// Request bodies held in memory at once, across all uploads.
     pub memory_bytes: u64,
     /// The longest wait before a failed publish is tried again.
@@ -59,6 +65,7 @@ impl Default for QueueConfig {
             part_size: 16 * MIB,
             multipart_from: 64 * MIB,
             parts_at_once: 4,
+            direct_from: voidfs_sdk::DIRECT_MIN_BYTES as u64,
             memory_bytes: 256 * MIB,
             retry_max: Duration::from_secs(60),
             connectivity: None,
@@ -808,6 +815,7 @@ impl Queue {
                     part_size: self.0.cfg.part_size,
                     multipart_from: self.0.cfg.multipart_from,
                     parts_at_once: self.0.cfg.parts_at_once,
+                    direct_from: self.0.cfg.direct_from,
                     memory: self.0.memory.clone(),
                     memory_kib: self.0.memory_kib,
                     stop: r.stop.clone(),
