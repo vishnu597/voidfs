@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Where the cache gets the bytes it doesn't have.
 //!
-//! [`ApiFetcher`] reads through the protocol, a ranged GET of one version. A fetcher that reads
-//! shards straight from the bucket with storage credentials (step 4, item 6) implements the same
-//! trait; it needs the protocol additions item 6 is waiting on (an object's shard list, or
-//! presigned shard URLs), so it isn't here.
+//! [`ApiFetcher`] reads through the protocol, a ranged GET of one version.
+//! [`crate::BucketFetcher`] reads straight from the bucket with storage credentials (step 4, item
+//! 6), and through an [`ApiFetcher`] where it can't.
 
 use bytes::Bytes;
 use futures::future::BoxFuture;

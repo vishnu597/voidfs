@@ -222,6 +222,38 @@ pub async fn load_drive(src: &impl Source, pool: &PoolDescriptor, id: &DriveId) 
     Ok(Some((desc, state)))
 }
 
+/// A drive's latest state as [`load_drive`] reads it, with the pool's descriptor, in two rounds of
+/// requests rather than one after another: the pool's and the drive's descriptors and the list of
+/// checkpoints at once, then the newest checkpoint and the log after it at once (a checkpoint's
+/// name is its sequence number). For a reader far from the bucket, such as a client with storage
+/// credentials. `None` if the drive does not exist.
+pub async fn open_drive(src: &impl Source, id: &DriveId) -> anyhow::Result<Option<(PoolDescriptor, DriveDescriptor, DriveState)>> {
+    let dir = format!("drives/{id}/checkpoints/");
+    let (pool, desc, names) = futures::try_join!(open_pool(src), drive(src, id), src.list(&dir, None))?;
+    let Some(desc) = desc else { return Ok(None) };
+    let multi_object_versions = pool.has(MULTI_OBJECT_VERSIONS);
+    let newest = names.into_iter().rfind(|n| n.ends_with(".json"));
+    let seq = match &newest {
+        Some(n) => n.trim_end_matches(".json").parse::<u64>().with_context(|| format!("checkpoint {dir}{n}"))?,
+        None if desc.fork_of.is_some() => bail!("fork {id} has no checkpoint"),
+        None => 0,
+    };
+    let checkpoint = async {
+        match &newest {
+            Some(n) => load_checkpoint(src, &format!("{dir}{n}"), multi_object_versions).await.map(|c| c.state),
+            None => Ok(DriveState::empty().with_multi_object_versions(multi_object_versions)),
+        }
+    };
+    let (mut state, commits) = futures::try_join!(checkpoint, commits_after(src, id, seq))?;
+    if state.seq() != seq {
+        bail!("checkpoint {dir}{} is at {}", newest.unwrap_or_default(), state.seq());
+    }
+    for (c, _) in &commits {
+        state = state.apply(c).with_context(|| format!("applying {}", log_path(id, c.seq)))?;
+    }
+    Ok(Some((pool, desc, state)))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Content (format §5)
 

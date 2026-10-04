@@ -139,11 +139,13 @@ pub struct Rules {
     pub scope: bool,
     /// How long minted credentials last, if not as long as asked.
     pub lifetime: Option<Duration>,
+    /// Objects per page of a listing, as S3's 1,000.
+    pub list_page: usize,
 }
 
 impl Default for Rules {
     fn default() -> Rules {
-        Rules { checksum: true, signed_headers: 403, if_none_match: Some(true), refuse: None, sts: true, scope: true, lifetime: None }
+        Rules { checksum: true, signed_headers: 403, if_none_match: Some(true), refuse: None, sts: true, scope: true, lifetime: None, list_page: 1000 }
     }
 }
 
@@ -234,6 +236,12 @@ impl FakeBucket {
     /// Where the credentials it mints reach.
     pub fn location(&self) -> Location {
         Location { bucket: FAKE_BUCKET.into(), root: FAKE_ROOT.into(), region: "us-east-1".into(), endpoint: self.endpoint.clone() }
+    }
+
+    /// Forgets every credential it minted, as if they had been revoked: requests made with them
+    /// are refused (403 InvalidAccessKeyId).
+    pub fn revoke(&self) {
+        self.state.issued.lock().unwrap().clear();
     }
 
     /// What it did with storage credentials so far.
@@ -360,12 +368,24 @@ async fn fake_s3(b: &FakeState, req: Request) -> Response {
             if q.get("delimiter").map(String::as_str) != Some("/") || !(dir.is_empty() || dir.ends_with('/')) {
                 return fake_error(501, "NotImplemented");
             }
-            let after = q.get("start-after").and_then(|a| a.strip_prefix(&prefix)).map(str::to_owned);
-            let (Ok(files), Ok(dirs)) = (b.store.list_files(&dir, after.as_deref()).await, b.store.list_dirs(&dir).await) else { return fake_error(500, "InternalError") };
+            // A continuation token is the last name of the page before.
+            let token = q.get("continuation-token").cloned();
+            let after = token.clone().or_else(|| q.get("start-after").and_then(|a| a.strip_prefix(&prefix)).map(str::to_owned));
+            let (Ok(mut files), Ok(dirs)) = (b.store.list_files(&dir, after.as_deref()).await, b.store.list_dirs(&dir).await) else { return fake_error(500, "InternalError") };
+            let dirs = if token.is_some() { Vec::new() } else { dirs };
+            let truncated = files.len() > rules.list_page;
+            files.truncate(rules.list_page);
             b.lists.fetch_add(1, Ordering::Relaxed);
             let contents: String = files.iter().map(|f| format!("<Contents><Key>{prefix}{f}</Key></Contents>")).collect();
             let common: String = dirs.iter().map(|d| format!("<CommonPrefixes><Prefix>{prefix}{d}/</Prefix></CommonPrefixes>")).collect();
-            let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult><Name>{FAKE_BUCKET}</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><IsTruncated>false</IsTruncated>{contents}{common}</ListBucketResult>", files.len() + dirs.len());
+            let next = match (truncated, files.last()) {
+                (true, Some(last)) => format!("<NextContinuationToken>{last}</NextContinuationToken>"),
+                _ => String::new(),
+            };
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult><Name>{FAKE_BUCKET}</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><IsTruncated>{truncated}</IsTruncated>{next}{contents}{common}</ListBucketResult>",
+                files.len() + dirs.len()
+            );
             (http::StatusCode::OK, [(http::header::CONTENT_TYPE, "application/xml")], xml).into_response()
         }
         http::Method::GET | http::Method::HEAD => {

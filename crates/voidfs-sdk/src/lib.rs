@@ -38,6 +38,10 @@
 //! body the drive's pool lacks, straight to the bucket, and falls back to a put; opt-in, as
 //! SpaceFS's Rust SDK's are, or for every large `put_object` with [`Config::direct_uploads`].
 //!
+//! **Storage credentials** (protocol §5.5): [`Client::storage_credentials`] gives read-only
+//! credentials to a drive's storage, and [`Client::storage`] reads with them, straight from the
+//! bucket: the pool's descriptor, the drive's checkpoints and log, its pages and shards.
+//!
 //! **Errors.** Every call fails with [`Error`]: [`Error::status`], [`Error::code`] and, on a
 //! `412`, [`Error::current_version_id`], the version to re-read from before retrying. The errors
 //! of [`Client::s3`]'s calls convert into it, with `?`.
@@ -57,6 +61,7 @@ mod error;
 mod feed;
 mod retry;
 pub mod sign;
+mod storage;
 mod types;
 
 /// The AWS SDK for S3 this crate is built on, for the types of [`Client::s3`]'s calls.
@@ -66,6 +71,7 @@ pub use client::{Client, Config, DEFAULT_ENDPOINT, DEFAULT_REGION, ObjectStream,
 pub use direct::{DIRECT_MIN_BYTES, PlannedShard, UploadPlan};
 pub use error::{Error, Result, ServiceError};
 pub use feed::ChangeWatch;
+pub use storage::Storage;
 pub use types::*;
 
 /// Edits per patch (protocol §7).

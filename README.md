@@ -242,6 +242,11 @@ clients read through the server. Revoking an access key does not reach credentia
 issued: they last until they expire. Clients must be able to reach the bucket's endpoint as the
 server does.
 
+The Rust SDK reads with them (`Client::storage_credentials`, then `Client::storage`), and so does
+the client core: the daemon's cache reads a drive's state and shards straight from the bucket,
+each shard checked against its hash, and through the server where it answers `501` or the bucket
+can't be read.
+
 ### Small files in the log
 
 A file of up to 4 KiB can be held in the log itself, so that writing it takes one request to the
@@ -350,7 +355,7 @@ nothing on either port does. The drives' state, which the server serves from, st
 | [`crates/voidfs-server`](crates/voidfs-server/) | The S3 server: storage backends, commit log, checkpoints, forks, SigV4, change feed |
 | [`crates/voidfs-sdk`](crates/voidfs-sdk/) | The Rust SDK: the AWS SDK for S3 plus typed calls for the extensions |
 | [`crates/voidfs-cli`](crates/voidfs-cli/) | `void`, the command line, on the SDK |
-| [`crates/voidfs-client`](crates/voidfs-client/) | The client core the daemon runs, and the mount will: the block cache with read-ahead, the write journal and upload queue, and the change-feed client with connectivity, on the SDK |
+| [`crates/voidfs-client`](crates/voidfs-client/) | The client core the daemon runs, and the mount will: the block cache with read-ahead, reading through the server or straight from the bucket with storage credentials, the write journal and upload queue, and the change-feed client with connectivity, on the SDK |
 | [`crates/voidfs-daemon`](crates/voidfs-daemon/) | The per-user daemon `void daemon run` runs: the client core behind a Unix socket, with HTTP and JSON over it |
 | [`crates/voidfs-conformance`](crates/voidfs-conformance/) | Runs the conformance suite against any endpoint |
 | [`crates/voidfs-bench`](crates/voidfs-bench/), [`bench/`](bench/) | SpaceFS's 49 benchmark scenarios, run through voidfs and against the bare bucket; scripts and results |

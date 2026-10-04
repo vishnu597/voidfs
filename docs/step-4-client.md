@@ -705,7 +705,8 @@ upload queue, and the change-feed client and connectivity. What the first built:
   blocks do; a reader of many large files' first bytes pays 8 MiB each, which step 5 can tune.
 - **Verified as filled:** through the API, the fetcher checks the response's version id and ETag
   against the ones asked for, and the cache checks the length. Checking the bytes themselves against
-  the format's shard hashes needs an object's shard list, item 6's second open decision. On disk,
+  the format's shard hashes needs an object's shard list, which the user deferred (item 6); from the
+  bucket, item 6's fetcher checks every whole shard against its hash. On disk,
   each block's CRC-32C per 64 KiB is in the index and is checked on every read of those 64 KiB: a
   block that fails, or whose file is gone or the wrong size, is dropped and fetched again.
 - **Limits:** 20 GiB at most and 5 GiB free on the volume at least (SpaceFS's reserve isn't
@@ -722,9 +723,9 @@ upload queue, and the change-feed client and connectivity. What the first built:
 - **Read-ahead:** per `Reader`. A read is forward if it starts at or after the last one's start and
   no more than a block past its end (the kernel's reads of a stream overlap and arrive a little out
   of order); each forward read doubles how far ahead the reader fetches, from one block to 64 MiB.
-- **Where item 6 slots in:** `Fetch` is the interface: a fetcher that reads shards with storage
-  credentials implements it, and the cache's key would gain a shard-by-hash form. Neither is needed
-  for the API path, so neither decision item 6 waits on was needed here.
+- **Where item 6 slots in:** `Fetch` is the interface, which item 6's `BucketFetcher`, reading
+  shards with storage credentials, implements. The cache's blocks stay keyed by ETag (item 6's
+  decisions).
 
 What the second built (the journal and the upload queue):
 - `Queue`, with `journal` and `publish`: the journal's calls (`put`, `write`, `truncate`,
@@ -1176,8 +1177,11 @@ shard (bytes sent and time, against a put).
 **Checklist:** B4 (protocol §5.5, with `voidfs.json` among what the credentials read, which the
 user approved on 4 October).
 
-**Status (4 October 2026): in progress**, in three pull requests: the format reader, the server,
-then the client. What the first built:
+**Status (4 October 2026): done**, in three pull requests: the format reader
+([vishnu597/voidfs#35](https://github.com/vishnu597/voidfs/pull/35)), the server
+([#36](https://github.com/vishnu597/voidfs/pull/36)), then the client. Checked on MinIO; on AWS once
+the user makes the role to assume, and R2's credentials wait for an API token (Cloudflare mints
+them through its own API). What the first built:
 - `crates/voidfs-format`, a reader of the on-bucket format: the pool's descriptor, refused if
   the reader can't read the pool (format §3, §3.1); a drive's descriptor (§6); its newest
   checkpoint and the segments it lists (§8); the log after it, up to the first gap (§8.4); and
@@ -1273,6 +1277,54 @@ What the second built:
 - **Compose's versitygw overlay** turns them off, as it does direct uploads: that bucket isn't
   reachable from outside the Compose network.
 
+What the third built:
+- In the SDK, `Client::storage` and `Storage`: GETs and listings (every page) of the storage that
+  storage credentials reach, path-style at their endpoint and signed with them and their session
+  token, retried as reads are, but for a `400` or a `403`.
+- In the client core, `BucketFetcher`, which the daemon's cache reads through: a drive's
+  credentials from the server; its state from the bucket, with `voidfs-format`; the whole shards a
+  block needs, each checked against its hash; and through the API where it can't.
+- In `voidfs-format`, `open_drive`: a drive's state in two rounds of requests, not one request after
+  another.
+- In the test server, `FakeBucket::revoke`, and listings in pages.
+- [`bench/scripts/bucket-read.sh`](../bench/scripts/bucket-read.sh) and the client's `bucketread`
+  example, which measure a cold read from the bucket against one through the API; and
+  [`bench/scripts/credentials-check.sh`](../bench/scripts/credentials-check.sh), which checks a
+  bucket ([bench/results/storage-credentials](../bench/results/storage-credentials/README.md)): 12
+  ms away and 40 MB/s down, a 64 MiB file read cold in 1,916 ms from the bucket where through the
+  server it took 3,205 ms, and the next file's first 4 KiB in 259 ms where it took 466.
+
+**Decisions taken while building the third:**
+- **The cache stays keyed by ETag:** an ETag names one content however it was fetched, so blocks
+  from the bucket and through the API are the same blocks. What the fetcher derives from
+  credentials, the drive's state, content layouts, and the shards it holds in memory (64 MiB a
+  drive, so that a shard that straddles two blocks is fetched once), is kept per drive and
+  `accessGeneration`: credentials of another generation, or for another drive of that name, start
+  afresh. The plan's shard-by-hash form of the cache's key isn't needed for that.
+- **Whole shards, checked:** a block fetches the whole shards it covers, each checked against its
+  hash (format §4), as the server's reads do. One that fails, or is missing, is read through the
+  API. Pieces of shards wait for step 5, as through the API.
+- **When the API instead:** for 10 minutes after the server answers `501`, or after the drive's
+  state can't be read from the bucket (from here the bucket may be out of reach); and for a single
+  read the bucket can't answer: a network failure, a shard missing or wrong, a version its log
+  doesn't have yet.
+- **Renewal:** credentials with less than 2 minutes left are asked for again before they are used,
+  and once at once if the bucket refuses them (`400` or `403`). The server's are good for at least
+  7.5 minutes when it hands them out, so a reader asks every 5.5 minutes at most. Credentials the
+  bucket refuses before they expire (a revoked session) send reads through the API until the
+  server mints new ones, which it does once less than half of theirs is left.
+- **Newer than the state:** a version whose sequence number the state hasn't reached, or a current
+  content whose ETag the state doesn't have, makes the fetcher read the log after the state first.
+  The state is as of the last read that needed it; the change feed's invalidations don't need to
+  reach it.
+- **Two rounds, not seven:** read one request after another, as the server's loader reads near its
+  bucket, a drive's state cost the first read 255–300 ms 12 ms away. `open_drive` reads the
+  descriptors and the list of checkpoints at once, then the newest checkpoint and the log after it
+  at once (a checkpoint's name is its sequence number): 198–236 ms, and the next file of the drive
+  starts as fast as through the server.
+- **The daemon reads through it:** against a server with storage credentials it reads from the
+  bucket; against one without, it asks once per drive every 10 minutes.
+
 **Design.**
 - **Server.** Read-only credentials for `shards/`, `pages/` and `drives/<id>/` under the pool's
   root: on AWS through STS AssumeRole with a session policy (a role the deployment names); on R2
@@ -1346,8 +1398,8 @@ for first); a cold read through the bucket against one through the API.
     commit three times; the measurement, and the conformance cases on AWS S3 and R2, which both
     refuse a shard's URL other bytes
     ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)).
-- Item 6, short-lived storage credentials: **in progress** (4 October), in three pull requests,
-  each test seen to fail with the code it guards broken, each break run alone with a timeout:
+- Item 6, short-lived storage credentials: **done** (4 October), in three pull requests, each test
+  seen to fail with the code it guards broken, each break run alone with a timeout:
   - the format reader, factored out of the server into `voidfs-format`: its 6 tests (against
     pools the server wrote, and a bucket with nothing but a broken descriptor or tree), and the
     server's own that load drives, 11 breaks;
@@ -1355,4 +1407,11 @@ for first); a cold read through the bucket against one through the API.
     in the server's own process against the stand-in bucket and a stand-in STS, 1 of which
     services mint), 31 breaks; and five conformance cases, which pass on MinIO (built from source,
     as CI builds it), both addressing styles, and skip with their reason on memory, local disk and
-    versitygw, but the one that checks the `501`: 7 breaks against a server on MinIO.
+    versitygw, but the one that checks the `501`: 7 breaks against a server on MinIO;
+  - the client: 10 tests (6 of the fetcher against a server in the same process and the stand-in
+    bucket, 3 of its pieces, 1 of the SDK's `Storage`), and `open_drive` in the format reader's
+    tests, 19 breaks; and the measurement
+    ([bench/results/storage-credentials](../bench/results/storage-credentials/README.md)).
+
+  R2's storage credentials (Cloudflare's API, with an API token) and the AWS check (a role to
+  assume) wait on the user.
