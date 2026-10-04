@@ -916,8 +916,8 @@ SDK's `put_object_direct` and the upload queue). What the first built:
   `If-None-Match` only where the fourth does. A bucket that ignores a binding stores nothing but
   that valid shard. versitygw 1.8.0 (on this Mac) and MinIO (built from source in CI) enforce all
   three; Backblaze B2 answers `If-None-Match` on a presigned PUT with 501 (observed through
-  Space's URLs, §1.5). Memory and local disk answer 501:
-  nothing presigns there, and their bytes would go through the server anyway.
+  Space's URLs, §1.5). Memory and local disk answer 501: nothing presigns there, and their bytes
+  would go through the server anyway.
 - **Held:** shards the key's head references (option 1 of format §12.4, no request), shards this
   server checked recently (option 2: uploaded, read or HEADed since its last read of
   `gc/pending.json`, and not proposed since), and shards a HEAD finds with their length. A
