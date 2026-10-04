@@ -1482,7 +1482,7 @@ mod tests {
         let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
         let pool = pool(&mem).await;
         pool.create_drive("d", None).await.unwrap();
-        let app = Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct: None });
+        let app = Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct: None, credentials: None });
         let mut bodies = Vec::new();
         for i in 0..n {
             let body = random_bytes(i as u64, 40 << 10);
@@ -1586,7 +1586,7 @@ mod tests {
         let store = Store::mem(mem.clone());
         let pool = Pool::open_creating(store, 1 << 20, crate::clock::Clock::System, CommitGuard::CreateIfAbsent, &features).await.unwrap();
         let d = pool.create_drive("d", None).await.unwrap();
-        (Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct: None }), d)
+        (Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct: None, credentials: None }), d)
     }
 
     /// Sends a request for `key` of drive `d` as the admin key, with `payload` as what its

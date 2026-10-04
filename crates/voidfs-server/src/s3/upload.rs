@@ -247,7 +247,7 @@ mod tests {
         let http = HttpClient::new().unwrap();
         let (_, direct) = crate::probe::offer(Box::new(bucket.clone()), &http).await;
         assert!(direct.is_some(), "the fake bucket binds checksums");
-        let app = Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct });
+        let app = Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct, credentials: None });
         Setup { app, mem, bucket, http }
     }
 
@@ -566,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn without_presigning_plans_and_commits_answer_501() {
         let s = setup().await;
-        let app = Arc::new(App { pool: s.app.pool.clone(), keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct: None });
+        let app = Arc::new(App { pool: s.app.pool.clone(), keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct: None, credentials: None });
         let list = list_of(&s, b"abc");
         refused(call(&app, Method::POST, "x", "x-voidfs-upload-plan", &[], serde_json::to_vec(&json!({ "shards": listed(&list) })).unwrap()).await, 501, "not offered");
         refused(call(&app, Method::PUT, "x", "x-voidfs-upload-commit", &[], commit_body(&list, "1.x", b"abc")).await, 501, "not offered");

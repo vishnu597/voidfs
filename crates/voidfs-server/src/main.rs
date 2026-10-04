@@ -78,6 +78,21 @@ struct Args {
     /// shard); elsewhere, and with `off`, their requests answer 501 and clients put as usual.
     #[arg(long, env = "VOIDFS_DIRECT_UPLOADS", value_enum, default_value = "on")]
     direct_uploads: Switch,
+    /// Storage credentials (protocol §5.5): short-lived, read-only credentials to a drive's
+    /// storage, so that a mount reads shards and metadata straight from the bucket. `on` offers
+    /// them where the bucket's STS mints credentials that read only what a drive's reader needs,
+    /// which is checked at start (MinIO, or AWS with --storage-credentials-role); elsewhere, and
+    /// with `off`, their requests answer 501 and clients read through the server.
+    #[arg(long, env = "VOIDFS_STORAGE_CREDENTIALS", value_enum, default_value = "on")]
+    storage_credentials: Switch,
+    /// The IAM role whose credentials AWS STS narrows to a drive: it must allow reading the pool
+    /// (s3:GetObject and s3:ListBucket), and trust the bucket's credentials to assume it.
+    #[arg(long, env = "VOIDFS_STORAGE_CREDENTIALS_ROLE", global = true)]
+    storage_credentials_role: Option<String>,
+    /// The STS endpoint that mints storage credentials. Default: AWS's regional one for an AWS
+    /// bucket, and the bucket's own endpoint elsewhere, where MinIO serves it.
+    #[arg(long, env = "VOIDFS_STS_ENDPOINT", global = true)]
+    sts_endpoint: Option<String>,
     /// Also serve `<drive>.<domain>/<key>` (virtual-host addressing) under this domain, which
     /// needs a wildcard DNS name `*.<domain>` pointing at the server (repeatable). Requests to
     /// the domain itself, or to any other host, stay path-style (`/<drive>/<key>`).
@@ -233,6 +248,37 @@ async fn direct_uploads(args: &Args, bucket: Option<probe::Bucket>) -> Option<Ar
     direct
 }
 
+fn sts_options(args: &Args) -> voidfs_server::credentials::StsOptions {
+    voidfs_server::credentials::StsOptions { role: args.storage_credentials_role.clone(), endpoint: args.sts_endpoint.clone() }
+}
+
+/// Storage credentials, if `--storage-credentials on` and the bucket's STS mints credentials
+/// scoped to a drive's reader (protocol §5.5, §9).
+async fn storage_credentials(args: &Args, bucket: Option<&probe::Bucket>) -> Option<Arc<voidfs_server::credentials::Credentials>> {
+    if args.storage_credentials == Switch::Off {
+        tracing::info!("storage credentials are off (--storage-credentials off)");
+        return None;
+    }
+    let Some(bucket) = bucket else {
+        tracing::info!("storage credentials are not offered: the store is not a bucket");
+        return None;
+    };
+    let mint = match bucket.sts(&sts_options(args)) {
+        Ok(m) => m,
+        Err(why) => {
+            tracing::info!("storage credentials are not offered: {why}");
+            return None;
+        }
+    };
+    let (checks, offered) = voidfs_server::credentials::offer(Box::new(mint), bucket.location(), bucket.http()).await;
+    // A bucket without STS is common; one whose STS mints credentials that reach too far is not.
+    match (&offered, &checks.refused) {
+        (None, None) => tracing::warn!("storage credentials: {checks}"),
+        _ => tracing::info!("storage credentials: {checks}"),
+    }
+    offered
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
@@ -256,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Probe) => {
             let (store, bucket) = open_store(&args)?;
-            let report = probe::report(&store, bucket.as_ref(), args.commit_guard.into()).await?;
+            let report = probe::report(&store, bucket.as_ref(), args.commit_guard.into(), &sts_options(&args)).await?;
             println!("{report}");
             std::process::exit(if report.refusals.is_empty() { 0 } else { 1 });
         }
@@ -324,8 +370,18 @@ async fn main() -> anyhow::Result<()> {
     for d in &args.virtual_host_domains {
         tracing::info!("serving virtual-host requests to *.{d}");
     }
+    let credentials = storage_credentials(&args, bucket.as_ref()).await;
     let direct = direct_uploads(&args, bucket).await;
-    let app = Arc::new(s3::App { pool: pool.clone(), keys, domains: s3::Domains::new(args.virtual_host_domains), metrics: metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct });
+    let app = Arc::new(s3::App {
+        pool: pool.clone(),
+        keys,
+        domains: s3::Domains::new(args.virtual_host_domains),
+        metrics: metrics::S3Metrics::new(),
+        uploads: Default::default(),
+        read_ahead: Default::default(),
+        direct,
+        credentials,
+    });
     let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("listening on {}", args.listen))?;
     tracing::info!("serving on http://{}", args.listen);
     admin.serving(app.clone());
