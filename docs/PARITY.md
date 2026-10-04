@@ -132,8 +132,7 @@ since 3 October: the server offers direct uploads (item 5), and the SDK and the 
 "Partly" means:
 - E1 has no compression (`shard-zstd` is a reserved pool feature that servers refuse).
 - E10's direct uploads (§4.11) are served where the bucket binds a shard's checksum to its URL
-  (AWS S3, R2 and MinIO to be confirmed; versitygw does), and answer `501` elsewhere; no client
-  uses them yet.
+  (AWS S3, R2, MinIO and versitygw do), and answer `501` elsewhere; no client uses them yet.
 - S3 lacks storage credentials (§5.5, which answer `501`), copy-mode forks
   (`x-voidfs-fork-mode: copy` answers `501`) and display names (`x-voidfs-display-name` is
   ignored: a drive's display name is its alias). S5 is memory-only. S8 has the protocol header
