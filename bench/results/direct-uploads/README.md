@@ -55,17 +55,18 @@ direct uploads, reach R2 over the internet.
 A direct upload waits on R2 for a shard's PUT and the commit's HEAD of it, about 0.5 s more than
 locally; the put still sends the whole file over the client's link.
 
-## What the buckets enforce ([AWS S3](aws-check.txt), [R2](r2-check.txt))
+## What the buckets enforce ([AWS S3](aws-check.txt), [R2](r2-check.txt), [MinIO](minio-check.txt))
 
 On 4 October, a server on a fresh pool in each bucket (AWS S3 in us-east-1, and R2), its start-up
 check of presigned PUTs, the seven direct-upload conformance cases against it, and `probe`; the pool
-was purged after each.
+was purged after each. MinIO's row is CI's interop run the same day, against MinIO built from source.
 
 | Bucket | A wrong `x-amz-checksum-sha256` | Without the signed checksum | `If-None-Match` on an existing object | Conformance |
 |---|---|---|---|---|
 | AWS S3 | refused, 400 | refused, 403 | refused, 412 | 6 passed, 1 skipped (the one for servers without the extension) |
 | Cloudflare R2 | refused, 400 | refused, 403 | refused, 412 | 6 passed, 1 skipped |
 | versitygw 1.8.0 | refused, 400 | refused, 403 | refused, 412 | 6 passed, 1 skipped |
+| MinIO (built from source, in CI) | refused, 400 | refused, 400 AccessDenied | refused, 412 | 6 passed, 1 skipped |
 | Backblaze B2 (through Space's URLs, 3 October) | not checked | an unsigned one refused | 501 | — |
 
 In each, the case that PUTs a shard's URL other bytes was refused by the bucket itself (400).
