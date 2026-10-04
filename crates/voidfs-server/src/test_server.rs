@@ -91,8 +91,9 @@ impl Drop for TestServer {
 pub struct Rules {
     /// Refuse bytes that don't match `x-amz-checksum-sha256` (400 BadDigest).
     pub checksum: bool,
-    /// Refuse a PUT without, or with other values of, the headers its URL was signed with (403).
-    pub signed_headers: bool,
+    /// Refuse a PUT without, or with other values of, the headers its URL was signed with, with
+    /// this status: AWS, R2 and versitygw answer 403, MinIO 400. 0 accepts it.
+    pub signed_headers: u16,
     /// For `If-None-Match: *`: `Some(true)` refuses an object that exists (412), `Some(false)`
     /// ignores the header, and `None` answers 501, as Backblaze B2 does.
     pub if_none_match: Option<bool>,
@@ -102,7 +103,7 @@ pub struct Rules {
 
 impl Default for Rules {
     fn default() -> Rules {
-        Rules { checksum: true, signed_headers: true, if_none_match: Some(true), refuse: None }
+        Rules { checksum: true, signed_headers: 403, if_none_match: Some(true), refuse: None }
     }
 }
 
@@ -199,10 +200,10 @@ async fn fake_put(State(b): State<Arc<FakeState>>, req: Request) -> Response {
         return fake_error(403, "AccessDenied");
     }
     let header = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
-    if rules.signed_headers {
+    if rules.signed_headers != 0 {
         let sent: Vec<(String, String)> = q.get("headers").map(|h| h.split(',').filter(|n| !n.is_empty()).map(|n| (n.to_owned(), header(n).unwrap_or_default())).collect()).unwrap_or_default();
         if q.get("sig") != Some(&b.sign(&path, expires, &sent)) {
-            return fake_error(403, "SignatureDoesNotMatch");
+            return fake_error(rules.signed_headers, if rules.signed_headers == 403 { "SignatureDoesNotMatch" } else { "AccessDenied" });
         }
     }
     let Ok(data) = axum::body::to_bytes(body, 64 << 20).await else { return fake_error(400, "IncompleteBody") };

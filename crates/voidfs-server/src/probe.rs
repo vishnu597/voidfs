@@ -745,7 +745,7 @@ impl fmt::Display for PresignedPuts {
             f,
             "a wrong x-amz-checksum-sha256 was {}; a PUT without the signed checksum was {}; If-None-Match on an existing object was {}. ",
             said(&self.checksum, "HTTP 400"),
-            said(&self.signed_header, "HTTP 403"),
+            said(&self.signed_header, "HTTP 400 or 403"),
             said(&self.if_none_match, "HTTP 412")
         )?;
         match (self.binds_checksums(), self.if_none_match == Check::Enforced) {
@@ -780,8 +780,8 @@ pub async fn presigned_puts(presign: &dyn crate::direct::Presign, http: &HttpCli
         let code = error_code(&String::from_utf8_lossy(&resp.into_body().to_bytes())).unwrap_or_default();
         Ok((status, code))
     };
-    let judge = |r: Result<(u16, String), String>, refusal: u16| match r {
-        Ok((s, _)) if s == refusal => Check::Enforced,
+    let judge = |r: Result<(u16, String), String>, refusals: &[u16]| match r {
+        Ok((s, _)) if refusals.contains(&s) => Check::Enforced,
         Ok((200..=299, _)) => Check::Ignored,
         Ok((501, _)) => Check::Unsupported,
         Ok((s, code)) => Check::Unknown(format!("HTTP {s}{}", if code.is_empty() { String::new() } else { format!(" {code}") })),
@@ -795,10 +795,11 @@ pub async fn presigned_puts(presign: &dyn crate::direct::Presign, http: &HttpCli
     if refused.is_some() {
         return PresignedPuts { refused, checksum: Check::Unknown("not tried".into()), signed_header: Check::Unknown("not tried".into()), if_none_match: Check::Unknown("not tried".into()) };
     }
-    let checksum = judge(put(std::slice::from_ref(&wrong), std::slice::from_ref(&wrong)).await, 400);
-    let signed_header = judge(put(std::slice::from_ref(&sum), &[]).await, 403);
+    let checksum = judge(put(std::slice::from_ref(&wrong), std::slice::from_ref(&wrong)).await, &[400]);
+    // AWS, R2 and versitygw answer 403; MinIO 400 AccessDenied.
+    let signed_header = judge(put(std::slice::from_ref(&sum), &[]).await, &[400, 403]);
     let both = [sum.clone(), inm];
-    let if_none_match = judge(put(&both, &both).await, 412);
+    let if_none_match = judge(put(&both, &both).await, &[412]);
     PresignedPuts { refused, checksum, signed_header, if_none_match }
 }
 

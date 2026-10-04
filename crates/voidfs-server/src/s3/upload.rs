@@ -595,8 +595,11 @@ mod tests {
         let (c, d) = check(Rules { checksum: false, ..Rules::default() }).await;
         assert_eq!((c.checksum.clone(), d), (crate::probe::Check::Ignored, None));
         assert!(c.to_string().contains("NOT offered"), "{c}");
-        let (c, d) = check(Rules { signed_headers: false, ..Rules::default() }).await;
+        let (c, d) = check(Rules { signed_headers: 0, ..Rules::default() }).await;
         assert_eq!((c.signed_header.clone(), d), (crate::probe::Check::Ignored, None));
+        // MinIO refuses a PUT without the signed header with 400 AccessDenied.
+        let (c, d) = check(Rules { signed_headers: 400, ..Rules::default() }).await;
+        assert_eq!((c.signed_header.clone(), d), (crate::probe::Check::Enforced, Some(true)));
         let all = store.list_recursive("").await.unwrap();
         assert_eq!(all.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), [format!("shards/{}", ShardHash::of(crate::probe::PROBE_SHARD).object_path())]);
         assert_eq!(store.get(&all[0].name).await.unwrap().unwrap(), crate::probe::PROBE_SHARD);

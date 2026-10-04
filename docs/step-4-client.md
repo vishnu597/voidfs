@@ -911,7 +911,7 @@ uploads surviving a daemon restart.
 - **What the bucket enforces is checked, not assumed:** at start, four PUTs of a 36-byte shard at
   its own path (`probe::PROBE_SHARD`, a valid shard that garbage collection removes): with its
   checksum, which must be accepted; with another checksum, which must be refused (400); without
-  the signed checksum header (403); and with `If-None-Match: *`, now that it exists (412). Direct
+  the signed checksum header (403, or MinIO's 400 AccessDenied); and with `If-None-Match: *`, now that it exists (412). Direct
   uploads are offered only where the first three hold, and URLs bind `If-None-Match` only where
   the fourth does. A bucket that ignores a binding stores nothing but that valid shard. AWS S3,
   Cloudflare R2 and versitygw 1.8.0 enforce all three, and refuse a shard's URL other bytes (checked
