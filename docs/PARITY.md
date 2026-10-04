@@ -113,27 +113,24 @@ Every item of the plan's checklist (§3, 65 items, including the Finder integrat
 
 | Area | Done | Partly | Missing | State |
 |---|---|---|---|---|
-| Engine (E1–E13) | 9 | 2 | 2 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints, garbage collection, small files held in the log (RFC 0003, the `inline-data` pool feature), and a folder restore that is one version in the history of every file it changes (RFC 0004, the `multi-object-versions` pool feature) work. Direct uploads are served where the bucket binds a shard's checksum to its URL; the SDK and the upload queue don't use them yet (step 4, item 5). Missing: encryption, retention policies |
+| Engine (E1–E13) | 10 | 1 | 2 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints, garbage collection, small files held in the log (RFC 0003, the `inline-data` pool feature), a folder restore that is one version in the history of every file it changes (RFC 0004, the `multi-object-versions` pool feature), and direct uploads (step 4, item 5: where the bucket binds a shard's checksum to its URL, from the SDK and the upload queue) work. Missing: encryption, retention policies |
 | Storage backends (B1–B8) | 2 | 0 | 6 | Local disk, AWS S3, Cloudflare R2, MinIO (built from source in CI) and versitygw work, and rclone works against the server. A capability probe checks the bucket at start. No other providers tried, no short-lived storage credentials, no stored bucket credentials, no adopt or export |
 | Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed (long poll and SSE), and direct uploads where the bucket binds checksums, on one node. Missing: storage credentials, a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
 | Clients (D1–D12) | 0 | 5 | 7 | A read-only macOS mount and its menu-bar shell (the spike), the CLI on the protocol, `void` (step 4, item 2), the client core (item 3): block cache, write journal and upload queue, change-feed client, and the daemon that runs it, with uploads handed to it and the mount table (item 4). No mounting yet (step 5's adapters), no Finder integration, Linux or Windows |
-| SDKs, agents, search (A1–A7) | 0 | 1 | 6 | A Rust SDK on the official AWS SDK, with a typed call for every extension (step 4, item 1). Stock S3 SDKs, boto3, rclone and curl work. No TypeScript, Python or Go SDK, MCP server or search |
+| SDKs, agents, search (A1–A7) | 0 | 1 | 6 | A Rust SDK on the official AWS SDK, with a typed call for every extension (step 4, item 1) and direct uploads (item 5). Stock S3 SDKs, boto3, rclone and curl work. No TypeScript, Python or Go SDK, MCP server or search |
 | Operations (O1–O6) | 1 | 2 | 3 | One binary, with a Compose file. Health checks and Prometheus metrics on a port of their own. A benchmark harness run locally, against R2 and AWS S3 for the small objects, and in CI, not yet in SpaceFS's setup. No tracing, Helm chart, fuzzing or audit |
-| **Total** | **15** | **14** | **36** | Of the 28 P0 items: 14 done, 9 partly, 5 missing |
+| **Total** | **16** | **13** | **36** | Of the 28 P0 items: 14 done, 9 partly, 5 missing |
 
 What moved since 28 September: E9 (small files held in the log, RFC 0003) is done, and B1 is done
 now that AWS S3 and MinIO have run the conformance suite and the clients. A1 is partly done since
 1 October, with the Rust SDK (step 4, item 1), and so is D9, with the CLI (step 4, item 2). D1
 is partly done since 2 October, with the client core's cache and fetcher (item 3), which a daemon
-runs since 3 October (item 4), with background uploads and the mount table. E10 is partly done
-since 3 October: the server offers direct uploads (item 5), and the SDK and the queue come next.
+runs since 3 October (item 4), with background uploads and the mount table. E10 is done since 4
+October: the server offers direct uploads, and the SDK and the upload queue use them (item 5).
 
 "Partly" means:
 - E1 has no compression (`shard-zstd` is a reserved pool feature that servers refuse).
-- E10's direct uploads (§4.11) are served where the bucket binds a shard's checksum to its URL
-  (AWS S3, R2 and MinIO to be confirmed; versitygw does), and answer `501` elsewhere; no client
-  uses them yet.
 - S3 lacks storage credentials (§5.5, which answer `501`), copy-mode forks
   (`x-voidfs-fork-mode: copy` answers `501`) and display names (`x-voidfs-display-name` is
   ignored: a drive's display name is its alias). S5 is memory-only. S8 has the protocol header
@@ -178,7 +175,7 @@ The 28 P0 items, which a credible v1 needs:
 | `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version, and `update` | `void` (step 4, item 2): drives, drive create, show, delete and undelete, fork, history, show, restore, a foreground upload, version, and keys generate for the server, with `--json` on every command and errors as JSON. Next: the daemon and its commands (step 4, item 4); accounts in step 6 ([step-4-client.md](step-4-client.md#item-2-the-cli-on-the-protocol)) |
 | Linux FUSE mount | None (step 9) |
 | Web app: sign-in, settings, access keys, billing | None (billing does not apply) |
-| SDKs: TypeScript, Python, Go, Rust (MIT), each on the official AWS SDK | Rust (`crates/voidfs-sdk`): the official AWS SDK for S3, a typed call for every extension, one error type, the retry rule. Not yet: direct uploads (step 4, item 5), TypeScript, Python, Go |
+| SDKs: TypeScript, Python, Go, Rust (MIT), each on the official AWS SDK | Rust (`crates/voidfs-sdk`): the official AWS SDK for S3, a typed call for every extension, one error type, the retry rule, and direct uploads, opt-in as SpaceFS's are (step 4, item 5). Not yet: TypeScript, Python, Go |
 | Agent docs: `llms.txt`, `llms-full.txt`, `operations.json` | None |
 | Public and restricted share links | None |
 | Passwordless email sign-in, workspaces, scoped keys with drive allowlists, revocation within a minute | Static scoped keys; the allowlist exists in the code but cannot be set |
@@ -776,10 +773,15 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      `void status`; uploads through it (`void upload --detach`, `void uploads`), which survive its
      restart; the mount table and remembered mounts (`void mount|unmount|mounts`, which answer
      `NoAdapter` until step 5), and a launchd agent (`void daemon install|uninstall`).
-   - Direct uploads (E10, §4.11), server and client.
+   - Direct uploads (E10, §4.11), server and client. **Done** (4 October): the server offers them
+     where the bucket binds a shard's checksum to its URL (checked at start); the SDK sends them,
+     opt-in as SpaceFS's does, and the upload queue sends a file that way when the drive holds most
+     of it. A 32 MiB file with 4 KiB changed went in 404 ms and 2.6 MB where a put took 2,023 ms
+     and 33.5 MB, over a link of 12 ms and 20 MB/s up
+     ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)).
    - Short-lived storage credentials (B4, §5.5): AWS STS, R2, MinIO. Presigned URLs as a fallback,
      and an object's shard list for the API path, would be protocol additions (RFC first).
-   - **Status (2026-10-03):** items 1–4 of 6 done.
+   - **Status (2026-10-04):** items 1–5 of 6 done.
 5. **Writable macOS drive** (Phase 2).
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
