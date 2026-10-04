@@ -135,7 +135,7 @@ mod tests {
 
     async fn app(mem: &Arc<MemStore>) -> Arc<App> {
         let pool = Pool::open(Store::mem(mem.clone()), 1 << 20).await.unwrap();
-        Arc::new(App { pool, keys: Keys::default(), domains: Domains::new(Vec::new()), metrics: S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default() })
+        Arc::new(App { pool, keys: Keys::default(), domains: Domains::new(Vec::new()), metrics: S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct: None })
     }
 
     async fn get(admin: &Arc<Admin>, path: &str) -> (StatusCode, String) {

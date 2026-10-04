@@ -12,7 +12,8 @@
 //! of its own ([`Bucket`]). A lifecycle rule that would delete the pool's objects, or move them
 //! where they can't be read, stops a server from starting. Versioning, which keeps deleted
 //! objects billed, is a warning. Presigned URLs, CORS, object lock, modification times and the
-//! bucket's clock are only reported.
+//! bucket's clock are only reported. What a presigned PUT binds decides whether a server offers
+//! direct uploads ([`presigned_puts`]), which it checks when it starts.
 //!
 //! Some things can't be checked without new objects, which the format does not allow under the
 //! root: that create-if-absent holds when writers race, and that reads and listings see writes at
@@ -37,6 +38,9 @@ pub const DESCRIPTOR: &str = "voidfs.json";
 
 /// Storage classes whose objects can't be read until they are restored.
 const COLD: &[&str] = &["GLACIER", "DEEP_ARCHIVE"];
+
+/// What stays as it is in a key in a URL: unreserved characters and `/`.
+const KEY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~').remove(b'/');
 
 // ---------------------------------------------------------------------------------------------
 // Create-if-absent
@@ -206,6 +210,11 @@ impl Bucket {
         Ok(Bucket { http, signer, url: format!("{base}/{bucket}"), prefix: if prefix.is_empty() { String::new() } else { format!("{prefix}/") }, provider })
     }
 
+    /// The HTTP client its requests go through.
+    pub fn http(&self) -> &HttpClient {
+        &self.http
+    }
+
     /// Where the pool is, in words.
     fn scope(&self) -> String {
         if self.prefix.is_empty() { "the bucket".into() } else { format!("the pool's prefix {:?}", self.prefix) }
@@ -248,6 +257,21 @@ impl Bucket {
             Doc::Absent => Ok(Lifecycle::default()),
             Doc::Unchecked(u) => Err(u),
         }
+    }
+
+    /// A PUT of `path` (relative to the pool's root), presigned with `headers` among the signed
+    /// ones, path-style as OpenDAL addresses the bucket.
+    pub async fn presign_put(&self, path: &str, headers: &[(String, String)], expires: Duration) -> anyhow::Result<crate::direct::Presigned> {
+        let key = format!("{}{path}", self.prefix);
+        let url = format!("{}/{}", self.url, percent_encoding::utf8_percent_encode(&key, KEY));
+        let mut b = http::Request::put(url);
+        for (k, v) in headers {
+            b = b.header(k, v);
+        }
+        let (mut parts, ()) = b.body(())?.into_parts();
+        self.signer.sign(&mut parts, Some(expires)).await.map_err(|e| anyhow!("presigning a PUT of {path}: {e}"))?;
+        let headers = parts.headers.iter().filter(|(k, _)| *k != http::header::HOST).map(|(k, v)| Ok((k.as_str().to_owned(), v.to_str()?.to_owned()))).collect::<anyhow::Result<_>>()?;
+        Ok(crate::direct::Presigned { url: parts.uri.to_string(), headers })
     }
 
     async fn versioning(&self) -> Result<Versioning, Unchecked> {
@@ -513,11 +537,13 @@ impl fmt::Display for Report {
 }
 
 /// Every check, for a server that would be started with `--commit-guard guard`. It changes
-/// nothing: the only write is the create-if-absent check's, which a bucket that honours the
-/// condition refuses.
+/// nothing a pool holds: the writes are the create-if-absent check's, which a bucket that honours
+/// the condition refuses, and the presigned PUTs of [`PROBE_SHARD`], a valid shard.
 pub async fn report(store: &Store, bucket: Option<&Bucket>, guard: CommitGuard) -> anyhow::Result<Report> {
     let mut r = Report::default();
-    match store.get(DESCRIPTOR).await? {
+    let descriptor = store.get(DESCRIPTOR).await?;
+    let pool_exists = descriptor.is_some();
+    match descriptor {
         None => {
             r.row("pool", format!("none here yet; a server would create one with the {} commit guard", guard_name(guard)));
             r.row(
@@ -590,6 +616,10 @@ pub async fn report(store: &Store, bucket: Option<&Bucket>, guard: CommitGuard) 
     );
     r.row("presigned URLs", presigned);
     r.row(
+        "presigned PUTs",
+        if pool_exists { presigned_puts(b, &b.http).await.to_string() } else { "not checked, as there is no pool here yet; a server checks them when it starts".into() },
+    );
+    r.row(
         "temporary credentials",
         match b.provider {
             Provider::Aws => "not probed: AWS STS AssumeRole needs a role to assume. Direct uploads will need it, or presigned URLs",
@@ -651,6 +681,133 @@ async fn presigned(store: &Store, b: &Bucket) -> String {
         Ok(s) => format!("unknown: a presigned HEAD of voidfs.json was answered with HTTP {s}"),
         Err(e) => format!("unknown: {e:#}"),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Presigned PUTs, for direct uploads (protocol §4.11)
+
+impl crate::direct::Presign for Bucket {
+    fn put<'a>(&'a self, path: &'a str, headers: &'a [(String, String)], expires: Duration) -> futures::future::BoxFuture<'a, anyhow::Result<crate::direct::Presigned>> {
+        Box::pin(self.presign_put(path, headers, expires))
+    }
+}
+
+/// The bytes of the shard the checks upload. It is a valid shard, stored under its own hash, so a
+/// store that ignores what a URL binds stores nothing a pool must not hold (format §2, §4), and
+/// garbage collection removes it.
+pub const PROBE_SHARD: &[u8] = b"voidfs: a presigned upload, checked\n";
+
+/// What a store did with something a presigned PUT binds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Check {
+    /// It refused the PUT that broke it.
+    Enforced,
+    /// It accepted the PUT that broke it.
+    Ignored,
+    /// It answers that it does not implement it (`501`).
+    Unsupported,
+    Unknown(String),
+}
+
+/// What the store does with presigned PUTs (protocol §4.11, §9).
+#[derive(Clone, Debug)]
+pub struct PresignedPuts {
+    /// A PUT of a valid shard with its own checksum. `None` when the store accepted it.
+    pub refused: Option<String>,
+    /// A PUT whose bytes do not match the signed `x-amz-checksum-sha256`.
+    pub checksum: Check,
+    /// A PUT sent without the signed checksum header.
+    pub signed_header: Check,
+    /// A PUT with the signed `If-None-Match: *` of an object that exists.
+    pub if_none_match: Check,
+}
+
+impl PresignedPuts {
+    /// Whether a URL keeps a client from storing bytes under a hash they don't match, which
+    /// direct uploads need (protocol §9).
+    pub fn binds_checksums(&self) -> bool {
+        self.refused.is_none() && self.checksum == Check::Enforced && self.signed_header == Check::Enforced
+    }
+}
+
+impl fmt::Display for PresignedPuts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(why) = &self.refused {
+            return write!(f, "REFUSED: a presigned PUT of a valid shard {why}. Direct uploads are not offered");
+        }
+        let said = |c: &Check, refused: &str| match c {
+            Check::Enforced => format!("refused ({refused})"),
+            Check::Ignored => "ACCEPTED".to_owned(),
+            Check::Unsupported => "not implemented (HTTP 501)".to_owned(),
+            Check::Unknown(why) => format!("unknown ({why})"),
+        };
+        write!(
+            f,
+            "a wrong x-amz-checksum-sha256 was {}; a PUT without the signed checksum was {}; If-None-Match on an existing object was {}. ",
+            said(&self.checksum, "HTTP 400"),
+            said(&self.signed_header, "HTTP 403"),
+            said(&self.if_none_match, "HTTP 412")
+        )?;
+        match (self.binds_checksums(), self.if_none_match == Check::Enforced) {
+            (true, true) => write!(f, "Direct uploads are offered, binding both"),
+            (true, false) => write!(f, "Direct uploads are offered, binding checksums only"),
+            (false, _) => write!(f, "Direct uploads are NOT offered: the store must refuse bytes that don't match a URL's checksum"),
+        }
+    }
+}
+
+/// Finds out what a store enforces on the PUTs it presigns, with four PUTs of
+/// [`PROBE_SHARD`] at its own path: one that must be accepted, then one with another checksum,
+/// one without the checksum header, and one with `If-None-Match: *`, which must be refused.
+pub async fn presigned_puts(presign: &dyn crate::direct::Presign, http: &HttpClient) -> PresignedPuts {
+    let h = voidfs_core::ids::ShardHash::of(PROBE_SHARD);
+    let path = format!("shards/{}", h.object_path());
+    let sum = ("x-amz-checksum-sha256".to_owned(), crate::direct::checksum(&h));
+    let wrong = ("x-amz-checksum-sha256".to_owned(), crate::direct::checksum(&voidfs_core::ids::ShardHash::of(b"other bytes")));
+    let inm = ("if-none-match".to_owned(), "*".to_owned());
+    let ttl = Duration::from_secs(300);
+    // Presigns with `signed` and sends with `sent`: the status and the error code.
+    let put = async |signed: &[(String, String)], sent: &[(String, String)]| -> Result<(u16, String), String> {
+        let p = presign.put(&path, signed, ttl).await.map_err(|e| format!("{e:#}"))?;
+        let mut req = http::Request::put(&p.url);
+        for (k, v) in &p.headers {
+            if sent.iter().any(|(s, _)| s == k) || !signed.iter().any(|(s, _)| s == k) {
+                req = req.header(k, v);
+            }
+        }
+        let resp = http.send(req.body(Buffer::from(Bytes::from_static(PROBE_SHARD))).map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        let code = error_code(&String::from_utf8_lossy(&resp.into_body().to_bytes())).unwrap_or_default();
+        Ok((status, code))
+    };
+    let judge = |r: Result<(u16, String), String>, refusal: u16| match r {
+        Ok((s, _)) if s == refusal => Check::Enforced,
+        Ok((200..=299, _)) => Check::Ignored,
+        Ok((501, _)) => Check::Unsupported,
+        Ok((s, code)) => Check::Unknown(format!("HTTP {s}{}", if code.is_empty() { String::new() } else { format!(" {code}") })),
+        Err(e) => Check::Unknown(e),
+    };
+    let refused = match put(std::slice::from_ref(&sum), std::slice::from_ref(&sum)).await {
+        Ok((200..=299, _)) => None,
+        Ok((s, code)) => Some(format!("was answered with HTTP {s}{}", if code.is_empty() { String::new() } else { format!(" {code}") })),
+        Err(e) => Some(format!("failed: {e}")),
+    };
+    if refused.is_some() {
+        return PresignedPuts { refused, checksum: Check::Unknown("not tried".into()), signed_header: Check::Unknown("not tried".into()), if_none_match: Check::Unknown("not tried".into()) };
+    }
+    let checksum = judge(put(std::slice::from_ref(&wrong), std::slice::from_ref(&wrong)).await, 400);
+    let signed_header = judge(put(std::slice::from_ref(&sum), &[]).await, 403);
+    let both = [sum.clone(), inm];
+    let if_none_match = judge(put(&both, &both).await, 412);
+    PresignedPuts { refused, checksum, signed_header, if_none_match }
+}
+
+/// Direct uploads through `presign`, if the store behind it binds a URL's checksum: what a server
+/// offers, after the checks it makes when it starts.
+pub async fn offer(presign: Box<dyn crate::direct::Presign>, http: &HttpClient) -> (PresignedPuts, Option<std::sync::Arc<crate::direct::Direct>>) {
+    let checks = presigned_puts(presign.as_ref(), http).await;
+    let direct = checks.binds_checksums().then(|| std::sync::Arc::new(crate::direct::Direct::new(presign, checks.if_none_match == Check::Enforced)));
+    (checks, direct)
 }
 
 #[cfg(test)]
