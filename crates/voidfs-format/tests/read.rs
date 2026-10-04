@@ -46,6 +46,11 @@ async fn same_as(b: &Bucket, pool: &Pool, name: &str) {
     let want = d.snapshot();
     assert_eq!(state.seq(), want.seq(), "{name}");
     assert_eq!(state.rows(), want.rows(), "{name}");
+    // And all at once, as a client far from the bucket reads it.
+    let (pool, drive, state) = voidfs_format::open_drive(b, &d.id).await.unwrap().unwrap();
+    assert_eq!((pool, drive), (desc, d.desc.clone()));
+    assert_eq!(state.seq(), want.seq(), "{name}, at once");
+    assert_eq!(state.rows(), want.rows(), "{name}, at once");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -66,6 +71,7 @@ async fn drives_are_read_as_the_server_has_them() {
     same_as(&b, &s.pool, "drv").await;
     same_as(&b, &s.pool, "fork").await;
     assert!(voidfs_format::load_drive(&b, &voidfs_format::open_pool(&b).await.unwrap(), &DriveId::generate()).await.unwrap().is_none(), "no such drive");
+    assert!(voidfs_format::open_drive(&b, &DriveId::generate()).await.unwrap().is_none(), "no such drive");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -121,6 +127,7 @@ async fn the_log_is_read_up_to_its_first_gap() {
     s.pool.store.delete(&voidfs_format::log_path(&id, 3)).await.unwrap();
     let (_, state) = voidfs_format::load_drive(&b, &desc, &id).await.unwrap().unwrap();
     assert_eq!(state.seq(), 2);
+    assert_eq!(voidfs_format::open_drive(&b, &id).await.unwrap().unwrap().2.seq(), 2);
     let mut caught = state.clone();
     assert_eq!(voidfs_format::catch_up(&b, &id, &mut caught).await.unwrap(), 0);
 }
