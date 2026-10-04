@@ -1,0 +1,13 @@
+# Before ca9308d (run 37207819662, commit 75c8bef), the start-up check took MinIO's answer to a PUT without the signed checksum for unknown:
+start-up: presigned PUTs: a wrong x-amz-checksum-sha256 was refused (HTTP 400); a PUT without the signed checksum was unknown (HTTP 400 AccessDenied); If-None-Match on an existing object was refused (HTTP 412). Direct uploads are NOT offered: the store must refuse bytes that don't match a URL's checksum
+
+# CI interop against MinIO built from source, 4 October 2026: https://github.com/vishnu597/voidfs/actions/runs/37208206920 (job "Conformance and clients (minio)", commit ca9308d)
+start-up: presigned PUTs: a wrong x-amz-checksum-sha256 was refused (HTTP 400); a PUT without the signed checksum was refused (HTTP 400 or 403); If-None-Match on an existing object was refused (HTTP 412). Direct uploads are offered, binding both
+SKIP  direct-upload-not-offered        the server offers direct uploads, which the other direct-upload cases test
+PASS  direct-upload-roundtrip            2579 ms
+PASS  direct-upload-held-counts          7401 ms
+PASS  direct-upload-missing-shard        2068 ms
+PASS  direct-upload-token                5637 ms
+PASS  direct-upload-preconditions        4617 ms
+PASS  direct-upload-store-refuses-wrong-bytes   2064 ms
+49 passed, 0 failed, 1 skipped

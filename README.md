@@ -137,6 +137,12 @@ for v in client.list_versions("footage", "cut.txt", false).await? {
 }
 ```
 
+`put_object_direct` uploads a large file the drive mostly holds already, such as a render with
+one scene changed, by sending only the shards the drive lacks, straight to the bucket (below, *Direct
+uploads*); `Config { direct_uploads: true, .. }` makes `put_object` do so for bodies of 8 MiB and
+more. Where the server doesn't offer it, or anything but a `409` or `412` fails, it puts as usual.
+The background upload queue (`void upload`) does the same for a file it replaces.
+
 Every call fails with one error type, which carries the status, the S3 code and, on a `412`, the
 version that won. Calls are retried on server errors and broken connections, except an insert or
 removal without a precondition, which is never sent twice: pass `if_version` to make it safe to

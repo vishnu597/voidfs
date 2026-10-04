@@ -44,6 +44,10 @@ pub struct Config {
     pub upload_bandwidth: Option<Arc<Bandwidth>>,
     /// Told what each attempt of the SDK's own requests came to (not [`Client::s3`]'s).
     pub observer: Option<Arc<dyn Observe>>,
+    /// [`Client::put_object`] sends bodies of [`crate::direct::DIRECT_MIN_BYTES`] and more as
+    /// direct uploads (protocol §4.11), as [`Client::put_object_direct`] does. Off by default: it
+    /// pays when the drive holds most of what is uploaded already.
+    pub direct_uploads: bool,
 }
 
 /// What one attempt of a request came to.
@@ -75,6 +79,7 @@ impl Default for Config {
             max_attempts: 3,
             upload_bandwidth: None,
             observer: None,
+            direct_uploads: false,
         }
     }
 }
@@ -90,6 +95,7 @@ impl fmt::Debug for Config {
             .field("max_attempts", &self.max_attempts)
             .field("upload_bandwidth", &self.upload_bandwidth.as_ref().map(|b| b.get()))
             .field("observer", &self.observer.is_some())
+            .field("direct_uploads", &self.direct_uploads)
             .finish_non_exhaustive()
     }
 }
@@ -179,23 +185,23 @@ impl Req {
         self
     }
 
-    fn header_opt(self, name: &str, value: Option<impl Into<String>>) -> Req {
+    pub(crate) fn header_opt(self, name: &str, value: Option<impl Into<String>>) -> Req {
         match value {
             Some(v) => self.header(name, v),
             None => self,
         }
     }
 
-    fn body(mut self, body: impl Into<Bytes>) -> Req {
+    pub(crate) fn body(mut self, body: impl Into<Bytes>) -> Req {
         self.body = body.into();
         self
     }
 
-    fn guard(self, if_version: Option<&String>, if_match: Option<&String>) -> Req {
+    pub(crate) fn guard(self, if_version: Option<&String>, if_match: Option<&String>) -> Req {
         self.header_opt("x-voidfs-if-version", if_version.cloned()).header_opt("if-match", if_match.cloned())
     }
 
-    fn attrs(self, mtime: Option<&String>, mode: Option<u32>) -> Req {
+    pub(crate) fn attrs(self, mtime: Option<&String>, mode: Option<u32>) -> Req {
         self.header_opt("x-voidfs-mtime", mtime.cloned()).header_opt("x-voidfs-mode", mode.map(|m| format!("{m:04o}")))
     }
 
@@ -236,7 +242,7 @@ impl Reply {
         serde_json::from_slice(&self.body).map_err(|e| Error::decode(format!("{e}: {}", String::from_utf8_lossy(&self.body[..self.body.len().min(200)]))))
     }
 
-    fn write_result(&self) -> Result<WriteResult> {
+    pub(crate) fn write_result(&self) -> Result<WriteResult> {
         Ok(WriteResult {
             version_id: self.header("x-amz-version-id").ok_or_else(|| Error::decode("no x-amz-version-id on a mutation"))?,
             etag: self.header("etag"),
@@ -246,7 +252,7 @@ impl Reply {
 }
 
 /// `body` in pieces, each after the limit allows it.
-fn paced(body: Bytes, bw: Arc<Bandwidth>) -> impl futures::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + 'static {
+pub(crate) fn paced(body: Bytes, bw: Arc<Bandwidth>) -> impl futures::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + 'static {
     futures::stream::unfold((body, bw), |(mut rest, bw)| async move {
         if rest.is_empty() {
             return None;
@@ -340,6 +346,11 @@ impl Client {
 
     pub fn config(&self) -> &Config {
         &self.0.config
+    }
+
+    /// The HTTP client for requests answered at once.
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.0.http
     }
 
     // -----------------------------------------------------------------------------------------
@@ -488,8 +499,19 @@ impl Client {
     // -----------------------------------------------------------------------------------------
     // Objects (§3, §4)
 
-    /// Writes a whole object. A key ending in `/` with an empty body is a folder.
+    /// Writes a whole object. A key ending in `/` with an empty body is a folder. With
+    /// [`Config::direct_uploads`], a body of [`crate::direct::DIRECT_MIN_BYTES`] or more goes as
+    /// [`Client::put_object_direct`] sends it.
     pub async fn put_object(&self, drive: &str, key: &str, body: impl Into<Bytes>, opts: PutOptions) -> Result<WriteResult> {
+        let body: Bytes = body.into();
+        if self.0.config.direct_uploads {
+            return self.put_object_direct(drive, key, body, opts).await;
+        }
+        self.put_plain(drive, key, body, opts).await
+    }
+
+    /// A PutObject.
+    pub(crate) async fn put_plain(&self, drive: &str, key: &str, body: Bytes, opts: PutOptions) -> Result<WriteResult> {
         require("key", key)?;
         let mut req = Req::new(Method::PUT, object_path(drive, key))
             .body(body)

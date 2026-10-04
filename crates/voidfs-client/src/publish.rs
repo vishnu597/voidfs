@@ -118,9 +118,13 @@ pub(crate) struct Ctx {
     pub part_size: u64,
     pub multipart_from: u64,
     pub parts_at_once: usize,
+    /// Files from this size may go as direct uploads.
+    pub direct_from: u64,
     /// Bodies in flight, in KiB, of `memory_kib` at most.
     pub memory: Arc<Semaphore>,
     pub memory_kib: u32,
+    /// Whether the server offers direct uploads, which the queue's publishes share.
+    pub offered: Arc<Offered>,
     pub stop: Stop,
     /// Bytes sent, for progress.
     pub sent: Arc<AtomicU64>,
@@ -128,6 +132,27 @@ pub(crate) struct Ctx {
     pub may_have_landed: bool,
     /// The multipart upload the entry has open, which the queue keeps with the entry.
     pub upload_id: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// How long the queue takes a server's `501` to a direct upload's plan as its answer.
+const RECHECK: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether the server offers direct uploads (protocol §4.11), as the queue last found out.
+#[derive(Default)]
+pub(crate) struct Offered(std::sync::Mutex<Option<(bool, std::time::Instant)>>);
+
+impl Offered {
+    /// What was found within [`RECHECK`], if anything.
+    fn known(&self) -> Option<bool> {
+        match *self.0.lock().unwrap_or_else(|p| p.into_inner()) {
+            Some((offered, at)) if at.elapsed() < RECHECK => Some(offered),
+            _ => None,
+        }
+    }
+
+    fn found(&self, offered: bool) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some((offered, std::time::Instant::now()));
+    }
 }
 
 fn is_412(e: &voidfs_sdk::Error) -> bool {
@@ -218,6 +243,12 @@ async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
         Ok(n) => n,
         Err(err) => return Err(Outcome::Failed { error: format!("{}: {err}", e.key), transient: false }),
     };
+    // A new file is new bytes, which an ordinary put sends as fast.
+    if run.len() == 1 && size >= ctx.direct_from && guard != Guard::Absent
+        && let Some(o) = direct(ctx, e, size, &guard).await?
+    {
+        return Ok(o);
+    }
     if run.len() == 1 && size >= ctx.multipart_from {
         return multipart(ctx, e, size, guard).await;
     }
@@ -370,6 +401,122 @@ async fn attrs(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
         }
         Err(err) => Err(err.into()),
     }
+}
+
+/// A file cut into shards as format §4.1 says (each shard's hash and length, in order), and the
+/// SHA-256 of the whole, read in pieces so that it is never held whole.
+fn cut(path: &std::path::Path) -> Result<(Vec<(voidfs_core::ids::ShardHash, u64)>, String)> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut chunker = voidfs_core::chunk::StreamChunker::new(voidfs_core::chunk::Params::DEFAULT);
+    let mut whole = sha2::Sha256::new();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        whole.update(&buf[..n]);
+        out.extend(chunker.push(&buf[..n]).into_iter().map(|s| (s.hash, s.bytes.len() as u64)));
+    }
+    out.extend(chunker.finish().into_iter().map(|s| (s.hash, s.bytes.len() as u64)));
+    Ok((out, hex::encode(whole.finalize())))
+}
+
+/// A file sent as a direct upload (protocol §4.11): only the shards the drive's pool lacks go,
+/// straight to the bucket, and a commit makes the version, guarded and marked as a put is. `None`
+/// when it should go the ordinary way: the server doesn't offer direct uploads, the pool holds
+/// less than half of the file, or a step failed with anything but a `409` or a `412`.
+async fn direct(ctx: &Ctx, e: &Entry, size: u64, guard: &Guard) -> Step<Option<Outcome>> {
+    if ctx.offered.known() == Some(false) {
+        return Ok(None);
+    }
+    // An import doesn't know what is at the key: nothing there means new bytes.
+    if *guard == Guard::None && ctx.stop.or(ctx.client.head_object(&e.drive, &e.key, ReadOptions::default())).await?.is_err() {
+        return Ok(None);
+    }
+    // Cutting the file reads it whole: first ask, with an empty plan, whether it can go direct.
+    if ctx.offered.known().is_none() {
+        match ctx.stop.or(ctx.client.plan_upload(&e.drive, &e.key, &[])).await? {
+            Ok(_) => ctx.offered.found(true),
+            Err(err) if err.status() == Some(501) => {
+                ctx.offered.found(false);
+                return Ok(None);
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+    let src = e.source.clone().unwrap_or_default();
+    let path = src.clone();
+    let (shards, sha) = blocking(move || cut(&path)).await?;
+    if shards.len() > voidfs_sdk::direct::MAX_SHARDS {
+        return Ok(None);
+    }
+    let stands = |err: &voidfs_sdk::Error| err.status() == Some(409);
+    let plan = match ctx.stop.or(ctx.client.plan_upload(&e.drive, &e.key, &shards)).await? {
+        Ok(p) => p,
+        Err(err) if stands(&err) => return Err(err.into()),
+        Err(err) => {
+            if err.status() == Some(501) {
+                ctx.offered.found(false);
+            }
+            return Ok(None);
+        }
+    };
+    let missing: u64 = plan.upload.iter().map(|p| p.length).sum();
+    if missing * 2 > size {
+        return Ok(None);
+    }
+    ctx.sent.store(size - missing, Ordering::Relaxed);
+    let mut at = std::collections::HashMap::new();
+    let mut off = 0;
+    for (h, n) in &shards {
+        at.entry(h.to_hex()).or_insert(off);
+        off += n;
+    }
+    let file = Arc::new(std::fs::File::open(&src).map_err(|err| Outcome::Failed { error: format!("{}: {err}", src.display()), transient: false })?);
+    let sends = futures::stream::iter(plan.upload.iter().cloned()).map(|p| {
+        let (file, off) = (file.clone(), at.get(&p.hash).copied().unwrap_or(0));
+        async move {
+            let len = p.length;
+            let _mem = ctx.hold(len).await?;
+            let body = blocking(move || {
+                let mut buf = vec![0u8; len as usize];
+                file.read_exact_at(&mut buf, off)?;
+                Ok(Bytes::from(buf))
+            })
+            .await?;
+            let sent = ctx.stop.or(ctx.client.upload_shard(&p, body)).await?;
+            if sent.is_ok() {
+                ctx.sent.fetch_add(len, Ordering::Relaxed);
+            }
+            Ok::<_, Outcome>(sent.is_ok())
+        }
+    });
+    let mut sends = sends.buffer_unordered(voidfs_sdk::direct::SHARD_UPLOADS);
+    while let Some(r) = sends.next().await {
+        if !r? {
+            return Ok(None);
+        }
+    }
+    drop(sends);
+    let commit = |g: &Guard| ctx.client.commit_upload(&e.drive, &e.key, &plan.token, &shards, &sha, put_opts(ctx, e, &e.attrs, g));
+    let (version, clash) = match ctx.stop.or(commit(guard)).await? {
+        Ok(w) => (w.version_id, None),
+        Err(err) if is_412(&err) => match landed(ctx, e).await? {
+            Some(v) => (v, None),
+            None => match ctx.stop.or(commit(&Guard::None)).await? {
+                Ok(w) => (w.version_id, conflict(&err)),
+                Err(again) if stands(&again) => return Err(again.into()),
+                Err(_) => return Ok(None),
+            },
+        },
+        Err(err) if stands(&err) => return Err(err.into()),
+        Err(_) => return Ok(None),
+    };
+    done(Some(xattrs_after(ctx, e, &e.attrs, version).await?), clash).map(Some)
 }
 
 /// The part size for `size` bytes: `part_size`, or larger to stay within 10,000 parts.

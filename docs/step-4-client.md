@@ -1030,8 +1030,8 @@ uploads surviving a daemon restart.
 
 **Checklist:** E10 (protocol §4.11, as written).
 
-**Status (3 October 2026): in progress**, in two pull requests: the server, then the client (the
-SDK's `put_object_direct` and the upload queue). What the first built:
+**Status (4 October 2026): done**, in two pull requests: the server, then the client (the SDK's
+`put_object_direct` and the upload queue). What the first built:
 - In `voidfs-server`: the plan (`POST /{drive}/{key}?x-voidfs-upload-plan`) and the commit (`PUT
   …?x-voidfs-upload-commit`) in `s3/upload.rs`; `direct.rs`, with the token and the `Presign`
   trait; presigned PUTs from the bucket's own signer (`probe::Bucket::presign_put`);
@@ -1060,10 +1060,13 @@ SDK's `put_object_direct` and the upload queue). What the first built:
   the signed checksum header (403, or MinIO's 400 AccessDenied); and with `If-None-Match: *`, now
   that it exists (412). Direct uploads are offered only where the first three hold, and URLs bind
   `If-None-Match` only where the fourth does. A bucket that ignores a binding stores nothing but
-  that valid shard. versitygw 1.8.0 (on this Mac) and MinIO (built from source in CI) enforce all
-  three; Backblaze B2 answers `If-None-Match` on a presigned PUT with 501 (observed through
-  Space's URLs, §1.5). Memory and local disk answer 501: nothing presigns there, and their bytes
-  would go through the server anyway.
+  that valid shard. AWS S3, Cloudflare R2, versitygw 1.8.0 and MinIO (built from source in CI)
+  enforce all three, and refuse a shard's URL other bytes (checked 4 October,
+  [bench/results/direct-uploads](../bench/results/direct-uploads/README.md)); Backblaze B2 answers
+  `If-None-Match` on a presigned PUT with 501 (observed through Space's URLs, §1.5). Memory and
+  local disk answer 501: nothing presigns there, and their bytes would go through the server
+  anyway. So does Compose's versitygw overlay, whose bucket clients outside the Compose network
+  can't reach.
 - **Held:** shards the key's head references (option 1 of format §12.4, no request), shards this
   server checked recently (option 2: uploaded, read or HEADed since its last read of
   `gc/pending.json`, and not proposed since), and shards a HEAD finds with their length. A
@@ -1098,6 +1101,55 @@ SDK's `put_object_direct` and the upload queue). What the first built:
   to read `voidfs.json`'s. Every pool voidfs creates has them, and in another pool a plan only
   holds less (format §4.1 allows any cut). Space cuts with the same FastCDC sizes (read, and
   observed: §1.5).
+
+What the second built:
+- In the SDK, `direct`: `plan_upload`, `upload_shard`, `upload_planned` and `commit_upload`, the three
+  steps one at a time; `put_object_direct`, which takes them and falls back to a put; and
+  `Config::direct_uploads`, with which `put_object` sends bodies of 8 MiB and more that way.
+- In the client core, the upload queue sends a file that replaces a version the drive holds most
+  of as a direct upload (`QueueConfig::direct_from`).
+- [`bench/scripts/direct-reupload.sh`](../bench/scripts/direct-reupload.sh) and the SDK's
+  `reupload` example, which measure it against a put
+  ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)): a 32 MiB file with 4 KiB
+  changed, over a link of 12 ms and 20 MB/s up, went in 404 ms and 2.6 MB where a put took 2,023 ms
+  and 33.5 MB; with the pool in R2, 963 ms where a put took 2,565.
+- The bucket checks: AWS S3 and R2 refuse a shard's URL other bytes, and the conformance cases pass
+  on both.
+
+**Decisions taken while building the second:**
+- **The SDK, as SpaceFS's:** opt-in, by `put_object_direct` or `Config::direct_uploads` (bodies of 8
+  MiB and more, `DIRECT_MIN_BYTES`, Space's constant). It puts the ordinary way on anything but a
+  `409` or a `412`, which are answers about the object: a server answering `501`, a bucket it can't
+  reach or that refuses a shard, a commit refused for an expired token or a missing shard. A body
+  of more than 4,096 shards is put. The steps are public too, for a caller that decides after the
+  plan, as the queue does.
+- **Shards go to the bucket as the SDK's own requests do:** within `Config::upload_bandwidth`,
+  which counts them, 8 at once, retried as idempotent requests; a `412` (the bucket has the shard
+  already, under `If-None-Match`) counts as sent. The commit is retried as a put is.
+- **The queue plans when a file may be mostly there:** a put of 8 MiB or more, alone in its run,
+  that replaces a version (a change based on one, or an import over a file the key has, which a
+  HEAD finds). A new file is never planned: new bytes go as fast through a put, as SpaceFS says.
+  Before it reads a file to cut it, the queue asks once, with an empty plan, whether the server
+  offers direct uploads, and takes a `501` as the answer for ten minutes. The plan decides: the
+  file goes direct if the pool holds at least half of its bytes, and the ordinary way (a put, or a
+  multipart upload) otherwise, the plan costing one request. (Cutting a 30 MiB import before
+  asking delayed its upload on CI's slower runner, and was wasted where the server answers 501.)
+- **The file is cut once, never held whole:** on a blocking thread, 4 MiB at a time, keeping each
+  shard's hash and length and the whole file's SHA-256; shards to send are read from the file by
+  offset, within the queue's memory budget. A file that changes meanwhile has shards the bucket
+  refuses (their checksums are bound), and goes the ordinary way.
+- **A direct commit is a put to the queue:** guarded by the version its change was based on, with
+  the entry's `x-amz-meta-voidfs-entry` marker (protocol §4.11, as approved on 3 October), so a
+  commit whose answer was lost is recognised as the queue's own; and the `412` rule: a version that
+  isn't its own is the conflict, and the commit is made again, unguarded, with the same token.
+  Extended attributes follow as an attribute version, as after a put.
+- **Progress:** a plan's held bytes count as sent, and each shard's as it lands. A paused or
+  restarted direct upload plans again; the shards that reached the bucket are then held.
+- **A file uploaded in parts holds less:** a multipart upload is cut at its parts' boundaries
+  (format §11), which a whole-file cut doesn't share; FastCDC finds its own boundaries again a shard
+  or two after each. Measured: a plan of a 128 MiB file uploaded in 16 MiB parts held 45 of its 56
+  shards, 74% of its bytes, so such files still go direct. Files the queue put whole hold all but
+  the shards around a change.
 
 **Design.**
 - **Server.** Plan: up to 4,096 shards; which the pool holds safely (§12.4 of the format: present,
@@ -1194,11 +1246,14 @@ for first); a cold read through the bucket against one through the API.
     one runs on macOS, and its Linux twin checks that `install` refuses), 27 breaks.
 
   Space's daemon was observed running (§1.2). Mounting itself comes with step 5's adapters.
-- Item 5, direct uploads: **in progress** (3 October). The server is built: its 14 tests (12 in
-  the server's own process against a stand-in bucket that binds what its URLs carry, 2 of the
-  token) each failed with the code they guard broken, 31 breaks in all, each run alone with a
-  timeout (the one that waits on a gate three times); its seven conformance cases pass on memory
-  and local disk (skipped there, but for the one that checks the `501`) and on versitygw, both
-  addressing styles, and each failed against a server with the code it guards broken, 8 breaks.
-  The client (the SDK's `put_object_direct` and the upload queue) is next.
+- Item 5, direct uploads: **done** (4 October), in two pull requests, each test seen to fail with
+  the code it guards broken, each break run alone with a timeout:
+  - the server: 14 tests (12 in the server's own process against a stand-in bucket that binds what
+    its URLs carry, 2 of the token), 31 breaks (the one that waits on a gate three times); and seven
+    conformance cases, which pass on memory and local disk (skipped there, but for the one that
+    checks the `501`) and on versitygw, both addressing styles, 8 breaks against a server;
+  - the client: 10 tests (5 of the SDK's, 5 of the queue's), 19 breaks, the one that waits for a
+    commit three times; the measurement, and the conformance cases on AWS S3 and R2, which both
+    refuse a shard's URL other bytes
+    ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)).
 - Item 6: not started.

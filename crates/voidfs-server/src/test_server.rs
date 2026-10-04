@@ -97,11 +97,13 @@ pub struct Rules {
     /// For `If-None-Match: *`: `Some(true)` refuses an object that exists (412), `Some(false)`
     /// ignores the header, and `None` answers 501, as Backblaze B2 does.
     pub if_none_match: Option<bool>,
+    /// Answer every PUT with this status, as a bucket the client can't use.
+    pub refuse: Option<u16>,
 }
 
 impl Default for Rules {
     fn default() -> Rules {
-        Rules { checksum: true, signed_headers: 403, if_none_match: Some(true) }
+        Rules { checksum: true, signed_headers: 403, if_none_match: Some(true), refuse: None }
     }
 }
 
@@ -187,6 +189,9 @@ async fn fake_put(State(b): State<Arc<FakeState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     if parts.method != http::Method::PUT {
         return fake_error(405, "MethodNotAllowed");
+    }
+    if let Some(status) = rules.refuse {
+        return fake_error(status, "AccessDenied");
     }
     let path = parts.uri.path().trim_start_matches('/').to_owned();
     let q: std::collections::HashMap<String, String> = parts.uri.query().unwrap_or("").split('&').filter_map(|p| p.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
