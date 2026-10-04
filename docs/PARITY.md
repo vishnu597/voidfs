@@ -170,7 +170,7 @@ The 28 P0 items, which a credible v1 needs:
 
 | SpaceFS | voidfs today |
 |---|---|
-| S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 50 conformance cases, path or virtual-host addressing, and direct uploads where the bucket binds checksums (AWS S3, R2 and versitygw do). Missing: storage credentials, display names, copy-mode forks |
+| S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 50 conformance cases, path or virtual-host addressing, and direct uploads where the bucket binds checksums (AWS S3, R2, MinIO and versitygw do). Missing: storage credentials, display names, copy-mode forks |
 | macOS app: writable mount (a loopback SMB server by default since 0.2.333, or FSKit), transfers (pause, resume, speed limits), a disk and a memory cache, pinned files, previews, video reviews, Space Search, Finder badges | Read-only FSKit mount and a menu-bar shell |
 | `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version, and `update` | `void` (step 4, item 2): drives, drive create, show, delete and undelete, fork, history, show, restore, a foreground upload, version, and keys generate for the server, with `--json` on every command and errors as JSON. Next: the daemon and its commands (step 4, item 4); accounts in step 6 ([step-4-client.md](step-4-client.md#item-2-the-cli-on-the-protocol)) |
 | Linux FUSE mount | None (step 9) |
