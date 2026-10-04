@@ -14,7 +14,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
 use tokio::sync::watch;
-use voidfs_client::{ApiFetcher, Cache, CacheConfig, Connectivity, ConnectivityConfig, Queue, QueueConfig, Store};
+use voidfs_client::{BucketConfig, BucketFetcher, Cache, CacheConfig, Connectivity, ConnectivityConfig, Queue, QueueConfig, Store};
 
 use crate::mounts::{Adapter, Core, Mounts};
 
@@ -244,7 +244,9 @@ impl Daemon {
     async fn open_core(cfg: &DaemonConfig, store: &Arc<Store>) -> Result<(Queue, Cache, Connectivity, voidfs_sdk::Client), Error> {
         let conn = Connectivity::new(cfg.connectivity.clone());
         let client = voidfs_sdk::Client::new(voidfs_sdk::Config { observer: Some(Arc::new(conn.clone())), upload_bandwidth: None, ..cfg.client.clone() }).map_err(voidfs_client::Error::from)?;
-        let fetcher = Arc::new(ApiFetcher::new(client.clone()).with_connectivity(conn.clone()));
+        // Straight from the bucket where the server issues storage credentials (protocol §5.5),
+        // through the API elsewhere.
+        let fetcher = Arc::new(BucketFetcher::new(client.clone(), BucketConfig::default()).with_connectivity(conn.clone()));
         let cache = Cache::open(store.clone(), fetcher, cfg.cache.clone()).await?;
         let queue = Queue::open(store.clone(), client.clone(), QueueConfig { connectivity: Some(conn.clone()), ..cfg.queue.clone() }).await?;
         Ok((queue, cache, conn, client))

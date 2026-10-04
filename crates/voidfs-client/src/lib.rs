@@ -2,11 +2,13 @@
 //! The voidfs client core (step 4, item 3 of the parity plan): what the daemon and the mount run.
 //!
 //! - [`store`]: the per-user state database.
-//! - [`cache`] and [`fetch`]: the block cache, with read-ahead, and where it gets bytes.
+//! - [`cache`] and [`fetch`]: the block cache, with read-ahead, and where it gets bytes: through
+//!   the API, or with [`bucket`], straight from the bucket with storage credentials.
 //! - [`queue`] and [`journal`]: the write journal and the upload queue.
 //! - [`feed`] and [`connectivity`]: the change-feed client, and whether the server can be reached.
 //! - [`mounts`]: the mounts the daemon brings back when it starts.
 
+pub mod bucket;
 pub mod cache;
 pub mod connectivity;
 pub mod error;
@@ -18,6 +20,7 @@ mod publish;
 pub mod queue;
 pub mod store;
 
+pub use bucket::{BucketConfig, BucketFetcher, BucketUsage};
 pub use cache::{Cache, CacheConfig, Reader, Usage};
 pub use connectivity::{Connectivity, ConnectivityConfig, Link};
 pub use feed::{FeedEvent, FeedWatch, Invalidation, invalidations};
