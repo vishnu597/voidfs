@@ -41,6 +41,35 @@ threshold is half). The re-uploads after it, the first of them a put of the whol
 | Put | 6,983 ms | 134.2 MB |
 | Direct upload | 649 ms | 4.2 MB |
 
+## On R2 ([raw](r2-32m.txt))
+
+The same 32 MiB, the pool in Cloudflare R2 (location hint ENAM) over this Mac's home internet. The
+client still reaches the server through the relay (12 ms, 20 MB/s up); the server, and the client's
+direct uploads, reach R2 over the internet.
+
+| | Median time | Median sent | Each of 6 |
+|---|--:|--:|---|
+| Put | 2,565 ms | 33.5 MB | 2,276–2,651 ms |
+| Direct upload | 963 ms | 2.6 MB | 804–1,221 ms |
+
+A direct upload waits on R2 for a shard's PUT and the commit's HEAD of it, about 0.5 s more than
+locally; the put still sends the whole file over the client's link.
+
+## What the buckets enforce ([AWS S3](aws-check.txt), [R2](r2-check.txt))
+
+On 4 October, a server on a fresh pool in each bucket (AWS S3 in us-east-1, and R2), its start-up
+check of presigned PUTs, the seven direct-upload conformance cases against it, and `probe`; the pool
+was purged after each.
+
+| Bucket | A wrong `x-amz-checksum-sha256` | Without the signed checksum | `If-None-Match` on an existing object | Conformance |
+|---|---|---|---|---|
+| AWS S3 | refused, 400 | refused, 403 | refused, 412 | 6 passed, 1 skipped (the one for servers without the extension) |
+| Cloudflare R2 | refused, 400 | refused, 403 | refused, 412 | 6 passed, 1 skipped |
+| versitygw 1.8.0 | refused, 400 | refused, 403 | refused, 412 | 6 passed, 1 skipped |
+| Backblaze B2 (through Space's URLs, 3 October) | not checked | an unsigned one refused | 501 | — |
+
+In each, the case that PUTs a shard's URL other bytes was refused by the bucket itself (400).
+
 ## Reproduce
 
 ```bash
@@ -48,4 +77,5 @@ cargo build --release -p voidfs-server -p voidfs-bench
 cargo build --release -p voidfs-sdk --example reupload
 bench/scripts/direct-reupload.sh
 BENCH_FIRST_MULTIPART=1 BENCH_SIZE_MIB=128 BENCH_ROUNDS=2 bench/scripts/direct-reupload.sh
+BENCH_R2=1 bench/scripts/direct-reupload.sh    # then: voidfs-bench purge --prefix voidfs-bench/ --yes
 ```

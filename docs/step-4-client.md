@@ -913,10 +913,13 @@ uploads surviving a daemon restart.
   checksum, which must be accepted; with another checksum, which must be refused (400); without
   the signed checksum header (403); and with `If-None-Match: *`, now that it exists (412). Direct
   uploads are offered only where the first three hold, and URLs bind `If-None-Match` only where
-  the fourth does. A bucket that ignores a binding stores nothing but that valid shard. versitygw
-  1.8.0 enforces all three (observed on this Mac); Backblaze B2 answers `If-None-Match` on a
-  presigned PUT with 501 (observed through Space's URLs, §1.5). Memory and local disk answer 501:
-  nothing presigns there, and their bytes would go through the server anyway.
+  the fourth does. A bucket that ignores a binding stores nothing but that valid shard. AWS S3,
+  Cloudflare R2 and versitygw 1.8.0 enforce all three, and refuse a shard's URL other bytes (checked
+  4 October, [bench/results/direct-uploads](../bench/results/direct-uploads/README.md)); Backblaze B2
+  answers `If-None-Match` on a presigned PUT with 501 (observed through Space's URLs, §1.5). Memory
+  and local disk answer 501: nothing presigns there, and their bytes would go through the server
+  anyway. So does Compose's versitygw overlay, whose bucket clients outside the Compose network
+  can't reach.
 - **Held:** shards the key's head references (option 1 of format §12.4, no request), shards this
   server checked recently (option 2: uploaded, read or HEADed since its last read of
   `gc/pending.json`, and not proposed since), and shards a HEAD finds with their length. A
@@ -962,7 +965,9 @@ What the second built:
   `reupload` example, which measure it against a put
   ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)): a 32 MiB file with 4 KiB
   changed, over a link of 12 ms and 20 MB/s up, went in 404 ms and 2.6 MB where a put took 2,023 ms
-  and 33.5 MB.
+  and 33.5 MB; with the pool in R2, 963 ms where a put took 2,565.
+- The bucket checks: AWS S3 and R2 refuse a shard's URL other bytes, and the conformance cases pass
+  on both.
 
 **Decisions taken while building the second:**
 - **The SDK, as SpaceFS's:** opt-in, by `put_object_direct` or `Config::direct_uploads` (bodies of 8
@@ -1097,6 +1102,8 @@ for first); a cold read through the bucket against one through the API.
     its URLs carry, 2 of the token), 31 breaks (the one that waits on a gate three times); and seven
     conformance cases, which pass on memory and local disk (skipped there, but for the one that
     checks the `501`) and on versitygw, both addressing styles, 8 breaks against a server;
-  - the client: 9 tests (5 of the SDK's, 4 of the queue's), 17 breaks, the one that waits for a commit three times; and the measurement
+  - the client: 9 tests (5 of the SDK's, 4 of the queue's), 17 breaks, the one that waits for a
+    commit three times; the measurement, and the conformance cases on AWS S3 and R2, which both
+    refuse a shard's URL other bytes
     ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)).
 - Item 6: not started.

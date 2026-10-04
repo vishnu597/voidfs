@@ -22,7 +22,8 @@
 #                      voidfs-bench/direct-reupload-<time>/, instead of versitygw: the bucket is
 #                      then reached over this Mac's internet connection, by the server and by the
 #                      client's direct uploads alike. Nothing from .env is printed. Purge it
-#                      afterwards: voidfs-bench purge --prefix voidfs-bench/ --yes
+#                      afterwards: voidfs-bench purge --prefix voidfs-bench/ --yes. BENCH_ENV names
+#                      another env file than the checkout's .env (a worktree has none).
 #   S3_PORT, VOIDFS_PORT   loopback ports (default 7170 and 9100; the relays use the next ones)
 
 set -euo pipefail
@@ -67,8 +68,8 @@ vf_secret="$(random 'A-Za-z0-9' 40)"
 s3_args=()
 if [[ "${BENCH_R2:-0}" == 1 ]]; then
     set -a
-    # shellcheck disable=SC1091
-    . "$root/.env"
+    # shellcheck disable=SC1090
+    . "${BENCH_ENV:-$root/.env}"
     set +a
     export VOIDFS_S3_REGION=auto
     store="s3:$VOIDFS_S3_BUCKET/voidfs-bench/direct-reupload-$(date -u +%Y%m%dT%H%M%SZ)"
