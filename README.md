@@ -321,6 +321,7 @@ nothing on either port does. The drives' state, which the server serves from, st
 |---|---|
 | [`spec/`](spec/) | Normative specs: [wire protocol](spec/protocol.md), [on-bucket format](spec/format.md), [conformance suite](spec/conformance/) |
 | [`crates/voidfs-core`](crates/voidfs-core/) | The engine: format types, chunking, in-place edits, manifests, drive state, planning |
+| [`crates/voidfs-format`](crates/voidfs-format/) | A reader of the on-bucket format: a pool's drives, their checkpoints and logs, and manifest trees, from nothing but read access to the bucket |
 | [`crates/voidfs-server`](crates/voidfs-server/) | The S3 server: storage backends, commit log, checkpoints, forks, SigV4, change feed |
 | [`crates/voidfs-sdk`](crates/voidfs-sdk/) | The Rust SDK: the AWS SDK for S3 plus typed calls for the extensions |
 | [`crates/voidfs-cli`](crates/voidfs-cli/) | `void`, the command line, on the SDK |

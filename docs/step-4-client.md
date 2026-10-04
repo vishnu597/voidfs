@@ -1173,7 +1173,48 @@ shard (bytes sent and time, against a put).
 
 ### Item 6. Short-lived storage credentials
 
-**Checklist:** B4 (protocol §5.5, as written).
+**Checklist:** B4 (protocol §5.5, with `voidfs.json` among what the credentials read, which the
+user approved on 4 October).
+
+**Status (4 October 2026): in progress**, in three pull requests: the format reader, the server,
+then the client. What the first built:
+- `crates/voidfs-format`, a reader of the on-bucket format: the pool's descriptor, refused if
+  the reader can't read the pool (format §3, §3.1); a drive's descriptor (§6); its newest
+  checkpoint and the segments it lists (§8); the log after it, up to the first gap (§8.4); and
+  manifest trees (§5.1). It reads through a `Source` (a GET, a listing, and a page checked
+  against its hash), so that the server loads drives through its caches and a client reads them
+  straight from the bucket.
+- The server loads drives, rebuilds past states and flattens manifests with it. Nothing it does
+  changed.
+
+**Decisions the user took (4 October), from the evidence of §1.6:**
+- **Presigned GET URLs per shard:** deferred. Space's mount gets credentials, not URLs, so
+  parity doesn't need them, and local disk can't presign GETs anyway. A store that can't mint
+  credentials answers `501`, and clients read through the API, which the cache makes fast once
+  warm. An RFC if a deployment on such a store needs reads taken off the server.
+- **A call that returns an object's shard list:** deferred. With credentials the client reads
+  the same list from the format, as Space's reads `shard_manifest`; what it would add is for
+  clients reading through the API (not fetching unchanged shards again after an edit), which is
+  step 5's to measure.
+- **Providers:** MinIO first (its STS needs no new secrets, and CI builds MinIO), then R2 once
+  the user makes an API token, then AWS once the user makes a role. Bucket runs on R2 and AWS
+  are made from the user's Mac, with commands given for each.
+- **`voidfs.json` is readable:** a reader must refuse a pool whose format or incompatible
+  features it doesn't implement (format §3.1), and `multi-object-versions` changes how it replays
+  the log, so §5.5's `readable` lists it. It also gives credentialed clients the pool's chunking,
+  which item 5 found the protocol had no way to give them.
+
+**Decisions taken while building the first:**
+- **A crate of its own,** not a module of `voidfs-core`, which does no I/O. The reader fetches,
+  32 segments and 32 log entries at once as the server did, and its errors are `anyhow`'s, as the
+  server's are.
+- **What moved:** the checkpoint index's types, the loader of a checkpoint, the reader of the
+  log, and the walk of a manifest tree. The checkpoint writer, the change feed's batches and the
+  cadence of checkpoints stay in the server, which replays the log itself to make the feed.
+- **Pages are checked by the source:** the default `Source::page` reads `pages/…` and checks its
+  hash; the server's is its page cache, which checks as it fills.
+- **The pool says how versions are read:** `load_drive` applies `multi-object-versions` if
+  `voidfs.json` lists it.
 
 **Design.**
 - **Server.** Read-only credentials for `shards/`, `pages/` and `drives/<id>/` under the pool's
@@ -1185,14 +1226,6 @@ shard (bytes sent and time, against a put).
   renewing the credentials before they expire, and keys the cache on `accessGeneration`. Reading
   metadata from the bucket needs a read-only reader of the format (the drive's log, checkpoints
   and pages) in the client: the server's loader, factored out of `pool.rs` into a shared crate.
-
-**Decisions this item needs from the user (not taken here):**
-- §5.5 gives credentials only. Presigned GET URLs per shard, the plan's fallback "where the
-  backend can't mint credentials", and a call that returns an object's shard list (so that a
-  client reading through the API can cache shards by hash too), would each be a protocol
-  addition, so an RFC first.
-- Which providers to support first. AWS and R2 need credentials the deployment holds (a role, an
-  API token): B5's stored credentials.
 
 **Checked by:** the credentials refused for writes and for other prefixes, on AWS and R2 (asked
 for first); a cold read through the bucket against one through the API.
@@ -1256,4 +1289,8 @@ for first); a cold read through the bucket against one through the API.
     commit three times; the measurement, and the conformance cases on AWS S3 and R2, which both
     refuse a shard's URL other bytes
     ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)).
-- Item 6: not started.
+- Item 6, short-lived storage credentials: **in progress** (4 October). The format reader is
+  factored out of the server into `voidfs-format`: its 6 tests (against pools the server wrote,
+  and a bucket with nothing but a broken descriptor or tree), and the server's own that load
+  drives, each failed with the code they guard broken, 11 breaks in all, each run alone with a
+  timeout. The conformance suite passes on memory, local disk and versitygw.
