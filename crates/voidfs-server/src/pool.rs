@@ -10,7 +10,7 @@ use anyhow::{Context, anyhow, bail};
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use voidfs_core::chunk::{Params, Shard};
 use voidfs_core::ids::{DriveId, ObjectId, ShardHash, Timestamp, VersionId};
 use voidfs_core::manifest::{self, Page};
@@ -19,7 +19,8 @@ use voidfs_core::model::{
     Txn,
 };
 use voidfs_core::ops::OpError;
-use voidfs_core::state::{DriveState, Rows, Spilled};
+use voidfs_core::state::{DriveState, Spilled};
+use voidfs_format::{CheckpointIndex, CheckpointTables, SegmentRef, log_path};
 
 use crate::clock::Clock;
 use crate::gc::Phase;
@@ -38,16 +39,12 @@ const SEGMENT_MAX_ROWS: usize = 8192;
 const SEGMENT_CUT_BITS: u32 = 12;
 /// ...or, if it reaches the maximum first, at the last of its rows whose key hash has this many.
 const SEGMENT_FALLBACK_BITS: u32 = 10;
-/// Checkpoint segments fetched at once when loading (each is a round trip to the bucket).
-const PAGE_FETCH_PARALLELISM: usize = 32;
 /// A checkpoint lists the previous one's pages without storing them again only if that one's
 /// index was seen this recently; otherwise it reads the index again first (format §12.4,
 /// option 1).
 const REUSE_WITHOUT_REREAD: Duration = Duration::from_secs(6 * 3600);
 /// Change-feed batches kept in memory per drive.
 const FEED_KEEP: usize = 10_000;
-/// Log entries fetched at once when replaying (each is a round trip to the bucket).
-const LOG_FETCH_PARALLELISM: usize = 32;
 /// Drives loaded at once when a pool opens.
 const DRIVE_LOAD_PARALLELISM: usize = 8;
 /// Shards and pages remembered as safe to reference without uploading (format §12.4).
@@ -72,10 +69,6 @@ const HOLD_SHARE: u32 = 4;
 /// How coarse tokio's timers are. A hold shorter than this would take a tick all the same, so
 /// an entry written in less than four is not held.
 const TIMER_TICK: Duration = Duration::from_millis(1);
-
-fn log_path(id: &DriveId, seq: u64) -> String {
-    format!("drives/{id}/log/{seq:020}.json")
-}
 
 // ---------------------------------------------------------------------------------------------
 // Change feed
@@ -161,45 +154,6 @@ fn apply_logged(state: &DriveState, commit: &Commit) -> Result<(DriveState, Feed
 
 // ---------------------------------------------------------------------------------------------
 // Checkpoints (format §8)
-
-#[derive(Serialize, Deserialize)]
-struct SegmentRef {
-    page: ShardHash,
-    first: String,
-    last: String,
-    count: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-struct CheckpointTables {
-    entries: Vec<SegmentRef>,
-    objects: Vec<SegmentRef>,
-    history: Vec<SegmentRef>,
-    #[serde(default)]
-    removed: Vec<SegmentRef>,
-}
-
-impl CheckpointTables {
-    /// Every page the index lists.
-    fn pages(&self) -> HashSet<ShardHash> {
-        self.entries.iter().chain(&self.objects).chain(&self.history).chain(&self.removed).map(|s| s.page).collect()
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct CheckpointIndex {
-    format: u32,
-    seq: u64,
-    #[serde(default)]
-    time: Option<Timestamp>,
-    tables: CheckpointTables,
-    stats: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-struct Segment<T> {
-    rows: Vec<T>,
-}
 
 #[derive(Serialize)]
 struct SegmentOut<'a, T> {
@@ -293,16 +247,6 @@ impl Cadence {
     fn due(&self) -> bool {
         self.commits >= CHECKPOINT_EVERY || self.bytes >= CHECKPOINT_LOG_BYTES
     }
-}
-
-/// The rows of the next `n` segments that `pages` yields.
-async fn rows_of<T: for<'de> Deserialize<'de>>(pages: &mut (impl futures::Stream<Item = anyhow::Result<Bytes>> + Unpin), n: usize) -> anyhow::Result<Vec<T>> {
-    let mut out = Vec::new();
-    for _ in 0..n {
-        let bytes = pages.next().await.ok_or_else(|| anyhow!("a checkpoint segment went missing"))??;
-        out.extend(serde_json::from_slice::<Segment<T>>(&bytes)?.rows);
-    }
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -757,8 +701,9 @@ impl Pool {
         let Some(b) = self.store.get(&format!("drives/{id}/drive.json")).await? else { return Ok(None) };
         let desc: DriveDescriptor = serde_json::from_slice(&b).context("reading drive.json")?;
         let mut cadence = Cadence::default();
-        let (mut state, last) = match self.latest_checkpoint(id).await? {
-            Some((s, c)) => (s, Some(c)),
+        let seen = self.clock.mono();
+        let (mut state, last) = match voidfs_format::latest_checkpoint(self, id, self.multi_object_versions).await? {
+            Some(c) => (c.state, Some(Checkpointed { pages: c.index.tables.pages(), index: c.path, seen })),
             None if desc.fork_of.is_some() => bail!("fork {id} has no checkpoint"),
             None => (self.empty_state(), None),
         };
@@ -774,40 +719,11 @@ impl Pool {
         Ok(Some(d))
     }
 
-    /// The drive's commits after `seq`, in order, each with its size as stored. Fetched
-    /// concurrently, since each is a round trip to the bucket; stops at the first gap (format
-    /// §8.4).
-    async fn commits_after(&self, id: &DriveId, seq: u64) -> anyhow::Result<Vec<(Commit, usize)>> {
-        let dir = format!("drives/{id}/log/");
-        let names = self.store.list_files(&dir, Some(&format!("{seq:020}.json"))).await?;
-        let mut stream = futures::stream::iter(names)
-            .map(|name| {
-                let path = format!("{dir}{name}");
-                async move {
-                    let bytes = self.store.get(&path).await?.ok_or_else(|| anyhow!("log entry {path} vanished"))?;
-                    let c = serde_json::from_slice::<Commit>(&bytes).with_context(|| format!("parsing {path}"))?;
-                    anyhow::Ok((c, bytes.len()))
-                }
-            })
-            .buffered(LOG_FETCH_PARALLELISM);
-        let mut out = Vec::new();
-        let mut expect = seq + 1;
-        while let Some(c) = stream.next().await {
-            let (c, len) = c?;
-            if c.seq != expect {
-                break;
-            }
-            expect += 1;
-            out.push((c, len));
-        }
-        Ok(out)
-    }
-
     /// Applies every commit after `state.seq()`, counts them towards the next checkpoint, and
     /// returns their feed batches.
     async fn replay(&self, id: &DriveId, state: &mut DriveState, cadence: &mut Cadence) -> anyhow::Result<Vec<FeedBatch>> {
         let mut out = Vec::new();
-        for (commit, len) in self.commits_after(id, state.seq()).await? {
+        for (commit, len) in voidfs_format::commits_after(self, id, state.seq()).await? {
             let name = log_path(id, commit.seq);
             if commit.seq != state.seq() + 1 {
                 break; // a gap: stop at it (format §8.4)
@@ -820,31 +736,11 @@ impl Pool {
         Ok(out)
     }
 
-    async fn latest_checkpoint(&self, id: &DriveId) -> anyhow::Result<Option<(DriveState, Checkpointed)>> {
-        let dir = format!("drives/{id}/checkpoints/");
-        let Some(name) = self.store.list_files(&dir, None).await?.into_iter().rfind(|n| n.ends_with(".json")) else {
-            return Ok(None);
-        };
-        self.load_checkpoint(&format!("{dir}{name}")).await.map(Some)
-    }
-
     /// Reads a checkpoint index and its segments into a state (format §8).
     async fn load_checkpoint(&self, path: &str) -> anyhow::Result<(DriveState, Checkpointed)> {
         let seen = self.clock.mono();
-        let bytes = self.store.get(path).await?.ok_or_else(|| anyhow!("checkpoint {path} is missing"))?;
-        let idx: CheckpointIndex = serde_json::from_slice(&bytes).with_context(|| format!("parsing {path}"))?;
-        let t = &idx.tables;
-        // Each segment is a round trip to the bucket: fetch them concurrently, and in order.
-        let hashes: Vec<ShardHash> = t.entries.iter().chain(&t.objects).chain(&t.history).chain(&t.removed).map(|r| r.page).collect();
-        let mut pages = std::pin::pin!(futures::stream::iter(hashes).map(|h| async move { self.page(&h).await }).buffered(PAGE_FETCH_PARALLELISM));
-        let rows = Rows {
-            entries: rows_of(&mut pages, t.entries.len()).await?,
-            objects: rows_of(&mut pages, t.objects.len()).await?,
-            history: rows_of(&mut pages, t.history.len()).await?,
-            removed: rows_of(&mut pages, t.removed.len()).await?,
-        };
-        let state = DriveState::from_rows(idx.seq, idx.time, rows)?.with_multi_object_versions(self.multi_object_versions);
-        Ok((state, Checkpointed { index: path.to_owned(), pages: t.pages(), seen }))
+        let c = voidfs_format::load_checkpoint(self, path, self.multi_object_versions).await?;
+        Ok((c.state, Checkpointed { index: c.path, pages: c.index.tables.pages(), seen }))
     }
 
     /// Writes a checkpoint of `state` (format §8) and returns it, with what it spilled. `state`
@@ -1151,22 +1047,10 @@ impl Pool {
         m.gather()
     }
 
-    /// The full extent list of a content descriptor.
+    /// The full extent list of a content descriptor. Flattened from the pages fetched, as the
+    /// cache may already have evicted some of them.
     pub async fn extents(&self, desc: &ContentDescriptor) -> anyhow::Result<Vec<Extent>> {
-        // Fetch the tree's pages, then flatten from what was fetched: the cache may already have
-        // evicted some of them.
-        let mut pages = HashMap::new();
-        if let ContentDescriptor::Tree { root, .. } = desc {
-            let mut pending = vec![*root];
-            while let Some(h) = pending.pop() {
-                let bytes = self.page(&h).await?;
-                if let Ok(voidfs_core::model::ManifestPage::Node { children }) = serde_json::from_slice(&bytes) {
-                    pending.extend(children.iter().map(|c| c.page));
-                }
-                pages.insert(h, bytes);
-            }
-        }
-        Ok(manifest::flatten(desc, &mut |h| pages.get(h).cloned())?)
+        voidfs_format::extents(self, desc).await
     }
 
     /// Fetches the given shards for an edit.
@@ -1680,13 +1564,29 @@ impl Pool {
                 bail!("that instant is before this fork was made");
             }
         }
-        for (commit, _) in self.commits_after(&d.id, state.seq()).await? {
+        for (commit, _) in voidfs_format::commits_after(self, &d.id, state.seq()).await? {
             if commit.time > t {
                 break;
             }
             state = state.apply(&commit)?;
         }
         Ok(state)
+    }
+}
+
+/// The server reads its pool through its caches: pages come from [`Pool::page`], so loading a
+/// checkpoint shares them, and each read is checked as format §12.4 asks.
+impl voidfs_format::Source for Pool {
+    fn get<'a>(&'a self, path: &'a str) -> BoxFuture<'a, anyhow::Result<Option<Bytes>>> {
+        Box::pin(self.store.get(path))
+    }
+
+    fn list<'a>(&'a self, dir: &'a str, after: Option<&'a str>) -> BoxFuture<'a, anyhow::Result<Vec<String>>> {
+        Box::pin(self.store.list_files(dir, after))
+    }
+
+    fn page<'a>(&'a self, h: &'a ShardHash) -> BoxFuture<'a, anyhow::Result<Bytes>> {
+        Box::pin(Pool::page(self, h))
     }
 }
 
@@ -1738,6 +1638,7 @@ mod tests {
     use voidfs_core::model::{Actor, Attrs, Change, CreateChange, RemoveChange, SetChange};
     use voidfs_core::names::Key;
     use voidfs_core::ops::{self, AttrsPatch, OpError, Precondition};
+    use voidfs_core::state::Rows;
 
     use super::*;
     use crate::store::{Fault, MemOp, MemStore, Store};
@@ -3417,7 +3318,7 @@ mod tests {
         let text = String::from_utf8(mem.peek(&path).unwrap().to_vec()).unwrap();
         let changed = text.replacen("\"f000000\"", "\"f000001\"", 1);
         assert_ne!(changed, text);
-        serde_json::from_str::<Segment<serde_json::Value>>(&changed).expect("the segment still parses");
+        serde_json::from_str::<voidfs_format::Segment<serde_json::Value>>(&changed).expect("the segment still parses");
         pool.store.put(&path, Bytes::from(changed)).await.unwrap();
         let fresh = Pool::open(pool.store.clone(), 64 << 20).await.unwrap();
         assert!(fresh.drive("big").is_none(), "the drive is not served from a corrupt checkpoint");
