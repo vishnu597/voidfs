@@ -38,12 +38,14 @@ billing or plans), this page says so.
   search and share links. The first SDK, for Rust, exists (step 4, item 1): the official AWS SDK
   for S3 with a typed call for every extension, one error type and the retry rule. So does a CLI
   on the protocol, `void` (step 4, item 2): drives, forks, history, show, restore and a foreground
-  upload, with JSON output everywhere. The client core has begun (step 4, item 3): a block
+  upload, with JSON output everywhere. The client core exists (step 4, items 3–6): a block
   cache on the Mac with read-ahead, which turns the head-to-head's random reads from 140–164 ms
   into hits (p50 0.06–0.15 ms, R2 included, as Space's 1.2 ms are) and streams a reader that waits
   for each read (37–40 MB/s from R2, as fast as Space's Finder copy); a write journal and upload
   queue that pause, resume and cancel anything, resume after a restart, and cap bandwidth at once;
-  and a change-feed client and a connectivity state that fails fast offline. Its daemon commands and background uploads come next.
+  and a change-feed client and a connectivity state that fails fast offline. A per-user daemon
+  runs it, with uploads that outlive it; a file changed in one place goes up as a direct upload;
+  and reads come straight from the bucket where the server issues storage credentials.
 - **Performance is measured locally, not yet in SpaceFS's setup.** SpaceFS publishes 49
   benchmark scenarios; [`bench/`](../bench/README.md) runs all of them against voidfs and the bare
   bucket underneath it.
@@ -90,10 +92,10 @@ billing or plans), this page says so.
     patch chunking each touched shard once, multipart completion in two round trips, and
     coalesced shard fetches with shared read-ahead. Reading pieces of shards is deferred to the
     mount (step 5), as SpaceFS's S3 layer also reads whole shards for a range.
-  - Step 4 (client core, CLI and Rust SDK) has started: its plan is
-    [step-4-client.md](step-4-client.md), and items 1 and 2, the Rust SDK and the CLI (`void`),
-    are built, and so is item 3, the client core: the cache and fetcher, the write journal and
-    upload queue, and the change-feed client with connectivity. Next: the daemon (item 4).
+  - Step 4 (client core, CLI and Rust SDK) is done, items 1–6 of 6 (4 October): the Rust SDK, the
+    CLI (`void`), the client core, the daemon, direct uploads and storage credentials
+    ([step-4-client.md](step-4-client.md)). R2's storage credentials, and a check of them on AWS,
+    wait on an API token and a role the user makes.
   - Steps 5–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -117,7 +119,7 @@ Every item of the plan's checklist (§3, 65 items, including the Finder integrat
 | Storage backends (B1–B8) | 2 | 1 | 5 | Local disk, AWS S3, Cloudflare R2, MinIO (built from source in CI) and versitygw work, and rclone works against the server. A capability probe checks the bucket at start. Short-lived storage credentials where the bucket's STS mints them scoped to a drive (MinIO; AWS with a role). No other providers tried, no R2 credentials yet, no stored bucket credentials, no adopt or export |
 | Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed (long poll and SSE), direct uploads where the bucket binds checksums, and storage credentials where its STS mints them scoped, on one node. Missing: a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
-| Clients (D1–D12) | 0 | 5 | 7 | A read-only macOS mount and its menu-bar shell (the spike), the CLI on the protocol, `void` (step 4, item 2), the client core (item 3): block cache, write journal and upload queue, change-feed client, and the daemon that runs it, with uploads handed to it and the mount table (item 4). No mounting yet (step 5's adapters), no Finder integration, Linux or Windows |
+| Clients (D1–D12) | 0 | 5 | 7 | A read-only macOS mount and its menu-bar shell (the spike), the CLI on the protocol, `void` (step 4, item 2), the client core (item 3): block cache, write journal and upload queue, change-feed client, and the daemon that runs it, with uploads handed to it and the mount table (item 4), direct uploads (item 5), and reads straight from the bucket with storage credentials (item 6). No mounting yet (step 5's adapters), no Finder integration, Linux or Windows |
 | SDKs, agents, search (A1–A7) | 0 | 1 | 6 | A Rust SDK on the official AWS SDK, with a typed call for every extension (step 4, item 1) and direct uploads (item 5). Stock S3 SDKs, boto3, rclone and curl work. No TypeScript, Python or Go SDK, MCP server or search |
 | Operations (O1–O6) | 1 | 2 | 3 | One binary, with a Compose file. Health checks and Prometheus metrics on a port of their own. A benchmark harness run locally, against R2 and AWS S3 for the small objects, and in CI, not yet in SpaceFS's setup. No tracing, Helm chart, fuzzing or audit |
 | **Total** | **16** | **14** | **35** | Of the 28 P0 items: 14 done, 9 partly, 5 missing |
@@ -129,7 +131,8 @@ is partly done since 2 October, with the client core's cache and fetcher (item 3
 runs since 3 October (item 4), with background uploads and the mount table. E10 is done since 4
 October: the server offers direct uploads, and the SDK and the upload queue use them (item 5).
 B4 is partly done since 4 October: the server mints storage credentials scoped to a drive where
-the bucket's STS can (item 6).
+the bucket's STS can, and the client core reads from the bucket with them (item 6); R2's wait for
+an API token.
 
 "Partly" means:
 - E1 has no compression (`shard-zstd` is a reserved pool feature that servers refuse).
@@ -794,14 +797,18 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      of it. A 32 MiB file with 4 KiB changed went in 404 ms and 2.6 MB where a put took 2,023 ms
      and 33.5 MB, over a link of 12 ms and 20 MB/s up
      ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)).
-   - Short-lived storage credentials (B4, §5.5): AWS STS, R2, MinIO. **In progress** (4 October):
-     the format reader is factored out of the server (`voidfs-format`), and the server mints
-     credentials with the bucket's STS, scoped to what a drive's reader needs and checked at
-     start, where it can (MinIO; AWS with a role), and answers `501` elsewhere. Next: the
-     client's fetcher from the bucket, then R2's credentials. Presigned URLs as a fallback,
+   - Short-lived storage credentials (B4, §5.5): AWS STS, R2, MinIO. **Done** (4 October): the
+     format reader is factored out of the server (`voidfs-format`); the server mints credentials
+     with the bucket's STS, scoped to what a drive's reader needs and checked at start, where it
+     can (MinIO; AWS with a role), and answers `501` elsewhere; and the client core reads shards
+     and the drive's state straight from the bucket with them, through the API where it can't.
+     12 ms away and 40 MB/s down, a 64 MiB file read cold in 1.9 s from the bucket, 3.2 s through
+     the server ([bench/results/storage-credentials](../bench/results/storage-credentials/README.md)).
+     R2's credentials (Cloudflare's API) wait for an API token, and the AWS check for a role.
+     Presigned URLs as a fallback,
      and an object's shard list for the API path, would be protocol additions (RFC first): the
      user deferred both on 4 October.
-   - **Status (2026-10-04):** items 1–5 of 6 done, and item 6 in progress.
+   - **Status (2026-10-04):** items 1–6 of 6 done.
 5. **Writable macOS drive** (Phase 2).
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
