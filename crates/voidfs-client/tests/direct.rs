@@ -78,14 +78,17 @@ async fn a_file_the_drive_mostly_holds_goes_direct() {
     q.settle().await;
     assert_eq!(read(&straight, "cut.mov").await, data);
     assert_eq!(bucket.accepted().1, before, "new bytes went to the server");
-    assert_eq!((seen(&proxy, "x-voidfs-upload-plan"), seen(&proxy, "x-voidfs-upload-commit"), exactly(&proxy, "PUT /drv/cut.mov")), (1, 0, 1), "a plan, then a put");
+    assert_eq!((exactly(&proxy, "HEAD /drv/cut.mov"), seen(&proxy, "x-voidfs-upload"), exactly(&proxy, "PUT /drv/cut.mov")), (1, 0, 1), "nothing at the key: no plan, a put");
 
     let mut edited = data.clone();
     edited[(5 * MIB) as usize..(5 * MIB) as usize + 64].copy_from_slice(&[9; 64]);
     std::fs::write(&path, &edited).unwrap();
     proxy.clear();
-    // The commit's answer is held, so that the upload's progress shows while it waits.
-    proxy.fault(Fault::Pass);
+    // The commit's answer is held, so that the upload's progress shows while it waits: after a
+    // HEAD of the key, an empty plan to ask whether it may go direct, and the plan.
+    for _ in 0..3 {
+        proxy.fault(Fault::Pass);
+    }
     proxy.fault(Fault::Hang(Duration::from_secs(2)));
     let sent = q.bytes_sent();
     q.import("two", vec![Import { path: path.clone(), drive: "drv".into(), key: "cut.mov".into() }]).await.unwrap();
@@ -104,7 +107,7 @@ async fn a_file_the_drive_mostly_holds_goes_direct() {
     assert!(to_bucket > 0 && to_bucket < 6 * MIB, "{to_bucket} bytes to the bucket for a change of 64");
     let all = q.bytes_sent() - sent;
     assert!(all < to_bucket + MIB, "{all} bytes sent in all");
-    assert_eq!((seen(&proxy, "x-voidfs-upload-plan"), seen(&proxy, "x-voidfs-upload-commit"), seen(&proxy, "uploadId"), exactly(&proxy, "PUT /drv/cut.mov")), (1, 1, 0, 0));
+    assert_eq!((seen(&proxy, "x-voidfs-upload-plan"), seen(&proxy, "x-voidfs-upload-commit"), seen(&proxy, "uploadId"), exactly(&proxy, "PUT /drv/cut.mov")), (2, 1, 0, 0), "an empty plan to ask, a plan and a commit");
     let st = q.status().await.unwrap();
     assert!(st.items.iter().all(|i| i.state == State::Done && i.sent == i.size), "{:?}", st.items);
     let head = straight.head_object("drv", "cut.mov", ReadOptions::default()).await.unwrap();
@@ -139,6 +142,24 @@ async fn without_direct_uploads_a_file_is_put() {
     q.settle().await;
     assert_eq!(read(&straight, "f").await, edited);
     assert_eq!((seen(&proxy, "x-voidfs-upload-plan"), exactly(&proxy, "PUT /drv/f")), (1, 1));
+}
+
+/// A server that answers a plan `501` is asked once, not for every file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_without_direct_uploads_is_asked_once() {
+    let (_s, _bucket, proxy, straight, c) = setup(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let q = open(dir.path(), &c).await;
+    for key in ["a", "b", "c"] {
+        let data = bytes_of(5, 9 * MIB);
+        let v1 = straight.put_object("drv", key, Bytes::from(data.clone()), Default::default()).await.unwrap();
+        let mut edited = data;
+        edited[7] ^= 1;
+        q.put("drv", key, Bytes::from(edited.clone()), Base::Version(v1.version_id), Attrs::default()).await.unwrap();
+        q.settle().await;
+        assert_eq!(read(&straight, key).await, edited);
+    }
+    assert_eq!((seen(&proxy, "x-voidfs-upload-plan"), exactly(&proxy, "PUT /drv/a") + exactly(&proxy, "PUT /drv/b") + exactly(&proxy, "PUT /drv/c")), (1, 3));
 }
 
 /// A direct commit over a version that changed meanwhile follows the `412` rule: the local

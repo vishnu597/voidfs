@@ -980,10 +980,13 @@ What the second built:
   which counts them, 8 at once, retried as idempotent requests; a `412` (the bucket has the shard
   already, under `If-None-Match`) counts as sent. The commit is retried as a put is.
 - **The queue plans when a file may be mostly there:** a put of 8 MiB or more, alone in its run,
-  that replaces a version (a change based on one, or an import over whatever is there). A new file
-  (`Base::Absent`) is never planned: new bytes go as fast through a put, as SpaceFS says. The plan
-  decides: the file goes direct if the pool holds at least half of its bytes, and the ordinary way
-  (a put, or a multipart upload) otherwise, the plan costing one request.
+  that replaces a version (a change based on one, or an import over a file the key has, which a
+  HEAD finds). A new file is never planned: new bytes go as fast through a put, as SpaceFS says.
+  Before it reads a file to cut it, the queue asks once, with an empty plan, whether the server
+  offers direct uploads, and takes a `501` as the answer for ten minutes. The plan decides: the
+  file goes direct if the pool holds at least half of its bytes, and the ordinary way (a put, or a
+  multipart upload) otherwise, the plan costing one request. (Cutting a 30 MiB import before
+  asking delayed its upload on CI's slower runner, and was wasted where the server answers 501.)
 - **The file is cut once, never held whole:** on a blocking thread, 4 MiB at a time, keeping each
   shard's hash and length and the whole file's SHA-256; shards to send are read from the file by
   offset, within the queue's memory budget. A file that changes meanwhile has shards the bucket
@@ -1102,7 +1105,7 @@ for first); a cold read through the bucket against one through the API.
     its URLs carry, 2 of the token), 31 breaks (the one that waits on a gate three times); and seven
     conformance cases, which pass on memory and local disk (skipped there, but for the one that
     checks the `501`) and on versitygw, both addressing styles, 8 breaks against a server;
-  - the client: 9 tests (5 of the SDK's, 4 of the queue's), 17 breaks, the one that waits for a
+  - the client: 10 tests (5 of the SDK's, 5 of the queue's), 19 breaks, the one that waits for a
     commit three times; the measurement, and the conformance cases on AWS S3 and R2, which both
     refuse a shard's URL other bytes
     ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)).

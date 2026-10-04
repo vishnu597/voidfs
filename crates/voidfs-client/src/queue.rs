@@ -190,6 +190,8 @@ struct Inner {
     changed: Notify,
     memory: Arc<Semaphore>,
     memory_kib: u32,
+    /// Whether the server offers direct uploads, as last found out.
+    direct: Arc<publish::Offered>,
     /// Set once the publisher has stopped and let go of the queue.
     stopped: Arc<(Mutex<bool>, Notify)>,
 }
@@ -261,6 +263,7 @@ impl Queue {
         let inner = Inner {
             memory: Arc::new(Semaphore::new(memory_kib as usize)),
             memory_kib,
+            direct: Arc::default(),
             store,
             client,
             bandwidth,
@@ -818,6 +821,7 @@ impl Queue {
                     direct_from: self.0.cfg.direct_from,
                     memory: self.0.memory.clone(),
                     memory_kib: self.0.memory_kib,
+                    offered: self.0.direct.clone(),
                     stop: r.stop.clone(),
                     sent: r.sent.clone(),
                     may_have_landed,

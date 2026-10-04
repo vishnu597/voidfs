@@ -123,6 +123,8 @@ pub(crate) struct Ctx {
     /// Bodies in flight, in KiB, of `memory_kib` at most.
     pub memory: Arc<Semaphore>,
     pub memory_kib: u32,
+    /// Whether the server offers direct uploads, which the queue's publishes share.
+    pub offered: Arc<Offered>,
     pub stop: Stop,
     /// Bytes sent, for progress.
     pub sent: Arc<AtomicU64>,
@@ -130,6 +132,27 @@ pub(crate) struct Ctx {
     pub may_have_landed: bool,
     /// The multipart upload the entry has open, which the queue keeps with the entry.
     pub upload_id: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// How long the queue takes a server's `501` to a direct upload's plan as its answer.
+const RECHECK: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether the server offers direct uploads (protocol §4.11), as the queue last found out.
+#[derive(Default)]
+pub(crate) struct Offered(std::sync::Mutex<Option<(bool, std::time::Instant)>>);
+
+impl Offered {
+    /// What was found within [`RECHECK`], if anything.
+    fn known(&self) -> Option<bool> {
+        match *self.0.lock().unwrap_or_else(|p| p.into_inner()) {
+            Some((offered, at)) if at.elapsed() < RECHECK => Some(offered),
+            _ => None,
+        }
+    }
+
+    fn found(&self, offered: bool) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some((offered, std::time::Instant::now()));
+    }
 }
 
 fn is_412(e: &voidfs_sdk::Error) -> bool {
@@ -407,6 +430,24 @@ fn cut(path: &std::path::Path) -> Result<(Vec<(voidfs_core::ids::ShardHash, u64)
 /// when it should go the ordinary way: the server doesn't offer direct uploads, the pool holds
 /// less than half of the file, or a step failed with anything but a `409` or a `412`.
 async fn direct(ctx: &Ctx, e: &Entry, size: u64, guard: &Guard) -> Step<Option<Outcome>> {
+    if ctx.offered.known() == Some(false) {
+        return Ok(None);
+    }
+    // An import doesn't know what is at the key: nothing there means new bytes.
+    if *guard == Guard::None && ctx.stop.or(ctx.client.head_object(&e.drive, &e.key, ReadOptions::default())).await?.is_err() {
+        return Ok(None);
+    }
+    // Cutting the file reads it whole: first ask, with an empty plan, whether it can go direct.
+    if ctx.offered.known().is_none() {
+        match ctx.stop.or(ctx.client.plan_upload(&e.drive, &e.key, &[])).await? {
+            Ok(_) => ctx.offered.found(true),
+            Err(err) if err.status() == Some(501) => {
+                ctx.offered.found(false);
+                return Ok(None);
+            }
+            Err(_) => return Ok(None),
+        }
+    }
     let src = e.source.clone().unwrap_or_default();
     let path = src.clone();
     let (shards, sha) = blocking(move || cut(&path)).await?;
@@ -417,7 +458,12 @@ async fn direct(ctx: &Ctx, e: &Entry, size: u64, guard: &Guard) -> Step<Option<O
     let plan = match ctx.stop.or(ctx.client.plan_upload(&e.drive, &e.key, &shards)).await? {
         Ok(p) => p,
         Err(err) if stands(&err) => return Err(err.into()),
-        Err(_) => return Ok(None),
+        Err(err) => {
+            if err.status() == Some(501) {
+                ctx.offered.found(false);
+            }
+            return Ok(None);
+        }
     };
     let missing: u64 = plan.upload.iter().map(|p| p.length).sum();
     if missing * 2 > size {
