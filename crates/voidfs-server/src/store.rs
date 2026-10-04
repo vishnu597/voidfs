@@ -140,6 +140,26 @@ impl Store {
         .await
     }
 
+    /// An object's length, or `None` if it does not exist.
+    pub async fn length(&self, path: &str) -> anyhow::Result<Option<u64>> {
+        self.timed(BucketOp::Head, async {
+            match &self.backend {
+                Backend::Local(root) => match tokio::fs::metadata(Self::local_path(root, path)).await {
+                    Ok(m) => Ok(Some(m.len())),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e).with_context(|| format!("reading the metadata of {path}")),
+                },
+                Backend::Dal(op) => match op.stat(path).await {
+                    Ok(m) => Ok(Some(m.content_length())),
+                    Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e).with_context(|| format!("reading the metadata of {path}")),
+                },
+                Backend::Mem(m) => m.run(MemOp::Head, path, |o| Ok(o.get(path).map(|(b, _)| b.len() as u64))).await,
+            }
+        })
+        .await
+    }
+
     pub async fn exists(&self, path: &str) -> anyhow::Result<bool> {
         self.timed(BucketOp::Head, async {
             match &self.backend {
@@ -504,6 +524,8 @@ mod tests {
         assert!(all.iter().all(|l| l.modified.is_some()));
         assert_eq!(s.modified("a/d/e").await.unwrap(), all[2].modified);
         assert!(s.modified("a/nope").await.unwrap().is_none());
+        assert_eq!(s.length("a/b.json").await.unwrap(), Some(1));
+        assert_eq!(s.length("a/nope").await.unwrap(), None);
         assert!(s.list_recursive("nope/").await.unwrap().is_empty());
         s.delete("a/c.json").await.unwrap();
         s.delete("a/c.json").await.unwrap();

@@ -391,6 +391,7 @@ list in content order, covering exactly `size` bytes.
 
 - Preconditions (`x-voidfs-if-version`, `If-Match`, `If-None-Match: *`) apply as for PutObject.
 - `x-voidfs-content-type` carries the content type.
+- `x-amz-meta-*` headers apply as for PutObject.
 - The server MUST confirm that every shard it did not already reference is present with the
   right length before committing ([format §12.4](format.md#124-what-writers-must-do)).
 
@@ -572,6 +573,9 @@ truncated.
 - **Clients never write shared prefixes with credentials.** Direct uploads use URLs that bind
   the shard's checksum (§4.11), so a client cannot store bytes under a hash they do not match.
   Without that binding, a client could corrupt every drive that shares the shard.
+- **Direct uploads show what a pool holds.** A plan's `held` count (§4.11) tells a writer whether
+  content exists anywhere in the pool, and a commit can reference a shard by its hash alone. As
+  with credentials, the pool is the boundary.
 - **Bucket credentials** held by the deployment reach every drive in a pool. Deployments SHOULD
   prefer role assumption (for example AWS IAM roles) over stored static keys, and SHOULD encrypt
   stored credentials at rest.

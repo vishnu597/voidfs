@@ -29,7 +29,7 @@ use crate::sigv4::Scope;
 const OBJECT_KNOWN: &[&str] = &[
     "versionId", "partNumber", "uploadId", "uploads", "x-voidfs-versions", "x-voidfs-attrs", "x-voidfs-all", "x-voidfs-write",
     "x-voidfs-splice", "x-voidfs-patch", "x-voidfs-rename", "x-voidfs-restore", "max-keys", "continuation-token", "max-parts",
-    "part-number-marker",
+    "part-number-marker", "x-voidfs-upload-plan", "x-voidfs-upload-commit",
 ];
 
 pub async fn dispatch(app: &Arc<App>, ctx: &Ctx, body: Body) -> Result<Response, S3Error> {
@@ -61,6 +61,8 @@ pub async fn dispatch(app: &Arc<App>, ctx: &Ctx, body: Body) -> Result<Response,
                 splice(app, ctx, &d, body).await
             } else if q.has("x-voidfs-rename") {
                 rename(app, ctx, &d).await
+            } else if q.has("x-voidfs-upload-commit") {
+                super::upload::commit(app, ctx, &d, body).await
             } else if ctx.header("x-amz-copy-source").is_some() {
                 copy(app, ctx, &d).await
             } else {
@@ -75,6 +77,8 @@ pub async fn dispatch(app: &Arc<App>, ctx: &Ctx, body: Body) -> Result<Response,
                 complete_upload(app, ctx, &d, body).await
             } else if q.has("x-voidfs-patch") {
                 patch(app, ctx, &d, body).await
+            } else if q.has("x-voidfs-upload-plan") {
+                super::upload::plan(app, ctx, &d, body).await
             } else if q.has("x-voidfs-restore") {
                 restore(app, ctx, &d).await
             } else if q.has("x-voidfs-attrs") {
@@ -140,7 +144,7 @@ impl View {
     }
 }
 
-fn parse_key(k: &str) -> Result<Key, S3Error> {
+pub(super) fn parse_key(k: &str) -> Result<Key, S3Error> {
     Key::parse(k).map_err(|e| S3Error::invalid(e.to_string()))
 }
 
@@ -449,7 +453,7 @@ async fn ingest(pool: &Pool, mut reader: BodyReader, inline: bool) -> Result<Vec
     Ok(content::normalize(extents))
 }
 
-fn mutation_response(v: VersionId, s: &DriveState, key: &str) -> http::response::Builder {
+pub(super) fn mutation_response(v: VersionId, s: &DriveState, key: &str) -> http::response::Builder {
     let mut b = empty(200).header("x-amz-version-id", v.to_string());
     if let Some(r) = Key::parse(key).ok().and_then(|k| s.lookup(&k)).and_then(|o| s.record(&o)) {
         b = b.header("etag", &r.etag).header("x-voidfs-size", r.size);
@@ -1478,7 +1482,7 @@ mod tests {
         let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
         let pool = pool(&mem).await;
         pool.create_drive("d", None).await.unwrap();
-        let app = Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default() });
+        let app = Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct: None });
         let mut bodies = Vec::new();
         for i in 0..n {
             let body = random_bytes(i as u64, 40 << 10);
@@ -1582,7 +1586,7 @@ mod tests {
         let store = Store::mem(mem.clone());
         let pool = Pool::open_creating(store, 1 << 20, crate::clock::Clock::System, CommitGuard::CreateIfAbsent, &features).await.unwrap();
         let d = pool.create_drive("d", None).await.unwrap();
-        (Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default() }), d)
+        (Arc::new(App { pool, keys: crate::sigv4::Keys::default(), domains: super::super::Domains::new(Vec::new()), metrics: crate::metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct: None }), d)
     }
 
     /// Sends a request for `key` of drive `d` as the admin key, with `payload` as what its

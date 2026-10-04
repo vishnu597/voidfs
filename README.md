@@ -189,7 +189,8 @@ Commits rely on the bucket refusing to create an object that already exists (`If
 [format §7.2](spec/format.md#72-claiming-a-sequence-number-create-if-absent)). A server checks
 that before it writes the pool, and refuses a bucket that ignores it. It also refuses lifecycle
 rules that would delete or archive the pool's objects. `probe` reports these and the rest of
-what the bucket supports, and stores nothing:
+what the bucket supports. It stores nothing but the 36-byte shard its check of presigned uploads
+sends (a valid shard, which garbage collection removes):
 
 ```bash
 cargo run --release -p voidfs-server -- probe --store s3:<bucket>/<prefix> --s3-endpoint <url>
@@ -198,6 +199,17 @@ cargo run --release -p voidfs-server -- probe --store s3:<bucket>/<prefix> --s3-
 For a bucket without conditional writes, create the pool with `--commit-guard external`. At most
 one server, and one garbage collector, may then write it
 ([§7.3](spec/format.md#73-external-guard)).
+
+### Direct uploads
+
+A client that uploads a file the drive mostly holds already, such as a large file changed in one
+place, can send only the shards the pool lacks, straight to the bucket
+([protocol §4.11](spec/protocol.md#411-direct-upload-optional-x-voidfs-upload-plan-then-x-voidfs-upload-commit)):
+the server's plan says which shards it holds and presigns a PUT for each of the others, and its
+commit checks that they arrived. A server offers this only where the bucket refuses bytes that
+don't match the checksum a URL carries, which it checks when it starts (and `probe` reports, as
+`presigned PUTs`); elsewhere, and with `--direct-uploads off`, the two requests answer `501` and
+clients put as usual. Clients must be able to reach the bucket's endpoint as the server does.
 
 ### Small files in the log
 

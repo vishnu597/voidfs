@@ -6,6 +6,7 @@ mod chunked;
 mod error;
 mod host;
 mod object;
+mod upload;
 mod util;
 
 use std::sync::Arc;
@@ -35,6 +36,9 @@ pub struct App {
     pub uploads: object::Uploads,
     /// The shard reads GETs share past their own window.
     pub read_ahead: object::ReadAhead,
+    /// Direct uploads (protocol §4.11), where the store presigns PUTs that bind a shard's
+    /// checksum; otherwise their requests answer `501`.
+    pub direct: Option<Arc<crate::direct::Direct>>,
 }
 
 pub fn router(app: Arc<App>) -> axum::Router {

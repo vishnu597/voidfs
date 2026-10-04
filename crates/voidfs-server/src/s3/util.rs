@@ -101,6 +101,14 @@ impl Ctx {
         Ok(p)
     }
 
+    /// Attributes for a direct upload's object (protocol §4.11): as a put's, but the content type
+    /// is `x-voidfs-content-type`, since the commit's own body is JSON.
+    pub fn attrs_for_commit(&self) -> Result<Attrs, S3Error> {
+        let mut a = self.attrs_for_put()?;
+        a.content_type = self.header("x-voidfs-content-type").map(str::to_owned);
+        Ok(a)
+    }
+
     /// Attributes for a new object from the request headers.
     pub fn attrs_for_put(&self) -> Result<Attrs, S3Error> {
         let mut a = Attrs::default();

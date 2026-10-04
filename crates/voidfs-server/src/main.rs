@@ -72,6 +72,12 @@ struct Args {
     /// default; `voidfs-server gc` does one step on demand.
     #[arg(long, env = "VOIDFS_GC_INTERVAL", value_parser = clock::parse_duration)]
     gc_interval: Option<Duration>,
+    /// Direct uploads (protocol §4.11): clients PUT the shards a drive lacks straight to the
+    /// bucket, with URLs the server presigns. `on` offers them where the bucket refuses bytes that
+    /// don't match a URL's checksum, which is checked at start (with PUTs of a small valid
+    /// shard); elsewhere, and with `off`, their requests answer 501 and clients put as usual.
+    #[arg(long, env = "VOIDFS_DIRECT_UPLOADS", value_enum, default_value = "on")]
+    direct_uploads: Switch,
     /// Also serve `<drive>.<domain>/<key>` (virtual-host addressing) under this domain, which
     /// needs a wildcard DNS name `*.<domain>` pointing at the server (repeatable). Requests to
     /// the domain itself, or to any other host, stay path-style (`/<drive>/<key>`).
@@ -93,9 +99,10 @@ enum Command {
     /// Check what the bucket supports, and report whether a server could write the pool there.
     ///
     /// Checks create-if-absent writes, lifecycle rules, versioning, object lock, CORS, presigned
-    /// URLs, modification times and the bucket's clock. It stores nothing: the one write, which
-    /// creates voidfs.json again, must be refused by the bucket. Exits with status 1 if a server
-    /// started with the same options would refuse to open the pool.
+    /// URLs and what presigned PUTs bind, modification times and the bucket's clock. It stores
+    /// nothing a pool must not hold: creating voidfs.json again must be refused by the bucket, and
+    /// the presigned PUTs send a small valid shard, which garbage collection removes. Exits with
+    /// status 1 if a server started with the same options would refuse to open the pool.
     Probe,
 }
 
@@ -112,6 +119,12 @@ enum PoolCommand {
         /// `multi-object-versions` gives a version to every object it changes (RFC 0004).
         feature: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -188,15 +201,36 @@ fn open_store(args: &Args) -> anyhow::Result<(Store, Option<probe::Bucket>)> {
 }
 
 /// Opens the pool for writing, after checking that the bucket won't lose its objects and
-/// honours the commit guard.
-async fn open_pool(args: &Args) -> anyhow::Result<Arc<pool::Pool>> {
+/// honours the commit guard. Returns the bucket's own requests too, for a bucket.
+async fn open_pool(args: &Args) -> anyhow::Result<(Arc<pool::Pool>, Option<probe::Bucket>)> {
     let (store, bucket) = open_store(args)?;
     if let Some(b) = &bucket {
         probe::check_bucket(b).await.context("checking the bucket")?;
     }
     // An empty value, as from VOIDFS_NEW_POOL_FEATURES= in the environment, names none.
     let features: Vec<String> = args.new_pool_features.iter().filter(|f| !f.is_empty()).cloned().collect();
-    pool::Pool::open_creating(store, args.cache_mib * 1024 * 1024, clock::Clock::System, args.commit_guard.into(), &features).await.context("opening the pool")
+    let pool = pool::Pool::open_creating(store, args.cache_mib * 1024 * 1024, clock::Clock::System, args.commit_guard.into(), &features).await.context("opening the pool")?;
+    Ok((pool, bucket))
+}
+
+/// Direct uploads, if `--direct-uploads on` and the store presigns PUTs that bind a shard's
+/// checksum (protocol §4.11, §9).
+async fn direct_uploads(args: &Args, bucket: Option<probe::Bucket>) -> Option<Arc<voidfs_server::direct::Direct>> {
+    if args.direct_uploads == Switch::Off {
+        tracing::info!("direct uploads are off (--direct-uploads off)");
+        return None;
+    }
+    let Some(bucket) = bucket else {
+        tracing::info!("direct uploads are not offered: the store is not a bucket that can presign uploads");
+        return None;
+    };
+    let http = bucket.http().clone();
+    let (checks, direct) = probe::offer(Box::new(bucket), &http).await;
+    match &direct {
+        Some(_) => tracing::info!("presigned PUTs: {checks}"),
+        None => tracing::warn!("presigned PUTs: {checks}"),
+    }
+    direct
 }
 
 #[tokio::main]
@@ -206,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
     match &args.command {
         Some(Command::Gc(g)) => {
             let opts = gc::Options { grace: g.grace, offline: g.offline, dry_run: g.dry_run, expire_deleted_drives: g.expire_deleted_drives.0, abort_uploads: g.abort_uploads.0 };
-            let pool = open_pool(&args).await?;
+            let (pool, _) = open_pool(&args).await?;
             let report = gc::step(&pool, &opts).await?;
             println!("{report}");
             return Ok(());
@@ -271,7 +305,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let pool = open_pool(&args).await?;
+    let (pool, bucket) = open_pool(&args).await?;
     tracing::info!(
         "pool {} open with {} drives, commit guard {}, features {:?}",
         pool.desc.pool_id,
@@ -290,7 +324,8 @@ async fn main() -> anyhow::Result<()> {
     for d in &args.virtual_host_domains {
         tracing::info!("serving virtual-host requests to *.{d}");
     }
-    let app = Arc::new(s3::App { pool: pool.clone(), keys, domains: s3::Domains::new(args.virtual_host_domains), metrics: metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default() });
+    let direct = direct_uploads(&args, bucket).await;
+    let app = Arc::new(s3::App { pool: pool.clone(), keys, domains: s3::Domains::new(args.virtual_host_domains), metrics: metrics::S3Metrics::new(), uploads: Default::default(), read_ahead: Default::default(), direct });
     let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("listening on {}", args.listen))?;
     tracing::info!("serving on http://{}", args.listen);
     admin.serving(app.clone());

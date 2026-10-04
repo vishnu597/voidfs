@@ -10,7 +10,7 @@ use rand::RngExt;
 use serde_json::Value;
 use voidfs_sdk::sign::{QUERY, Signer};
 
-use crate::cases::{Body, BodyExpect, Case, Step, seeded_bytes};
+use crate::cases::{Body, BodyExpect, Case, Step, Upload};
 use crate::check::{self, Subject, Vars, subst};
 
 #[derive(Clone, Debug)]
@@ -74,20 +74,32 @@ impl Runner {
         for v in ["drive", "drive2", "drive3"] {
             vars.insert(v.into(), fresh_drive_name());
         }
+        let nonce: u64 = rand::rng().random();
         let mut outcome = Outcome::Pass;
         for (i, step) in case.steps.iter().enumerate() {
-            if let Err(message) = self.step(step, &mut vars).await {
-                outcome = Outcome::Fail { step: i, message };
-                break;
+            match self.step(step, &mut vars, nonce).await {
+                Ok(Some(skip)) => {
+                    outcome = Outcome::Skip(skip);
+                    break;
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    outcome = Outcome::Fail { step: i, message };
+                    break;
+                }
             }
         }
         self.cleanup(&vars).await;
         CaseResult { id: case.id.clone(), outcome, elapsed: started.elapsed() }
     }
 
-    async fn step(&self, step: &Step, vars: &mut Vars) -> Result<(), String> {
+    /// Runs a step; `Some` with why when it ends the case as skipped.
+    async fn step(&self, step: &Step, vars: &mut Vars, nonce: u64) -> Result<Option<String>, String> {
+        if let Some(u) = &step.upload {
+            return self.upload(u, step, vars, nonce).await.map(|()| None);
+        }
         let key = self.keys.get(&step.key).ok_or_else(|| format!("no key named {}", step.key))?;
-        let req = &step.request;
+        let req = step.request.as_ref().ok_or("a step needs a request or an upload")?;
         let path = subst(&req.path, vars)?;
         let mut query = Vec::new();
         for (name, raw) in &req.query {
@@ -102,7 +114,7 @@ impl Runner {
             None => Vec::new(),
             Some(Body::Text(t)) => subst(t, vars)?.into_bytes(),
             Some(Body::Base64(b)) => base64::engine::general_purpose::STANDARD.decode(b).map_err(|e| e.to_string())?,
-            Some(Body::Bytes { seed, size }) => seeded_bytes(*seed, *size),
+            Some(Body::Bytes(c)) => c.bytes(nonce),
             Some(Body::Patch(edits)) => {
                 let edits: Vec<_> = edits.iter().map(|(o, t)| voidfs_core::patch::Edit { offset: *o, data: t.as_bytes() }).collect();
                 voidfs_core::patch::encode(&edits)
@@ -113,13 +125,61 @@ impl Runner {
                 }
                 serde_json::to_vec(v).unwrap()
             }
+            Some(Body::Plan(c)) => {
+                headers.push(("content-type".into(), "application/json".into()));
+                serde_json::to_vec(&serde_json::json!({ "shards": listed(&c.shards(nonce)) })).unwrap()
+            }
+            Some(Body::Commit(f)) => {
+                headers.push(("content-type".into(), "application/json".into()));
+                let c = f.content();
+                let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(c.bytes(nonce)));
+                serde_json::to_vec(&serde_json::json!({ "token": subst(&f.token, vars)?, "size": c.size, "contentSha256": digest, "shards": listed(&c.shards(nonce)) })).unwrap()
+            }
         };
         let unsigned: Vec<String> = req.unsigned_headers.iter().map(|h| h.to_ascii_lowercase()).collect();
         let resp = self.send(&req.method, &path, &query.join("&"), headers, &unsigned, body, key).await?;
         if self.verbose {
             eprintln!("    {} {}{} -> {} {}", req.method, path, if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) }, resp.status, String::from_utf8_lossy(&resp.body).chars().take(300).collect::<String>());
         }
-        self.expect(step, &resp, vars)
+        if let Some(s) = step.skip_if.as_ref().filter(|s| s.status == resp.status) {
+            return Ok(Some(s.reason.clone()));
+        }
+        self.expect(step, &resp, vars, nonce)?;
+        Ok(None)
+    }
+
+    /// PUTs each shard a plan lists to its URL, with exactly its headers and no signature
+    /// (protocol §4.11), and checks each answer's status.
+    async fn upload(&self, u: &Upload, step: &Step, vars: &Vars, nonce: u64) -> Result<(), String> {
+        let list: Value = serde_json::from_str(&subst(&u.list, vars)?).map_err(|e| format!("the upload list is not JSON: {e}"))?;
+        let list = list.as_array().ok_or("the upload list is not a JSON array")?;
+        let shards = u.content.shards(nonce);
+        for (i, entry) in list.iter().enumerate() {
+            if u.skip.contains(&i) {
+                continue;
+            }
+            let hash = entry["hash"].as_str().ok_or_else(|| format!("upload[{i}] has no hash"))?;
+            let url = entry["url"].as_str().ok_or_else(|| format!("upload[{i}] has no url"))?;
+            let shard = shards.iter().find(|s| s.hash.to_hex() == hash).ok_or_else(|| format!("upload[{i}] names shard {hash}, which the content does not have"))?;
+            let mut body = shard.bytes.to_vec();
+            if u.corrupt {
+                *body.last_mut().expect("a shard has bytes") ^= 0xff;
+            }
+            let mut req = self.client.put(url).body(body);
+            for (k, v) in entry["headers"].as_object().into_iter().flatten() {
+                req = req.header(k, v.as_str().ok_or_else(|| format!("upload[{i}] header {k} is not a string"))?);
+            }
+            let resp = req.send().await.map_err(|e| format!("upload[{i}] failed: {e}"))?;
+            let status = resp.status().as_u16();
+            if self.verbose {
+                eprintln!("    PUT <upload[{i}]> -> {status}");
+            }
+            if !step.expect.status.accepts(status) {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("upload[{i}]: status {status} but expected {}: {}", step.expect.status, text.chars().take(200).collect::<String>()));
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -148,7 +208,7 @@ impl Runner {
         Ok(Response { status, headers, body })
     }
 
-    fn expect(&self, step: &Step, resp: &Response, vars: &mut Vars) -> Result<(), String> {
+    fn expect(&self, step: &Step, resp: &Response, vars: &mut Vars, nonce: u64) -> Result<(), String> {
         let exp = &step.expect;
         let brief = || {
             let text = String::from_utf8_lossy(&resp.body);
@@ -163,7 +223,7 @@ impl Runner {
             check::check(m, Subject::Value(v), vars).map_err(|e| format!("header {name} {e}"))?;
         }
         if let Some(b) = &exp.body {
-            check_body(b, &resp.body, vars)?;
+            check_body(b, &resp.body, vars, nonce)?;
         }
         Ok(())
     }
@@ -178,7 +238,7 @@ impl Runner {
     }
 }
 
-fn check_body(b: &BodyExpect, body: &[u8], vars: &mut Vars) -> Result<(), String> {
+fn check_body(b: &BodyExpect, body: &[u8], vars: &mut Vars, nonce: u64) -> Result<(), String> {
     if let Some(t) = &b.text {
         let want = subst(t, vars)?;
         if body != want.as_bytes() {
@@ -194,6 +254,10 @@ fn check_body(b: &BodyExpect, body: &[u8], vars: &mut Vars) -> Result<(), String
     if let Some(n) = b.size
         && body.len() as u64 != n {
             return Err(format!("body is {} bytes, expected {n}", body.len()));
+        }
+    if let Some(c) = &b.bytes
+        && body != c.bytes(nonce).as_slice() {
+            return Err(format!("body is {} bytes that are not the content {c:?}", body.len()));
         }
     if b.s3_error.is_some() || !b.xml.is_empty() {
         let text = std::str::from_utf8(body).map_err(|_| "body is not UTF-8 XML".to_string())?;
@@ -219,6 +283,11 @@ fn check_body(b: &BodyExpect, body: &[u8], vars: &mut Vars) -> Result<(), String
         }
     }
     Ok(())
+}
+
+/// A plan's or commit's shard list (protocol §4.11).
+fn listed(shards: &[voidfs_core::chunk::Shard]) -> Vec<Value> {
+    shards.iter().map(|s| serde_json::json!({ "hash": s.hash.to_hex(), "length": s.bytes.len() })).collect()
 }
 
 fn fresh_drive_name() -> String {

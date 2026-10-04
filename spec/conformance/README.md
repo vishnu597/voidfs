@@ -59,6 +59,24 @@ in Phase 1.
   "expect":  { "status": 200, "headers": {}, "body": {} } }
 ```
 
+A step has a `request` or an `upload`, and an `expect`. Optionally:
+
+| Member | Meaning |
+|---|---|
+| `name` | Words for a reader; the runner ignores it |
+| `skip_if` | `{ "status": s, "reason": "…" }`: if the response has status `s`, the case ends here as skipped with that reason, before `expect` is checked. For optional extensions such as direct uploads (protocol §4.11), which a server answers `501` without |
+
+**`upload`** PUTs the shards of a direct upload's plan to the URLs it gave (protocol §4.11), each
+with exactly the headers listed for it and no signature, and checks every answer's status against
+`expect.status`.
+
+| Member | Meaning |
+|---|---|
+| `list` | The plan's `upload` array, captured from its response (`{ "path": "$.upload", "capture": "uploads" }`, then `"${uploads}"`) |
+| `content` | The content the plan was made from, in the form below; each listed shard is cut from it |
+| `skip` | Positions in the list not to upload |
+| `corrupt` | `true`: send each shard with its last byte changed, which the store must refuse |
+
 **`request`**
 
 | Member | Meaning |
@@ -76,7 +94,9 @@ in Phase 1.
 |---|---|
 | `{ "text": "…" }` | The UTF-8 string |
 | `{ "base64": "…" }` | The decoded bytes |
-| `{ "bytes": { "seed": s, "size": n } }` | `n` deterministic bytes: the concatenation of `SHA-256("voidfs-conformance" ‖ u64be(s) ‖ u64be(i))` for `i` = 0, 1, 2, …, truncated to `n` |
+| `{ "bytes": content }` | The content, where `content` is `{ "seed": s, "size": n }`: `n` deterministic bytes, the concatenation of `SHA-256("voidfs-conformance" ‖ u64be(s) ‖ u64be(i))` for `i` = 0, 1, 2, …, truncated to `n`. Optionally `"edit": [offset, "text"]` overwrites the bytes at `offset` with the text, and `"unique": true` mixes a 64-bit value of the runner's, fresh for each case, into `s` (by exclusive or), so that no other case or run has the same content |
+| `{ "plan": content }` | A direct upload's plan of the content (protocol §4.11): `{ "shards": [ { "hash", "length" }, … ] }`, the content cut as format §4.1 says with the chunking of a default `voidfs.json` (256 KiB, 2 MiB, 16 MiB). The runner also sends `Content-Type: application/json` |
+| `{ "commit": content and "token" }` | A direct upload's commit of the content: `{ "token", "size", "contentSha256", "shards" }`, the shards cut as for `plan`, with `token` after variable substitution |
 | `{ "patch": [[offset, "text"], …] }` | A `VFSP` version 1 patch body ([protocol §4.2](../protocol.md#42-batched-edits-post-drivekeyx-voidfs-patch)) with those edits, in order |
 | `{ "json": … }` | The value serialized as JSON. The runner also sends `Content-Type: application/json` unless `headers` sets one |
 
@@ -107,6 +127,7 @@ in Phase 1.
 | `text` | The body, as UTF-8, equals this |
 | `base64` | The body equals these decoded bytes |
 | `size` | The body is this many bytes long |
+| `bytes` | The body is this content, in the form of the `bytes` body |
 | `s3_error` | The body is an S3 XML error whose `Code` equals this |
 | `json` | A list of `{ "path": …, …matcher }`. The body is JSON, and each matcher holds for the value at its path |
 | `xml` | A list of `{ "path": …, …matcher }`. The body is XML, and each matcher holds for the elements at its path |
@@ -122,6 +143,6 @@ in Phase 1.
 
 ### Variables
 
-`${name}` in a path, query value, header value, `text` body, `equals`, `contains` or
-`not_equals` is replaced by the variable's value. A variable must be one of `drive`, `drive2`
+`${name}` in a path, query value, header value, `text` body, a commit's `token`, an upload's
+`list`, `equals`, `contains` or `not_equals` is replaced by the variable's value. A variable must be one of `drive`, `drive2`
 and `drive3`, or captured by an earlier step of the same case. `$${` produces a literal `${`.

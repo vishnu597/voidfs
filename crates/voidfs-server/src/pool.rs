@@ -22,6 +22,7 @@ use voidfs_core::ops::OpError;
 use voidfs_core::state::{DriveState, Rows, Spilled};
 
 use crate::clock::Clock;
+use crate::gc::Phase;
 use crate::gc::guard::{self, Guard};
 use crate::metrics::PoolMetrics;
 use crate::probe;
@@ -393,6 +394,15 @@ pub struct Drive {
     feed_floor: RwLock<u64>,
     notify: tokio::sync::watch::Sender<u64>,
     pub forks: RwLock<Vec<DriveId>>,
+}
+
+/// What [`Pool::find_shards`] found of a shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Found {
+    Held,
+    Missing,
+    /// In the bucket, with this length rather than the one it was listed with.
+    Length(u64),
 }
 
 /// Why a commit did not happen.
@@ -1030,6 +1040,59 @@ impl Pool {
             self.shards.insert(s.hash, cached(&s.bytes));
         }
         Ok(())
+    }
+
+    /// Finds shards a direct upload's commit will reference without this server having uploaded
+    /// them (protocol §4.11, format §12.4), each with the length it is listed with. A shard is
+    /// held if a request to the bucket that started after the view of `gc/pending.json` was read
+    /// finds it, with that length, and the view does not propose it (option 2); with `ask_all`
+    /// false, as for a plan, one this server checked recently counts without a request. A
+    /// candidate of a waiting run is fetched, checked against its hash and rewritten (option 3).
+    /// One a run is deleting is reported missing; with `ask_all`, as for a commit, it fails the
+    /// call instead, since it may be gone by the time the commit lands.
+    pub async fn find_shards(&self, items: &[(ShardHash, u64)], ask_all: bool) -> anyhow::Result<Vec<Found>> {
+        let view = self.guard.view(&self.store, &self.clock).await?;
+        let generation = self.guard.generation();
+        let mut out = vec![Found::Missing; items.len()];
+        let (mut ask, mut rescue) = (Vec::new(), Vec::new());
+        for (i, (h, _)) in items.iter().enumerate() {
+            match view.proposed(h) {
+                Some(Phase::Deleting) if ask_all => bail!("garbage collection is deleting shards this upload needs; try again shortly"),
+                Some(Phase::Deleting) => {}
+                Some(_) if self.guard.checked(h) && !ask_all => out[i] = Found::Held,
+                Some(_) => rescue.push(i),
+                None if self.guard.checked(h) && !ask_all => out[i] = Found::Held,
+                None => ask.push(i),
+            }
+        }
+        let mut heads = futures::stream::iter(ask).map(|i| async move { (i, self.store.length(&guard::Kind::Shard.path(&items[i].0)).await) }).buffer_unordered(guard::ADMIT_UPLOADS);
+        while let Some((i, r)) = heads.next().await {
+            let (h, n) = items[i];
+            out[i] = match r? {
+                Some(len) if len == n => {
+                    self.guard.confirmed(h, generation);
+                    Found::Held
+                }
+                Some(len) => Found::Length(len),
+                None => Found::Missing,
+            };
+        }
+        drop(heads);
+        for i in rescue {
+            let (h, n) = items[i];
+            let bytes = match self.shard(&h).await {
+                Ok(b) => b,
+                Err(_) if !self.store.exists(&guard::Kind::Shard.path(&h)).await? => continue,
+                Err(e) => return Err(e),
+            };
+            if bytes.len() as u64 != n {
+                out[i] = Found::Length(bytes.len() as u64);
+                continue;
+            }
+            self.guard.admit(&self.store, &self.clock, guard::Kind::Shard, &[(h, bytes)]).await?;
+            out[i] = Found::Held;
+        }
+        Ok(out)
     }
 
     /// [`Pool::write_shards`] for manifest pages and checkpoint segments.

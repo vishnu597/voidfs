@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod clock;
+pub mod direct;
 pub mod gc;
 pub mod metrics;
 pub mod pool;

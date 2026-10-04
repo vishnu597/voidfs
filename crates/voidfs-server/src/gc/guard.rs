@@ -65,6 +65,11 @@ impl View {
         self.run.as_ref().filter(|r| r.candidates.contains(h))
     }
 
+    /// The phase of the run that proposes `h` for deletion, if one does.
+    pub fn proposed(&self, h: &ShardHash) -> Option<Phase> {
+        self.candidate(h).map(|r| r.phase)
+    }
+
     fn same_run(&self, other: &Option<RunView>) -> bool {
         match (&self.run, other) {
             (None, None) => true,
@@ -175,6 +180,13 @@ impl Guard {
     /// the view changed while the read was in flight.
     pub fn generation(&self) -> Option<u64> {
         self.current().map(|v| v.generation)
+    }
+
+    /// Whether `h` was checked under option 2 and not proposed since, or rescued from the run in
+    /// the view (option 3): a commit may reference it without asking the bucket.
+    pub fn checked(&self, h: &ShardHash) -> bool {
+        let st = self.state.lock().unwrap();
+        st.reuse.contains(h) || st.rescued.contains(h)
     }
 
     /// Records that `h` was read or written successfully by a request that started under the
