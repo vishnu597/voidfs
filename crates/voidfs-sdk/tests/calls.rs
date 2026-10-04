@@ -432,8 +432,11 @@ async fn request_bodies_keep_to_a_shared_bandwidth_limit() {
     let secs = t.elapsed().as_secs_f64();
     assert!((0.7..1.3).contains(&secs), "4 MiB at 4 MiB/s took {secs} s");
     assert_eq!(c.get_object("drv", "f1", Default::default()).await.unwrap().body.len(), 2 << 20, "the whole body arrives");
-    bw.set(Some(64 << 20));
+    // 1 MiB at 1 MiB/s, less the quarter of a second's burst: at least 0.75 s, where the old rate
+    // would take a quarter of that. A floor, which a slow machine can't fail.
+    bw.set(Some(1 << 20));
     let t = std::time::Instant::now();
-    c.put_object("drv", "f2", vec![7u8; 4 << 20], Default::default()).await.unwrap();
-    assert!(t.elapsed().as_secs_f64() < 0.5, "a new rate applies to the next request");
+    c.put_object("drv", "f2", vec![7u8; 1 << 20], Default::default()).await.unwrap();
+    let secs = t.elapsed().as_secs_f64();
+    assert!(secs > 0.6, "a new rate applies to the next request: 1 MiB at 1 MiB/s took {secs} s");
 }
