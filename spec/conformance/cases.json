@@ -1059,6 +1059,91 @@
           "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
         { "request": { "method": "HEAD", "path": "/${drive}/w.bin" }, "expect": { "status": 404 } }
       ]
+    },
+    {
+      "id": "storage-credentials-not-offered",
+      "title": "A server that can't mint scoped storage credentials answers 501, so clients read through the API",
+      "spec": ["protocol §5.5"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive2}", "query": { "x-voidfs-credentials": "" } }, "expect": { "status": 404, "body": { "s3_error": "NoSuchBucket" } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-credentials": "" } },
+          "skip_if": { "status": 200, "reason": "the server issues storage credentials, which the other storage-credentials cases test" },
+          "expect": { "status": 501, "body": { "s3_error": "NotImplemented" } } }
+      ]
+    },
+    {
+      "id": "storage-credentials-describe-the-drives-storage",
+      "title": "Storage credentials name the drive, its bucket and root, the paths they read, and when they expire",
+      "spec": ["protocol §5.5", "format §2"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200, "headers": { "x-voidfs-drive-id": { "capture": "driveId" } } } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-credentials": "" } },
+          "skip_if": { "status": 501, "reason": "the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones" },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.driveId", "equals": "${driveId}" },
+            { "path": "$.accessGeneration", "matches": "[0-9]+" },
+            { "path": "$.storage.backend", "equals": "s3" },
+            { "path": "$.storage.bucket", "present": true },
+            { "path": "$.storage.endpoint", "matches": "https?://.+" },
+            { "path": "$.storage.readable", "contains": "voidfs.json" },
+            { "path": "$.storage.readable", "contains": "shards/" },
+            { "path": "$.storage.readable", "contains": "pages/" },
+            { "path": "$.storage.readable", "contains": "drives/${driveId}/" },
+            { "path": "$.storage.credentials.accessKeyId", "present": true },
+            { "path": "$.storage.credentials.secretAccessKey", "present": true },
+            { "path": "$.storage.credentials.expiresAt", "matches": "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})" } ] } } }
+      ]
+    },
+    {
+      "id": "storage-credentials-read-the-drive",
+      "title": "Storage credentials read the pool's descriptor, the drive's descriptor and log, and its content's shards straight from the bucket",
+      "spec": ["protocol §5.5", "format §2", "format §4"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200, "headers": { "x-voidfs-drive-id": { "capture": "driveId" } } } },
+        { "request": { "method": "PUT", "path": "/${drive}/a.bin", "body": { "bytes": { "seed": 5501, "size": 102400, "unique": true } } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-credentials": "" } },
+          "skip_if": { "status": 501, "reason": "the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones" },
+          "expect": { "status": 200 } },
+        { "bucket": { "method": "GET", "path": "voidfs.json" }, "expect": { "status": 200, "body": { "json": [ { "path": "$.format", "equals": 1 } ] } } },
+        { "bucket": { "method": "GET", "path": "drives/${driveId}/drive.json" }, "expect": { "status": 200, "body": { "json": [ { "path": "$.drive_id", "equals": "${driveId}" } ] } } },
+        { "bucket": { "method": "GET", "list": "drives/${driveId}/log/" }, "expect": { "status": 200, "body": { "xml": [ { "path": "ListBucketResult/Contents/Key", "present": true } ] } } },
+        { "bucket": { "method": "GET", "shard": { "seed": 5501, "size": 102400, "unique": true } }, "expect": { "status": 200, "body": { "bytes": { "seed": 5501, "size": 102400, "unique": true } } } }
+      ]
+    },
+    {
+      "id": "storage-credentials-reach-no-further",
+      "title": "Storage credentials are refused another drive, the pool's root, and every write",
+      "spec": ["protocol §5.5", "protocol §9"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200, "headers": { "x-voidfs-drive-id": { "capture": "driveId" } } } },
+        { "request": { "method": "PUT", "path": "/${drive2}" }, "expect": { "status": 200, "headers": { "x-voidfs-drive-id": { "capture": "otherId" } } } },
+        { "request": { "method": "PUT", "path": "/${drive2}/b.txt", "body": { "text": "another drive's" } }, "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-credentials": "" } },
+          "skip_if": { "status": 501, "reason": "the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones" },
+          "expect": { "status": 200 } },
+        { "name": "another drive's descriptor", "bucket": { "method": "GET", "path": "drives/${otherId}/drive.json" }, "expect": { "status": 403 } },
+        { "name": "another drive's prefix", "bucket": { "method": "GET", "list": "drives/${otherId}/" }, "expect": { "status": 403 } },
+        { "name": "the pool's root", "bucket": { "method": "GET", "list": "" }, "expect": { "status": 403 } },
+        { "name": "a shard, under its own hash", "bucket": { "method": "PUT", "shard": { "seed": 5502, "size": 5000, "unique": true }, "body": { "bytes": { "seed": 5502, "size": 5000, "unique": true } } },
+          "expect": { "status": [400, 403] } },
+        { "name": "the drive's own descriptor", "bucket": { "method": "DELETE", "path": "drives/${driveId}/drive.json" }, "expect": { "status": [400, 403] } },
+        { "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-drive": "" } }, "expect": { "status": 200, "body": { "json": [ { "path": "$.driveId", "equals": "${driveId}" } ] } } }
+      ]
+    },
+    {
+      "id": "storage-credentials-for-read-keys",
+      "title": "A read key gets storage credentials for the drives it reaches, and 404 for any other",
+      "spec": ["protocol §2", "protocol §5.5"],
+      "requires": ["key:read"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200, "headers": { "x-voidfs-drive-id": { "capture": "driveId" } } } },
+        { "key": "read", "request": { "method": "GET", "path": "/${drive3}", "query": { "x-voidfs-credentials": "" } }, "expect": { "status": 404, "body": { "s3_error": "NoSuchBucket" } } },
+        { "key": "read", "request": { "method": "GET", "path": "/${drive}", "query": { "x-voidfs-credentials": "" } },
+          "skip_if": { "status": 501, "reason": "the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones" },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.driveId", "equals": "${driveId}" } ] } } },
+        { "bucket": { "method": "GET", "path": "drives/${driveId}/drive.json" }, "expect": { "status": 200 } }
+      ]
     }
   ]
 }

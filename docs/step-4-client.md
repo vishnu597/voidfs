@@ -1216,6 +1216,63 @@ then the client. What the first built:
 - **The pool says how versions are read:** `load_drive` applies `multi-object-versions` if
   `voidfs.json` lists it.
 
+What the second built:
+- In `voidfs-server`: `GET /{drive}?x-voidfs-credentials` (`credentials.rs`): read-only
+  credentials that read `voidfs.json`, `shards/`, `pages/` and `drives/<id>/` under the pool's
+  root, and list the drive's prefix; minted by STS AssumeRole with a session policy narrowed to
+  those paths (MinIO's STS on the bucket's endpoint, or AWS's with `--storage-credentials-role`),
+  and checked when the server starts. `--storage-credentials on|off` and `--sts-endpoint`.
+- `voidfs-server probe` reports what minted credentials reach (`storage credentials`): B3's row
+  that was "not probed".
+- In the test server: `TestServer::with_storage_credentials`, and a `FakeBucket` that mints
+  credentials, verifies the SigV4 signatures and session tokens of requests made with them, and
+  holds them to what they were minted for.
+- In the SDK, `Signer::with_session_token`, which signs with temporary credentials.
+- Five conformance cases (`storage-credentials-*`), with the runner's `bucket` steps: requests to
+  the storage the credentials describe, signed with them.
+- In the protocol, the addition the user approved on 4 October: `voidfs.json` in `readable`
+  (§5.5). And in the spec's changelog, revision 7 for item 5's additions, which it lacked.
+
+**Decisions taken while building the second:**
+- **STS, called by the server itself:** the AssumeRole request is a form signed with the reqsign
+  signer the server already has for the bucket (service `sts`), sent through OpenDAL's HTTP client,
+  and its answer read with `roxmltree`: no new dependency. `reqsign-aws-core` 3.2.0 has
+  AssumeRole with a session policy, but it calls only AWS's own `https://sts…amazonaws.com`
+  endpoints and checks that the role's ARN is an AWS one, so it can't call MinIO's.
+- **Where STS is:** for an AWS bucket, the region's STS, with the role the deployment names (the
+  ARN is required: AWS STS assumes a role, never the caller itself); elsewhere the bucket's own
+  endpoint, where MinIO serves it with the server's own keys and no role. MinIO's root user may
+  call it, and its session policy holds prefixes for GETs and listings (checked here on 4
+  October, MinIO `RELEASE.2025-10-15T17-29-55Z`, as CI builds it). R2 isn't tried: it mints
+  through Cloudflare's API with an API token, the next pull request. versitygw 1.8.0 has no
+  AssumeRole (its `versitygw iam` server answers STS's GetCallerIdentity only, and its S3 port
+  answers `405`), so it answers `501`, as memory and local disk do.
+- **The session policy:** `s3:GetObject` on `<root>voidfs.json`, `<root>shards/*`,
+  `<root>pages/*` and `<root>drives/<id>/*`, and `s3:ListBucket` on the bucket where `s3:prefix`
+  is under `<root>drives/<id>/`: a reader lists `checkpoints/` and `log/` (format §8.4), never
+  `shards/` or `pages/`. `readable` lists the same four paths.
+- **Offered only where checked:** at start the server mints credentials for a drive no pool has
+  and tries them: they must read `voidfs.json` and list their drive, and be refused a listing of
+  the pool's root, another drive's prefix and descriptor, and a write (a PUT of the 36-byte probe
+  shard, a valid shard, as direct uploads' check sends). Anything else is `501`. A bucket that
+  can't mint is logged as information; one whose credentials reach too far as a warning.
+- **15 minutes, minted per drive and shared:** revoking an access key doesn't reach credentials
+  already issued (protocol §5.5), so they last as little as AWS and MinIO allow, where Space's
+  last an hour (§1.6). A drive's are minted once and handed to every key that reads it, since
+  they reach the same paths, until less than half their life is left: every answer is good for
+  at least 7.5 minutes, and a drive costs STS one call in 7.5 minutes however many read it. A
+  mint that fails then answers `503`, and clients read through the API.
+- **`accessGeneration`:** a digest of the access rules that reach the drive (each key's id and
+  scope), in 48 bits so that every language's JSON holds it exactly. Keys are fixed while a server
+  runs, so it changes when a restart changes them; step 6's keys will keep a counter instead.
+  Space's was `1` (§1.6).
+- **`storageBudget`** is left out until quotas (S9). **`forcePathStyle`** is `true`: the server
+  reaches the bucket path-style, and clients reach it as the server does.
+- **What an answer carries:** `Cache-Control: no-store`, since it holds a secret. The server logs
+  no secret, and `Minted`'s `Debug` leaves them out.
+- **Compose's versitygw overlay** turns them off, as it does direct uploads: that bucket isn't
+  reachable from outside the Compose network.
+
 **Design.**
 - **Server.** Read-only credentials for `shards/`, `pages/` and `drives/<id>/` under the pool's
   root: on AWS through STS AssumeRole with a session policy (a role the deployment names); on R2
@@ -1289,8 +1346,13 @@ for first); a cold read through the bucket against one through the API.
     commit three times; the measurement, and the conformance cases on AWS S3 and R2, which both
     refuse a shard's URL other bytes
     ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)).
-- Item 6, short-lived storage credentials: **in progress** (4 October). The format reader is
-  factored out of the server into `voidfs-format`: its 6 tests (against pools the server wrote,
-  and a bucket with nothing but a broken descriptor or tree), and the server's own that load
-  drives, each failed with the code they guard broken, 11 breaks in all, each run alone with a
-  timeout. The conformance suite passes on memory, local disk and versitygw.
+- Item 6, short-lived storage credentials: **in progress** (4 October), in three pull requests,
+  each test seen to fail with the code it guards broken, each break run alone with a timeout:
+  - the format reader, factored out of the server into `voidfs-format`: its 6 tests (against
+    pools the server wrote, and a bucket with nothing but a broken descriptor or tree), and the
+    server's own that load drives, 11 breaks;
+  - the server: 10 tests (3 of the session policy, STS's answers and the access generation, 6
+    in the server's own process against the stand-in bucket and a stand-in STS, 1 of which
+    services mint), 31 breaks; and five conformance cases, which pass on MinIO (built from source,
+    as CI builds it), both addressing styles, and skip with their reason on memory, local disk and
+    versitygw, but the one that checks the `501`: 7 breaks against a server on MinIO.

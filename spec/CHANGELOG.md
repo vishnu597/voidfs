@@ -4,6 +4,32 @@ Every change to the [protocol](protocol.md), the [format](format.md) and the
 [conformance suite](conformance/) is recorded here, newest first. Drafts may change
 incompatibly; entries say when they do.
 
+## Draft 1, revision 8: storage credentials read the pool's descriptor (2026-10-04)
+
+Step 4, item 6. Additive: a reader with storage credentials can now check the pool before reading
+a drive, as the format requires.
+
+- **Protocol §5.5:** `readable` lists `voidfs.json` as well as `shards/`, `pages/` and the
+  drive's prefix, since a reader checks the pool's format and features first (format §3.1). The
+  credentials list the drive's prefix too, and an entry ending in `/` is a prefix.
+- **Conformance:** `bucket` steps, a request to the storage that the case's last storage
+  credentials describe, signed with them: an object by its `path` under the pool's root, the
+  `shard` that holds some content, or a `list` of a prefix. `storage-credentials-not-offered`,
+  `storage-credentials-describe-the-drives-storage`, `storage-credentials-read-the-drive`,
+  `storage-credentials-reach-no-further` and `storage-credentials-for-read-keys`, which a server
+  that answers `501` skips but the first.
+
+## Draft 1, revision 7: direct uploads, as built (2026-10-03)
+
+Step 4, item 5, recorded here on 4 October. Additive.
+
+- **Protocol §4.11:** `x-amz-meta-*` headers apply to a commit as to a PutObject.
+- **Protocol §9:** direct uploads show what a pool holds: a plan's `held` count, and a commit
+  that references a shard by its hash.
+- **Conformance:** `upload` steps, the `plan`, `commit` and `bytes` bodies, `unique` content and
+  `skip_if`, with seven cases, `direct-upload-*`, which a server without direct uploads skips but
+  `direct-upload-not-offered`.
+
 ## Draft 1, revision 6: a version for every object it changes (2026-10-02)
 
 [RFC 0004](../rfcs/0004-a-version-for-every-object-it-changes.md). Readers that do not implement

@@ -195,8 +195,9 @@ Commits rely on the bucket refusing to create an object that already exists (`If
 [format §7.2](spec/format.md#72-claiming-a-sequence-number-create-if-absent)). A server checks
 that before it writes the pool, and refuses a bucket that ignores it. It also refuses lifecycle
 rules that would delete or archive the pool's objects. `probe` reports these and the rest of
-what the bucket supports. It stores nothing but the 36-byte shard its check of presigned uploads
-sends (a valid shard, which garbage collection removes):
+what the bucket supports. It stores nothing but the 36-byte shard its checks of presigned uploads
+and storage credentials send, where the bucket accepts it (a valid shard, which garbage collection
+removes):
 
 ```bash
 cargo run --release -p voidfs-server -- probe --store s3:<bucket>/<prefix> --s3-endpoint <url>
@@ -216,6 +217,30 @@ commit checks that they arrived. A server offers this only where the bucket refu
 don't match the checksum a URL carries, which it checks when it starts (and `probe` reports, as
 `presigned PUTs`); elsewhere, and with `--direct-uploads off`, the two requests answer `501` and
 clients put as usual. Clients must be able to reach the bucket's endpoint as the server does.
+
+### Storage credentials
+
+A mount or a bulk reader can read a drive straight from the bucket, so that the server carries no
+content bytes: it asks for short-lived, read-only credentials to the drive's storage
+([protocol §5.5](spec/protocol.md#55-storage-credentials-get-drivex-voidfs-credentials)), which
+read only the pool's `voidfs.json`, its shared `shards/` and `pages/`, and the drive's own
+prefix. The server mints them with the bucket's STS, AssumeRole with a session policy narrowed to
+those paths, for 15 minutes, and shares a drive's among the keys that read it:
+
+- **MinIO:** its STS, on the bucket's endpoint, with the server's own bucket keys. Nothing to set.
+- **AWS S3:** STS needs a role to assume. Make one that may read the pool (`s3:GetObject` on
+  `<bucket>/<prefix>/*`, `s3:ListBucket` on the bucket) and that trusts the server's bucket
+  credentials, allow those credentials `sts:AssumeRole` on it, and start the server with
+  `--storage-credentials-role <its ARN>` (or `VOIDFS_STORAGE_CREDENTIALS_ROLE`).
+- **Cloudflare R2:** not yet (R2 mints temporary credentials through Cloudflare's API, with an
+  API token).
+
+A server offers them only where a check at start finds that minted credentials read those paths
+and are refused the pool's root, another drive and a write (`probe` reports it as `storage
+credentials`); elsewhere, and with `--storage-credentials off`, the request answers `501` and
+clients read through the server. Revoking an access key does not reach credentials already
+issued: they last until they expire. Clients must be able to reach the bucket's endpoint as the
+server does.
 
 ### Small files in the log
 

@@ -33,9 +33,12 @@ docker compose -f compose.yaml -f compose.versitygw.yaml up -d --build --wait
 
 The server checks at start that the bucket refuses a second create of the same object (format
 §7.2), which versitygw does. MinIO would serve the same purpose, but it no longer publishes images
-or binaries; CI builds its last release from source instead. Direct uploads (protocol §4.11) are
-off here: versitygw is reachable only inside the Compose network, so a client couldn't send shards
-to it. A pool in your own bucket has them, where the bucket enforces what their URLs bind.
+or binaries; CI builds its last release from source instead. Direct uploads (protocol §4.11) and
+storage credentials (§5.5) are off here: versitygw is reachable only inside the Compose network,
+so a client couldn't send shards to it or read from it (and it has no STS to mint credentials). A
+pool in your own bucket has direct uploads where the bucket enforces what their URLs bind, and
+storage credentials where its STS mints them scoped to a drive (MinIO, or AWS with
+`VOIDFS_STORAGE_CREDENTIALS_ROLE`).
 
 ## In your own bucket
 

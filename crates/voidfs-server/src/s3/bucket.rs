@@ -85,7 +85,7 @@ pub async fn dispatch(app: &Arc<App>, ctx: &Ctx, body: Body) -> Result<Response,
             } else if q.has("x-voidfs-changes") {
                 changes(ctx, &d).await
             } else if q.has("x-voidfs-credentials") {
-                Err(S3Error::not_implemented("this deployment cannot issue storage credentials yet"))
+                credentials(app, &d).await
             } else {
                 list_objects(ctx, &d)
             }
@@ -165,6 +165,40 @@ fn describe(app: &Arc<App>, d: &Drive) -> Result<Response, S3Error> {
         "seq": s.seq(),
         "usageBytes": s.live_bytes(),
     })))
+}
+
+/// Read-only credentials to the drive's storage (protocol §5.5). Not cached by anything between:
+/// they hold a secret.
+async fn credentials(app: &Arc<App>, d: &Drive) -> Result<Response, S3Error> {
+    let Some(c) = &app.credentials else {
+        return Err(S3Error::not_implemented("this deployment does not issue storage credentials: its store can't mint them scoped to a drive. Read through the API"));
+    };
+    let m = c.for_drive(&d.id).await.map_err(|e| {
+        tracing::warn!("minting storage credentials for {}: {e:#}", d.id);
+        S3Error::new(503, "ServiceUnavailable", "storage credentials could not be minted just now; read through the API, or try again later")
+    })?;
+    let l = &c.location;
+    let mut r = json(&json!({
+        "driveId": d.id,
+        "accessGeneration": crate::credentials::access_generation(&app.keys, &d.alias, d.id.as_str()),
+        "storage": {
+            "backend": "s3",
+            "bucket": l.bucket,
+            "root": l.root,
+            "region": l.region,
+            "endpoint": l.endpoint,
+            "forcePathStyle": true,
+            "readable": crate::credentials::readable(&d.id),
+            "credentials": {
+                "accessKeyId": m.access_key_id,
+                "secretAccessKey": m.secret_access_key,
+                "sessionToken": m.session_token,
+                "expiresAt": m.expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            },
+        },
+    }));
+    r.headers_mut().insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
+    Ok(r)
 }
 
 fn encode_key(ctx: &Ctx, key: &str) -> String {

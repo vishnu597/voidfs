@@ -45,8 +45,11 @@ services:
       VOIDFS_S3_ACCESS_KEY_ID: ${BUCKET_ACCESS_KEY_ID}
       VOIDFS_S3_SECRET_ACCESS_KEY: ${BUCKET_SECRET_ACCESS_KEY}
       # versitygw is reachable only inside this network, so clients outside it couldn't PUT to
-      # the URLs a direct upload's plan gives (protocol §4.11): they put as usual.
+      # the URLs a direct upload's plan gives (protocol §4.11): they put as usual. Nor could they
+      # read with storage credentials (§5.5), which versitygw can't mint anyway: they read through
+      # the server.
       VOIDFS_DIRECT_UPLOADS: "off"
+      VOIDFS_STORAGE_CREDENTIALS: "off"
 
 volumes:
   bucket-data:

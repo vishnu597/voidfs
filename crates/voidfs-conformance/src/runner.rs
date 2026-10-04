@@ -8,10 +8,14 @@ use base64::Engine;
 use percent_encoding::utf8_percent_encode;
 use rand::RngExt;
 use serde_json::Value;
-use voidfs_sdk::sign::{QUERY, Signer};
+use voidfs_sdk::sign::{PATH, QUERY, Signer};
 
-use crate::cases::{Body, BodyExpect, Case, Step, Upload};
+use crate::cases::{Body, BodyExpect, BucketRequest, Case, Step, Upload};
 use crate::check::{self, Subject, Vars, subst};
+
+/// Where the runner keeps the case's last storage credentials (protocol §5.5): not a name a case
+/// can use as a variable.
+const CREDENTIALS: &str = "storage:credentials";
 
 #[derive(Clone, Debug)]
 pub struct Key {
@@ -98,6 +102,9 @@ impl Runner {
         if let Some(u) = &step.upload {
             return self.upload(u, step, vars, nonce).await.map(|()| None);
         }
+        if let Some(b) = &step.bucket {
+            return self.bucket(b, step, vars, nonce).await.map(|()| None);
+        }
         let key = self.keys.get(&step.key).ok_or_else(|| format!("no key named {}", step.key))?;
         let req = step.request.as_ref().ok_or("a step needs a request or an upload")?;
         let path = subst(&req.path, vars)?;
@@ -144,8 +151,50 @@ impl Runner {
         if let Some(s) = step.skip_if.as_ref().filter(|s| s.status == resp.status) {
             return Ok(Some(s.reason.clone()));
         }
+        if resp.status == 200 && req.query.contains_key("x-voidfs-credentials") {
+            vars.insert(CREDENTIALS.into(), String::from_utf8_lossy(&resp.body).into_owned());
+        }
         self.expect(step, &resp, vars, nonce)?;
         Ok(None)
+    }
+
+    /// Sends a request to the storage the case's last storage credentials describe (protocol
+    /// §5.5): path-style at their endpoint, under their root, signed with them.
+    async fn bucket(&self, b: &BucketRequest, step: &Step, vars: &mut Vars, nonce: u64) -> Result<(), String> {
+        let c: Value = serde_json::from_str(vars.get(CREDENTIALS).ok_or("no storage credentials: a bucket step needs an earlier 200 answer to ?x-voidfs-credentials")?)
+            .map_err(|e| format!("the storage credentials are not JSON: {e}"))?;
+        let st = &c["storage"];
+        let field = |v: &Value, name: &str| v[name].as_str().map(str::to_owned).ok_or_else(|| format!("the storage credentials have no {name}"));
+        let (endpoint, bucket, root) = (field(st, "endpoint")?, field(st, "bucket")?, st["root"].as_str().unwrap_or_default().to_owned());
+        let cr = &st["credentials"];
+        let region = st["region"].as_str().filter(|r| !r.is_empty()).unwrap_or("us-east-1");
+        let signer = Signer::new(&endpoint, &field(cr, "accessKeyId")?, &field(cr, "secretAccessKey")?)
+            .map_err(|e| e.to_string())?
+            .with_region(region)
+            .with_session_token(cr["sessionToken"].as_str());
+        let bucket_path = format!("/{}", utf8_percent_encode(&bucket, QUERY));
+        let (path, query) = match (&b.path, &b.shard, &b.list) {
+            (Some(p), None, None) => (format!("{bucket_path}/{}", utf8_percent_encode(&format!("{root}{}", subst(p, vars)?), PATH)), String::new()),
+            (None, Some(content), None) => {
+                let shards = content.shards(nonce);
+                let [shard] = shards.as_slice() else { return Err(format!("the content is {} shards, not one", shards.len())) };
+                (format!("{bucket_path}/{}", utf8_percent_encode(&format!("{root}shards/{}", shard.hash.object_path()), PATH)), String::new())
+            }
+            (None, None, Some(prefix)) => (bucket_path, format!("delimiter=%2F&list-type=2&prefix={}", utf8_percent_encode(&format!("{root}{}", subst(prefix, vars)?), QUERY))),
+            _ => return Err("a bucket step names one of path, shard and list".into()),
+        };
+        let body = match &b.body {
+            None => Vec::new(),
+            Some(Body::Text(t)) => subst(t, vars)?.into_bytes(),
+            Some(Body::Bytes(c)) => c.bytes(nonce),
+            Some(_) => return Err("a bucket step's body is text or bytes".into()),
+        };
+        let request = signer.sign(&b.method, &path, &query, Vec::new(), &[], body.into()).map_err(|e| e.to_string())?;
+        let resp = self.execute(reqwest::Request::try_from(request).map_err(|e| e.to_string())?).await?;
+        if self.verbose {
+            eprintln!("    {} <bucket>{path}{} -> {} {}", b.method, if query.is_empty() { String::new() } else { format!("?{query}") }, resp.status, String::from_utf8_lossy(&resp.body).chars().take(300).collect::<String>());
+        }
+        self.expect(step, &resp, vars, nonce)
     }
 
     /// PUTs each shard a plan lists to its URL, with exactly its headers and no signature
@@ -196,7 +245,10 @@ impl Runner {
         let mut signer = Signer::new(&self.endpoint, &key.id, &key.secret).map_err(|e| e.to_string())?;
         signer.virtual_host = self.virtual_host.clone();
         let request = signer.sign(method, path, query, headers, unsigned, body.into()).map_err(|e| e.to_string())?;
-        let request = reqwest::Request::try_from(request).map_err(|e| e.to_string())?;
+        self.execute(reqwest::Request::try_from(request).map_err(|e| e.to_string())?).await
+    }
+
+    async fn execute(&self, request: reqwest::Request) -> Result<Response, String> {
         let resp = self.client.execute(request).await.map_err(|e| format!("request failed: {e}"))?;
         let status = resp.status().as_u16();
         let headers = resp

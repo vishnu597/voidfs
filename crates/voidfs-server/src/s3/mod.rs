@@ -39,6 +39,9 @@ pub struct App {
     /// Direct uploads (protocol §4.11), where the store presigns PUTs that bind a shard's
     /// checksum; otherwise their requests answer `501`.
     pub direct: Option<Arc<crate::direct::Direct>>,
+    /// Storage credentials (protocol §5.5), where the store mints them scoped to a drive's reader;
+    /// otherwise their requests answer `501`.
+    pub credentials: Option<Arc<crate::credentials::Credentials>>,
 }
 
 pub fn router(app: Arc<App>) -> axum::Router {

@@ -61,6 +61,10 @@ impl Keys {
     pub fn get(&self, id: &str) -> Option<&KeyInfo> {
         self.0.get(id)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &KeyInfo> {
+        self.0.values()
+    }
 }
 
 /// How the request body is covered by the signature.

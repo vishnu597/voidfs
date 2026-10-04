@@ -13,7 +13,8 @@
 //! where they can't be read, stops a server from starting. Versioning, which keeps deleted
 //! objects billed, is a warning. Presigned URLs, CORS, object lock, modification times and the
 //! bucket's clock are only reported. What a presigned PUT binds decides whether a server offers
-//! direct uploads ([`presigned_puts`]), which it checks when it starts.
+//! direct uploads ([`presigned_puts`]), and what minted credentials reach whether it offers storage
+//! credentials ([`crate::credentials::check`]); it checks both when it starts.
 //!
 //! Some things can't be checked without new objects, which the format does not allow under the
 //! root: that create-if-absent holds when writers race, and that reads and listings see writes at
@@ -128,6 +129,12 @@ enum Provider {
 pub struct Bucket {
     http: HttpClient,
     signer: Signer<Credential>,
+    /// The same credentials, for STS (storage credentials, protocol §5.5).
+    sts_signer: Signer<Credential>,
+    name: String,
+    region: String,
+    /// The endpoint, as a URL.
+    base: String,
     /// The bucket's URL, path-style, as OpenDAL addresses it.
     url: String,
     /// The pool's root as a key prefix: empty, or ending in `/`.
@@ -188,11 +195,12 @@ impl Bucket {
     pub fn new(bucket: &str, prefix: &str, endpoint: Option<&str>, region: &str, credentials: Option<(&str, &str)>) -> anyhow::Result<Bucket> {
         let http = HttpClient::new()?;
         let ctx = reqsign_core::Context::new().with_file_read(reqsign_file_read_tokio::TokioFileRead).with_http_send(ViaOpendal(http.clone())).with_env(OsEnv);
-        let chain = match credentials {
+        let chain = || match credentials {
             Some((id, secret)) => ProvideCredentialChain::new().push(StaticCredentialProvider::new(id, secret)),
             None => ProvideCredentialChain::new().push(DefaultCredentialProvider::builder().build()),
         };
-        let signer = Signer::new(ctx, chain, RequestSigner::new("s3", region));
+        let signer = Signer::new(ctx.clone(), chain(), RequestSigner::new("s3", region));
+        let sts_signer = Signer::new(ctx, chain(), RequestSigner::new("sts", region));
         let base = match endpoint {
             Some(e) if e.starts_with("http://") || e.starts_with("https://") => e.trim_end_matches('/').to_owned(),
             Some(e) => format!("https://{}", e.trim_end_matches('/')),
@@ -207,7 +215,36 @@ impl Bucket {
             Provider::Other
         };
         let prefix = prefix.trim_matches('/');
-        Ok(Bucket { http, signer, url: format!("{base}/{bucket}"), prefix: if prefix.is_empty() { String::new() } else { format!("{prefix}/") }, provider })
+        Ok(Bucket {
+            http,
+            signer,
+            sts_signer,
+            name: bucket.to_owned(),
+            region: region.to_owned(),
+            url: format!("{base}/{bucket}"),
+            base,
+            prefix: if prefix.is_empty() { String::new() } else { format!("{prefix}/") },
+            provider,
+        })
+    }
+
+    /// Where storage credentials for the pool reach (protocol §5.5).
+    pub fn location(&self) -> crate::credentials::Location {
+        crate::credentials::Location { bucket: self.name.clone(), root: self.prefix.clone(), region: self.region.clone(), endpoint: self.base.clone() }
+    }
+
+    /// What mints storage credentials through STS for this bucket, or why its service can't: AWS's
+    /// STS needs a role to assume, and R2 has none. Elsewhere STS is tried on the bucket's own
+    /// endpoint, as MinIO serves it.
+    pub fn sts(&self, opts: &crate::credentials::StsOptions) -> Result<crate::credentials::Sts, String> {
+        let endpoint = match (&opts.endpoint, self.provider, &opts.role) {
+            (_, Provider::R2, _) => return Err("R2 mints temporary credentials through Cloudflare's API with an API token, which this server does not use yet".into()),
+            (None, Provider::Aws, None) => return Err("AWS STS needs a role to assume (--storage-credentials-role)".into()),
+            (Some(e), _, _) => e.trim_end_matches('/').to_owned(),
+            (None, Provider::Aws, _) => format!("https://sts.{}.amazonaws.com", self.region),
+            (None, Provider::Other, _) => self.base.clone(),
+        };
+        Ok(crate::credentials::Sts { http: self.http.clone(), signer: self.sts_signer.clone(), endpoint: format!("{endpoint}/"), role: opts.role.clone(), bucket: self.name.clone(), root: self.prefix.clone() })
     }
 
     /// The HTTP client its requests go through.
@@ -284,7 +321,7 @@ impl Bucket {
 }
 
 /// The `Code` of an S3 error document.
-fn error_code(xml: &str) -> Option<String> {
+pub(crate) fn error_code(xml: &str) -> Option<String> {
     let doc = roxmltree::Document::parse(xml).ok()?;
     let code = doc.root_element().children().find(|n| n.has_tag_name("Code"))?.text()?;
     Some(code.trim().to_owned())
@@ -536,10 +573,11 @@ impl fmt::Display for Report {
     }
 }
 
-/// Every check, for a server that would be started with `--commit-guard guard`. It changes
-/// nothing a pool holds: the writes are the create-if-absent check's, which a bucket that honours
-/// the condition refuses, and the presigned PUTs of [`PROBE_SHARD`], a valid shard.
-pub async fn report(store: &Store, bucket: Option<&Bucket>, guard: CommitGuard) -> anyhow::Result<Report> {
+/// Every check, for a server that would be started with `--commit-guard guard` and `sts`. It
+/// changes nothing a pool holds: the writes are the create-if-absent check's, which a bucket that
+/// honours the condition refuses, and PUTs of [`PROBE_SHARD`], a valid shard, presigned and with
+/// minted storage credentials.
+pub async fn report(store: &Store, bucket: Option<&Bucket>, guard: CommitGuard, sts: &crate::credentials::StsOptions) -> anyhow::Result<Report> {
     let mut r = Report::default();
     let descriptor = store.get(DESCRIPTOR).await?;
     let pool_exists = descriptor.is_some();
@@ -620,11 +658,11 @@ pub async fn report(store: &Store, bucket: Option<&Bucket>, guard: CommitGuard) 
         if pool_exists { presigned_puts(b, &b.http).await.to_string() } else { "not checked, as there is no pool here yet; a server checks them when it starts".into() },
     );
     r.row(
-        "temporary credentials",
-        match b.provider {
-            Provider::Aws => "not probed: AWS STS AssumeRole needs a role to assume. Direct uploads will need it, or presigned URLs",
-            Provider::R2 => "not probed: R2 mints them with a Cloudflare API token, not with S3 keys. Direct uploads will need one, or presigned URLs",
-            Provider::Other => "not probed: this service's own mechanism, if any, is unknown. Direct uploads can use presigned URLs",
+        "storage credentials",
+        match (b.sts(sts), pool_exists) {
+            (Err(why), _) => format!("not offered: {why}"),
+            (Ok(_), false) => "not checked, as there is no pool here yet; a server checks them when it starts".into(),
+            (Ok(mint), true) => crate::credentials::check(&mint, &b.location(), &b.http).await.to_string(),
         },
     );
     r.row(
@@ -938,23 +976,41 @@ mod tests {
         assert_eq!((b.url.as_str(), b.prefix.as_str(), b.provider), ("https://127.0.0.1:7070/b", "a/b/", Provider::Other));
     }
 
+    #[test]
+    fn storage_credentials_are_minted_where_the_service_can() {
+        use crate::credentials::{Location, StsOptions};
+        let opts = |role: Option<&str>, endpoint: Option<&str>| StsOptions { role: role.map(str::to_owned), endpoint: endpoint.map(str::to_owned) };
+        let minio = Bucket::new("b", "pool", Some("http://127.0.0.1:9000/"), "us-east-1", Some(("id", "secret"))).unwrap();
+        assert_eq!(minio.location(), Location { bucket: "b".into(), root: "pool/".into(), region: "us-east-1".into(), endpoint: "http://127.0.0.1:9000".into() });
+        let sts = minio.sts(&opts(None, None)).unwrap();
+        assert_eq!((sts.endpoint.as_str(), sts.role.as_deref(), sts.bucket.as_str(), sts.root.as_str()), ("http://127.0.0.1:9000/", None, "b", "pool/"), "MinIO's STS is on its own endpoint");
+        let aws = Bucket::new("b", "", None, "eu-west-1", None).unwrap();
+        assert!(aws.sts(&opts(None, None)).err().unwrap().contains("--storage-credentials-role"));
+        let sts = aws.sts(&opts(Some("arn:aws:iam::1:role/r"), None)).unwrap();
+        assert_eq!((sts.endpoint.as_str(), sts.role.as_deref()), ("https://sts.eu-west-1.amazonaws.com/", Some("arn:aws:iam::1:role/r")));
+        assert_eq!(aws.location().endpoint, "https://s3.eu-west-1.amazonaws.com");
+        assert_eq!(aws.sts(&opts(Some("arn:aws:iam::1:role/r"), Some("https://sts.example/"))).unwrap().endpoint, "https://sts.example/");
+        let r2 = Bucket::new("b", "pool", Some("https://acct.r2.cloudflarestorage.com"), "auto", Some(("id", "secret"))).unwrap();
+        assert!(r2.sts(&opts(None, None)).err().unwrap().contains("Cloudflare"));
+    }
+
     #[tokio::test]
     async fn the_report_says_whether_a_server_would_start() {
         let (m, store) = mem();
-        let r = report(&store, None, CommitGuard::CreateIfAbsent).await.unwrap();
+        let r = report(&store, None, CommitGuard::CreateIfAbsent, &Default::default()).await.unwrap();
         assert!(r.refusals.is_empty());
         assert!(r.to_string().contains("none here yet"), "{r}");
         let desc = serde_json::json!({ "format": 1, "pool_id": "p-1", "created": "2026-09-28T00:00:00Z", "features": { "compatible": [], "incompatible": [] },
             "chunking": { "algorithm": "fastcdc-2020", "min": 262144, "avg": 2097152, "max": 16777216 }, "hash": "sha256", "commit_guard": "create-if-absent" });
         store.put(DESCRIPTOR, Bytes::from(desc.to_string())).await.unwrap();
-        let r = report(&store, None, CommitGuard::CreateIfAbsent).await.unwrap();
+        let r = report(&store, None, CommitGuard::CreateIfAbsent, &Default::default()).await.unwrap();
         assert!(r.refusals.is_empty(), "{r}");
         assert!(r.to_string().contains("honoured"));
         assert!(r.to_string().ends_with("would open the pool."));
-        let r = report(&store, None, CommitGuard::External).await.unwrap();
+        let r = report(&store, None, CommitGuard::External, &Default::default()).await.unwrap();
         assert_eq!(r.refusals.len(), 1, "{r}");
         fault_on_put_new(&m, Fault::Unconditional);
-        let r = report(&store, None, CommitGuard::CreateIfAbsent).await.unwrap();
+        let r = report(&store, None, CommitGuard::CreateIfAbsent, &Default::default()).await.unwrap();
         assert!(r.to_string().contains("IGNORED"));
         assert!(r.refusals[0].contains("ignores create-if-absent"), "{r}");
     }
