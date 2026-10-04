@@ -1,7 +1,8 @@
 # Step 4: client core, CLI and Rust SDK
 
 *Work items for step 4 of the [parity plan](PARITY.md#7-step-by-step-plan), written on 1 October
-2026. The code references point at `main` at `939b57c`. What SpaceFS does is marked by how it is
+2026. The code references point at `main` at `939b57c`. §1.5–§1.9 were added on 3 October, the
+trial's last day, from Space 0.2.343. What SpaceFS does is marked by how it is
 known: **read** (their docs or the CLI's help), **observed** (run or looked at on this Mac, Space
 0.2.333) or **inferred** (from strings, file names or a schema, not confirmed).*
 
@@ -287,6 +288,151 @@ content, then the modification time `cp` sets after it).
 - Space's imports have a conflict policy (Keep Both by default). The CLI's `upload` makes a new
   version of a file that exists instead, since every version is kept; the queue keeps that, and a
   policy can come with item 4's `upload` if it is wanted.
+
+### 1.5 Direct uploads (observed through the API, 3 October, 0.2.343, protocol 1)
+
+*With the s3sdk key in `.env.space`, signed requests from a scratch tool, in `void-probe/direct/`
+on the trial drive, which the user approved for it. Times are UTC.*
+
+**Where things are (observed).**
+- The API answers from Cloudflare's edge: every response has `x-s3sdk-edge-colo` (here `YUL`,
+  Montreal), `x-s3sdk-edge-source: do` (a Durable Object) and `x-s3sdk-edge-spent` (`auth`, `route`,
+  `do`, `stage`, `commit`, `inside`, `fetch`, in ms). An unknown extension answers `501`, "is not
+  served at the edge, and the central gateway is retired".
+- A drive's objects are in **Backblaze B2** (`s3.ca-east-006.backblazeb2.com`, bucket
+  `sp-5e078295296b`): the upload URLs point there, at `groups/<group>/data/<h0h1>/<h2h3>/<sha256>`,
+  the same layout as voidfs's `shards/`.
+
+**Plan and placement (observed).**
+- `POST /{drive}/{key}?x-s3sdk-direct-plan` answers `{token, upload: [{hash, length, url}], held,
+  expiresSeconds: 900}`: no `headers`. Each URL is presigned with `X-Amz-SignedHeaders=host` only
+  and `X-Amz-Expires=900`.
+- The token is base64url JSON, `{key, group, plannedId, expiresMs}` (`plannedId` only for a new
+  key: the object's record id), a dot, and a 32-byte MAC. It binds the key and its group, not the
+  drive or the shard list.
+- A new key is placed in one of 16 groups, `files-00000` to `files-00015`, chosen again at each plan
+  (40 plans of new keys landed in 13 groups); an existing key keeps its group. **`held` counts the
+  shards the key's group has**: a 9 MiB file planned again at its own key held 6 of 6, at a new key
+  in another group 0, and at new keys that landed in its group 6.
+- Space cuts with FastCDC at 256 KiB / 2 MiB / 16 MiB, as voidfs does: its plan of the 9 MiB file
+  listed the six shards voidfs-core cuts (535,188 to 3,661,168 bytes).
+- With 4 KiB changed at 4 MiB, the plan at the same key held 4 and listed 2.
+
+**Commit (observed).**
+- `PUT …?x-s3sdk-direct-commit` with `{size, contentHash, token, shards}` answered `200` in 674 ms
+  with `etag: "v-<version>"`, `x-amz-object-size`, `x-amz-version-id` and
+  `x-s3sdk-direct-spent: verify=140;commit=72;shards=6;checked=6`; read back, the same SHA-256.
+- Refused, each `400 InvalidArgument`: shards not uploaded ("2 shard(s) are missing from the bucket
+  or do not match their hash, first <hash>"), a changed MAC ("upload token does not verify"), another
+  key's token ("upload token was issued for another key"), and a token 15 minutes old ("upload
+  token has expired"). A wrong `x-s3sdk-if-version`, `If-None-Match: *` on an existing key and a
+  wrong `If-Match` each answered `412` with the head's `x-amz-version-id`.
+- Accepted: **a shard list other than the plan's** (its shards in reverse order, read back
+  reversed), **a `contentHash` of 64 zeros** (stored as given), and held shards without a check
+  (`checked=0`).
+- `x-amz-meta-*` is dropped on a commit, and on an ordinary PutObject too; `x-s3sdk-content-type`
+  sets the content type.
+
+**A shard with the wrong bytes (observed).** At the URL of a shard named for random bytes (never
+committed), B2 accepted 1 MiB of other bytes (`200`). The same PUT with an unsigned
+`x-amz-checksum-sha256` was refused ("must be included in signature"), and `If-None-Match: *` on a
+presigned PUT answered `501 NotImplemented`. So Space's URLs bind nothing but the object's name; its
+protection is the commit's check of each new shard ("missing … or do not match their hash").
+
+### 1.6 Mount credentials and the format behind them (observed, 3 and 4 October)
+
+- `GET /{drive}?x-s3sdk-mount` gave two sets of credentials, each for an hour: **`metadata`** in R2
+  (bucket `sp-mesh-sjc-none-mtz5q4oe`, Cloudflare temporary credentials with a session token) and
+  **`content`** in B2 (backend `b2worker`, region `ca-east-006`, a key without a session token), both
+  with `base: ""`; `canWrite: true`, `accessGeneration: 1`, and `storageBudget: {limitBytes:
+  1000000000000, otherUsageBytes: 0}` (the trial's 1 TB). The drive's id, alias and display name
+  were all `spacedb-<workspace>-data`.
+- A read key's credentials had `canWrite: false`, and a PUT with either set was refused (B2: `403`
+  "not entitled"; R2: `403`).
+- The R2 credentials list only `groups/` (the bucket's root, `drives/` and the workspace's id are
+  `403`); the B2 credentials list the whole bucket.
+- **The format** (read with them): per group, in R2, `_lease` (`{group_id, owner_worker_id:
+  "worker-<uuid>", lease_expires_at` 30 s ahead, `cursor, verified, applied, last_checkpoint_at}`),
+  `_retention_v1`, `index` (the group's records in one JSON object: 6.8 MB for the mount's
+  `root-native` group, 85 live records), `records/<id>/HEAD` (`{current_version_id, record_id,
+  updated_at}`), `records/<id>/version-transactions/<version>`, and `transactions/<UTC time>-<n>-<uuid>`:
+  JSON with `op_type`, `based_on_version`, `record_id`, `resulting_version_id` and a `document`
+  (`name`, `parent_id`, `kind`, `mode`, `uid`, `gid`, `nlink`, base64 `xattrs`, `mtime_ms`, and
+  atime, ctime and mtime in nanoseconds), and `content: {content_hash, size_bytes, shard_manifest:
+  [{hash, length, offset, object_key, shard_id}]}`. Groups seen: `root`, `root-native`,
+  `root-native-staging` and `files-000NN`. (Inferred: one worker owns a group under a lease, the
+  fenced lease of voidfs's step 10.)
+- B2 holds the bytes of objects written through the API (`groups/files-000NN/data/…`), the
+  benchmark's included, and two small objects the mount wrote while it was on FSKit
+  (`groups/root-native/data/…`). The 4 GB written over SMB on 2 October is under no prefix these
+  credentials list.
+
+### 1.7 Keys and drives (observed, 3 October)
+
+- `spacefs keys create --access read --drive <id>` made a key that worked at once: GET and HEAD
+  `200`, PUT and a direct plan `403 AccessDenied`. That key minted a narrower key through the API
+  (`POST /_s3sdk/keys`, SigV4, `{"drives": [<id>], "access": "read", "label": …}` → `201` with the
+  secret and `parent`); asked for a write key, it answered `403 {"error": "a read key cannot mint a
+  write key"}`. `keys list --json` showed `lastUsedAt: null` even for the key in use all day.
+- **Revoked** with `spacefs keys revoke`, the key was refused `0.2 s` later and its child `0.3 s`
+  later, from this Mac; the docs say "within about a minute".
+- **Drives:** creating a second one (`PUT /void-probe-2` with a display name and placement `enam`)
+  and forking the drive both answered `400 InvalidArgument`, `plan_constraint_violation`:
+  "Individual workspaces support one server-provisioned My Drive". A placement outside `wnam, enam,
+  sam, weur, eeur, apac, oc, afr, me` is `400`. The drive's `createdAt` (and ListBuckets'
+  CreationDate) is `1970-01-01`.
+- **Extensions:** an offset write past the end fills with zeros; a patch of 0 or 10,001 edits is
+  `400 InvalidPatch` ("edit count out of range"); a splice past the end, or of nothing, is `400`; a
+  rename onto an existing key is `409 PathConflict`, keeps the ETag, and history follows the file; a
+  folder rename moves its subtree. In history every edit (write, truncate, patch, splice) is
+  `operation: write`, and renames are not listed. There is no recently-deleted listing and no change
+  feed (`501`). Unloaded, from this Mac: put 1 MiB 1.05 s, write 4 KiB at an offset 0.44–2.0 s,
+  patch 16 × 4 KiB 0.5–1.9 s, insert 4 bytes 0.56–1.8 s.
+
+### 1.8 The mount (observed, 3 October, 0.2.343)
+
+- **What reaches it:** no file written through the API showed on the mount, new or three hours
+  old, in 15 minutes of watching; the folders they made did show, empty. A file written on the mount
+  was readable through the API 3.0 s later. The mount process connects to Cloudflare (172.64.66.1)
+  and to Railway (69.46.46.x), never to B2. (Inferred: the mount works through Space's engine on
+  Railway, and the API's objects are in another namespace it doesn't show.)
+- **Semantics over SMB:** xattrs are kept (in the document, base64; a `:` in a name is stored as
+  U+F022, SMB's stand-in for it); no `._` files; a resource fork can't be written ("Operation not
+  supported"); `Case.txt` and `case.txt` coexist; an NFD name is stored as NFC; `chmod 755` is lost
+  (every file is `0600`); a modification time set by `touch` is kept, and is the API's
+  `Last-Modified`; a symlink is stored (`kind: symlink`) but the API hides it (`404`, not listed).
+- **Reads:** a cold random 4 KiB read fetched about 8.4 MB, one 8 MiB block, and returned in
+  220–730 ms; another read in the same block returned at once, with nothing fetched; the next
+  block was not fetched. Reading 64 MiB in 1 MiB reads ran at 20 MiB/s and fetched 1.89× the bytes
+  (read-ahead). (So Space's Mac client does not answer a cold random read from a piece of a shard:
+  it fills the 8 MiB block first.)
+- **Pins:** Finder's context menu has one Space item, "Pin to Space" ("Unpin from Space" once
+  pinned). Pinning a 537 MB file downloaded about all of it in 50 s; the badge was a blue arrow
+  while it downloaded and a grey pin after, and unpinning removed it. Unpinned files show no badge.
+- **FSKit** (Settings → Advanced → Mount Method, then its remount button): "Drives mount through
+  Space's file system extension, which has to be enabled in System Settings. Needs macOS 26.4 to
+  write." It remounted in about 20 s at the same `/tmp/Space`, as `spacefs` with `fskit` and
+  `noowners`, served by `spacefs-fskitd --socket <group container>/fskitd.sock` and the
+  extension. There, `chmod 755` held, a resource fork could be written, xattrs worked, both
+  `Case.txt` and `case.txt` were listed, and a cold random read fetched one block as over SMB. It
+  was set back to SMB.
+
+### 1.9 Settings and the plan (observed through UI scripting, 3 October)
+
+- **The trial:** "Your trial ends on Oct 4" and "Space Individual · Trial ends today" (seen on 3
+  October's evening, US Eastern time), "Choose a plan to keep your files editable after the trial"
+  (inferred: read-only after it). The API still answered at 00:30 UTC on 4 October.
+- **Pages:** Space (updates, login, hotkey, appearance), Drives, Search (Contacts and Messages as
+  sources, 4,111 items indexed), Space AI (its own plan, or your OpenAI, Anthropic or OpenRouter
+  key), Workspace (name, description, id, storage: 9.43 GB of 931.32 GB), Uploads, Members
+  ("Individual workspaces do not have member invitations"; invites last 7 days), Plan, Permissions
+  (Accessibility, Full Disk Access, Screen Recording, Automation, Calendars for Space AI), Cache (20
+  GB on disk, 192 MB in memory, at `~/Library/Application Support/com.spacefs.launcher/retained-smb/cloud-cache`),
+  Advanced (the mount method, the FSKit daemon, the gateway `web-gateway.spacefs.com`), About.
+
+**Not observed:** the web app (share links, the file browser, previews, video review, audit,
+keys, plans): Claude in Chrome was not connected. The launcher's search and previews: its elements
+have no accessible names.
 
 ## 2. What voidfs has
 

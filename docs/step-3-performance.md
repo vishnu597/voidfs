@@ -645,6 +645,8 @@ as well: bounded range GETs of up to 1 MiB, checked only for length, while whole
 against their hash. So when the writable mount is built (step 5, checklist D6), its client should
 read pieces the same way, cached and coalesced apart from whole shards, and decide then how a piece
 is checked: by length alone, as SpaceFS appears to, or by block hashes (a format change, so an RFC).
+(3 October: a cold random read through SpaceFS's mount fetches and waits for a whole 8 MiB block,
+observed; [step 4 §1.8](step-4-client.md#18-the-mount-observed-3-october-02343).)
 The evidence and the options are in the
 [results](../bench/results/shard-fetch/README.md#ranged-shard-reads-options-not-built).
 
