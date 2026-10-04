@@ -69,7 +69,15 @@ fn a_daemon_starts_answers_and_stops() {
     assert!(!s.socket().exists(), "the socket goes with it");
     assert_eq!(s.void(&["daemon", "status", "--json"]).ok().json()["running"], false);
     assert_eq!(s.void(&["daemon", "stop"]).ok().out().trim(), format!("daemon not running (socket {socket})"));
-    let log = std::fs::read_to_string(s.dir.join("daemon.log")).unwrap();
+    // `stop` returns once the state directory is free; the daemon's last line may come after.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let log = loop {
+        let log = std::fs::read_to_string(s.dir.join("daemon.log")).unwrap();
+        if log.ends_with("stopped\n") || std::time::Instant::now() > deadline {
+            break log;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     assert!(log.contains(&format!("daemon started: pid {pid}")) && log.contains("stopping (asked to stop)") && log.ends_with("stopped\n"), "{log}");
 }
 
