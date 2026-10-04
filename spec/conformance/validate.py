@@ -19,9 +19,9 @@ BUILTIN_VARS = {"drive", "drive2", "drive3"}
 KNOWN_KEYS = {"admin", "read"}
 # Pool features (format §3.1) a case may need the server's drives to have.
 KNOWN_FEATURES = {"inline-data", "multi-object-versions"}
-BODY_FORMS = {"text", "base64", "bytes", "patch", "json"}
+BODY_FORMS = {"text", "base64", "bytes", "patch", "json", "plan", "commit"}
 MATCHER_MEMBERS = {"equals", "matches", "present", "contains", "not_equals", "count", "capture"}
-BODY_MATCHERS = {"text", "base64", "size", "s3_error", "json", "xml"}
+BODY_MATCHERS = {"text", "base64", "size", "bytes", "s3_error", "json", "xml"}
 ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 VAR_RE = re.compile(r"(?<!\$)\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 JSON_PATH_RE = re.compile(r"^\$((\.[A-Za-z_][A-Za-z0-9_]*)|(\[-?\d+\])|(\['[^']*'\]))*$")
@@ -57,6 +57,21 @@ class Checker:
             return False
         return True
 
+    def check_content(self, where, value, extra=()):
+        """Seeded content: {seed, size} and an optional edit [offset, text] inside it."""
+        if not isinstance(value, dict) or not {"seed", "size"} <= set(value) or set(value) - {"seed", "size", "edit", "unique", *extra}:
+            self.err(where, f"must be {{seed, size}} with an optional edit and unique{''.join(', ' + e for e in extra)}")
+            return
+        if not all(isinstance(value[k], int) and value[k] >= 0 for k in ("seed", "size")):
+            self.err(where, "seed and size must be non-negative integers")
+            return
+        if not isinstance(value.get("unique", False), bool):
+            self.err(where, "unique must be true or false")
+        edit = value.get("edit")
+        if edit is not None and not (isinstance(edit, list) and len(edit) == 2 and isinstance(edit[0], int) and isinstance(edit[1], str)
+                                     and 0 <= edit[0] and edit[0] + len(edit[1].encode()) <= value["size"]):
+            self.err(where, "edit must be [offset, text] inside the content")
+
     def check_body(self, where, body, defined):
         if not isinstance(body, dict) or len(body) != 1 or next(iter(body)) not in BODY_FORMS:
             self.err(where, f"must be an object with exactly one of {sorted(BODY_FORMS)}")
@@ -67,9 +82,15 @@ class Checker:
         if form == "text":
             self.use(where, value, defined)
         if form == "bytes":
-            if not (isinstance(value, dict) and set(value) == {"seed", "size"}
-                    and all(isinstance(value[k], int) and value[k] >= 0 for k in value)):
-                self.err(where, "bytes must be {seed, size} with non-negative integers")
+            self.check_content(where, value)
+        if form == "plan":
+            self.check_content(where, value)
+        if form == "commit":
+            self.check_content(where, value, ("token",))
+            if isinstance(value, dict):
+                if not isinstance(value.get("token"), str):
+                    self.err(where, "commit needs a token string")
+                self.use(where, value.get("token"), defined)
         if form == "patch":
             if not isinstance(value, list) or not 1 <= len(value) <= 10_000:
                 self.err(where, "patch must be a list of 1 to 10,000 edits")
@@ -120,15 +141,35 @@ class Checker:
         if not isinstance(step, dict):
             self.err(where, "step must be an object")
             return captures
-        unknown = set(step) - {"key", "request", "expect", "name"}
+        unknown = set(step) - {"key", "request", "upload", "expect", "name", "skip_if"}
         if unknown:
             self.err(where, f"unknown members {sorted(unknown)}")
         key = step.get("key", "admin")
         if key not in allowed_keys:
             self.err(where, f"key {key!r} is not admin and not listed in requires as key:{key}")
+        skip_if = step.get("skip_if")
+        if skip_if is not None and not (isinstance(skip_if, dict) and set(skip_if) == {"status", "reason"}
+                                        and isinstance(skip_if["status"], int) and 100 <= skip_if["status"] <= 599
+                                        and isinstance(skip_if["reason"], str) and skip_if["reason"].strip()):
+            self.err(f"{where}.skip_if", "must be {status, reason}")
 
         req = step.get("request")
-        if not isinstance(req, dict):
+        upload = step.get("upload")
+        if (req is None) == (upload is None):
+            self.err(where, "a step has a request or an upload, not both")
+        if upload is not None:
+            if not isinstance(upload, dict) or set(upload) - {"list", "content", "skip", "corrupt"} or not {"list", "content"} <= set(upload):
+                self.err(f"{where}.upload", "must be {list, content} with optional skip and corrupt")
+            else:
+                if not isinstance(upload["list"], str):
+                    self.err(f"{where}.upload.list", "must be a string, a captured upload list")
+                self.use(f"{where}.upload.list", upload["list"], defined)
+                self.check_content(f"{where}.upload.content", upload["content"])
+                if not (isinstance(upload.get("skip", []), list) and all(isinstance(i, int) and i >= 0 for i in upload.get("skip", []))):
+                    self.err(f"{where}.upload.skip", "must list positions in the upload list")
+                if not isinstance(upload.get("corrupt", False), bool):
+                    self.err(f"{where}.upload.corrupt", "must be true or false")
+        elif not isinstance(req, dict):
             self.err(where, "request is required")
         else:
             unknown = set(req) - {"method", "path", "query", "headers", "unsigned_headers", "body"}
@@ -180,6 +221,8 @@ class Checker:
                     self.use(f"{where}.expect.body.text", body["text"], defined)
                 if "size" in body and not (isinstance(body["size"], int) and body["size"] >= 0):
                     self.err(f"{where}.expect.body.size", "must be a non-negative integer")
+                if "bytes" in body:
+                    self.check_content(f"{where}.expect.body.bytes", body["bytes"])
                 for kind in ("json", "xml"):
                     for i, m in enumerate(body.get(kind, [])):
                         self.check_matcher(f"{where}.expect.body.{kind}[{i}]", m, defined, captures, kind)

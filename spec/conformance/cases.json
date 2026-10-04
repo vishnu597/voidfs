@@ -919,6 +919,146 @@
         { "request": { "method": "PUT", "path": "/${drive}/d", "headers": { "x-amz-copy-source": "/${drive}/a?versionId=${va}" } }, "expect": { "status": 200 } },
         { "request": { "method": "GET", "path": "/${drive}/d" }, "expect": { "status": 200, "body": { "text": "aaa" } } }
       ]
+    },
+    {
+      "id": "direct-upload-not-offered",
+      "title": "A server without direct uploads answers both of their requests 501, so clients put instead",
+      "spec": ["protocol §4.11"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "POST", "path": "/${drive}/n.bin", "query": { "x-voidfs-upload-plan": "" }, "body": { "plan": { "seed": 4102, "size": 3145728 } } },
+          "skip_if": { "status": 200, "reason": "the server offers direct uploads, which the other direct-upload cases test" },
+          "expect": { "status": 501, "body": { "s3_error": "NotImplemented" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/n.bin", "query": { "x-voidfs-upload-commit": "" }, "body": { "commit": { "seed": 4102, "size": 3145728, "token": "0.x" } } },
+          "expect": { "status": 501, "body": { "s3_error": "NotImplemented" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/n.bin", "body": { "bytes": { "seed": 4102, "size": 3145728 } } }, "expect": { "status": 200 } }
+      ]
+    },
+    {
+      "id": "direct-upload-roundtrip",
+      "title": "A plan presigns every shard a new object needs; uploaded and committed, it reads back as put",
+      "spec": ["protocol §4.11", "protocol §9"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "POST", "path": "/${drive}/big.bin", "query": { "x-voidfs-upload-plan": "" }, "body": { "plan": { "seed": 4102, "size": 3145728, "unique": true } } },
+          "skip_if": { "status": 501, "reason": "the server does not offer direct uploads (protocol §4.11 is optional)" },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.held", "equals": 0 },
+            { "path": "$.expiresSeconds", "equals": 900 },
+            { "path": "$.upload.length", "matches": "[1-9]" },
+            { "path": "$.upload[0].length", "present": true },
+            { "path": "$.upload[0].headers['x-amz-checksum-sha256']", "present": true },
+            { "path": "$.upload", "capture": "uploads" },
+            { "path": "$.token", "capture": "token" } ] } } },
+        { "upload": { "list": "${uploads}", "content": { "seed": 4102, "size": 3145728, "unique": true } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/big.bin", "query": { "x-voidfs-upload-commit": "" }, "headers": { "x-voidfs-content-type": "application/x-probe" },
+            "body": { "commit": { "seed": 4102, "size": 3145728, "unique": true, "token": "${token}" } } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "present": true }, "etag": { "present": true }, "x-voidfs-size": { "equals": "3145728" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/big.bin" },
+          "expect": { "status": 200, "headers": { "content-type": { "equals": "application/x-probe" } }, "body": { "bytes": { "seed": 4102, "size": 3145728, "unique": true } } } }
+      ]
+    },
+    {
+      "id": "direct-upload-held-counts",
+      "title": "A plan holds the shards the drive has, and an object changed in one place needs one new shard",
+      "spec": ["protocol §4.11", "format §4.1", "format §12.4"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/v.bin", "body": { "bytes": { "seed": 4101, "size": 6291456, "unique": true } } }, "expect": { "status": 200 } },
+        { "request": { "method": "POST", "path": "/${drive}/v.bin", "query": { "x-voidfs-upload-plan": "" }, "body": { "plan": { "seed": 4101, "size": 6291456, "unique": true } } },
+          "skip_if": { "status": 501, "reason": "the server does not offer direct uploads (protocol §4.11 is optional)" },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.held", "not_equals": 0 }, { "path": "$.upload.length", "equals": 0 } ] } } },
+        { "request": { "method": "POST", "path": "/${drive}/v.bin", "query": { "x-voidfs-upload-plan": "" }, "body": { "plan": { "seed": 4101, "size": 6291456, "unique": true, "edit": [3000000, "voidfs"] } } },
+          "expect": { "status": 200, "body": { "json": [
+            { "path": "$.held", "not_equals": 0 },
+            { "path": "$.upload.length", "matches": "[12]" },
+            { "path": "$.upload", "capture": "uploads" },
+            { "path": "$.token", "capture": "token" } ] } } },
+        { "upload": { "list": "${uploads}", "content": { "seed": 4101, "size": 6291456, "unique": true, "edit": [3000000, "voidfs"] } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/v.bin", "query": { "x-voidfs-upload-commit": "" }, "body": { "commit": { "seed": 4101, "size": 6291456, "unique": true, "edit": [3000000, "voidfs"], "token": "${token}" } } },
+          "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/v.bin" }, "expect": { "status": 200, "body": { "bytes": { "seed": 4101, "size": 6291456, "unique": true, "edit": [3000000, "voidfs"] } } } }
+      ]
+    },
+    {
+      "id": "direct-upload-missing-shard",
+      "title": "A commit that needs a shard nobody uploaded is refused, and commits nothing",
+      "spec": ["protocol §4.11", "format §12.4"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "POST", "path": "/${drive}/m.bin", "query": { "x-voidfs-upload-plan": "" }, "body": { "plan": { "seed": 4102, "size": 3145728, "unique": true } } },
+          "skip_if": { "status": 501, "reason": "the server does not offer direct uploads (protocol §4.11 is optional)" },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.upload", "capture": "uploads" }, { "path": "$.token", "capture": "token" } ] } } },
+        { "upload": { "list": "${uploads}", "content": { "seed": 4102, "size": 3145728, "unique": true }, "skip": [1] }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/m.bin", "query": { "x-voidfs-upload-commit": "" }, "body": { "commit": { "seed": 4102, "size": 3145728, "unique": true, "token": "${token}" } } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/m.bin" }, "expect": { "status": 404 } }
+      ]
+    },
+    {
+      "id": "direct-upload-token",
+      "title": "A commit's token holds only for the key and the shard list of its plan",
+      "spec": ["protocol §4.11"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "POST", "path": "/${drive}/a.bin", "query": { "x-voidfs-upload-plan": "" }, "body": { "plan": { "seed": 4103, "size": 3145728, "unique": true } } },
+          "skip_if": { "status": 501, "reason": "the server does not offer direct uploads (protocol §4.11 is optional)" },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.upload", "capture": "uploads" }, { "path": "$.token", "capture": "token" } ] } } },
+        { "upload": { "list": "${uploads}", "content": { "seed": 4103, "size": 3145728, "unique": true } }, "expect": { "status": 200 } },
+        { "name": "another key",
+          "request": { "method": "PUT", "path": "/${drive}/b.bin", "query": { "x-voidfs-upload-commit": "" }, "body": { "commit": { "seed": 4103, "size": 3145728, "unique": true, "token": "${token}" } } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
+        { "name": "another shard list",
+          "request": { "method": "PUT", "path": "/${drive}/a.bin", "query": { "x-voidfs-upload-commit": "" }, "body": { "commit": { "seed": 4103, "size": 3145728, "unique": true, "edit": [100, "x"], "token": "${token}" } } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
+        { "name": "a token this server did not issue",
+          "request": { "method": "PUT", "path": "/${drive}/a.bin", "query": { "x-voidfs-upload-commit": "" }, "body": { "commit": { "seed": 4103, "size": 3145728, "unique": true, "token": "9999999999.AAAA" } } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/b.bin" }, "expect": { "status": 404 } },
+        { "request": { "method": "PUT", "path": "/${drive}/a.bin", "query": { "x-voidfs-upload-commit": "" }, "body": { "commit": { "seed": 4103, "size": 3145728, "unique": true, "token": "${token}" } } },
+          "expect": { "status": 200 } },
+        { "request": { "method": "GET", "path": "/${drive}/a.bin" }, "expect": { "status": 200, "body": { "bytes": { "seed": 4103, "size": 3145728, "unique": true } } } }
+      ]
+    },
+    {
+      "id": "direct-upload-preconditions",
+      "title": "A commit's preconditions are a put's: the version, the ETag, or none",
+      "spec": ["protocol §4.11", "protocol §4.0"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/p.bin", "body": { "text": "before" } },
+          "expect": { "status": 200, "headers": { "etag": { "capture": "e1" }, "x-amz-version-id": { "capture": "v1" } } } },
+        { "request": { "method": "POST", "path": "/${drive}/p.bin", "query": { "x-voidfs-upload-plan": "" }, "body": { "plan": { "seed": 4103, "size": 3145728, "unique": true } } },
+          "skip_if": { "status": 501, "reason": "the server does not offer direct uploads (protocol §4.11 is optional)" },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.upload", "capture": "uploads" }, { "path": "$.token", "capture": "token" } ] } } },
+        { "upload": { "list": "${uploads}", "content": { "seed": 4103, "size": 3145728, "unique": true } }, "expect": { "status": 200 } },
+        { "request": { "method": "PUT", "path": "/${drive}/p.bin", "query": { "x-voidfs-upload-commit": "" }, "headers": { "If-None-Match": "*" },
+            "body": { "commit": { "seed": 4103, "size": 3145728, "unique": true, "token": "${token}" } } },
+          "expect": { "status": 412, "headers": { "x-amz-version-id": { "equals": "${v1}" } }, "body": { "s3_error": "PreconditionFailed" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/p.bin", "query": { "x-voidfs-upload-commit": "" }, "headers": { "If-Match": "\"not-the-etag\"" },
+            "body": { "commit": { "seed": 4103, "size": 3145728, "unique": true, "token": "${token}" } } },
+          "expect": { "status": 412, "body": { "s3_error": "PreconditionFailed" } } },
+        { "request": { "method": "GET", "path": "/${drive}/p.bin" }, "expect": { "status": 200, "body": { "text": "before" } } },
+        { "request": { "method": "PUT", "path": "/${drive}/p.bin", "query": { "x-voidfs-upload-commit": "" }, "headers": { "x-voidfs-if-version": "${v1}", "If-Match": "${e1}" },
+            "body": { "commit": { "seed": 4103, "size": 3145728, "unique": true, "token": "${token}" } } },
+          "expect": { "status": 200, "headers": { "x-amz-version-id": { "not_equals": "${v1}" } } } },
+        { "request": { "method": "GET", "path": "/${drive}/p.bin" }, "expect": { "status": 200, "body": { "bytes": { "seed": 4103, "size": 3145728, "unique": true } } } }
+      ]
+    },
+    {
+      "id": "direct-upload-store-refuses-wrong-bytes",
+      "title": "The store refuses a shard's URL other bytes, so nothing can be stored under a hash it does not match",
+      "spec": ["protocol §4.11", "protocol §9"],
+      "steps": [
+        { "request": { "method": "PUT", "path": "/${drive}" }, "expect": { "status": 200 } },
+        { "request": { "method": "POST", "path": "/${drive}/w.bin", "query": { "x-voidfs-upload-plan": "" }, "body": { "plan": { "seed": 4103, "size": 3145728, "unique": true } } },
+          "skip_if": { "status": 501, "reason": "the server does not offer direct uploads (protocol §4.11 is optional)" },
+          "expect": { "status": 200, "body": { "json": [ { "path": "$.upload", "capture": "uploads" }, { "path": "$.token", "capture": "token" } ] } } },
+        { "upload": { "list": "${uploads}", "content": { "seed": 4103, "size": 3145728, "unique": true }, "corrupt": true }, "expect": { "status": 400 } },
+        { "request": { "method": "PUT", "path": "/${drive}/w.bin", "query": { "x-voidfs-upload-commit": "" }, "body": { "commit": { "seed": 4103, "size": 3145728, "unique": true, "token": "${token}" } } },
+          "expect": { "status": 400, "body": { "s3_error": "InvalidArgument" } } },
+        { "request": { "method": "HEAD", "path": "/${drive}/w.bin" }, "expect": { "status": 404 } }
+      ]
     }
   ]
 }

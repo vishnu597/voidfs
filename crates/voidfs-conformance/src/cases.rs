@@ -31,8 +31,85 @@ pub struct Step {
     pub key: String,
     #[serde(default)]
     pub name: Option<String>,
-    pub request: Request,
+    /// A signed request; a step has this or `upload`.
+    #[serde(default)]
+    pub request: Option<Request>,
+    /// PUTs to the URLs of a direct upload's plan (protocol §4.11), unsigned.
+    #[serde(default)]
+    pub upload: Option<Upload>,
     pub expect: Expect,
+    /// Ends the case, skipped, when the response has this status.
+    #[serde(default)]
+    pub skip_if: Option<SkipIf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkipIf {
+    pub status: u16,
+    pub reason: String,
+}
+
+/// Content made from seeded bytes, with an optional edit: `text` written at `offset`. With
+/// `unique`, the runner mixes a value of its own, fresh for each case, into the seed.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Content {
+    pub seed: u64,
+    pub size: u64,
+    #[serde(default)]
+    pub edit: Option<(u64, String)>,
+    #[serde(default)]
+    pub unique: bool,
+}
+
+impl Content {
+    /// The bytes, for a case whose own value is `nonce`.
+    pub fn bytes(&self, nonce: u64) -> Vec<u8> {
+        let mut b = seeded_bytes(if self.unique { self.seed ^ nonce } else { self.seed }, self.size);
+        if let Some((offset, text)) = &self.edit {
+            let at = *offset as usize;
+            b[at..at + text.len()].copy_from_slice(text.as_bytes());
+        }
+        b
+    }
+
+    /// Its shards, cut as format §4.1 says with the sizes of a default `voidfs.json`.
+    pub fn shards(&self, nonce: u64) -> Vec<voidfs_core::chunk::Shard> {
+        voidfs_core::chunk::shards(&bytes::Bytes::from(self.bytes(nonce)), voidfs_core::chunk::Params::DEFAULT)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitForm {
+    pub seed: u64,
+    pub size: u64,
+    #[serde(default)]
+    pub edit: Option<(u64, String)>,
+    #[serde(default)]
+    pub unique: bool,
+    pub token: String,
+}
+
+impl CommitForm {
+    pub fn content(&self) -> Content {
+        Content { seed: self.seed, size: self.size, edit: self.edit.clone(), unique: self.unique }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upload {
+    /// A plan's `upload` list, as captured from its response.
+    pub list: String,
+    pub content: Content,
+    /// Positions in the list not to upload.
+    #[serde(default)]
+    pub skip: Vec<usize>,
+    /// Send each shard with its last byte changed.
+    #[serde(default)]
+    pub corrupt: bool,
 }
 
 fn admin() -> String {
@@ -59,9 +136,13 @@ pub struct Request {
 pub enum Body {
     Text(String),
     Base64(String),
-    Bytes { seed: u64, size: u64 },
+    Bytes(Content),
     Patch(Vec<(u64, String)>),
     Json(serde_json::Value),
+    /// A direct upload's plan of the content (protocol §4.11).
+    Plan(Content),
+    /// A direct upload's commit of the content, with a token.
+    Commit(CommitForm),
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +210,8 @@ pub struct BodyExpect {
     pub base64: Option<String>,
     #[serde(default)]
     pub size: Option<u64>,
+    #[serde(default)]
+    pub bytes: Option<Content>,
     #[serde(default)]
     pub s3_error: Option<String>,
     #[serde(default)]
