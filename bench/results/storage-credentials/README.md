@@ -57,7 +57,7 @@ conformance cases against it, and `probe`; the pool purged after.
 |---|---|---|---|---|
 | MinIO (built from source) | its STS, AssumeRole with a session policy | read (200) | refused (403) | 4 passed, 1 skipped (the one for servers without them) |
 | versitygw 1.8.0 | none: its S3 port answers AssumeRole 405 | — | — | 1 passed (the `501`), 4 skipped |
-| AWS S3 ([rerun](aws-check.txt), `d12cde1-dirty`) | STS minted a session | both refused (403 AccessDenied), unexpectedly | all four refused (403 AccessDenied) | 1 fallback pass, 4 skipped; capability check exits 1 |
+| AWS S3 ([after role fix](aws-check-after-role-fix.txt), `a108f12`) | STS, AssumeRole with a session policy | read/list (200) | all four refused (403 AccessDenied) | 4 passed, 1 skipped; capability check exits 0 |
 | Cloudflare R2 ([live check](r2-check.txt), `d12cde1-dirty`) | Cloudflare's API, account-level API token and static parent key | read/list (200) | all four refused (403 AccessDenied) | 4 passed, 1 skipped; capability check exits 0 |
 
 ### AWS user-supplied check, 4 October
@@ -83,8 +83,18 @@ with `d12cde1-dirty`, the release build containing this PR's uncommitted changes
 minted a session and all six S3 requests returned `403 AccessDenied`. The script correctly
 exited 1, while conformance alone reported the fallback pass and four skips. Startup and
 `probe` agree. Four pool objects were deleted; two objects present before the check were
-left in place (two before, two after). A successful AWS scoped-read result still needs
-the role/bucket access-policy diagnosis and another run after it is corrected.
+left in place (two before, two after).
+
+The user then supplied the IAM policies. The caller's S3 policy and `.env.aws` named the same
+bucket, but the read role's two resource ARNs named a different bucket. The role ARN matched;
+STS success did not supply the missing S3 grants. After the user corrected both bucket ARNs
+in the role policy, the [successful rerun](aws-check-after-role-fix.txt) began at
+`2026-10-05T00:38:01Z` (4 October in Toronto), build `a108f12`. Startup and `probe` both read
+the descriptor and list the drive (200), while the pool root, another drive's listing/descriptor
+and a write are refused (403 AccessDenied). Conformance reports **4 passed, 0 failed, 1 skipped**;
+the skip is the no-credentials case. The script exits 0, honors create-if-absent and purges four
+objects from its own pool. The two pre-existing objects remain (two before, two after).
+The earlier failed result is preserved in `aws-check.txt`.
 
 ### R2 follow-up status
 

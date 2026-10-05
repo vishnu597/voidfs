@@ -51,9 +51,10 @@ endpoint out and set the bucket's region.
 For AWS storage credentials, the assumed role needs its own pool-read policy and must trust
 the server's bucket credentials; caller permissions alone are insufficient. Set
 `VOIDFS_STORAGE_CREDENTIALS_ROLE` to its ARN. The user's 4 October check minted a session but
-received six 403s. The rerun with error-code diagnostics confirmed `AccessDenied`, so direct
-reads on that setup are not verified; use the
-[AWS policy and diagnostic guide](../../docs/aws-storage-credentials.md) before the rerun.
+received six 403s because the read role's resource ARNs named a different bucket. After
+correcting both ARNs, the live check passes all four applicable conformance cases; required
+reads return 200 and forbidden operations return 403. The
+[AWS policy and diagnostic guide](../../docs/aws-storage-credentials.md) records the fix.
 
 For R2 minting, set `VOIDFS_R2_API_TOKEN` to an account-level API token with **Workers R2 Storage
 Write** access, alongside the explicit static `VOIDFS_S3_ACCESS_KEY_ID` and
@@ -65,8 +66,8 @@ from the configured R2 endpoint. Cloudflare's API base defaults to
 Compose passes these settings from `.env`; `VOIDFS_TOKEN_VALUE` is a convenience fallback in
 the bucket-check script, not a server/Compose setting. A deployment offers credentials only
 after its own scoped mint passes; otherwise clients read through the server. The
-[provider results](../../bench/results/storage-credentials/README.md#reproduce) record R2's
-live pass and AWS's remaining access-policy failure.
+[provider results](../../bench/results/storage-credentials/README.md#reproduce) record live
+passes on R2 and AWS, with the earlier AWS failure preserved.
 
 ## Health and metrics
 

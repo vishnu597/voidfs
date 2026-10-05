@@ -1,4 +1,12 @@
-# AWS storage credentials: a mint succeeds, every S3 request is 403
+# AWS storage credentials: diagnosing S3 403s
+
+The live check now passes after correcting the assumed role's bucket ARNs. The
+[successful rerun](../bench/results/storage-credentials/aws-check-after-role-fix.txt) began at
+`2026-10-05T00:38:01Z` (4 October in Toronto), build `a108f12`. Startup and `probe` read
+`voidfs.json` and list the scoped drive (200), while all four forbidden operations return
+403 AccessDenied. All four applicable conformance cases pass, the no-credentials case skips,
+and the script exits 0. It deleted four test-pool objects and preserved the two pre-existing
+objects (two before, two after).
 
 The 4 October 2026 credentials check minted a session, but both requests that must succeed failed:
 reading `voidfs.json` and listing that session's drive. The four denied requests alone do not prove
@@ -12,8 +20,10 @@ The approved rerun on 4 October (Toronto), `2026-10-05T00:15:23Z`, confirmed
 four objects in its own pool and preserved the two pre-existing `voidfs-bench/` objects
 (two before, two after). The [saved result](../bench/results/storage-credentials/aws-check.txt)
 contains no credential values. AWS CLI is not installed on the test machine, so the role's
-actual attached/inline policies have not been inspected; a specific missing grant or deny
-is not yet established.
+policies were reviewed from the JSON the user supplied. The user's S3 policy and `.env.aws`
+named the intended bucket, but the read role's object and bucket resource ARNs named a different
+bucket. The role ARN itself matched. The user corrected both resource ARNs in the role's
+permissions policy; the successful rerun above confirms the resulting scoped access.
 
 The log distinguishes two stages. `none could be minted: STS AssumeRole answered ...` means STS
 refused the mint. Six S3 request statuses mean the mint succeeded. In the reported run, the role's

@@ -1179,11 +1179,11 @@ user approved on 4 October).
 
 **Status (4 October 2026): done**, in three pull requests: the format reader
 ([vishnu597/voidfs#35](https://github.com/vishnu597/voidfs/pull/35)), the server
-([#36](https://github.com/vishnu597/voidfs/pull/36)), then the client. Checked on MinIO; on AWS once
-the role's S3 access is verified. The user's AWS run at `d12cde1` minted a session but got six
-403s, including the required reads; the server therefore withheld credentials. The new rerun
-confirms AccessDenied on all six requests. R2 minting through Cloudflare's API passes the
-live scoped-read check and all four applicable conformance cases. The
+([#36](https://github.com/vishnu597/voidfs/pull/36)), then the client. Checked on MinIO, live AWS
+and live R2. The user's AWS run at `d12cde1` minted a session but got six 403s, including the
+required reads; the server therefore withheld credentials. After correcting the read role's
+bucket ARNs, AWS passes the live scoped-read check and all four applicable conformance cases.
+R2 minting through Cloudflare's API also passes that check and those four cases. The
 [provider results](../bench/results/storage-credentials/README.md) distinguish the original
 MinIO pass from these follow-ups. What the first built:
 - `crates/voidfs-format`, a reader of the on-bucket format: the pool's descriptor, refused if
@@ -1205,8 +1205,8 @@ MinIO pass from these follow-ups. What the first built:
   clients reading through the API (not fetching unchanged shards again after an edit), which is
   step 5's to measure.
 - **Providers:** MinIO first (its STS needs no new secrets, and CI builds MinIO), then R2 with
-  the user's API token, then AWS with the user's role. The role now exists and a session minted,
-  but the AWS check failed its required reads. Bucket runs on R2 and AWS are made from the user's
+  the user's API token, then AWS with the user's role. Live R2 and AWS now pass the scoped-read
+  conformance checks. Bucket runs on R2 and AWS are made from the user's
   Mac, with commands given for each; a configured token/role is not itself a provider pass.
 - **`voidfs.json` is readable:** a reader must refuse a pool whose format or incompatible
   features it doesn't implement (format §3.1), and `multi-object-versions` changes how it replays
@@ -1330,7 +1330,7 @@ What the third built:
 - **The daemon reads through it:** against a server with storage credentials it reads from the
   bucket; against one without, it asks once per drive every 10 minutes.
 
-**Provider follow-up (4 October, R2 verified live; AWS access-policy failure confirmed):**
+**Provider follow-up (4 October, R2 and AWS verified live):**
 
 - **Local verification:** workspace tests and clippy, the 55-case spec validator, memory/fs/
   versitygw interoperability, and the five script regression tests pass. R2's fake API passes
@@ -1364,11 +1364,15 @@ What the third built:
   `voidfs-bench/` before and after. The server now includes safe S3 error codes in the check's
   output. The approved rerun (`2026-10-05T00:15:23Z`) confirms `403 AccessDenied` on all six
   requests. The script exits 1, purges four objects in its own pool and preserves two
-  pre-existing objects (two before/after). Review the assumed role's S3 permissions and
-  other policy denials: caller grants do not carry into the role. See the
+  pre-existing objects (two before/after). The user supplied the IAM policies: the read role's
+  resource ARNs named a different bucket from the caller's policy and `.env.aws`. After the
+  user corrected both role resource ARNs, the rerun (`2026-10-05T00:38:01Z`, 4 October in Toronto,
+  build `a108f12`) passes all four applicable conformance cases. Startup and probe allow the
+  two required reads (200) and refuse the other four operations (403 AccessDenied). The script
+  exits 0, purges four pool objects and preserves the two pre-existing objects. See the
   [AWS guide](aws-storage-credentials.md) and
-  [saved rerun](../bench/results/storage-credentials/aws-check.txt). No AWS direct-read pass
-  is recorded; the role's actual policies have not been inspected.
+  [successful rerun](../bench/results/storage-credentials/aws-check-after-role-fix.txt).
+  The [earlier failed rerun](../bench/results/storage-credentials/aws-check.txt) is preserved.
 - **Check script:** `.env.r2` can hold `VOIDFS_R2_API_TOKEN`, or the script's convenience fallback
   `VOIDFS_TOKEN_VALUE`; it exports the latter under the server's name and chooses S3 region
   `auto` when absent for an R2 endpoint. It prints no env values or minted secrets. The fallback
@@ -1389,8 +1393,8 @@ What the third built:
   out of `pool.rs` into a shared crate.
 
 **Provider acceptance:** the two required reads succeed and the four forbidden requests are
-refused on AWS and R2; then a cold read through the bucket against one through the API. R2's
-scope check passes; AWS still fails with AccessDenied. Provider cold-read measurements remain
+refused on AWS and R2; then a cold read through the bucket against one through the API. Both
+providers' scope checks pass. Provider cold-read measurements remain
 optional and were not part of the approved checks; the original MinIO/local measurements are linked above.
 
 ## 5. Out of scope for step 4
@@ -1468,9 +1472,9 @@ optional and were not part of the approved checks; the original MinIO/local meas
     tests, 19 breaks; and the measurement
     ([bench/results/storage-credentials](../bench/results/storage-credentials/README.md)).
 
-  R2's Cloudflare API minting passes its live scope/conformance check. The AWS rerun with
-  improved error-code diagnostics confirms AccessDenied on all six S3 operations; it proves
-  minting and the safe fallback, but still needs access-policy diagnosis for scoped reads.
+  R2's Cloudflare API minting passes its live scope/conformance check. AWS also passes after
+  correcting the read role's bucket ARNs; the earlier failed result is preserved alongside
+  the successful rerun.
 
 - Step 5 has a [proposed macOS plan](step-5-macos.md); no writable mount implementation is
   included in this provider follow-up.

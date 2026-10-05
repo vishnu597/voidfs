@@ -258,11 +258,11 @@ each shard checked against its hash, and through the server where it answers `50
 can't be read.
 
 The [provider results](bench/results/storage-credentials/README.md#what-the-buckets-do-with-minted-credentials-minio)
-record R2's four passing scoped-read cases and AWS's failed capability check. The AWS rerun
-minted a session but returned `403 AccessDenied` on all six S3 requests, including the two
-reads that must succeed. Its one conformance pass confirmed the `501` fallback; four
-direct-read cases skipped. The assumed role's S3 policy or another policy denial still needs
-review, as described in the guide above. Both runs purged their own test pools.
+record four passing scoped-read cases on both live R2 and AWS. AWS initially returned
+`403 AccessDenied` on all six S3 requests because the assumed role's policy named a different
+bucket from the one configured. After the role policy was corrected, required reads returned
+200 and all four forbidden operations returned 403. Both providers' checks purged only their
+own test pools; the AWS check preserved two pre-existing objects.
 
 ### Small files in the log
 
