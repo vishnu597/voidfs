@@ -18,7 +18,7 @@ use futures::future::BoxFuture;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
-use crate::credentials::{Location, Mint, Minted};
+use crate::credentials::{Location, Mint, Minted, R2};
 use crate::direct::{Presign, Presigned};
 use crate::pool::Pool;
 use crate::s3::{App, Domains};
@@ -62,14 +62,20 @@ impl TestServer {
     /// §5.5) that a [`FakeBucket`] over its pool's store mints and enforces. The server checks
     /// them as it would a real bucket's when it starts, with `rules`.
     pub async fn with_storage_credentials(keys: Vec<KeyInfo>, rules: Rules) -> anyhow::Result<TestServer> {
-        TestServer::serve_with(keys, false, Some(rules)).await
+        TestServer::serve_with(keys, false, Some(rules), false).await
+    }
+
+    /// A server offering storage credentials through the fake Cloudflare API. Its credentials
+    /// reach only the objects and prefixes the R2 mint requests.
+    pub async fn with_r2_storage_credentials(keys: Vec<KeyInfo>, rules: Rules) -> anyhow::Result<TestServer> {
+        TestServer::serve_with(keys, false, Some(rules), true).await
     }
 
     async fn serve(keys: Vec<KeyInfo>, direct_uploads: bool, credentials: bool) -> anyhow::Result<TestServer> {
-        TestServer::serve_with(keys, direct_uploads, credentials.then(Rules::default)).await
+        TestServer::serve_with(keys, direct_uploads, credentials.then(Rules::default), false).await
     }
 
-    async fn serve_with(keys: Vec<KeyInfo>, direct_uploads: bool, credentials: Option<Rules>) -> anyhow::Result<TestServer> {
+    async fn serve_with(keys: Vec<KeyInfo>, direct_uploads: bool, credentials: Option<Rules>, r2: bool) -> anyhow::Result<TestServer> {
         let mut all = Keys::default();
         all.insert(KeyInfo { id: ADMIN_KEY_ID.into(), secret: ADMIN_SECRET.into(), scope: Scope::Admin, drives: None });
         for k in keys {
@@ -89,7 +95,14 @@ impl TestServer {
         let credentials = match (&bucket, credentials) {
             (Some(b), Some(rules)) => {
                 b.set_rules(rules);
-                crate::credentials::offer(Box::new(b.clone()), b.location(), &http).await.1
+                let mut location = b.location();
+                let mint: Box<dyn Mint> = if r2 {
+                    location.region = "auto".into();
+                    Box::new(b.r2())
+                } else {
+                    Box::new(b.clone())
+                };
+                crate::credentials::offer(mint, location, &http).await.1
             }
             _ => None,
         };
@@ -137,6 +150,9 @@ pub struct Rules {
     /// Hold minted credentials to what they were minted for (format §2's paths, read only);
     /// without, they reach everything, writes included, as credentials minted unscoped would.
     pub scope: bool,
+    /// Hold listings to granted prefixes; without, object reads remain scoped but listings
+    /// reach every prefix, as a provider that does not scope ListObjectsV2 would.
+    pub list_scope: bool,
     /// How long minted credentials last, if not as long as asked.
     pub lifetime: Option<Duration>,
     /// Objects per page of a listing, as S3's 1,000.
@@ -145,7 +161,7 @@ pub struct Rules {
 
 impl Default for Rules {
     fn default() -> Rules {
-        Rules { checksum: true, signed_headers: 403, if_none_match: Some(true), refuse: None, sts: true, scope: true, lifetime: None, list_page: 1000 }
+        Rules { checksum: true, signed_headers: 403, if_none_match: Some(true), refuse: None, sts: true, scope: true, list_scope: true, lifetime: None, list_page: 1000 }
     }
 }
 
@@ -153,6 +169,9 @@ impl Default for Rules {
 /// with the credentials it mints.
 pub const FAKE_BUCKET: &str = "fake-bucket";
 pub const FAKE_ROOT: &str = "pool/";
+const R2_ACCOUNT: &str = "fake-r2-account";
+const R2_TOKEN: &str = "fake-r2-api-token";
+const R2_PARENT: &str = "FAKER2PARENTKEY";
 
 /// A stand-in for a bucket over a pool's [`Store`]: where the tests of direct uploads send shards,
 /// and the tests of storage credentials read. It signs a presigned URL's path, expiry and headers
@@ -190,7 +209,8 @@ struct Issued {
     token: String,
     expires: chrono::DateTime<chrono::Utc>,
     readable: Vec<String>,
-    listable: String,
+    prefixes: Vec<String>,
+    listable: Vec<String>,
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -238,6 +258,11 @@ impl FakeBucket {
         Location { bucket: FAKE_BUCKET.into(), root: FAKE_ROOT.into(), region: "us-east-1".into(), endpoint: self.endpoint.clone() }
     }
 
+    /// A mint that calls the fake Cloudflare API on this bucket's listener.
+    pub fn r2(&self) -> R2 {
+        R2 { http: opendal::raw::HttpClient::new().unwrap(), api: format!("{}/client/v4", self.endpoint), account: R2_ACCOUNT.into(), token: R2_TOKEN.into(), parent: R2_PARENT.into(), bucket: FAKE_BUCKET.into(), root: FAKE_ROOT.into() }
+    }
+
     /// Forgets every credential it minted, as if they had been revoked: requests made with them
     /// are refused (403 InvalidAccessKeyId).
     pub fn revoke(&self) {
@@ -276,7 +301,10 @@ impl Mint for FakeBucket {
             let secret = random_text(b"abcdefghijklmnopqrstuvwxyz0123456789", 40);
             let token = random_text(b"abcdefghijklmnopqrstuvwxyz0123456789", 64);
             let expires = chrono::Utc::now() + rules.lifetime.unwrap_or(ttl);
-            let issued = Issued { secret: secret.clone(), token: token.clone(), expires, readable: crate::credentials::readable(drive), listable: format!("drives/{drive}/") };
+            let paths = crate::credentials::readable(drive);
+            let readable = paths.iter().filter(|p| !p.ends_with('/')).map(|p| format!("{FAKE_ROOT}{p}")).collect();
+            let prefixes = paths.iter().filter(|p| p.ends_with('/')).map(|p| format!("{FAKE_ROOT}{p}")).collect();
+            let issued = Issued { secret: secret.clone(), token: token.clone(), expires, readable, prefixes, listable: vec![format!("{FAKE_ROOT}drives/{drive}/")] };
             self.state.issued.lock().unwrap().insert(id.clone(), issued);
             self.state.minted.fetch_add(1, Ordering::Relaxed);
             Ok(Minted { access_key_id: id, secret_access_key: secret, session_token: Some(token), expires_at: expires })
@@ -313,8 +341,49 @@ fn fake_error(status: u16, code: &str) -> Response {
 }
 
 async fn fake_request(State(b): State<Arc<FakeState>>, req: Request) -> Response {
+    if req.uri().path().starts_with("/client/v4/") {
+        return fake_r2(&b, req).await;
+    }
     let signed = req.headers().get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256"));
     if signed { fake_s3(&b, req).await } else { fake_put(&b, req).await }
+}
+
+async fn fake_r2(b: &FakeState, req: Request) -> Response {
+    let error = |status, code, message| {
+        (http::StatusCode::from_u16(status).unwrap(), axum::Json(serde_json::json!({ "success": false, "errors": [{ "code": code, "message": message }], "messages": [], "result": null }))).into_response()
+    };
+    if req.method() != http::Method::POST || req.uri().path() != format!("/client/v4/accounts/{R2_ACCOUNT}/r2/temp-access-credentials") {
+        return error(404, 10000, "API route not found");
+    }
+    if req.headers().get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {R2_TOKEN}")) {
+        return error(403, 10000, "Authentication error");
+    }
+    let Ok(body) = axum::body::to_bytes(req.into_body(), 1 << 20).await else { return error(400, 10001, "Invalid request body") };
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(&body) else { return error(400, 10001, "Invalid JSON") };
+    if request["parentAccessKeyId"] != R2_PARENT || request["bucket"] != FAKE_BUCKET || request["permission"] != "object-read-only" {
+        return error(403, 10002, "Parent key, bucket or permission refused");
+    }
+    let Some(ttl) = request["ttlSeconds"].as_u64().filter(|t| *t > 0) else { return error(400, 10003, "Invalid credential lifetime") };
+    let paths = |field: &str| -> Option<Vec<String>> {
+        match request.get(field) {
+            None => Some(Vec::new()),
+            Some(value) => value.as_array()?.iter().map(|v| v.as_str().map(str::to_owned)).collect(),
+        }
+    };
+    let (Some(prefixes), Some(objects)) = (paths("prefixes"), paths("objects")) else { return error(400, 10004, "Invalid object scope") };
+    let rules = *b.rules.lock().unwrap();
+    if !rules.sts {
+        return error(403, 10005, "Temporary credentials unavailable");
+    }
+    let id = format!("FAKER2{}", random_text(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", 16));
+    let secret = random_text(b"abcdefghijklmnopqrstuvwxyz0123456789", 40);
+    let token = random_text(b"abcdefghijklmnopqrstuvwxyz0123456789", 64);
+    let expires = chrono::Utc::now() + rules.lifetime.unwrap_or(Duration::from_secs(ttl));
+    // Grants come from the JSON request; a missing or incorrect requested path stays unreadable.
+    let issued = Issued { secret: secret.clone(), token: token.clone(), expires, readable: objects, prefixes: prefixes.clone(), listable: prefixes };
+    b.issued.lock().unwrap().insert(id.clone(), issued);
+    b.minted.fetch_add(1, Ordering::Relaxed);
+    axum::Json(serde_json::json!({ "success": true, "errors": [], "messages": [], "result": { "accessKeyId": id, "secretAccessKey": secret, "sessionToken": token } })).into_response()
 }
 
 /// A request signed with credentials the bucket minted: a GET or HEAD of an object, a listing
@@ -357,12 +426,12 @@ async fn fake_s3(b: &FakeState, req: Request) -> Response {
             (k.to_owned(), percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned())
         })
         .collect();
-    let reads = |path: &str| issued.readable.iter().any(|r| if r.ends_with('/') { path.starts_with(r.as_str()) } else { path == r });
+    let reads = |path: &str| issued.readable.iter().any(|r| path == r) || issued.prefixes.iter().any(|p| path.starts_with(p));
     match parts.method {
         http::Method::GET if key.is_empty() && q.get("list-type").map(String::as_str) == Some("2") => {
             let prefix = q.get("prefix").cloned().unwrap_or_default();
             let Some(dir) = prefix.strip_prefix(FAKE_ROOT).map(str::to_owned) else { return refused(403, "AccessDenied") };
-            if rules.scope && !dir.starts_with(&issued.listable) {
+            if rules.scope && rules.list_scope && !issued.listable.iter().any(|p| prefix.starts_with(p)) {
                 return refused(403, "AccessDenied");
             }
             if q.get("delimiter").map(String::as_str) != Some("/") || !(dir.is_empty() || dir.ends_with('/')) {
@@ -390,7 +459,7 @@ async fn fake_s3(b: &FakeState, req: Request) -> Response {
         }
         http::Method::GET | http::Method::HEAD => {
             let Some(path) = key.strip_prefix(FAKE_ROOT) else { return refused(403, "AccessDenied") };
-            if rules.scope && !reads(path) {
+            if rules.scope && !reads(key) {
                 return refused(403, "AccessDenied");
             }
             let data = match b.store.get(path).await {
@@ -471,5 +540,63 @@ async fn fake_put(b: &FakeState, req: Request) -> Response {
         }
         Ok(false) => fake_error(412, "PreconditionFailed"),
         Err(_) => fake_error(500, "InternalError"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credentials::{TTL, check, r2_request};
+
+    const DRIVE: &str = "d-00000000-0000-4000-8000-000000000000";
+
+    #[tokio::test]
+    async fn r2_mints_through_the_api_and_checks_the_buckets_scope() {
+        let store = Store::memory().unwrap();
+        let _pool = Pool::open(store.clone(), 64 << 20).await.unwrap();
+        let bucket = FakeBucket::start(store).await.unwrap();
+        let drive: DriveId = DRIVE.parse().unwrap();
+        let minted = bucket.r2().mint(&drive, TTL).await.unwrap();
+        let left = (minted.expires_at - chrono::Utc::now()).num_seconds();
+        assert!((TTL.as_secs() as i64 - 60..=TTL.as_secs() as i64).contains(&left), "{left} seconds left");
+        assert!(minted.access_key_id.starts_with("FAKER2") && minted.session_token.is_some());
+        let http = opendal::raw::HttpClient::new().unwrap();
+        let checks = check(&bucket.r2(), &bucket.location(), &http).await;
+        assert!(checks.scoped(), "{checks}");
+        bucket.set_rules(Rules { list_scope: false, ..Rules::default() });
+        let checks = check(&bucket.r2(), &bucket.location(), &http).await;
+        assert!(!checks.scoped(), "{checks}");
+        let failed: Vec<_> = checks.tried.iter().filter(|t| !t.1).map(|t| t.0).collect();
+        assert_eq!(failed, ["listing the pool's root", "listing another drive"]);
+        // A wrong root in the request cannot inherit grants from the drive's expected paths.
+        bucket.set_rules(Rules::default());
+        let mut wrong = bucket.r2();
+        wrong.root = "elsewhere/".into();
+        let checks = check(&wrong, &bucket.location(), &http).await;
+        assert!(!checks.scoped(), "{checks}");
+        let failed: Vec<_> = checks.tried.iter().filter(|t| !t.1).map(|t| t.0).collect();
+        assert_eq!(failed, ["reading voidfs.json", "listing its drive"]);
+    }
+
+    #[tokio::test]
+    async fn r2_api_checks_the_bearer_token_parent_and_permission() {
+        let bucket = FakeBucket::start(Store::memory().unwrap()).await.unwrap();
+        let drive: DriveId = DRIVE.parse().unwrap();
+        for (field, want) in [("token", "10000 Authentication error"), ("parent", "10002 Parent key, bucket or permission refused")] {
+            let mut mint = bucket.r2();
+            if field == "token" { mint.token = "wrong-r2-token".into(); } else { mint.parent = "wrong-parent".into(); }
+            let err = format!("{:#}", mint.mint(&drive, TTL).await.unwrap_err());
+            assert!(err.contains("HTTP 403") && err.contains(want), "{err}");
+            assert!(!err.contains(R2_TOKEN) && !err.contains("wrong-r2-token"), "the token must not appear in the error");
+        }
+        let mut request = r2_request(FAKE_BUCKET, FAKE_ROOT, &drive, R2_PARENT, TTL);
+        request["permission"] = "object-read-write".into();
+        let req = http::Request::post(format!("{}/client/v4/accounts/{R2_ACCOUNT}/r2/temp-access-credentials", bucket.endpoint))
+            .header(http::header::AUTHORIZATION, format!("Bearer {R2_TOKEN}"))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(opendal::Buffer::from(Bytes::from(request.to_string()))).unwrap();
+        let resp = opendal::raw::HttpClient::new().unwrap().send(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(bucket.credential_use().minted, 0);
     }
 }
