@@ -105,7 +105,7 @@ void daemon info                      # its build, what its journal holds unpubl
   `--detach` starts one.
 - `void mount <drive> [mountpoint]`, `void unmount` and `void mounts` keep the daemon's mount
   table and the mounts it brings back when it starts; mounting itself comes with the Mac drive
-  (step 5), so for now `void mount` answers `NoAdapter`.
+  ([step 5's plan](docs/step-5-macos.md)), so for now `void mount` answers `NoAdapter`.
 - `void daemon install` (macOS) writes a launchd agent, so that the daemon and its remembered
   mounts come back at login; `void daemon uninstall` removes it.
 
@@ -146,7 +146,8 @@ The background upload queue (`void upload`) does the same for a file it replaces
 Every call fails with one error type, which carries the status, the S3 code and, on a `412`, the
 version that won. Calls are retried on server errors and broken connections, except an insert or
 removal without a precondition, which is never sent twice: pass `if_version` to make it safe to
-retry. The client core comes next ([step 4's plan](docs/step-4-client.md)).
+retry. The daemon already runs the client core: its cache, durable journal, upload queue and
+change-feed client ([step 4's plan](docs/step-4-client.md)).
 
 ### Virtual-host addressing
 
@@ -224,16 +225,25 @@ A mount or a bulk reader can read a drive straight from the bucket, so that the 
 content bytes: it asks for short-lived, read-only credentials to the drive's storage
 ([protocol §5.5](spec/protocol.md#55-storage-credentials-get-drivex-voidfs-credentials)), which
 read only the pool's `voidfs.json`, its shared `shards/` and `pages/`, and the drive's own
-prefix. The server mints them with the bucket's STS, AssumeRole with a session policy narrowed to
+prefix. The server mints them through STS on AWS/MinIO or Cloudflare's API on R2, narrowed to
 those paths, for 15 minutes, and shares a drive's among the keys that read it:
 
 - **MinIO:** its STS, on the bucket's endpoint, with the server's own bucket keys. Nothing to set.
 - **AWS S3:** STS needs a role to assume. Make one that may read the pool (`s3:GetObject` on
   `<bucket>/<prefix>/*`, `s3:ListBucket` on the bucket) and that trusts the server's bucket
   credentials, allow those credentials `sts:AssumeRole` on it, and start the server with
-  `--storage-credentials-role <its ARN>` (or `VOIDFS_STORAGE_CREDENTIALS_ROLE`).
-- **Cloudflare R2:** not yet (R2 mints temporary credentials through Cloudflare's API, with an
-  API token).
+  `--storage-credentials-role <its ARN>` (or `VOIDFS_STORAGE_CREDENTIALS_ROLE`). The role needs
+  its own S3 permissions: an admin/read-write grant on the caller does not carry into the role.
+  See the [AWS setup and 403 guide](docs/aws-storage-credentials.md).
+- **Cloudflare R2:** verified against a live bucket on 4 October. Set
+  `VOIDFS_R2_API_TOKEN` (or `--r2-api-token`) to an account-level API token with **Workers R2
+  Storage Write** access, and supply the static parent S3 key through
+  `VOIDFS_S3_ACCESS_KEY_ID` and `VOIDFS_S3_SECRET_ACCESS_KEY`. Object-only S3 credentials alone
+  do not authorize Cloudflare's REST API; see [R2 authentication](https://developers.cloudflare.com/r2/api/tokens/).
+  The account id comes from `https://<account>.r2.cloudflarestorage.com`; use S3 region `auto`.
+  The request uses `object-read-only`, exact `voidfs.json` and the three readable prefixes.
+  The default API base is `https://api.cloudflare.com/client/v4`; `--sts-endpoint` (or
+  `VOIDFS_STS_ENDPOINT`) overrides that base for R2. The token's env value is hidden in help.
 
 A server offers them only where a check at start finds that minted credentials read those paths
 and are refused the pool's root, another drive and a write (`probe` reports it as `storage
@@ -246,6 +256,13 @@ The Rust SDK reads with them (`Client::storage_credentials`, then `Client::stora
 the client core: the daemon's cache reads a drive's state and shards straight from the bucket,
 each shard checked against its hash, and through the server where it answers `501` or the bucket
 can't be read.
+
+The [provider results](bench/results/storage-credentials/README.md#what-the-buckets-do-with-minted-credentials-minio)
+record four passing scoped-read cases on both live R2 and AWS. AWS initially returned
+`403 AccessDenied` on all six S3 requests because the assumed role's policy named a different
+bucket from the one configured. After the role policy was corrected, required reads returned
+200 and all four forbidden operations returned 403. Both providers' checks purged only their
+own test pools; the AWS check preserved two pre-existing objects.
 
 ### Small files in the log
 

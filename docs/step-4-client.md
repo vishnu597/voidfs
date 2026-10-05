@@ -1179,9 +1179,13 @@ user approved on 4 October).
 
 **Status (4 October 2026): done**, in three pull requests: the format reader
 ([vishnu597/voidfs#35](https://github.com/vishnu597/voidfs/pull/35)), the server
-([#36](https://github.com/vishnu597/voidfs/pull/36)), then the client. Checked on MinIO; on AWS once
-the user makes the role to assume, and R2's credentials wait for an API token (Cloudflare mints
-them through its own API). What the first built:
+([#36](https://github.com/vishnu597/voidfs/pull/36)), then the client. Checked on MinIO, live AWS
+and live R2. The user's AWS run at `d12cde1` minted a session but got six 403s, including the
+required reads; the server therefore withheld credentials. After correcting the read role's
+bucket ARNs, AWS passes the live scoped-read check and all four applicable conformance cases.
+R2 minting through Cloudflare's API also passes that check and those four cases. The
+[provider results](../bench/results/storage-credentials/README.md) distinguish the original
+MinIO pass from these follow-ups. What the first built:
 - `crates/voidfs-format`, a reader of the on-bucket format: the pool's descriptor, refused if
   the reader can't read the pool (format §3, §3.1); a drive's descriptor (§6); its newest
   checkpoint and the segments it lists (§8); the log after it, up to the first gap (§8.4); and
@@ -1200,9 +1204,10 @@ them through its own API). What the first built:
   the same list from the format, as Space's reads `shard_manifest`; what it would add is for
   clients reading through the API (not fetching unchanged shards again after an edit), which is
   step 5's to measure.
-- **Providers:** MinIO first (its STS needs no new secrets, and CI builds MinIO), then R2 once
-  the user makes an API token, then AWS once the user makes a role. Bucket runs on R2 and AWS
-  are made from the user's Mac, with commands given for each.
+- **Providers:** MinIO first (its STS needs no new secrets, and CI builds MinIO), then R2 with
+  the user's API token, then AWS with the user's role. Live R2 and AWS now pass the scoped-read
+  conformance checks. Bucket runs on R2 and AWS are made from the user's
+  Mac, with commands given for each; a configured token/role is not itself a provider pass.
 - **`voidfs.json` is readable:** a reader must refuse a pool whose format or incompatible
   features it doesn't implement (format §3.1), and `multi-object-versions` changes how it replays
   the log, so §5.5's `readable` lists it. It also gives credentialed clients the pool's chunking,
@@ -1247,8 +1252,8 @@ What the second built:
   ARN is required: AWS STS assumes a role, never the caller itself); elsewhere the bucket's own
   endpoint, where MinIO serves it with the server's own keys and no role. MinIO's root user may
   call it, and its session policy holds prefixes for GETs and listings (checked here on 4
-  October, MinIO `RELEASE.2025-10-15T17-29-55Z`, as CI builds it). R2 isn't tried: it mints
-  through Cloudflare's API with an API token, the next pull request. versitygw 1.8.0 has no
+  October, MinIO `RELEASE.2025-10-15T17-29-55Z`, as CI builds it). R2 wasn't part of that first
+  implementation; the local follow-up below adds Cloudflare's API minting. versitygw 1.8.0 has no
   AssumeRole (its `versitygw iam` server answers STS's GetCallerIdentity only, and its S3 port
   answers `405`), so it answers `501`, as memory and local disk do.
 - **The session policy:** `s3:GetObject` on `<root>voidfs.json`, `<root>shards/*`,
@@ -1325,26 +1330,80 @@ What the third built:
 - **The daemon reads through it:** against a server with storage credentials it reads from the
   bucket; against one without, it asks once per drive every 10 minutes.
 
-**Design.**
-- **Server.** Read-only credentials for `shards/`, `pages/` and `drives/<id>/` under the pool's
-  root: on AWS through STS AssumeRole with a session policy (a role the deployment names); on R2
-  through Cloudflare's temporary-credentials API (an account id and API token); on MinIO through
-  its STS. `accessGeneration` from the drive's access rules; `storageBudget` once quotas exist
-  (S9). Anything else keeps answering `501`.
-- **Client.** A fetcher that reads shards and the drive's metadata straight from the bucket,
-  renewing the credentials before they expire, and keys the cache on `accessGeneration`. Reading
-  metadata from the bucket needs a read-only reader of the format (the drive's log, checkpoints
-  and pages) in the client: the server's loader, factored out of `pool.rs` into a shared crate.
+**Provider follow-up (4 October, R2 and AWS verified live):**
 
-**Checked by:** the credentials refused for writes and for other prefixes, on AWS and R2 (asked
-for first); a cold read through the bucket against one through the API.
+- **Local verification:** workspace tests and clippy, the 55-case spec validator, memory/fs/
+  versitygw interoperability, and the five script regression tests pass. R2's fake API passes
+  all four applicable storage-credentials conformance cases (the no-credentials case skips).
+  Every new Rust/script test was seen to fail with its guarded code broken: 27 isolated Rust
+  breaks and 16 script breaks, restored afterward. MinIO is not installed locally and boto3
+  interoperability remains skipped; the existing CI job covers both. These checks do not
+  establish a live AWS or R2 pass.
+- **R2:** the server now calls Cloudflare's
+  [temporary-credentials API](https://developers.cloudflare.com/api/resources/r2/subresources/temporary_credentials/methods/create/)
+  with `object-read-only`, a 900-second lifetime, exact `voidfs.json` and the three readable
+  prefixes. Set `VOIDFS_R2_API_TOKEN` or `--r2-api-token` to an account-level API token with
+  **Workers R2 Storage Write** access. The server hides the env value in help and omits the
+  token from debug output. It requires the explicit static S3 parent key id/key pair;
+  credentials found only through a default chain cannot identify the parent for this API.
+  Object-only S3 permissions do not authorize the REST API
+  ([R2 authentication](https://developers.cloudflare.com/r2/api/tokens/)). The account comes
+  from the configured R2 endpoint. The API base defaults to
+  `https://api.cloudflare.com/client/v4`; `--sts-endpoint`/`VOIDFS_STS_ENDPOINT` overrides that
+  base for R2. The usual six startup checks still gate offering credentials. The approved
+  live run (`2026-10-05T00:14:58Z`, 4 October in Toronto) passes all four applicable
+  conformance cases; startup and probe both allow the required read/list and refuse the
+  other four requests. The check exits 0 and purges four objects, with zero before/after.
+  This confirms prefix-scoped listings on the tested R2 bucket. Jurisdiction endpoints
+  and lifetimes shorter than 900 seconds remain untested. The
+  [saved result](../bench/results/storage-credentials/r2-check.txt) names `d12cde1-dirty`,
+  the release build with this PR's changes before commit.
+- **AWS diagnosis:** the user's `2026-10-04T22:39:21Z` run at `d12cde1` minted credentials but
+  got 403 from all six S3 checks. Its one conformance pass tests the `501` fallback; all four
+  direct-read cases skipped. It purged its four pool objects, with zero objects under
+  `voidfs-bench/` before and after. The server now includes safe S3 error codes in the check's
+  output. The approved rerun (`2026-10-05T00:15:23Z`) confirms `403 AccessDenied` on all six
+  requests. The script exits 1, purges four objects in its own pool and preserves two
+  pre-existing objects (two before/after). The user supplied the IAM policies: the read role's
+  resource ARNs named a different bucket from the caller's policy and `.env.aws`. After the
+  user corrected both role resource ARNs, the rerun (`2026-10-05T00:38:01Z`, 4 October in Toronto,
+  build `a108f12`) passes all four applicable conformance cases. Startup and probe allow the
+  two required reads (200) and refuse the other four operations (403 AccessDenied). The script
+  exits 0, purges four pool objects and preserves the two pre-existing objects. See the
+  [AWS guide](aws-storage-credentials.md) and
+  [successful rerun](../bench/results/storage-credentials/aws-check-after-role-fix.txt).
+  The [earlier failed rerun](../bench/results/storage-credentials/aws-check.txt) is preserved.
+- **Check script:** `.env.r2` can hold `VOIDFS_R2_API_TOKEN`, or the script's convenience fallback
+  `VOIDFS_TOKEN_VALUE`; it exports the latter under the server's name and chooses S3 region
+  `auto` when absent for an R2 endpoint. It prints no env values or minted secrets. The fallback
+  name is not a server flag or Compose setting. Record real output from a rerun rather than
+  turning the user's pasted report into a raw results file.
+
+**Design.**
+
+- **Server.** Read-only credentials for `shards/`, `pages/` and `drives/<id>/` under the pool's
+  root, plus `voidfs.json`: on AWS through STS AssumeRole with a session policy (a role the
+  deployment names); on R2 through Cloudflare's temporary-credentials API (an account id and
+  API token); on MinIO through its STS. `accessGeneration` from the drive's access rules;
+  `storageBudget` once quotas exist (S9). Anything else keeps answering `501`.
+- **Client.** A fetcher that reads shards and the drive's metadata straight from the bucket,
+  renewing the credentials before they expire, keeping bucket state by drive/access generation
+  and cached content by ETag. Reading metadata from the bucket needs a read-only reader of the
+  format (the drive's log, checkpoints and pages) in the client: the server's loader, factored
+  out of `pool.rs` into a shared crate.
+
+**Provider acceptance:** the two required reads succeed and the four forbidden requests are
+refused on AWS and R2; then a cold read through the bucket against one through the API. Both
+providers' scope checks pass. Provider cold-read measurements remain
+optional and were not part of the approved checks; the original MinIO/local measurements are linked above.
 
 ## 5. Out of scope for step 4
 
 - Accounts: `login`, `logout`, `whoami`, workspaces, minting and revoking keys (step 6).
 - The mount adapters (FSKit, SMB, FUSE), Finder integration, and the menu-bar app's transfer
-  view (step 5); the Linux packaging and the systemd unit (step 9). Step 5 should weigh the
-  loopback SMB server SpaceFS 0.2.333 now mounts with by default (§1.3) against FSKit.
+  view ([step 5's proposed plan](step-5-macos.md)); the Linux packaging and the systemd unit
+  (step 9). Step 5 weighs the loopback SMB server SpaceFS 0.2.333 now mounts with by default
+  (§1.3) against FSKit, and the existing daemon socket against the spike's embedded-core host.
 - Self-update (`update`, D10), Windows, encryption, pinning's UI (D8, though the cache supports
   pins from item 3).
 - The TypeScript, Python and Go SDKs (step 7).
@@ -1413,5 +1472,9 @@ for first); a cold read through the bucket against one through the API.
     tests, 19 breaks; and the measurement
     ([bench/results/storage-credentials](../bench/results/storage-credentials/README.md)).
 
-  R2's storage credentials (Cloudflare's API, with an API token) and the AWS check (a role to
-  assume) wait on the user.
+  R2's Cloudflare API minting passes its live scope/conformance check. AWS also passes after
+  correcting the read role's bucket ARNs; the earlier failed result is preserved alongside
+  the successful rerun.
+
+- Step 5 has a [proposed macOS plan](step-5-macos.md); no writable mount implementation is
+  included in this provider follow-up.

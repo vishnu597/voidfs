@@ -5,8 +5,8 @@
 //!
 //! They reach what a reader of the drive needs (format §2): the pool's descriptor, the shared
 //! `shards/` and `pages/`, and the drive's own prefix, which they may also list ([`readable`]).
-//! [`Sts`] mints them through the bucket's STS with AssumeRole and a session policy that narrows
-//! the deployment's credentials to those paths: MinIO's, and AWS's with a role to assume. A server
+//! [`Sts`] mints them through MinIO's or AWS's STS with AssumeRole and a session policy, and
+//! [`R2`] through Cloudflare's API, narrowing the deployment's credentials to those paths. A server
 //! offers them only where a check at start ([`check`]) finds minted credentials that read those
 //! paths and are refused the pool's root, another drive and a write; anything else answers `501`,
 //! and clients read through the API.
@@ -127,13 +127,20 @@ impl Credentials {
 // ---------------------------------------------------------------------------------------------
 // STS
 
-/// What a server needs to mint credentials through STS, from its flags.
-#[derive(Clone, Debug, Default)]
-pub struct StsOptions {
+/// What a server needs to mint credentials, from its flags.
+#[derive(Clone, Default)]
+pub struct MintOptions {
     /// The role to assume, which AWS needs.
     pub role: Option<String>,
-    /// The STS endpoint, if not the default for the bucket.
+    /// The STS endpoint or Cloudflare API base, if not the default for the bucket.
     pub endpoint: Option<String>,
+    pub r2_api_token: Option<String>,
+}
+
+impl fmt::Debug for MintOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MintOptions").field("role", &self.role).field("endpoint", &self.endpoint).finish_non_exhaustive()
+    }
 }
 
 /// The session policy that narrows the deployment's credentials to what a reader of `drive`
@@ -217,6 +224,77 @@ fn parse_assume_role(xml: &str) -> anyhow::Result<Minted> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Cloudflare R2
+
+/// Cloudflare's temporary-credentials request, scoped to the same paths as [`session_policy`].
+pub fn r2_request(bucket: &str, root: &str, drive: &DriveId, parent: &str, ttl: Duration) -> serde_json::Value {
+    let (prefixes, objects): (Vec<_>, Vec<_>) = readable(drive).into_iter().partition(|p| p.ends_with('/'));
+    serde_json::json!({
+        "bucket": bucket,
+        "parentAccessKeyId": parent,
+        "permission": "object-read-only",
+        "ttlSeconds": ttl.as_secs(),
+        "prefixes": prefixes.iter().map(|p| format!("{root}{p}")).collect::<Vec<_>>(),
+        "objects": objects.iter().map(|p| format!("{root}{p}")).collect::<Vec<_>>(),
+    })
+}
+
+/// Mints through Cloudflare's API with a dedicated account-level R2 API token. `parent` is
+/// the server's static R2 access key id; temporary credentials cannot exceed its permissions.
+pub struct R2 {
+    pub http: HttpClient,
+    pub api: String,
+    pub account: String,
+    pub token: String,
+    pub parent: String,
+    pub bucket: String,
+    pub root: String,
+}
+
+impl fmt::Debug for R2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("R2").field("api", &self.api).field("account", &self.account).field("bucket", &self.bucket).field("root", &self.root).finish_non_exhaustive()
+    }
+}
+
+impl Mint for R2 {
+    fn mint<'a>(&'a self, drive: &'a DriveId, ttl: Duration) -> BoxFuture<'a, anyhow::Result<Minted>> {
+        Box::pin(async move {
+            let body = r2_request(&self.bucket, &self.root, drive, &self.parent, ttl).to_string();
+            let url = format!("{}/accounts/{}/r2/temp-access-credentials", self.api.trim_end_matches('/'), percent_encoding::utf8_percent_encode(&self.account, VALUE));
+            let req = http::Request::post(url)
+                .header(http::header::AUTHORIZATION, format!("Bearer {}", self.token))
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Buffer::from(Bytes::from(body)))?;
+            let sent = Utc::now();
+            let resp = self.http.send(req).await.context("calling Cloudflare's temporary-credentials API")?;
+            let status = resp.status().as_u16();
+            let bytes = resp.into_body().to_bytes();
+            let answer: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| format!("parsing Cloudflare's temporary-credentials answer (HTTP {status})"))?;
+            let errors = answer["errors"].as_array().into_iter().flatten().map(|e| {
+                let mut detail = format!("{} {}", e["code"], e["message"].as_str().unwrap_or_default());
+                for secret in [Some(self.token.as_str()), answer["result"]["secretAccessKey"].as_str(), answer["result"]["sessionToken"].as_str()].into_iter().flatten().filter(|s| !s.is_empty()) {
+                    detail = detail.replace(secret, "[redacted]");
+                }
+                detail
+            }).collect::<Vec<_>>().join("; ");
+            let detail = if errors.is_empty() { String::new() } else { format!(": {errors}") };
+            if status != 200 || answer["success"] != true {
+                bail!("Cloudflare temporary credentials answered HTTP {status}, success={}{}", answer["success"].as_bool().unwrap_or(false), detail);
+            }
+            let result = answer["result"].as_object().ok_or_else(|| anyhow!("Cloudflare temporary credentials answered HTTP {status} without a result{detail}"))?;
+            let field = |name: &str| result.get(name).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned).ok_or_else(|| anyhow!("Cloudflare temporary credentials answered HTTP {status} without {name}{detail}"));
+            Ok(Minted {
+                access_key_id: field("accessKeyId")?,
+                secret_access_key: field("secretAccessKey")?,
+                session_token: Some(field("sessionToken")?),
+                expires_at: sent + chrono::TimeDelta::from_std(ttl).context("R2 credential lifetime")?,
+            })
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The check at start
 
 /// The drive the check mints for, and another, which no pool has.
@@ -272,11 +350,20 @@ pub async fn check(mint: &dyn Mint, location: &Location, http: &HttpClient) -> C
     let ctx = reqsign_core::Context::new();
     let signer = Signer::new(ctx, ProvideCredentialChain::new().push(provider), RequestSigner::new("s3", &location.region));
     let base = format!("{}/{}", location.endpoint.trim_end_matches('/'), location.bucket);
-    let send = async |method: http::Method, url: String, body: Bytes| -> Result<u16, String> {
+    let send = async |method: http::Method, url: String, body: Bytes| -> Result<(u16, String), String> {
         let (mut parts, ()) = http::Request::builder().method(method).uri(url).header("x-amz-content-sha256", hex::encode(Sha256::digest(&body))).body(()).map_err(|e| e.to_string())?.into_parts();
         signer.sign(&mut parts, None).await.map_err(|e| format!("signing: {e}"))?;
         let resp = http.send(http::Request::from_parts(parts, Buffer::from(body))).await.map_err(|e| e.to_string())?;
-        Ok(resp.status().as_u16())
+        let status = resp.status().as_u16();
+        let code = if status >= 400 {
+            crate::probe::error_code(&String::from_utf8_lossy(&resp.into_body().to_bytes())).filter(|code| {
+                !code.is_empty() && code.len() <= 64 && code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+                    && [&m.access_key_id, &m.secret_access_key].into_iter().chain(m.session_token.iter()).all(|secret| secret.is_empty() || !code.contains(secret.as_str()))
+            })
+        } else {
+            None
+        };
+        Ok((status, format!("HTTP {status}{}", code.map(|c| format!(" {c}")).unwrap_or_default())))
     };
     let object = |path: &str| format!("{base}/{}", percent_encoding::utf8_percent_encode(&format!("{}{path}", location.root), KEY));
     let listing = |prefix: &str| format!("{base}?delimiter=%2F&list-type=2&max-keys=1&prefix={}", percent_encoding::utf8_percent_encode(&format!("{}{prefix}", location.root), VALUE));
@@ -293,9 +380,9 @@ pub async fn check(mint: &dyn Mint, location: &Location, http: &HttpClient) -> C
     for (what, method, url, body, allowed) in attempts {
         let (held, got) = match send(method, url, body).await {
             // MinIO refuses some requests with 400 AccessDenied (item 5).
-            Ok(s) if allowed => (s == 200, format!("HTTP {s}")),
-            Ok(s @ (400 | 403)) => (true, format!("refused (HTTP {s})")),
-            Ok(s) => (false, format!("HTTP {s}")),
+            Ok((s, got)) if allowed => (s == 200, got),
+            Ok((400 | 403, got)) => (true, format!("refused ({got})")),
+            Ok((_, got)) => (false, got),
             Err(e) => (false, e),
         };
         tried.push((what, held, got));
@@ -490,9 +577,80 @@ mod tests {
         (endpoint, asked)
     }
 
-    fn sts_at(endpoint: &str, role: Option<&str>) -> Sts {
+    fn sts_at(endpoint: &str, role: Option<&str>) -> Box<dyn Mint> {
         let b = crate::probe::Bucket::new("bkt", "pool", Some(endpoint), "us-east-1", Some(("AKEXAMPLE", "secretexample"))).unwrap();
-        b.sts(&StsOptions { role: role.map(str::to_owned), endpoint: None }).unwrap()
+        b.mint(&MintOptions { role: role.map(str::to_owned), ..Default::default() }).unwrap()
+    }
+
+    fn r2_at(api: &str) -> R2 {
+        R2 { http: HttpClient::new().unwrap(), api: api.into(), account: "account".into(), token: "private-api-token".into(), parent: "parent-key".into(), bucket: "bkt".into(), root: "pool/".into() }
+    }
+
+    #[test]
+    fn r2_requests_split_objects_and_prefixes_and_only_allow_reads() {
+        let drive: DriveId = CHECK_DRIVE.parse().unwrap();
+        let request = r2_request("bkt", "pool/", &drive, "parent-key", TTL);
+        assert_eq!(request, serde_json::json!({
+            "bucket": "bkt", "parentAccessKeyId": "parent-key", "permission": "object-read-only", "ttlSeconds": 900,
+            "prefixes": ["pool/shards/", "pool/pages/", format!("pool/drives/{drive}/")], "objects": ["pool/voidfs.json"],
+        }));
+        let at_root = r2_request("bkt", "", &drive, "parent-key", Duration::from_secs(300));
+        assert_eq!(at_root["objects"], serde_json::json!(["voidfs.json"]));
+        assert_eq!(at_root["prefixes"][0], "shards/");
+        assert_eq!(at_root["ttlSeconds"], 300);
+    }
+
+    #[tokio::test]
+    async fn r2_sends_its_bearer_token_and_reads_all_credentials() {
+        let ok = r#"{"success":true,"errors":[],"messages":[],"result":{"accessKeyId":"temp-id","secretAccessKey":"private-secret","sessionToken":"private-session"}}"#;
+        let (endpoint, asked) = fake_sts(ok, 200).await;
+        let drive: DriveId = CHECK_DRIVE.parse().unwrap();
+        let mint = r2_at(&format!("{endpoint}/client/v4/"));
+        let before = Utc::now();
+        let got = mint.mint(&drive, TTL).await.unwrap();
+        let after = Utc::now();
+        assert_eq!(got.access_key_id, "temp-id");
+        assert!(got.secret_access_key == "private-secret");
+        assert!(got.session_token.as_deref() == Some("private-session"));
+        assert!(got.expires_at >= before + chrono::TimeDelta::seconds(900) && got.expires_at <= after + chrono::TimeDelta::seconds(900));
+        let (headers, body) = &asked.lock().unwrap()[0];
+        assert!(headers.get(http::header::AUTHORIZATION).unwrap() == "Bearer private-api-token");
+        assert_eq!(headers.get(http::header::CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(serde_json::from_str::<Value>(body).unwrap(), r2_request("bkt", "pool/", &drive, "parent-key", TTL));
+        assert!(!format!("{mint:?}").contains("private-api-token"));
+        assert!(!format!("{got:?}").contains("private-secret") && !format!("{got:?}").contains("private-session"));
+        let opts = MintOptions { r2_api_token: Some("private-api-token".into()), ..Default::default() };
+        assert!(!format!("{opts:?}").contains("private-api-token"));
+    }
+
+    #[tokio::test]
+    async fn r2_errors_report_status_code_and_message_without_the_token() {
+        let drive: DriveId = CHECK_DRIVE.parse().unwrap();
+        for (status, body, missing) in [
+            (403, r#"{"success":false,"errors":[{"code":10000,"message":"refused private-api-token"},{"code":10001,"message":"needs permission"}]}"#, None),
+            (200, r#"{"success":false,"errors":[{"code":10000,"message":"refused private-api-token"},{"code":10001,"message":"needs permission"}]}"#, None),
+            (200, r#"{"success":true,"errors":[{"code":10000,"message":"refused private-api-token"},{"code":10001,"message":"needs permission"}]}"#, Some("result")),
+        ] {
+            let (endpoint, _) = fake_sts(body, status).await;
+            let error = format!("{:#}", r2_at(&endpoint).mint(&drive, TTL).await.unwrap_err());
+            assert!(error.contains(&format!("HTTP {status}")) && error.contains("10000 refused") && error.contains("10001 needs permission"), "{error}");
+            assert!(!error.contains("private-api-token"));
+            if missing.is_none() { assert!(error.contains("success=false"), "{error}"); }
+            if let Some(name) = missing { assert!(error.contains(&format!("without a {name}")), "{error}"); }
+        }
+        for body in [
+            r#"{"success":true,"result":{"accessKeyId":"id","sessionToken":"session"}}"#,
+            r#"{"success":true,"result":{"accessKeyId":"id","secretAccessKey":"secret","sessionToken":""}}"#,
+        ] {
+            let (endpoint, _) = fake_sts(body, 200).await;
+            assert!(r2_at(&endpoint).mint(&drive, TTL).await.is_err());
+        }
+        let (endpoint, _) = fake_sts("upstream unavailable", 503).await;
+        let error = format!("{:#}", r2_at(&endpoint).mint(&drive, TTL).await.unwrap_err());
+        assert!(error.contains("HTTP 503"), "{error}");
+        let (endpoint, _) = fake_sts(r#"{"success":false,"errors":[{"code":10000,"message":"private-api-token private-secret private-session"}],"result":{"secretAccessKey":"private-secret","sessionToken":"private-session"}}"#, 403).await;
+        let error = format!("{:#}", r2_at(&endpoint).mint(&drive, TTL).await.unwrap_err());
+        assert!(!error.contains("private-api-token") && !error.contains("private-secret") && !error.contains("private-session"));
     }
 
     #[tokio::test]
@@ -566,5 +724,98 @@ mod tests {
         other.insert(key("VFADMIN", Scope::Admin, None));
         keys.insert(key("VFREAD", Scope::Read, Some(&["elsewhere"])));
         assert_eq!(access_generation(&keys, "footage", "d-1"), access_generation(&other, "footage", "d-1"), "keys that don't reach the drive don't count");
+    }
+}
+
+#[cfg(test)]
+mod aws_checks {
+    use super::*;
+    use crate::sigv4::{KeyInfo, Scope};
+
+    const ID: &str = "ASIAFIXEDTESTKEY";
+    const SECRET: &str = "fixed-test-secret";
+    const TOKEN: &str = "fixed-test-session/+token=";
+
+    struct FixedMint;
+
+    impl Mint for FixedMint {
+        fn mint<'a>(&'a self, _: &'a DriveId, ttl: Duration) -> BoxFuture<'a, anyhow::Result<Minted>> {
+            Box::pin(async move {
+                Ok(Minted { access_key_id: ID.into(), secret_access_key: SECRET.into(), session_token: Some(TOKEN.into()), expires_at: Utc::now() + ttl })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_storage_check_signs_with_the_minted_session_and_bucket_region() {
+        let seen: Arc<Mutex<Vec<(bool, bool, bool)>>> = Arc::default();
+        let kept = seen.clone();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let kept = kept.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let body = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                let mut keys = Keys::default();
+                keys.insert(KeyInfo { id: ID.into(), secret: SECRET.into(), scope: Scope::Read, drives: None });
+                let signed = crate::sigv4::verify(parts.method.as_str(), &parts.uri, &parts.headers, &keys, Utc::now()).is_ok();
+                let region = parts.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("/eu-west-1/s3/aws4_request"));
+                let token = parts.headers.get("x-amz-security-token").and_then(|v| v.to_str().ok()) == Some(TOKEN);
+                let hash = parts.headers.get("x-amz-content-sha256").and_then(|v| v.to_str().ok()).is_some_and(|v| v == hex::encode(Sha256::digest(&body)));
+                kept.lock().unwrap().push((signed && hash, region, token));
+                if !(signed && hash && region && token) {
+                    return (http::StatusCode::FORBIDDEN, "<Error><Code>InvalidToken</Code></Error>");
+                }
+                let prefix = parts.uri.query().unwrap_or_default().split('&').filter_map(|p| p.split_once('=')).find(|(k, _)| *k == "prefix").map(|(_, p)| percent_encoding::percent_decode_str(p).decode_utf8().unwrap().into_owned());
+                let readable = parts.method == http::Method::GET && (parts.uri.path() == "/bucket/voidfs-bench/test/voidfs.json" || prefix.as_deref() == Some(&format!("voidfs-bench/test/drives/{CHECK_DRIVE}/")));
+                if readable {
+                    (http::StatusCode::OK, "")
+                } else {
+                    (http::StatusCode::FORBIDDEN, "<Error><Code>AccessDenied</Code></Error>")
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await });
+        let location = Location { bucket: "bucket".into(), root: "voidfs-bench/test/".into(), region: "eu-west-1".into(), endpoint };
+        let checks = check(&FixedMint, &location, &HttpClient::new().unwrap()).await;
+        task.abort();
+        assert!(checks.scoped(), "the scoped check must pass with correctly signed temporary credentials");
+        assert_eq!(*seen.lock().unwrap(), vec![(true, true, true); 6], "every request must sign its body, region and session token");
+    }
+
+    #[tokio::test]
+    async fn the_storage_check_reports_safe_s3_error_codes_without_response_secrets() {
+        let app = axum::Router::new().fallback(|| async {
+            (http::StatusCode::FORBIDDEN, format!("<Error><Code>AccessDenied</Code><Message>{ID} {SECRET} {TOKEN}</Message><RequestId>private-request</RequestId></Error>"))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await });
+        let location = Location { bucket: "bucket".into(), root: "voidfs-bench/test/".into(), region: "us-east-1".into(), endpoint };
+        let checks = check(&FixedMint, &location, &HttpClient::new().unwrap()).await;
+        task.abort();
+        assert!(!checks.scoped() && checks.refused.is_none(), "STS success does not establish S3 access");
+        assert_eq!(checks.tried.iter().map(|t| t.1).collect::<Vec<_>>(), [false, false, true, true, true, true], "retain the scope-check decisions");
+        let said = checks.to_string();
+        assert_eq!(said.matches("HTTP 403 AccessDenied").count(), 6, "identify S3 denials in every attempt");
+        assert!([ID, SECRET, TOKEN, "private-request"].iter().all(|value| !said.contains(value)), "omit credentials, messages and unrelated XML fields");
+    }
+
+    #[tokio::test]
+    async fn the_storage_check_drops_unsafe_or_secret_error_codes() {
+        for code in [ID.to_owned(), SECRET.to_owned(), "invalid code with whitespace".into(), "x".repeat(65), format!("AccessDenied-{SECRET}")] {
+            let app = axum::Router::new().fallback(move || {
+                let answer = format!("<Error><Code>{code}</Code></Error>");
+                async move { (http::StatusCode::FORBIDDEN, answer) }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await });
+            let location = Location { bucket: "bucket".into(), root: "".into(), region: "us-east-1".into(), endpoint };
+            let checks = check(&FixedMint, &location, &HttpClient::new().unwrap()).await;
+            task.abort();
+            assert!(checks.tried[0].2 == "HTTP 403", "unsafe XML error codes must be omitted");
+        }
     }
 }

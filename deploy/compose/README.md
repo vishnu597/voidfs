@@ -37,8 +37,9 @@ or binaries; CI builds its last release from source instead. Direct uploads (pro
 storage credentials (§5.5) are off here: versitygw is reachable only inside the Compose network,
 so a client couldn't send shards to it or read from it (and it has no STS to mint credentials). A
 pool in your own bucket has direct uploads where the bucket enforces what their URLs bind, and
-storage credentials where its STS mints them scoped to a drive (MinIO, or AWS with
-`VOIDFS_STORAGE_CREDENTIALS_ROLE`).
+storage credentials where a scoped mint passes the startup check (MinIO STS, AWS STS with
+`VOIDFS_STORAGE_CREDENTIALS_ROLE`, or R2's Cloudflare API with `VOIDFS_R2_API_TOKEN`). R2's minting
+code passed its live scoped-read check on 4 October.
 
 ## In your own bucket
 
@@ -46,6 +47,27 @@ Set `VOIDFS_STORE=s3:<bucket>/<prefix>` and the `VOIDFS_S3_*` settings in `.env`
 [example.env](example.env)), and use `compose.yaml` alone. For Cloudflare R2, the endpoint is
 `https://<account>.r2.cloudflarestorage.com` and the region `auto`. For AWS S3, leave the
 endpoint out and set the bucket's region.
+
+For AWS storage credentials, the assumed role needs its own pool-read policy and must trust
+the server's bucket credentials; caller permissions alone are insufficient. Set
+`VOIDFS_STORAGE_CREDENTIALS_ROLE` to its ARN. The user's 4 October check minted a session but
+received six 403s because the read role's resource ARNs named a different bucket. After
+correcting both ARNs, the live check passes all four applicable conformance cases; required
+reads return 200 and forbidden operations return 403. The
+[AWS policy and diagnostic guide](../../docs/aws-storage-credentials.md) records the fix.
+
+For R2 minting, set `VOIDFS_R2_API_TOKEN` to an account-level API token with **Workers R2 Storage
+Write** access, alongside the explicit static `VOIDFS_S3_ACCESS_KEY_ID` and
+`VOIDFS_S3_SECRET_ACCESS_KEY` for the parent. An object-only S3 token does not authorize the REST
+API ([R2 authentication](https://developers.cloudflare.com/r2/api/tokens/)). The account comes
+from the configured R2 endpoint. Cloudflare's API base defaults to
+`https://api.cloudflare.com/client/v4`; `VOIDFS_STS_ENDPOINT` overrides the base for R2.
+
+Compose passes these settings from `.env`; `VOIDFS_TOKEN_VALUE` is a convenience fallback in
+the bucket-check script, not a server/Compose setting. A deployment offers credentials only
+after its own scoped mint passes; otherwise clients read through the server. The
+[provider results](../../bench/results/storage-credentials/README.md#reproduce) record live
+passes on R2 and AWS, with the earlier AWS failure preserved.
 
 ## Health and metrics
 

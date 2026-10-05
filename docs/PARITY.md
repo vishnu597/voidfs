@@ -5,7 +5,8 @@ capability probe, group commit and the shard cache's admission, on 2026-09-29 af
 virtual-host addressing and then health checks and metrics, and on 2026-10-01 for cold reads and
 S3's bandwidth in the local benchmark, then coalesced shard fetches, and then for the start of
 step 4 (the scorecard refreshed, SpaceFS 0.2.333 looked at again, the Rust SDK, then the CLI),
-and then for the Mac apps head to head; the first was taken on 2026-09-27.*
+and then for the Mac apps head to head; provider follow-ups and the proposed step 5 plan added on
+2026-10-04. The first was taken on 2026-09-27.*
 
 Sources:
 - the voidfs code on `main` at `939b57c` (everything through coalesced shard fetches merged), with
@@ -94,9 +95,12 @@ billing or plans), this page says so.
     mount (step 5), as SpaceFS's S3 layer also reads whole shards for a range.
   - Step 4 (client core, CLI and Rust SDK) is done, items 1–6 of 6 (4 October): the Rust SDK, the
     CLI (`void`), the client core, the daemon, direct uploads and storage credentials
-    ([step-4-client.md](step-4-client.md)). R2's storage credentials, and a check of them on AWS,
-    wait on an API token and a role the user makes.
-  - Steps 5–10 have not started.
+    ([step-4-client.md](step-4-client.md)). R2's live scoped-read check passes all four applicable
+    conformance cases. AWS also passes all four after correcting the read role's bucket ARNs;
+    required reads return 200 and forbidden operations return 403. The
+    [AWS guide](aws-storage-credentials.md) records the initial failure and successful rerun.
+  - Step 5 has a [proposed plan](step-5-macos.md), including the FSKit/SMB, bridge and pieces
+    integrity decisions; its writable mount is not implemented. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -116,8 +120,8 @@ Every item of the plan's checklist (§3, 65 items, including the Finder integrat
 | Area | Done | Partly | Missing | State |
 |---|---|---|---|---|
 | Engine (E1–E13) | 10 | 1 | 2 | Chunking, versions, point-in-time reads, restore, in-place edits, forks, checkpoints, garbage collection, small files held in the log (RFC 0003, the `inline-data` pool feature), a folder restore that is one version in the history of every file it changes (RFC 0004, the `multi-object-versions` pool feature), and direct uploads (step 4, item 5: where the bucket binds a shard's checksum to its URL, from the SDK and the upload queue) work. Missing: encryption, retention policies |
-| Storage backends (B1–B8) | 2 | 1 | 5 | Local disk, AWS S3, Cloudflare R2, MinIO (built from source in CI) and versitygw work, and rclone works against the server. A capability probe checks the bucket at start. Short-lived storage credentials where the bucket's STS mints them scoped to a drive (MinIO; AWS with a role). No other providers tried, no R2 credentials yet, no stored bucket credentials, no adopt or export |
-| Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed (long poll and SSE), direct uploads where the bucket binds checksums, and storage credentials where its STS mints them scoped, on one node. Missing: a disk cache tier, several nodes, several regions, quotas |
+| Storage backends (B1–B8) | 2 | 1 | 5 | Local disk, AWS S3, Cloudflare R2, MinIO (built from source in CI) and versitygw work, and rclone works against the server. A capability probe checks the bucket at start. Storage credentials pass scoped-read checks on MinIO, live R2 and live AWS after correcting the read role's bucket ARNs. No other providers tried, no stored bucket credentials, no adopt or export |
+| Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed (long poll and SSE), direct uploads where the bucket binds checksums, and storage credentials where STS or Cloudflare's API passes the scoped-read check, on one node. Missing: a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
 | Clients (D1–D12) | 0 | 5 | 7 | A read-only macOS mount and its menu-bar shell (the spike), the CLI on the protocol, `void` (step 4, item 2), the client core (item 3): block cache, write journal and upload queue, change-feed client, and the daemon that runs it, with uploads handed to it and the mount table (item 4), direct uploads (item 5), and reads straight from the bucket with storage credentials (item 6). No mounting yet (step 5's adapters), no Finder integration, Linux or Windows |
 | SDKs, agents, search (A1–A7) | 0 | 1 | 6 | A Rust SDK on the official AWS SDK, with a typed call for every extension (step 4, item 1) and direct uploads (item 5). Stock S3 SDKs, boto3, rclone and curl work. No TypeScript, Python or Go SDK, MCP server or search |
@@ -131,13 +135,17 @@ is partly done since 2 October, with the client core's cache and fetcher (item 3
 runs since 3 October (item 4), with background uploads and the mount table. E10 is done since 4
 October: the server offers direct uploads, and the SDK and the upload queue use them (item 5).
 B4 is partly done since 4 October: the server mints storage credentials scoped to a drive where
-the bucket's STS can, and the client core reads from the bucket with them (item 6); R2's wait for
-an API token.
+the provider can, and the client core reads from the bucket with them (item 6). R2 minting is now
+verified live: four applicable conformance cases pass. AWS also passes all four after correcting
+the assumed role's bucket ARNs, which initially named a different bucket. This provider
+verification does not change the scorecard counts.
 
 "Partly" means:
 - E1 has no compression (`shard-zstd` is a reserved pool feature that servers refuse).
-- S3 serves storage credentials (§5.5) only where the bucket's STS mints them scoped to a drive
-  (MinIO, and AWS with a role; elsewhere they answer `501`), and lacks copy-mode forks
+- S3 serves storage credentials (§5.5) only where a provider's scoped mint passes the startup
+  checks (MinIO STS; AWS STS with a role; R2's Cloudflare API with an account-level token).
+  Live AWS and R2 pass those checks; a failed capability check answers `501`.
+  The server also lacks copy-mode forks
   (`x-voidfs-fork-mode: copy` answers `501`) and display names (`x-voidfs-display-name` is
   ignored: a drive's display name is its alias). S5 is memory-only. S8 has the protocol header
   and 55 conformance cases, but no operations catalogue.
@@ -174,9 +182,9 @@ The 28 P0 items, which a credible v1 needs:
 
 | SpaceFS | voidfs today |
 |---|---|
-| S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 55 conformance cases, path or virtual-host addressing, direct uploads where the bucket binds checksums (AWS S3, R2, MinIO and versitygw do), and storage credentials where its STS mints them scoped (MinIO; AWS with a role). Missing: R2's storage credentials, display names, copy-mode forks |
+| S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 55 conformance cases, path or virtual-host addressing, direct uploads where the bucket binds checksums (AWS S3, R2, MinIO and versitygw do), and storage credentials through provider minting with a startup scope check. MinIO, live R2 and live AWS pass. Missing: display names, copy-mode forks |
 | macOS app: writable mount (a loopback SMB server by default since 0.2.333, or FSKit), transfers (pause, resume, speed limits), a disk and a memory cache, pinned files, previews, video reviews, Space Search, Finder badges | Read-only FSKit mount and a menu-bar shell |
-| `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version, and `update` | `void` (step 4, item 2): drives, drive create, show, delete and undelete, fork, history, show, restore, a foreground upload, version, and keys generate for the server, with `--json` on every command and errors as JSON. Next: the daemon and its commands (step 4, item 4); accounts in step 6 ([step-4-client.md](step-4-client.md#item-2-the-cli-on-the-protocol)) |
+| `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version, and `update` | `void`: drives, drive create/show/delete/undelete, fork, history, show, restore, upload (foreground or daemon-backed with `--detach`), uploads with pause/resume/cancel and a limit, status, daemon run/start/stop/restart/status/info/install/uninstall, and mount/unmount/mounts with remembered mounts. JSON output everywhere. Mounting itself waits for step 5's adapters; account commands wait for step 6 ([step-4-client.md](step-4-client.md)). |
 | Linux FUSE mount | None (step 9) |
 | Web app: sign-in, settings, access keys, billing | None (billing does not apply) |
 | SDKs: TypeScript, Python, Go, Rust (MIT), each on the official AWS SDK | Rust (`crates/voidfs-sdk`): the official AWS SDK for S3, a typed call for every extension, one error type, the retry rule, and direct uploads, opt-in as SpaceFS's are (step 4, item 5). Not yet: TypeScript, Python, Go |
@@ -799,17 +807,25 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      ([bench/results/direct-uploads](../bench/results/direct-uploads/README.md)).
    - Short-lived storage credentials (B4, §5.5): AWS STS, R2, MinIO. **Done** (4 October): the
      format reader is factored out of the server (`voidfs-format`); the server mints credentials
-     with the bucket's STS, scoped to what a drive's reader needs and checked at start, where it
-     can (MinIO; AWS with a role), and answers `501` elsewhere; and the client core reads shards
-     and the drive's state straight from the bucket with them, through the API where it can't.
+     through provider minting, scoped to what a drive's reader needs and checked at start, where
+     it can (MinIO STS, AWS STS with a role, R2's Cloudflare API), and answers `501` elsewhere;
+     and the client core reads shards and the drive's state straight from the bucket with them,
+     through the API where it can't.
      12 ms away and 40 MB/s down, a 64 MiB file read cold in 1.9 s from the bucket, 3.2 s through
      the server ([bench/results/storage-credentials](../bench/results/storage-credentials/README.md)).
-     R2's credentials (Cloudflare's API) wait for an API token, and the AWS check for a role.
-     Presigned URLs as a fallback,
-     and an object's shard list for the API path, would be protocol additions (RFC first): the
-     user deferred both on 4 October.
+     R2's credentials (Cloudflare's API with `VOIDFS_R2_API_TOKEN` and a static parent key) are
+     verified live: the scoped reader's two operations return 200, the other four are refused,
+     and four conformance cases pass. AWS also passes all four after correcting the read role's
+     bucket ARNs, which initially named a different bucket. Both capability scripts exit 0
+     and purge four test-pool objects. R2 left zero objects and AWS preserved its two
+     pre-existing objects. The [AWS guide](aws-storage-credentials.md) records both the
+     initial AccessDenied result and the successful rerun.
+     Presigned URLs as a fallback, and an object's shard list for the API path, would be
+     protocol additions (RFC first): the user deferred both on 4 October.
    - **Status (2026-10-04):** items 1–6 of 6 done.
 5. **Writable macOS drive** (Phase 2).
+   - The ordered deliverables, adapter/bridge decisions and validation gates are in the
+     [proposed step 5 plan](step-5-macos.md). No writable adapter is implemented yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
@@ -826,6 +842,12 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
+   - **Status (2026-10-04):** plan proposed. Choose FSKit first, SMB first or both; a Swift XPC
+     bridge to the existing Rust daemon/socket or the spike's embedded UniFFI host; and whether
+     pieces keep hash verification through an RFC or accept an explicit weaker opt-in. The plan
+     recommends FSKit first, the bridge, and verified whole shards until an authenticated block
+     hash RFC. Implementation starts with the local namespace/open-handle core and a read-only
+     bridge slice, before writable callbacks.
 6. **Accounts and web app** (Phase 3).
    - Passwordless email sign-in, workspaces and roles.
    - Keys minted and revoked within a minute, with drive allowlists.

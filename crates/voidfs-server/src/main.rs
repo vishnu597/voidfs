@@ -80,8 +80,8 @@ struct Args {
     direct_uploads: Switch,
     /// Storage credentials (protocol §5.5): short-lived, read-only credentials to a drive's
     /// storage, so that a mount reads shards and metadata straight from the bucket. `on` offers
-    /// them where the bucket's STS mints credentials that read only what a drive's reader needs,
-    /// which is checked at start (MinIO, or AWS with --storage-credentials-role); elsewhere, and
+    /// them where the service mints credentials that read only what a drive's reader needs,
+    /// checked at start (MinIO, AWS with --storage-credentials-role, R2 with --r2-api-token); elsewhere, and
     /// with `off`, their requests answer 501 and clients read through the server.
     #[arg(long, env = "VOIDFS_STORAGE_CREDENTIALS", value_enum, default_value = "on")]
     storage_credentials: Switch,
@@ -90,9 +90,14 @@ struct Args {
     #[arg(long, env = "VOIDFS_STORAGE_CREDENTIALS_ROLE", global = true)]
     storage_credentials_role: Option<String>,
     /// The STS endpoint that mints storage credentials. Default: AWS's regional one for an AWS
-    /// bucket, and the bucket's own endpoint elsewhere, where MinIO serves it.
+    /// bucket, the bucket's endpoint for MinIO, or Cloudflare's API base for R2
+    /// (https://api.cloudflare.com/client/v4).
     #[arg(long, env = "VOIDFS_STS_ENDPOINT", global = true)]
     sts_endpoint: Option<String>,
+    /// Account-level R2 API token with Workers R2 Storage write access, used to mint read-only
+    /// temporary credentials. The bucket's static access key id is their parent.
+    #[arg(long, env = "VOIDFS_R2_API_TOKEN", hide_env_values = true, global = true)]
+    r2_api_token: Option<String>,
     /// Also serve `<drive>.<domain>/<key>` (virtual-host addressing) under this domain, which
     /// needs a wildcard DNS name `*.<domain>` pointing at the server (repeatable). Requests to
     /// the domain itself, or to any other host, stay path-style (`/<drive>/<key>`).
@@ -248,11 +253,11 @@ async fn direct_uploads(args: &Args, bucket: Option<probe::Bucket>) -> Option<Ar
     direct
 }
 
-fn sts_options(args: &Args) -> voidfs_server::credentials::StsOptions {
-    voidfs_server::credentials::StsOptions { role: args.storage_credentials_role.clone(), endpoint: args.sts_endpoint.clone() }
+fn mint_options(args: &Args) -> voidfs_server::credentials::MintOptions {
+    voidfs_server::credentials::MintOptions { role: args.storage_credentials_role.clone(), endpoint: args.sts_endpoint.clone(), r2_api_token: args.r2_api_token.clone() }
 }
 
-/// Storage credentials, if `--storage-credentials on` and the bucket's STS mints credentials
+/// Storage credentials, if `--storage-credentials on` and the service mints credentials
 /// scoped to a drive's reader (protocol §5.5, §9).
 async fn storage_credentials(args: &Args, bucket: Option<&probe::Bucket>) -> Option<Arc<voidfs_server::credentials::Credentials>> {
     if args.storage_credentials == Switch::Off {
@@ -263,15 +268,15 @@ async fn storage_credentials(args: &Args, bucket: Option<&probe::Bucket>) -> Opt
         tracing::info!("storage credentials are not offered: the store is not a bucket");
         return None;
     };
-    let mint = match bucket.sts(&sts_options(args)) {
+    let mint = match bucket.mint(&mint_options(args)) {
         Ok(m) => m,
         Err(why) => {
             tracing::info!("storage credentials are not offered: {why}");
             return None;
         }
     };
-    let (checks, offered) = voidfs_server::credentials::offer(Box::new(mint), bucket.location(), bucket.http()).await;
-    // A bucket without STS is common; one whose STS mints credentials that reach too far is not.
+    let (checks, offered) = voidfs_server::credentials::offer(mint, bucket.location(), bucket.http()).await;
+    // A bucket without a mint is common; one that mints credentials reaching too far is not.
     match (&offered, &checks.refused) {
         (None, None) => tracing::warn!("storage credentials: {checks}"),
         _ => tracing::info!("storage credentials: {checks}"),
@@ -302,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Probe) => {
             let (store, bucket) = open_store(&args)?;
-            let report = probe::report(&store, bucket.as_ref(), args.commit_guard.into(), &sts_options(&args)).await?;
+            let report = probe::report(&store, bucket.as_ref(), args.commit_guard.into(), &mint_options(&args)).await?;
             println!("{report}");
             std::process::exit(if report.refusals.is_empty() { 0 } else { 1 });
         }
@@ -476,6 +481,18 @@ mod tests {
         assert!(Args::try_parse_from(["voidfs-server", "--commit-guard", "none"]).is_err());
         let a = Args::try_parse_from(["voidfs-server", "gc", "--commit-guard", "external"]).unwrap();
         assert_eq!(a.commit_guard, Guard::External);
+    }
+
+    #[test]
+    fn the_r2_token_is_global_and_hidden_in_help() {
+        use clap::CommandFactory;
+        let a = Args::try_parse_from(["voidfs-server", "probe", "--r2-api-token", "private-api-token"]).unwrap();
+        assert!(a.r2_api_token.as_deref() == Some("private-api-token"));
+        assert!(mint_options(&a).r2_api_token.as_deref() == Some("private-api-token"));
+        let command = Args::command();
+        let token = command.get_arguments().find(|a| a.get_id() == "r2_api_token").unwrap();
+        assert!(token.is_hide_env_values_set());
+        assert!(token.is_global_set());
     }
 
     #[test]

@@ -140,6 +140,7 @@ pub struct Bucket {
     /// The pool's root as a key prefix: empty, or ending in `/`.
     prefix: String,
     provider: Provider,
+    access_key_id: Option<String>,
 }
 
 /// Lets reqsign fetch credentials (instance metadata, STS) through OpenDAL's HTTP client.
@@ -225,6 +226,7 @@ impl Bucket {
             base,
             prefix: if prefix.is_empty() { String::new() } else { format!("{prefix}/") },
             provider,
+            access_key_id: credentials.map(|(id, _)| id.to_owned()),
         })
     }
 
@@ -233,12 +235,28 @@ impl Bucket {
         crate::credentials::Location { bucket: self.name.clone(), root: self.prefix.clone(), region: self.region.clone(), endpoint: self.base.clone() }
     }
 
-    /// What mints storage credentials through STS for this bucket, or why its service can't: AWS's
-    /// STS needs a role to assume, and R2 has none. Elsewhere STS is tried on the bucket's own
-    /// endpoint, as MinIO serves it.
-    pub fn sts(&self, opts: &crate::credentials::StsOptions) -> Result<crate::credentials::Sts, String> {
+    /// What mints storage credentials for this bucket: Cloudflare's API for R2, regional STS
+    /// with a role for AWS, or STS on the bucket's endpoint as MinIO serves it.
+    pub fn mint(&self, opts: &crate::credentials::MintOptions) -> Result<Box<dyn crate::credentials::Mint>, String> {
+        match self.provider {
+            Provider::R2 => self.r2(opts).map(|m| Box::new(m) as Box<dyn crate::credentials::Mint>),
+            _ => self.sts(opts).map(|m| Box::new(m) as Box<dyn crate::credentials::Mint>),
+        }
+    }
+
+    fn r2(&self, opts: &crate::credentials::MintOptions) -> Result<crate::credentials::R2, String> {
+        let token = opts.r2_api_token.as_ref().filter(|s| !s.is_empty()).ok_or("R2 needs an account-level R2 API token (--r2-api-token or VOIDFS_R2_API_TOKEN)")?;
+        let parent = self.access_key_id.as_ref().filter(|s| !s.is_empty()).ok_or("R2 temporary credentials need a static parent access key id (--s3-access-key-id); the default credential chain cannot supply it")?;
+        let account = self.base.split("://").nth(1).unwrap_or_default().split('.').next().unwrap_or_default();
+        Ok(crate::credentials::R2 {
+            http: self.http.clone(), api: opts.endpoint.clone().unwrap_or_else(|| "https://api.cloudflare.com/client/v4".into()),
+            account: account.to_owned(), token: token.clone(), parent: parent.clone(), bucket: self.name.clone(), root: self.prefix.clone(),
+        })
+    }
+
+    fn sts(&self, opts: &crate::credentials::MintOptions) -> Result<crate::credentials::Sts, String> {
         let endpoint = match (&opts.endpoint, self.provider, &opts.role) {
-            (_, Provider::R2, _) => return Err("R2 mints temporary credentials through Cloudflare's API with an API token, which this server does not use yet".into()),
+            (_, Provider::R2, _) => return Err("R2 uses Cloudflare's API rather than STS".into()),
             (None, Provider::Aws, None) => return Err("AWS STS needs a role to assume (--storage-credentials-role)".into()),
             (Some(e), _, _) => e.trim_end_matches('/').to_owned(),
             (None, Provider::Aws, _) => format!("https://sts.{}.amazonaws.com", self.region),
@@ -577,7 +595,7 @@ impl fmt::Display for Report {
 /// changes nothing a pool holds: the writes are the create-if-absent check's, which a bucket that
 /// honours the condition refuses, and PUTs of [`PROBE_SHARD`], a valid shard, presigned and with
 /// minted storage credentials.
-pub async fn report(store: &Store, bucket: Option<&Bucket>, guard: CommitGuard, sts: &crate::credentials::StsOptions) -> anyhow::Result<Report> {
+pub async fn report(store: &Store, bucket: Option<&Bucket>, guard: CommitGuard, opts: &crate::credentials::MintOptions) -> anyhow::Result<Report> {
     let mut r = Report::default();
     let descriptor = store.get(DESCRIPTOR).await?;
     let pool_exists = descriptor.is_some();
@@ -659,10 +677,10 @@ pub async fn report(store: &Store, bucket: Option<&Bucket>, guard: CommitGuard, 
     );
     r.row(
         "storage credentials",
-        match (b.sts(sts), pool_exists) {
+        match (b.mint(opts), pool_exists) {
             (Err(why), _) => format!("not offered: {why}"),
             (Ok(_), false) => "not checked, as there is no pool here yet; a server checks them when it starts".into(),
-            (Ok(mint), true) => crate::credentials::check(&mint, &b.location(), &b.http).await.to_string(),
+            (Ok(mint), true) => crate::credentials::check(mint.as_ref(), &b.location(), &b.http).await.to_string(),
         },
     );
     r.row(
@@ -978,8 +996,8 @@ mod tests {
 
     #[test]
     fn storage_credentials_are_minted_where_the_service_can() {
-        use crate::credentials::{Location, StsOptions};
-        let opts = |role: Option<&str>, endpoint: Option<&str>| StsOptions { role: role.map(str::to_owned), endpoint: endpoint.map(str::to_owned) };
+        use crate::credentials::{Location, MintOptions};
+        let opts = |role: Option<&str>, endpoint: Option<&str>| MintOptions { role: role.map(str::to_owned), endpoint: endpoint.map(str::to_owned), ..Default::default() };
         let minio = Bucket::new("b", "pool", Some("http://127.0.0.1:9000/"), "us-east-1", Some(("id", "secret"))).unwrap();
         assert_eq!(minio.location(), Location { bucket: "b".into(), root: "pool/".into(), region: "us-east-1".into(), endpoint: "http://127.0.0.1:9000".into() });
         let sts = minio.sts(&opts(None, None)).unwrap();
@@ -991,7 +1009,17 @@ mod tests {
         assert_eq!(aws.location().endpoint, "https://s3.eu-west-1.amazonaws.com");
         assert_eq!(aws.sts(&opts(Some("arn:aws:iam::1:role/r"), Some("https://sts.example/"))).unwrap().endpoint, "https://sts.example/");
         let r2 = Bucket::new("b", "pool", Some("https://acct.r2.cloudflarestorage.com"), "auto", Some(("id", "secret"))).unwrap();
-        assert!(r2.sts(&opts(None, None)).err().unwrap().contains("Cloudflare"));
+        assert!(r2.mint(&opts(None, None)).err().unwrap().contains("--r2-api-token"));
+        let r2_opts = MintOptions { r2_api_token: Some("dedicated-token".into()), ..Default::default() };
+        let mint = r2.r2(&r2_opts).unwrap();
+        assert_eq!((mint.api.as_str(), mint.account.as_str(), mint.parent.as_str(), mint.bucket.as_str(), mint.root.as_str()), ("https://api.cloudflare.com/client/v4", "acct", "id", "b", "pool/"));
+        assert!(r2.mint(&r2_opts).is_ok());
+        let no_key = Bucket::new("b", "pool", Some("https://acct.r2.cloudflarestorage.com"), "auto", None).unwrap();
+        assert!(no_key.mint(&r2_opts).err().unwrap().contains("static parent access key id"));
+        let eu = Bucket::new("b", "pool", Some("https://acct.eu.r2.cloudflarestorage.com"), "auto", Some(("id", "secret"))).unwrap();
+        assert_eq!(eu.r2(&r2_opts).unwrap().account, "acct");
+        let override_opts = MintOptions { endpoint: Some("http://127.0.0.1:8000/client/v4/".into()), ..r2_opts };
+        assert_eq!(r2.r2(&override_opts).unwrap().api, "http://127.0.0.1:8000/client/v4/");
     }
 
     #[tokio::test]
