@@ -1,8 +1,9 @@
 # Step 5: a writable macOS drive
 
-*Proposed 4 October 2026, after step 4. This is an implementation plan; no writable adapter,
-platform service installation, new protocol field or format feature is delivered by this page.
-Recommendations below remain proposals where they revisit an earlier decision.*
+*Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
+5 October. Item 1 has begun with the Rust mount namespace. The later deliverables remain an
+implementation plan; no writable adapter, platform service installation, new protocol field or
+format feature is delivered by this slice.*
 
 Step 5 is **done when** the daemon mounts a writable drive from the same durable client core the
 CLI uses, Finder and the target applications can save through it, and a signed, notarized app can
@@ -37,18 +38,24 @@ filesystem**. There is no complete local namespace overlay, open-handle table or
 combines unpublished writes with a remote base. Those belong in the shared Rust core before
 writable FSKit or SMB callbacks are added.
 
-| Decision | Recommendation | Alternative and consequence |
+| Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
-| FSKit, SMB or both | **FSKit first, keep the adapter boundary, evaluate SMB only if the compatibility gate fails.** Preserve the native-module decision and the existing spike. | SMB first could avoid FSKit-specific cache and entitlement constraints, but needs a reusable SMB server, a license review and proof of Mac semantics. Shipping both now doubles adapter and coherence validation. SpaceFS's default SMB is evidence to evaluate, not evidence that voidfs's SMB adapter already exists. |
+| FSKit, SMB or both | **Accepted 5 October: FSKit first, keep the adapter boundary, evaluate SMB only if the compatibility gate fails.** Preserve the native-module decision and the existing spike. | SMB first could avoid FSKit-specific cache and entitlement constraints, but needs a reusable SMB server, a license review and proof of Mac semantics. Shipping both now doubles adapter and coherence validation. SpaceFS's default SMB is evidence to evaluate, not evidence that voidfs's SMB adapter already exists. |
 | Minimum OS | **Keep macOS 27 for FSKit.** Recheck the final SDK/runtime before release. | Any lower minimum requires a separate coherence strategy and an explicit change to the recorded platform decision. An SMB adapter would need its own measured minimum; it does not automatically lower the app's minimum. |
-| Rust/Swift boundary | **Keep the Rust daemon and socket; add a thin Swift XPC bridge for the sandboxed extension.** | A Swift agent embedding Rust through UniFFI follows the original spike, but replaces the now-built daemon host and adds bindings/build work. A direct extension-to-socket path is smaller only if a signed sandbox test proves access and notifications. |
+| Rust/Swift boundary | **Accepted 5 October: keep the Rust daemon and socket; add a thin Swift XPC bridge for the sandboxed extension.** | A Swift agent embedding Rust through UniFFI follows the original spike, but replaces the now-built daemon host and adds bindings/build work. A direct extension-to-socket path is smaller only if a signed sandbox test proves access and notifications. |
 | Cache and journal ownership | **One daemon owns mutable state; shared cache files are read through leases.** | An extension-owned core repeats state per drive and loses its process on eject. Neither a bridge nor an extension may independently open the writable state database. |
-| Partial-shard integrity | **Keep verified whole-shard reads by default; propose authenticated block hashes by RFC before enabling verified pieces.** | Length-only ranged reads fit today's format but weaken content-address verification. They require an explicit opt-in policy, separate cache trust state and user agreement; they must not silently replace the verified path. |
+| Partial-shard integrity | **Accepted 5 October: keep verified whole-shard reads; authenticated pieces require a later RFC.** | Length-only ranged reads fit today's format but weaken content-address verification. They require a separate policy decision and must not silently replace the verified path. |
 | `/Volumes` | **First prove a user-owned mountpoint; add a narrowly scoped privileged mount helper later.** | A release may use user-owned folders if the helper is not ready, but that does not complete the `/Volumes` deliverable in PARITY. Do not make all client I/O privileged. |
 
-The three choices to settle before adapter-specific implementation are FSKit versus SMB/both,
-the Swift bridge versus an embedded UniFFI host, and the pieces integrity policy. The other
-recommendations preserve the existing plan or describe implementation requirements.
+The adapter, bridge and integrity choices are settled. The other recommendations preserve the
+existing plan or describe implementation requirements. The user also accepted these item 1
+policies on 5 October; writes and conflict handling arrive in later slices.
+
+| Decision | Accepted policy |
+|---|---|
+| Names | New writes store NFC names, with equivalent NFD lookups, using the approved `unicode-normalization` dependency. Existing remote names stay byte-exact. If multiple names normalize alike, lookup reports ambiguity rather than choosing one. Names remain case-sensitive. |
+| Conflicts | Preserve the local saved data and remote version locally until the user resolves the conflict. Do not automatically publish a conflict sibling visible to other clients. |
+| Write acknowledgement | `write` returns after staging bytes that survive a daemon or extension crash. `fsync`, `F_FULLFSYNC` and `close` flush bytes and metadata to disk. Cloud publication has separate status. |
 
 ### Platform evidence, checked 4 October
 
@@ -78,9 +85,10 @@ not proof of macOS client behavior or a suitable Rust implementation. That proof
 
 Build the adapter-independent mount session in `voidfs-client`, reused by `voidfs-daemon`.
 
-- Stable local inode identity, a persisted namespace overlay, explicit directories, normalized
-  NFC names with equivalent NFD lookups, and case-sensitive collision rules. Do not derive an
-  open handle's identity solely from a path: rename and open-unlink must preserve it.
+- Stable local inode identity, a persisted namespace overlay, explicit directories, NFC names
+  for new writes with equivalent NFD lookups, and case-sensitive collision rules. Keep existing
+  remote names byte-exact and reject ambiguous normalized lookups. Do not derive an open handle's
+  identity solely from a path: rename and open-unlink must preserve it.
 - Open, close, lookup, enumeration, getattr, read, write, truncate, rename-over, remove, mkdir
   and attrs/xattrs operations with one error mapping contract. Unsupported hard links,
   exchange, cloning and cross-machine locks must be advertised and tested explicitly.
@@ -94,9 +102,9 @@ Build the adapter-independent mount session in `voidfs-client`, reused by `voidf
 - Admit local writes only when bytes and metadata can be made durable within the configured
   disk budget/reserve. Return a storage error on full disk; do not acknowledge an unrecorded
   write. Mark pending, saving, conflict and error states for the UI.
-- Reuse queue guards and the existing `412` policy. Preserve both local and remote data on a
-  conflict. Define how the mount presents the conflict and prevent a later unguarded publish
-  from silently overwriting it.
+- Reuse queue guards and the existing `412` policy. Keep both versions locally on a conflict
+  until the user resolves it, and prevent a later unguarded publish from silently overwriting
+  either version. Conflict UI remains a later slice; no automatic remote conflict copy is planned.
 
 **Done when:** local operations against a temporary store pass save/rename/open-unlink and
 crash-recovery cases without an OS mount, and reads agree with the durable overlay while upload
@@ -160,8 +168,9 @@ decision is reopened before adding more app surface.
 ### Item 4. Writable FSKit and desktop semantics
 
 Map writable handlers to the durable local operations, not directly to remote SDK mutations.
-Return write success after local durability; cloud publish is visible separately. Synchronize,
-`fsync`, `F_FULLFSYNC`, close and eject must have documented, tested durability semantics.
+Return write success after staging that survives a daemon or extension crash; cloud publish is
+visible separately. `fsync`, `F_FULLFSYNC` and close flush bytes and metadata to disk. Synchronize
+and eject must have documented, tested durability semantics too.
 
 - Create/write/truncate, sparse regions, directory mutations and atomic save via rename-over;
   retain the replaced object's history and the old object for existing open handles.
@@ -297,11 +306,46 @@ limits. Credential fallback must pass even when a backend cannot mint scoped sto
 
 ## 3. First implementation slice
 
-After the three architecture/integrity decisions, start with item 1 and a read-only transport
-slice of item 2, then item 3 at a user-owned mountpoint. In parallel, establish the signed-bundle
-probe and compatibility rig. Only after snapshot/coherence and restart behavior are demonstrated
-should writable callbacks land. Pieces, `/Volumes`, UI and distribution follow the same core;
-each remains a separate reviewable deliverable.
+Item 1 has started; the architecture and integrity choices above no longer block it. Finish its
+namespace, snapshot handles, staged writes, guarded publication and recovery in separate slices.
+Then connect a read-only transport slice of item 2 and item 3 at a user-owned mountpoint. In
+parallel, establish the signed-bundle probe on voidfs's own Apple team and the compatibility rig.
+Only after snapshot/coherence and restart behavior are demonstrated should writable callbacks
+land. Pieces, `/Volumes`, UI and distribution follow the same core; each remains a separate
+reviewable deliverable.
+
+### Namespace slice, 5 October
+
+[`voidfs-client::mount::Session`](../crates/voidfs-client/src/mount.rs) supplies `lookup`,
+`getattr` and `readdir`, plus one `FsError` contract mapping to native errno values. Store migration
+4 persists inode identities by drive and remote `object_id`, directory names, attributes and
+generations. Renames and new versions keep the inode; removing a name retains its identity record
+across restarts. A replacement object gets a distinct inode. The separate local overlay and its
+tombstones take precedence over remote names and reserve the namespace for later writable work.
+Callers must identify the drive by its stable canonical id, rather than a reusable display alias.
+
+Directory snapshots combine all pages of `?x-voidfs-list` with attributes. Pages must agree on
+their prefix and sequence; a feed invalidation during the refresh prevents stale publication.
+Successful refreshes advance the directory generation and a persisted drive sequence, so an older
+response from another session or directory cannot move an inode back or replace newer attributes.
+Retries are bounded and return `EAGAIN` when the namespace keeps changing. Async invalidation
+persists stale state, increments generations and returns known affected inodes and directories.
+The caller supplies feed invalidations; the session does not start a watcher. Opening a session
+marks persisted directories stale for online refresh. Offline metadata is served only from a
+previously complete directory snapshot; uncached names fail promptly. Enumeration keeps remote
+names and byte order, with an exclusive name cursor within the current generation.
+Adapters must track invalidations and restart enumeration when the directory generation changes.
+
+This slice has no open handles, file reads or writes, staged-data recovery, cache integration,
+daemon transport or FSKit adapter. Item 1's save, open-unlink and byte-recovery exit criteria are
+still pending, and no step 5 item is complete.
+
+Namespace validation must cover attributes and paging, stable inodes across version changes,
+rename, deletion and restart, complete offline snapshots, fresh online reopening, feed generation
+races, overlays and tombstones, Unicode ambiguity and errno mapping. Each regression test must
+fail with its relevant behavior broken. Workspace tests, clippy, spec validation and memory, fs
+and versitygw interoperability remain required before the pull request is complete; results belong
+in the pull request after they run.
 
 Accounts, web, search, previews, video review, Linux/Windows mounts, server locking, retention and
 encryption remain in their later steps. Cloud benchmark runs and new provider credentials do not

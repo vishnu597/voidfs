@@ -15,6 +15,7 @@ pub mod error;
 pub mod feed;
 pub mod fetch;
 pub mod journal;
+pub mod mount;
 pub mod mounts;
 mod publish;
 pub mod queue;
