@@ -415,3 +415,26 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn secret_environment_values_are_hidden_in_help() {
+        let command = Cli::command();
+        for (subcommand, secrets) in [
+            ("run", &[("voidfs_secret_access_key", "VOIDFS_SECRET_ACCESS_KEY"), ("bare_secret_access_key", "VOIDFS_S3_SECRET_ACCESS_KEY")][..]),
+            ("purge", &[("bare_secret_access_key", "VOIDFS_S3_SECRET_ACCESS_KEY")][..]),
+        ] {
+            let command = command.find_subcommand(subcommand).unwrap_or_else(|| panic!("missing subcommand {subcommand}"));
+            for &(id, env) in secrets {
+                let arg = command.get_arguments().find(|arg| arg.get_id() == id).unwrap_or_else(|| panic!("missing secret argument {subcommand} {id}"));
+                assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new(env)), "environment for {subcommand} {id}");
+                assert!(arg.is_hide_env_values_set(), "{subcommand} {id} must hide its environment value in help");
+            }
+        }
+    }
+}

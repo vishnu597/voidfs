@@ -38,6 +38,16 @@ const MIGRATIONS: &[&str] = &[
     // 3: the remembered mounts (mounts.rs).
     "CREATE TABLE mounts(mountpoint TEXT PRIMARY KEY, drive TEXT NOT NULL, adapter TEXT NOT NULL,
          read_only INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL) WITHOUT ROWID;",
+    // 4: the mount namespace (mount.rs). Identity outlives a name, including a remote deletion.
+    "CREATE TABLE mount_inodes(ino INTEGER PRIMARY KEY AUTOINCREMENT, drive TEXT NOT NULL, object_id TEXT,
+         attrs TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 0, sync TEXT NOT NULL DEFAULT 'saved', UNIQUE(drive, object_id));
+     CREATE TABLE mount_roots(drive TEXT PRIMARY KEY, ino INTEGER NOT NULL REFERENCES mount_inodes(ino), seq INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
+     CREATE TABLE mount_dirs(ino INTEGER PRIMARY KEY REFERENCES mount_inodes(ino), generation INTEGER NOT NULL DEFAULT 0,
+         listed INTEGER NOT NULL DEFAULT 0, seq INTEGER);
+     CREATE TABLE mount_names(parent INTEGER NOT NULL REFERENCES mount_inodes(ino), name TEXT NOT NULL,
+         ino INTEGER NOT NULL UNIQUE REFERENCES mount_inodes(ino), PRIMARY KEY(parent, name)) WITHOUT ROWID;
+     CREATE TABLE mount_overlay(parent INTEGER NOT NULL REFERENCES mount_inodes(ino), name TEXT NOT NULL,
+         ino INTEGER REFERENCES mount_inodes(ino), PRIMARY KEY(parent, name)) WITHOUT ROWID;",
 ];
 
 pub struct Store {
@@ -142,5 +152,24 @@ mod tests {
         assert_eq!(n, 1, "reopening keeps the rows and runs no migration again");
         let mode: String = s.with(|c| c.pragma_query_value(None, "journal_mode", |r| r.get(0))).unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn namespace_migration_preserves_step_four_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        for sql in &MIGRATIONS[..3] { c.execute_batch(sql).unwrap(); }
+        c.pragma_update(None, "user_version", 3).unwrap();
+        c.execute("INSERT INTO meta VALUES ('id', 'old-client')", []).unwrap();
+        c.execute("INSERT INTO mounts VALUES ('/mount', 'drv', 'fskit', 1, 1)", []).unwrap();
+        drop(c);
+        let s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.id().unwrap(), "old-client");
+        let remembered = crate::mounts::remembered(&s).unwrap();
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].mountpoint, "/mount");
+        s.with(|c| c.execute("INSERT INTO mount_inodes(drive, attrs) VALUES ('drv', '{}')", [])).unwrap();
+        let version: i64 = s.with(|c| c.pragma_query_value(None, "user_version", |r| r.get(0))).unwrap();
+        assert_eq!(version, 4);
     }
 }

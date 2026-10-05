@@ -107,3 +107,20 @@ async fn main() -> anyhow::Result<ExitCode> {
     println!("\n{pass} passed, {fail} failed, {skip} skipped");
     Ok(if fail == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn secret_environment_values_are_hidden_in_help() {
+        let command = Args::command();
+        for (id, env) in [("secret_access_key", "VOIDFS_SECRET_ACCESS_KEY"), ("read_secret_access_key", "VOIDFS_READ_SECRET_ACCESS_KEY")] {
+            let arg = command.get_arguments().find(|arg| arg.get_id() == id).unwrap_or_else(|| panic!("missing secret argument {id}"));
+            assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new(env)), "environment for {id}");
+            assert!(arg.is_hide_env_values_set(), "{id} must hide its environment value in help");
+        }
+    }
+}

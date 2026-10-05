@@ -348,3 +348,36 @@ fn fresh_drive_name() -> String {
     let suffix: String = (0..10).map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char).collect();
     format!("vfc-{suffix}")
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn held_count_case_accepts_an_edit_of_a_single_shard_but_still_checks_dedup() {
+        let suite = crate::cases::load(crate::CASES_JSON).unwrap();
+        let case = suite.cases.iter().find(|c| c.id == "direct-upload-held-counts").unwrap();
+        let Some(Body::Bytes(original)) = &case.steps[1].request.as_ref().unwrap().body else { panic!("original content") };
+        let Some(Body::Plan(edited)) = &case.steps[3].request.as_ref().unwrap().body else { panic!("edited content") };
+        // This legitimate per-case nonce makes the 6 MiB input one shard. An edit must change
+        // its only hash, so a correct plan cannot report any unchanged shard as held.
+        let nonce = 77;
+        let original = original.shards(nonce);
+        let edited = edited.shards(nonce);
+        assert_eq!(original.len(), 1);
+        assert_eq!(edited.len(), 1);
+        assert_ne!(original[0].hash, edited[0].hash);
+        let held = edited.iter().filter(|s| original.iter().any(|o| o.hash == s.hash)).count();
+        assert_eq!(held, 0);
+
+        let unchanged_expect = case.steps[2].expect.body.as_ref().unwrap();
+        let edited_expect = case.steps[3].expect.body.as_ref().unwrap();
+        let check = |expect, response| check_body(expect, &serde_json::to_vec(&response).unwrap(), &mut Vars::new(), nonce);
+        assert!(check(unchanged_expect, json!({ "held": original.len(), "upload": [] })).is_ok());
+        assert!(check(unchanged_expect, json!({ "held": 0, "upload": [] })).is_err(), "the unchanged plan must still hold its existing shard");
+        assert!(check(edited_expect, json!({ "held": held, "upload": listed(&edited), "token": "fixture" })).is_ok(), "a correct single-shard edit plan must satisfy the real case matchers");
+        assert!(check(edited_expect, json!({ "held": held, "upload": [], "token": "fixture" })).is_err(), "the edited plan must still require an upload");
+    }
+}
