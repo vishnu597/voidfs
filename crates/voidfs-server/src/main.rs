@@ -63,7 +63,7 @@ struct Args {
     #[arg(long, env = "VOIDFS_SECRET_ACCESS_KEY", hide_env_values = true)]
     secret_access_key: Option<String>,
     /// Extra keys as `id:secret:scope`, scope one of read, write, admin (repeatable).
-    #[arg(long = "key", env = "VOIDFS_KEYS", value_delimiter = ',')]
+    #[arg(long = "key", env = "VOIDFS_KEYS", hide_env_values = true, value_delimiter = ',')]
     keys: Vec<String>,
     /// Memory for the shard cache, in MiB.
     #[arg(long, env = "VOIDFS_CACHE_MIB", default_value_t = 512, global = true)]
@@ -447,6 +447,21 @@ mod tests {
     #[test]
     fn the_command_line_is_consistent() {
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn secret_environment_values_are_hidden_in_help() {
+        let command = Args::command();
+        for (id, env) in [
+            ("s3_secret_access_key", "VOIDFS_S3_SECRET_ACCESS_KEY"),
+            ("secret_access_key", "VOIDFS_SECRET_ACCESS_KEY"),
+            ("keys", "VOIDFS_KEYS"),
+            ("r2_api_token", "VOIDFS_R2_API_TOKEN"),
+        ] {
+            let arg = command.get_arguments().find(|arg| arg.get_id() == id).unwrap_or_else(|| panic!("missing secret argument {id}"));
+            assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new(env)), "environment for {id}");
+            assert!(arg.is_hide_env_values_set(), "{id} must hide its environment value in help");
+        }
     }
 
     #[test]
