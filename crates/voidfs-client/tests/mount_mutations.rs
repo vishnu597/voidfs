@@ -124,7 +124,9 @@ async fn create_is_exclusive_normalizes_names_and_opens_empty_files_locally() {
     assert_eq!(ns.handle_attr(fh).unwrap(), file);
     assert!(ns.read(fh, 0, u64::MAX).await.unwrap().is_empty());
     assert!(ns.read(fh, u64::MAX, 1).await.unwrap().is_empty());
-    assert_eq!(ns.open(file.ino, true).await.unwrap_err(), FsError::ReadOnly);
+    let writable = ns.open(file.ino, true).await.unwrap();
+    assert!(ns.read(writable, 0, 1).await.unwrap().is_empty());
+    ns.close(writable).await.unwrap();
     ns.close(fh).await.unwrap();
     assert_eq!(ns.read(fh, 0, 1).await.unwrap_err(), FsError::BadHandle);
     assert!(f.proxy.seen().is_empty(), "empty local reads need no remote version");
