@@ -113,11 +113,13 @@ Step 5 has started with the Rust mount core in
 [`voidfs-client::mount`](crates/voidfs-client/src/mount.rs): persistent inode identities,
 lookup, attributes and directory listings, with feed invalidation and complete cached listings
 offline, plus read-only handles that keep one version's attributes and bytes through the shared
-cache after overwrite, rename or file deletion. Cached bytes remain readable offline, and handles
-from a previous session return `ESTALE`. Writes, recovery and the Mac adapter follow in later slices. The accepted
+cache after overwrite, rename or file deletion. Moved snapshot reads first refresh the inode's
+namespace path, then use a bounded listing fallback for moves the namespace has not seen.
+Cached bytes remain readable offline, and handles from a previous session return `ESTALE`.
+Writes, recovery and the Mac adapter follow in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#open-handles-and-snapshot-reads-5-october) for the current scope
+[step 5 plan](docs/step-5-macos.md#moved-snapshot-resolution-6-october) for the current scope
 and decisions.
 
 ### The Rust SDK

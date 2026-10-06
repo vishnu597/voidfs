@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use unicode_normalization::UnicodeNormalization;
@@ -363,27 +363,56 @@ impl Session {
     /// The attributes bound at open, independent of later namespace changes.
     pub fn handle_attr(&self, fh: Fh) -> Result<Attr> { Ok(self.handle(fh)?.attr.clone()) }
 
+    async fn snapshot_key(&self, attr: &Attr, failed: &HashSet<String>, budget: &mut crate::mount_resolve::Budget) -> Result<String> {
+        let id = attr.object_id.as_deref().ok_or(FsError::Stale)?;
+        match self.ancestors(attr.ino).await {
+            Ok(()) => {
+                let ino = attr.ino;
+                let id = id.to_owned();
+                let key = self.db(move |c, d, root| {
+                    let tx = c.transaction()?;
+                    let Some(path) = chain(&tx, d, root, ino)? else { return Ok(None); };
+                    for (dir, _) in path.iter().take(path.len() - 1) {
+                        let listed: bool = tx.query_row("SELECT listed FROM mount_dirs WHERE ino=?1", [dir], |r| r.get(0))?;
+                        if !listed { return Ok(None); }
+                    }
+                    if node(&tx, d, ino)?.is_none_or(|n| n.entry.object_id != id) { return Ok(None); }
+                    Ok(Some(path.into_iter().skip(1).map(|(_, name)| name).collect::<Vec<_>>().join("/")))
+                }).await?;
+                if let Some(key) = key && !failed.contains(&key) { return Ok(key); }
+            }
+            Err(FsError::Stale | FsError::NotFound | FsError::Again) => {},
+            Err(e) => return Err(e),
+        }
+        let key = crate::mount_resolve::locate(&self.client, &self.drive, id, &self.connectivity, budget).await?.ok_or(FsError::Stale)?;
+        if failed.contains(&key) { return Err(FsError::Stale); }
+        Ok(key)
+    }
+
     pub async fn read(&self, fh: Fh, offset: u64, len: u64) -> Result<Bytes> {
         let handle = self.handle(fh)?;
         let mut reader = handle.reader.lock().await;
         if offset >= handle.attr.size || len == 0 { return Ok(Bytes::new()); }
         let len = len.min(handle.attr.size - offset);
+        let mut budget = crate::mount_resolve::Budget::default();
+        let mut remaining = Duration::from_secs(2);
+        let mut failed = HashSet::new();
         for _ in 0..4 {
             match reader.read(offset, len).await {
                 Ok(bytes) => return Ok(bytes),
-                Err(Error::Fetch(e)) if e.status() == Some(404) => {
-                    // Versions are retained, but the API addresses moved versions at their new key.
-                    let id = handle.attr.object_id.as_deref().ok_or(FsError::Stale)?;
-                    let key = crate::mount_resolve::locate(&self.client, &self.drive, id, &self.connectivity).await?.ok_or(FsError::Stale)?;
-                    reader.relocate(key);
-                }
                 Err(e) => {
-                    if matches!(e, Error::Changed { .. }) {
+                    let missing = matches!(&e, Error::Fetch(e) if e.status() == Some(404));
+                    if missing || matches!(e, Error::Changed { .. }) {
+                        if !failed.insert(reader.content().key.clone()) { return Err(if missing { FsError::Stale } else { e.into() }); }
+                        let start = tokio::time::Instant::now();
+                        let key = tokio::time::timeout(remaining, self.snapshot_key(&handle.attr, &failed, &mut budget)).await.map_err(|_| FsError::Again)?;
+                        remaining = remaining.saturating_sub(start.elapsed());
+                        match key {
+                            Ok(key) => { reader.relocate(key); continue; }
+                            Err(error) if missing || error == FsError::Again => return Err(error),
+                            Err(_) => {},
+                        }
                         eprintln!("voidfs mount snapshot read: {e}");
-                        if let Some(id) = handle.attr.object_id.as_deref()
-                            && let Ok(Some(key)) = crate::mount_resolve::locate(&self.client, &self.drive, id, &self.connectivity).await
-                            && key != reader.content().key
-                        { reader.relocate(key); continue; }
                     }
                     return Err(e.into());
                 }

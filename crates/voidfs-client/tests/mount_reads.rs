@@ -193,6 +193,182 @@ async fn cold_handle_reads_follow_file_and_folder_moves_without_feed_delivery_th
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn feed_delivered_file_and_folder_moves_use_ancestors_without_scanning() {
+    for backend in [Backend::Api, Backend::Bucket] {
+        for folder_move in [false, true] {
+            let f = Fixture::new(backend, 0).await;
+            let body = bytes_of(12, MIB);
+            f.put("folder/before", body.clone()).await;
+            f.put("unrelated/", Bytes::new()).await;
+            let ns = f.session().await;
+            let folder = ns.lookup(ns.root(), "folder").await.unwrap().ino;
+            let before = ns.lookup(folder, "before").await.unwrap();
+            let fh = ns.open(before.ino, false).await.unwrap();
+            if folder_move {
+                f.remote.rename("drv", "folder/", "moved/", Default::default()).await.unwrap();
+                ns.invalidate(&[Invalidation::Subtree("folder/".into()), Invalidation::Subtree("moved/".into())]).await.unwrap();
+            } else {
+                f.remote.rename("drv", "folder/before", "folder/after", Default::default()).await.unwrap();
+                ns.invalidate(&changes(&["folder/before", "folder/after"])).await.unwrap();
+            }
+            f.proxy.clear();
+            assert_eq!(ns.read(fh, 0, 31).await.unwrap(), body.slice(..31));
+            let requests = f.proxy.seen();
+            assert!(!requests.iter().any(|r| r.contains("x-voidfs-deleted") || r.contains("unrelated")), "{requests:?}");
+            assert_eq!(requests.iter().filter(|r| r.contains("x-voidfs-list")).count(), 2, "{requests:?}");
+            assert_eq!(ns.handle_attr(fh).unwrap(), before);
+            ns.close(fh).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cross_folder_move_already_in_the_namespace_needs_no_listing_scan() {
+    for backend in [Backend::Api, Backend::Bucket] {
+        let f = Fixture::new(backend, 0).await;
+        let body = bytes_of(13, MIB);
+        f.put("left/before", body.clone()).await;
+        f.put("right/", Bytes::new()).await;
+        let ns = f.session().await;
+        let left = ns.lookup(ns.root(), "left").await.unwrap().ino;
+        let right = ns.lookup(ns.root(), "right").await.unwrap().ino;
+        let before = ns.lookup(left, "before").await.unwrap();
+        let fh = ns.open(before.ino, false).await.unwrap();
+        f.remote.rename("drv", "left/before", "right/after", Default::default()).await.unwrap();
+        ns.invalidate(&changes(&["left/before", "right/after"])).await.unwrap();
+        assert_eq!(ns.lookup(right, "after").await.unwrap().ino, before.ino);
+        f.proxy.clear();
+        assert_eq!(ns.read(fh, 0, 31).await.unwrap(), body.slice(..31));
+        let requests = f.proxy.seen();
+        assert!(!requests.iter().any(|r| r.contains("x-voidfs-list") || r.contains("x-voidfs-deleted")), "{requests:?}");
+        assert_eq!(ns.handle_attr(fh).unwrap(), before);
+        ns.close(fh).await.unwrap();
+    }
+}
+
+struct MissingFetcher { calls: std::sync::atomic::AtomicUsize }
+
+impl Fetch for MissingFetcher {
+    fn fetch<'a>(&'a self, _c: &'a Content, _offset: u64, _len: u64) -> futures::future::BoxFuture<'a, voidfs_client::Result<Bytes>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(voidfs_sdk::Error::Service(voidfs_sdk::ServiceError { status: 404, code: "NoSuchVersion".into(), message: String::new(),
+                request_id: None, current_version_id: None, retry_after: None }).into())
+        })
+    }
+}
+
+async fn missing_session(f: &Fixture) -> (Session, Arc<MissingFetcher>, u64) {
+    let fetcher = Arc::new(MissingFetcher { calls: Default::default() });
+    let cache = Cache::open(f.store.clone(), fetcher.clone(), config(0)).await.unwrap();
+    let ns = Session::new(f.store.clone(), f.client.clone(), cache, "drv", f.connectivity.clone()).await.unwrap();
+    let fh = ns.open(ns.lookup(ns.root(), "file").await.unwrap().ino, false).await.unwrap();
+    (ns, fetcher, fh)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_version_at_its_resolved_key_stops_after_one_scan() {
+    let f = Fixture::new(Backend::Api, 0).await;
+    f.put("file", Bytes::from_static(b"bytes")).await;
+    let (ns, fetcher, fh) = missing_session(&f).await;
+    f.proxy.clear();
+    let error = ns.read(fh, 0, 1).await.unwrap_err();
+    assert_eq!(error, FsError::Stale);
+    assert_eq!(error.errno(), libc::ESTALE);
+    assert_eq!(fetcher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(f.proxy.seen().len(), 3, "one stable root/deleted/root scan: {:?}", f.proxy.seen());
+    ns.close(fh).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unseen_move_beyond_the_scan_budget_returns_again() {
+    for backend in [Backend::Api, Backend::Bucket] {
+        let f = Fixture::new(backend, 0).await;
+        let body = bytes_of(14, 101);
+        f.put("file", body.clone()).await;
+        for i in 0..20 { f.put(&format!("dir{i:02}/"), Bytes::new()).await; }
+        let ns = f.session().await;
+        let before = ns.lookup(ns.root(), "file").await.unwrap();
+        let fh = ns.open(before.ino, false).await.unwrap();
+        f.remote.rename("drv", "file", "dir19/moved", Default::default()).await.unwrap();
+        f.proxy.clear();
+        let error = ns.read(fh, 0, 31).await.unwrap_err();
+        assert_eq!(error, FsError::Again);
+        assert_eq!(error.errno(), libc::EAGAIN);
+        let requests = f.proxy.seen();
+        assert_eq!(requests.iter().filter(|r| r.contains("x-voidfs-list") || r.contains("x-voidfs-deleted")).count(), 16, "{requests:?}");
+        ns.invalidate(&changes(&["file", "dir19/moved"])).await.unwrap();
+        let dir = ns.lookup(ns.root(), "dir19").await.unwrap().ino;
+        assert_eq!(ns.lookup(dir, "moved").await.unwrap().ino, before.ino);
+        f.proxy.clear();
+        assert_eq!(ns.read(fh, 0, 31).await.unwrap(), body.slice(..31));
+        assert!(!f.proxy.seen().iter().any(|r| r.contains("x-voidfs-deleted")));
+        ns.close(fh).await.unwrap();
+    }
+}
+
+struct MovingMissingFetcher { remote: Client, calls: std::sync::atomic::AtomicUsize }
+
+impl Fetch for MovingMissingFetcher {
+    fn fetch<'a>(&'a self, c: &'a Content, _offset: u64, _len: u64) -> futures::future::BoxFuture<'a, voidfs_client::Result<Bytes>> {
+        Box::pin(async move {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let parent = c.key.rsplit_once('/').map(|(parent, _)| format!("{parent}/")).unwrap_or_default();
+            self.remote.rename("drv", &c.key, &format!("{parent}moved{n}"), Default::default()).await?;
+            Err(voidfs_sdk::Error::Service(voidfs_sdk::ServiceError { status: 404, code: "NoSuchVersion".into(), message: String::new(),
+                request_id: None, current_version_id: None, retry_after: None }).into())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_read_relocations_share_one_scan_budget() {
+    let f = Fixture::new(Backend::Api, 0).await;
+    f.put("a/", Bytes::new()).await;
+    f.put("z/file", Bytes::from_static(b"bytes")).await;
+    let fetcher = Arc::new(MovingMissingFetcher { remote: f.remote.clone(), calls: Default::default() });
+    let cache = Cache::open(f.store.clone(), fetcher.clone(), config(0)).await.unwrap();
+    let ns = Session::new(f.store.clone(), f.client.clone(), cache, "drv", f.connectivity.clone()).await.unwrap();
+    let z = ns.lookup(ns.root(), "z").await.unwrap().ino;
+    let fh = ns.open(ns.lookup(z, "file").await.unwrap().ino, false).await.unwrap();
+    f.proxy.clear();
+    assert_eq!(ns.read(fh, 0, 1).await.unwrap_err(), FsError::Again);
+    assert_eq!(fetcher.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(f.proxy.seen().len(), 16, "each completed search costs five calls, all relocations share sixteen: {:?}", f.proxy.seen());
+    ns.close(fh).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_read_relocations_share_the_resolution_time_budget() {
+    let f = Fixture::new(Backend::Api, 0).await;
+    f.put("file", Bytes::from_static(b"bytes")).await;
+    let fetcher = Arc::new(MovingMissingFetcher { remote: f.remote.clone(), calls: Default::default() });
+    let cache = Cache::open(f.store.clone(), fetcher.clone(), config(0)).await.unwrap();
+    let ns = Session::new(f.store.clone(), f.client.clone(), cache, "drv", f.connectivity.clone()).await.unwrap();
+    let fh = ns.open(ns.lookup(ns.root(), "file").await.unwrap().ino, false).await.unwrap();
+    f.proxy.slow(Duration::from_millis(400));
+    assert_eq!(tokio::time::timeout(Duration::from_secs(10), ns.read(fh, 0, 1)).await.unwrap().unwrap_err(), FsError::Again);
+    assert!(fetcher.calls.load(std::sync::atomic::Ordering::SeqCst) < 4, "three delayed listing calls per relocation must consume the shared time budget before all four fetches");
+    ns.close(fh).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_namespace_refresh_and_fallback_resolution_return_again() {
+    for invalidate in [false, true] {
+        let f = Fixture::new(Backend::Api, 0).await;
+        f.put("file", Bytes::from_static(b"bytes")).await;
+        let (ns, _, fh) = missing_session(&f).await;
+        if invalidate { ns.invalidate(&changes(&["file"])).await.unwrap(); }
+        f.proxy.clear();
+        f.proxy.slow(Duration::from_secs(30));
+        let error = tokio::time::timeout(Duration::from_secs(10), ns.read(fh, 0, 1)).await.expect("resolution has its own deadline").unwrap_err();
+        assert_eq!(error, FsError::Again);
+        assert_eq!(f.proxy.seen().len(), 1, "only the outstanding listing was sent");
+        ns.close(fh).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reads_clamp_at_eof_and_handle_empty_zero_length_and_overflowing_ranges() {
     for backend in [Backend::Api, Backend::Bucket] {
         let f = Fixture::new(backend, 0).await;
@@ -473,6 +649,28 @@ async fn a_moved_snapshot_relocates_when_a_replacement_at_its_old_key_has_a_diff
     // check then reports Changed at the replacement's key, rather than NoSuchVersion.
     assert_eq!(ns.read(fh, 0, u64::MAX).await.unwrap(), body);
     assert_eq!(ns.handle_attr(fh).unwrap(), before);
+    ns.close(fh).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_key_uses_the_namespace_before_scanning_for_a_mismatch() {
+    let f = Fixture::new(Backend::Api, 0).await;
+    let body = bytes_of(15, 101);
+    f.put("before", body.clone()).await;
+    let fetcher = Arc::new(ChangedAtOriginalKey { api: ApiFetcher::new(f.client.clone()).with_connectivity(f.connectivity.clone()) });
+    let cache = Cache::open(f.store.clone(), fetcher, config(0)).await.unwrap();
+    let ns = Session::new(f.store.clone(), f.client.clone(), cache, "drv", f.connectivity.clone()).await.unwrap();
+    let before = ns.lookup(ns.root(), "before").await.unwrap();
+    let fh = ns.open(before.ino, false).await.unwrap();
+    f.remote.rename("drv", "before", "after", Default::default()).await.unwrap();
+    f.put("before", Bytes::from_static(b"replacement")).await;
+    ns.invalidate(&changes(&["before", "after"])).await.unwrap();
+    f.proxy.clear();
+    assert_eq!(ns.read(fh, 0, 101).await.unwrap(), body);
+    assert_eq!(ns.handle_attr(fh).unwrap(), before);
+    let requests = f.proxy.seen();
+    assert!(!requests.iter().any(|r| r.contains("x-voidfs-deleted")), "{requests:?}");
+    assert_eq!(requests.iter().filter(|r| r.contains("x-voidfs-list")).count(), 1, "{requests:?}");
     ns.close(fh).await.unwrap();
 }
 
