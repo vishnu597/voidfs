@@ -15,7 +15,7 @@ pub type BatchId = i64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Op {
-    /// The whole file, from staged bytes or a file of the user's (an import).
+    /// The whole file, from staged bytes, an import, or a new empty mount file.
     Put,
     /// Bytes at an offset.
     Write,
@@ -200,7 +200,7 @@ pub(crate) struct Entry {
     pub key: String,
     pub op: Op,
     pub base: StoredBase,
-    /// The bytes of a put or a write.
+    /// The bytes of a put or a write; absent only for a new empty mount put.
     pub source: Option<PathBuf>,
     /// Whether `source` is the journal's own copy, deleted once the entry is finished.
     pub staged: bool,
@@ -223,6 +223,10 @@ pub(crate) struct Entry {
     pub error: Option<String>,
     pub upload_id: Option<String>,
     pub created: i64,
+    /// Mount edits preserve a competing remote version instead of retrying without a guard.
+    pub mount: bool,
+    /// The local inode whose next mutation uses this entry's published version.
+    pub mount_ino: Option<u64>,
 }
 
 impl Entry {
@@ -251,6 +255,8 @@ impl Entry {
             error: None,
             upload_id: None,
             created: now_ms(),
+            mount: false,
+            mount_ino: None,
         }
     }
 
@@ -264,7 +270,7 @@ pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-const COLUMNS: &str = "id, drive, key, op, base, source, staged, stamp, pos, length, to_key, overwrite, attrs, batch, state, paused, sent, size, version, conflict, error, upload_id, created";
+const COLUMNS: &str = "id, drive, key, op, base, source, staged, stamp, pos, length, to_key, overwrite, attrs, batch, state, paused, sent, size, version, conflict, error, upload_id, created, mount, mount_ino";
 
 fn from_row(r: &Row) -> rusqlite::Result<Entry> {
     let attrs: Option<String> = r.get(12)?;
@@ -293,6 +299,8 @@ fn from_row(r: &Row) -> rusqlite::Result<Entry> {
         error: r.get(20)?,
         upload_id: r.get(21)?,
         created: r.get(22)?,
+        mount: r.get(23)?,
+        mount_ino: r.get(24)?,
     })
 }
 
@@ -300,8 +308,8 @@ fn from_row(r: &Row) -> rusqlite::Result<Entry> {
 pub(crate) fn insert(c: &Connection, e: &mut Entry) -> rusqlite::Result<()> {
     let attrs = (!e.attrs.is_empty()).then(|| serde_json::to_string(&e.attrs).unwrap_or_default());
     c.execute(
-        "INSERT INTO entries(drive, key, op, base, source, staged, stamp, pos, length, to_key, overwrite, attrs, batch, state, paused, sent, size, created)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16, ?17)",
+        "INSERT INTO entries(drive, key, op, base, source, staged, stamp, pos, length, to_key, overwrite, attrs, batch, state, paused, sent, size, created, mount, mount_ino)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16, ?17, ?18, ?19)",
         params![
             e.drive,
             e.key,
@@ -320,6 +328,8 @@ pub(crate) fn insert(c: &Connection, e: &mut Entry) -> rusqlite::Result<()> {
             e.paused,
             e.size as i64,
             e.created,
+            e.mount,
+            e.mount_ino,
         ],
     )?;
     e.id = c.last_insert_rowid();

@@ -7,7 +7,8 @@
 //! - one key's changes in order, and a folder's after what was under it; other keys at once, up
 //!   to 16 (SpaceFS's default);
 //! - a put with the writes after it as one put, writes alone as one patch;
-//! - each guarded by the version it was based on, with the `412` rule ([`crate::publish`]);
+//! - each guarded by the version it was based on, with the `412` rule ([`crate::publish`]); mount
+//!   edits preserve the competing remote version for reconciliation;
 //! - pausable and cancellable for everything, a drive, a batch or one entry, and resumed after a
 //!   restart, a multipart upload with the parts it had;
 //! - within an upload bandwidth limit that applies at once ([`Queue::set_bandwidth`]);
@@ -17,6 +18,7 @@
 //! Imports ([`Queue::import`]) are files of the user's, read where they are when they publish,
 //! with their modification time, permission bits and extended attributes.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +28,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore};
+use unicode_normalization::UnicodeNormalization;
 use voidfs_sdk::{Bandwidth, Client};
 
 use crate::connectivity::{Connectivity, Link};
@@ -216,10 +219,16 @@ fn under(key: &str, prefix: &str) -> bool {
     prefix.ends_with('/') && key.starts_with(prefix)
 }
 
-/// Whether entry `a`, earlier, must finish before `b` may start: they touch a key in common,
-/// or one is a folder the other is in.
+/// Whether entry `a`, earlier, must finish before `b` may start: they touch the same name
+/// (including a file replaced by a folder), or one is a folder the other is in. Mount
+/// dependencies include equivalent Unicode spellings; ordinary queue keys remain byte-exact.
 fn depends(a: &Entry, b: &Entry) -> bool {
-    a.drive == b.drive && a.keys().any(|ka| b.keys().any(|kb| ka == kb || under(ka, kb) || under(kb, ka)))
+    a.drive == b.drive && a.keys().any(|ka| b.keys().any(|kb| {
+        let mount = a.mount || b.mount;
+        let ka = if mount { Cow::Owned(ka.nfc().collect::<String>()) } else { Cow::Borrowed(ka) };
+        let kb = if mount { Cow::Owned(kb.nfc().collect::<String>()) } else { Cow::Borrowed(kb) };
+        ka.trim_end_matches('/') == kb.trim_end_matches('/') || under(&ka, &kb) || under(&kb, &ka)
+    }))
 }
 
 impl Queue {
@@ -305,6 +314,67 @@ impl Queue {
 
     // -----------------------------------------------------------------------------------------
     // The journal: each call returns once its change is durable.
+
+    pub(crate) fn uses_store(&self, store: &Arc<Store>) -> bool {
+        Arc::ptr_eq(&self.0.store, store)
+    }
+
+    /// Makes namespace changes and their journal entries durable together. Holding the queue
+    /// lock across the commit keeps the publisher from observing only half of a local edit.
+    pub(crate) async fn mount_transaction<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> crate::mount::Result<(T, Vec<Entry>)> + Send + 'static,
+    ) -> crate::mount::Result<T> {
+        let this = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut st = this.st();
+            if st.closed {
+                return Err(crate::mount::FsError::Io("the upload queue is closed".into()));
+            }
+            let committed = this.0.store.with(|c| {
+                let tx = c.transaction()?;
+                let (value, mut entries) = match f(&tx) {
+                    Ok(result) => result,
+                    Err(err) => return Ok(Err(err)),
+                };
+                for i in 0..entries.len() {
+                    let (earlier, rest) = entries.split_at_mut(i);
+                    let e = &mut rest[0];
+                    e.mount = true;
+                    // A new inode must check absence even when an older inode occupied this
+                    // key. Its ordering dependency is independent of its version guard.
+                    if !matches!(e.base, StoredBase::Absent | StoredBase::Entry(_)) {
+                        let prev = earlier.iter().rev().chain(st.pending.values().rev()).find(|p| {
+                            p.drive == e.drive && (p.to_key.as_deref() == Some(&e.key) || p.key == e.key && p.op != Op::Delete && p.op != Op::Rename)
+                        });
+                        if let Some(prev) = prev {
+                            e.base = StoredBase::Entry(prev.id);
+                        }
+                    }
+                    journal::insert(&tx, e)?;
+                    if let Some(ino) = e.mount_ino {
+                        let updated = tx.execute("UPDATE mount_inodes SET entry_id=?2 WHERE ino=?1 AND drive=?3", rusqlite::params![ino, e.id, e.drive])?;
+                        if updated != 1 {
+                            return Ok(Err(crate::mount::FsError::Stale));
+                        }
+                    }
+                }
+                tx.commit()?;
+                Ok(Ok((value, entries)))
+            }).map_err(crate::mount::FsError::from)??;
+            let (value, entries) = committed;
+            for e in entries {
+                st.pending.insert(e.id, e);
+            }
+            st.idle = false;
+            Ok(value)
+        }).await.map_err(crate::Error::from).map_err(crate::mount::FsError::from)?;
+        if result.is_ok() {
+            self.0.wake.notify_one();
+            self.0.changed.notify_waiters();
+        }
+        result
+    }
 
     /// The whole file.
     pub async fn put(&self, drive: &str, key: &str, data: Bytes, base: Base, attrs: Attrs) -> Result<EntryId> {
@@ -577,7 +647,13 @@ impl Queue {
         let store = self.0.store.clone();
         blocking(move || {
             store.with(|c| {
-                c.execute("DELETE FROM entries WHERE state IN ('done', 'cancelled')", [])?;
+                // Retain every base reachable from unfinished changes: they still need the
+                // version a completed predecessor received, including after a restart.
+                c.execute("WITH RECURSIVE needed(id) AS (
+                    SELECT id FROM entries WHERE state NOT IN ('done', 'cancelled')
+                    UNION SELECT entry_id FROM mount_inodes WHERE entry_id IS NOT NULL
+                    UNION SELECT CAST(substr(e.base, 3) AS INTEGER) FROM entries e JOIN needed n ON e.id=n.id WHERE e.base LIKE 'e:%')
+                    DELETE FROM entries WHERE state IN ('done', 'cancelled') AND id NOT IN (SELECT id FROM needed)", [])?;
                 c.execute("DELETE FROM batches WHERE id NOT IN (SELECT batch FROM entries WHERE batch IS NOT NULL)", []).map(drop)
             })
         })
@@ -765,7 +841,7 @@ impl Queue {
                     if !depends(e, n) {
                         continue;
                     }
-                    let fits = n.drive == e.drive && n.key == e.key && matches!(n.op, Op::Write | Op::Truncate) && !st.paused(n) && n.state == State::Queued && n.batch == e.batch;
+                    let fits = n.drive == e.drive && n.key == e.key && matches!(n.op, Op::Write | Op::Truncate) && !st.paused(n) && n.state == State::Queued && n.batch == e.batch && n.mount == e.mount;
                     // A patch's truncate goes last: writes after it start a run of their own.
                     let after_truncate = e.op != Op::Put && run.last().is_some_and(|l: &Entry| l.op == Op::Truncate);
                     if !fits || after_truncate || body + n.size > 64 * MIB || run.len() >= 10_000 {
@@ -788,17 +864,21 @@ impl Queue {
     }
 
     /// The guard of an entry: the version its base is, or got.
-    fn guard(&self, base: &StoredBase) -> Result<Guard> {
+    fn guard(&self, base: &StoredBase, mount: bool) -> Result<Guard> {
         let mut base = base.clone();
+        let mut seen = HashSet::new();
         loop {
             match base {
                 StoredBase::Any => return Ok(Guard::None),
                 StoredBase::Absent => return Ok(Guard::Absent),
                 StoredBase::Version(v) => return Ok(Guard::Version(v)),
                 StoredBase::Entry(id) => match self.0.store.with(|c| journal::get(c, id))? {
+                    _ if !seen.insert(id) => return Err(crate::Error::Invalid("a journal base contains a cycle".into())),
+                    Some(e) if mount && e.state == State::Done && e.version.is_none() => return Err(crate::Error::Invalid("the mount edit's base has no known published version".into())),
                     Some(e) if e.state == State::Done => return Ok(e.version.map_or(Guard::None, Guard::Version)),
                     // Cancelled: whatever it was based on.
                     Some(e) => base = e.base,
+                    None if mount => return Err(crate::Error::Invalid("the mount edit's base is missing".into())),
                     None => return Ok(Guard::None),
                 },
             }
@@ -808,8 +888,9 @@ impl Queue {
     async fn run(&self, run: Vec<Entry>, r: Arc<Running>, may_have_landed: bool) {
         let this = self.clone();
         let base = run[0].base.clone();
+        let mount = run[0].mount;
         let upload_id = Arc::new(Mutex::new(run[0].upload_id.clone()));
-        let outcome = match blocking(move || this.guard(&base)).await {
+        let outcome = match blocking(move || this.guard(&base, mount)).await {
             Ok(guard) => {
                 let ctx = Ctx {
                     client: self.0.client.clone(),
@@ -986,5 +1067,247 @@ mod tests {
         let mut other = entry("a/x", None);
         other.drive = "e".into();
         assert!(!depends(&put, &other), "another drive");
+    }
+
+    fn client(endpoint: &str) -> Client {
+        Client::new(voidfs_sdk::Config { endpoint: endpoint.to_owned(), access_key_id: voidfs_server::test_server::ADMIN_KEY_ID.into(),
+            secret_access_key: voidfs_server::test_server::ADMIN_SECRET.into(), ..Default::default() }).unwrap()
+    }
+
+    async fn paused(dir: &Path) -> Queue {
+        let store = Arc::new(Store::open(dir).unwrap());
+        store.set_meta("paused", "1").unwrap();
+        Queue::open(store, client("http://127.0.0.1:1"), QueueConfig::default()).await.unwrap()
+    }
+
+    fn local_inode(tx: &rusqlite::Transaction<'_>) -> crate::mount::Result<u64> {
+        tx.execute("INSERT INTO mount_inodes(drive, attrs) VALUES ('d', '{}')", []).map_err(crate::Error::from)?;
+        Ok(tx.last_insert_rowid() as u64)
+    }
+
+    #[tokio::test]
+    async fn mount_edits_commit_namespace_journal_and_lineage_together_and_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let ino;
+        let first;
+        {
+            let q = paused(dir.path()).await;
+            assert!(q.uses_store(q.store()));
+            let other_dir = tempfile::tempdir().unwrap();
+            assert!(!q.uses_store(&Arc::new(Store::open(other_dir.path()).unwrap())));
+            ino = q.mount_transaction(|tx| {
+                let ino = local_inode(tx)?;
+                let mut create = Entry::new("d", "file", Op::Put, StoredBase::Absent);
+                create.mount_ino = Some(ino);
+                let mut attrs = Entry::new("d", "file", Op::Attrs, StoredBase::Any);
+                attrs.mount_ino = Some(ino);
+                Ok((ino, vec![create, attrs]))
+            }).await.unwrap();
+            let entries = q.store().with(|c| journal::all(c)).unwrap();
+            assert_eq!(entries.len(), 2);
+            first = entries[0].id;
+            assert_eq!(entries[0].base, StoredBase::Absent);
+            assert_eq!(entries[1].base, StoredBase::Entry(first));
+            assert!(entries.iter().all(|e| e.mount && e.mount_ino == Some(ino) && e.source.is_none()));
+            assert_eq!(q.st().pending.len(), 2);
+            let last: EntryId = q.store().with(|c| c.query_row("SELECT entry_id FROM mount_inodes WHERE ino=?1", [ino], |r| r.get(0))).unwrap();
+            assert_eq!(last, entries[1].id);
+            q.close().await;
+        }
+        let q = paused(dir.path()).await;
+        let entries = q.store().with(|c| journal::all(c)).unwrap();
+        assert_eq!(entries[0].id, first);
+        assert_eq!(entries[1].base, StoredBase::Entry(first));
+        assert_eq!(entries[1].mount_ino, Some(ino));
+        assert_eq!(q.status().await.unwrap().unpublished, 2);
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn mount_transaction_rolls_back_semantic_and_journal_failures_without_queue_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = paused(dir.path()).await;
+        let result: crate::mount::Result<()> = q.mount_transaction(|tx| {
+            local_inode(tx)?;
+            Err(crate::mount::FsError::Exists)
+        }).await;
+        assert_eq!(result, Err(crate::mount::FsError::Exists));
+        q.store().with(|c| c.execute_batch("CREATE TRIGGER reject_journal BEFORE INSERT ON entries WHEN NEW.key='refuse' BEGIN SELECT RAISE(ABORT, 'injected journal failure'); END")).unwrap();
+        let result: crate::mount::Result<()> = q.mount_transaction(|tx| {
+            let ino = local_inode(tx)?;
+            let mut first = Entry::new("d", "accepted", Op::Put, StoredBase::Absent);
+            first.mount_ino = Some(ino);
+            let mut second = Entry::new("d", "refuse", Op::Folder, StoredBase::Absent);
+            second.mount_ino = Some(ino);
+            Ok(((), vec![first, second]))
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(q.store().with(|c| c.query_row("SELECT count(*) FROM mount_inodes", [], |r| r.get::<_, u64>(0))).unwrap(), 0);
+        assert!(q.store().with(|c| journal::all(c)).unwrap().is_empty());
+        assert!(q.st().pending.is_empty());
+        let result: crate::mount::Result<()> = q.mount_transaction(|tx| {
+            local_inode(tx)?;
+            let mut e = Entry::new("d", "missing-inode", Op::Put, StoredBase::Absent);
+            e.mount_ino = Some(u64::MAX >> 1);
+            Ok(((), vec![e]))
+        }).await;
+        assert_eq!(result, Err(crate::mount::FsError::Stale));
+        assert_eq!(q.store().with(|c| c.query_row("SELECT count(*) FROM mount_inodes", [], |r| r.get::<_, u64>(0))).unwrap(), 0);
+        assert!(q.store().with(|c| journal::all(c)).unwrap().is_empty());
+        q.close().await;
+        assert_eq!(q.mount_transaction(|_| Ok(((), Vec::new()))).await, Err(crate::mount::FsError::Io("the upload queue is closed".into())));
+    }
+
+    #[tokio::test]
+    async fn mount_opposite_kind_recreations_wait_for_previous_occupants_to_leave() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = paused(dir.path()).await;
+        q.mount_transaction(|_| {
+            let mut renamed = Entry::new("d", "renamed", Op::Rename, StoredBase::Version("base".into()));
+            renamed.to_key = Some("destination".into());
+            let mut replacement = Entry::new("d", "replace-source", Op::Rename, StoredBase::Version("base".into()));
+            replacement.to_key = Some("café".into());
+            let mut folder_rename = Entry::new("d", "re\u{301}pertoire/", Op::Rename, StoredBase::Version("base".into()));
+            folder_rename.to_key = Some("de\u{301}place\u{301}/".into());
+            Ok(((), vec![Entry::new("d", "file", Op::Delete, StoredBase::Version("base".into())),
+                Entry::new("d", "file/", Op::Folder, StoredBase::Absent),
+                Entry::new("d", "folder/", Op::Delete, StoredBase::Version("base".into())),
+                Entry::new("d", "folder", Op::Put, StoredBase::Absent),
+                renamed, Entry::new("d", "renamed/", Op::Folder, StoredBase::Absent),
+                Entry::new("d", "cafe\u{301}", Op::Delete, StoredBase::Version("base".into())), replacement,
+                folder_rename, Entry::new("d", "répertoire/source-child", Op::Delete, StoredBase::Version("base".into())),
+                Entry::new("d", "déplacé/destination-child", Op::Put, StoredBase::Absent)]))
+        }).await.unwrap();
+        // Inspect the actual scheduler with a running queue's durable entries, without
+        // allowing the background publisher to race the deterministic selection.
+        let mut state = QState { pending: q.st().pending.clone(), ..Default::default() };
+        let (runs, retry) = q.select(&mut state);
+        let selected: Vec<_> = runs.iter().map(|run| (run[0].key.as_str(), run[0].op)).collect();
+        assert_eq!(selected, [("file", Op::Delete), ("folder/", Op::Delete), ("renamed", Op::Rename),
+            ("cafe\u{301}", Op::Delete), ("re\u{301}pertoire/", Op::Rename)]);
+        assert!(retry.is_none());
+        assert!(state.pending.values().filter(|e| matches!(e.op, Op::Put | Op::Folder)).all(|e| e.state == State::Queued && e.base == StoredBase::Absent));
+        let cli_nfd = Entry::new("d", "cafe\u{301}/", Op::Delete, StoredBase::Any);
+        let mut cli_nfc = Entry::new("d", "café/child", Op::Put, StoredBase::Any);
+        assert!(!depends(&cli_nfd, &cli_nfc), "CLI-only dependencies retain raw Unicode spellings");
+        cli_nfc.mount = true;
+        assert!(depends(&cli_nfd, &cli_nfc), "a mount child conservatively waits for an equivalent CLI ancestor");
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn mount_new_inodes_keep_absence_guards_and_existing_lineage_survives_clear_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = paused(dir.path()).await;
+        q.delete("d", "file", Base::Version("old".into())).await.unwrap();
+        q.mount_transaction(|tx| {
+            let ino = local_inode(tx)?;
+            let mut e = Entry::new("d", "file", Op::Put, StoredBase::Absent);
+            e.mount_ino = Some(ino);
+            Ok(((), vec![e]))
+        }).await.unwrap();
+        let create = q.store().with(|c| journal::all(c)).unwrap().pop().unwrap();
+        assert_eq!(create.base, StoredBase::Absent, "a recreated inode is not based on the deleted inode");
+        q.store().with(|c| {
+            let mut e = create.clone();
+            e.state = State::Done;
+            e.version = Some("new".into());
+            journal::update(c, &e)
+        }).unwrap();
+        q.clear_finished().await.unwrap();
+        assert_eq!(q.guard(&StoredBase::Entry(create.id), true).unwrap(), Guard::Version("new".into()));
+        let ino = create.mount_ino.unwrap();
+        q.mount_transaction(move |_| {
+            let mut e = Entry::new("d", "file", Op::Rename, StoredBase::Entry(create.id));
+            e.mount_ino = Some(ino);
+            e.to_key = Some("moved".into());
+            Ok(((), vec![e]))
+        }).await.unwrap();
+        let rename = q.store().with(|c| journal::all(c)).unwrap().pop().unwrap();
+        q.mount_transaction(|tx| {
+            let ino = local_inode(tx)?;
+            let mut e = Entry::new("d", "file", Op::Put, StoredBase::Absent);
+            e.mount_ino = Some(ino);
+            Ok(((), vec![e]))
+        }).await.unwrap();
+        let recreated = q.store().with(|c| journal::all(c)).unwrap().pop().unwrap();
+        assert_eq!(recreated.base, StoredBase::Absent, "the renamed inode's version does not guard its replacement");
+        assert!(depends(&rename, &recreated));
+        q.mount_transaction(move |_| {
+            let mut e = Entry::new("d", "moved", Op::Attrs, StoredBase::Entry(rename.id));
+            e.mount_ino = Some(ino);
+            Ok(((), vec![e]))
+        }).await.unwrap();
+        let attrs = q.store().with(|c| journal::all(c)).unwrap().pop().unwrap();
+        assert_eq!(attrs.base, StoredBase::Entry(rename.id));
+        assert!(depends(&rename, &attrs), "a rename's destination waits for its source publish");
+        q.store().with(|c| {
+            let mut e = rename.clone();
+            e.state = State::Done;
+            e.version = Some("renamed".into());
+            journal::update(c, &e)
+        }).unwrap();
+        q.clear_finished().await.unwrap();
+        assert_eq!(q.guard(&attrs.base, true).unwrap(), Guard::Version("renamed".into()));
+        assert!(q.store().with(|c| journal::get(c, create.id)).unwrap().is_some(), "transitive lineage remains available");
+        assert!(q.guard(&StoredBase::Entry(i64::MAX), true).is_err(), "missing lineage never silently removes a guard");
+        q.store().with(|c| {
+            let mut e = rename.clone();
+            e.state = State::Done;
+            e.version = None;
+            journal::update(c, &e)
+        }).unwrap();
+        assert!(q.guard(&attrs.base, true).is_err(), "a recovered rename without a known version never silently removes a guard");
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn empty_mount_files_publish_and_mount_conflicts_preserve_competing_objects() {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let client = client(&server.endpoint);
+        client.create_drive("drv", Default::default()).await.unwrap();
+        let mut stale = Vec::new();
+        for key in ["rename", "delete", "attrs"] {
+            let base = client.put_object("drv", key, "before", Default::default()).await.unwrap().version_id;
+            client.put_object("drv", key, "competing", Default::default()).await.unwrap();
+            stale.push((key.to_owned(), base));
+        }
+        client.put_object("drv", "occupied", "competing", Default::default()).await.unwrap();
+        client.put_object("drv", "folder/", Bytes::new(), Default::default()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.set_meta("paused", "1").unwrap();
+        store.with(|c| journal::insert(c, &mut Entry::new("drv", "missing-cli-source", Op::Put, StoredBase::Any))).unwrap();
+        let q = Queue::open(store, client.clone(), QueueConfig::default()).await.unwrap();
+        q.mount_transaction(move |_| {
+            let mut entries = vec![Entry::new("drv", "empty", Op::Put, StoredBase::Absent),
+                Entry::new("drv", "occupied", Op::Put, StoredBase::Absent), Entry::new("drv", "folder/", Op::Folder, StoredBase::Absent)];
+            let mut missing = Entry::new("drv", "missing-mount-source", Op::Put, StoredBase::Absent);
+            missing.size = 1;
+            entries.push(missing);
+            for (key, version) in stale {
+                let op = match key.as_str() { "rename" => Op::Rename, "delete" => Op::Delete, _ => Op::Attrs };
+                let mut e = Entry::new("drv", &key, op, StoredBase::Version(version));
+                if op == Op::Rename { e.to_key = Some("renamed".into()); }
+                if op == Op::Attrs { e.attrs.mode = Some(0o600); }
+                entries.push(e);
+            }
+            Ok(((), entries))
+        }).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        q.settle().await;
+        let status = q.status().await.unwrap();
+        assert_eq!(status.items.iter().find(|i| i.key == "empty").unwrap().state, State::Done);
+        assert_eq!(client.get_object("drv", "empty", Default::default()).await.unwrap().body, Bytes::new());
+        assert!(status.items.iter().filter(|i| i.key != "empty").all(|i| i.state == State::Failed && i.conflict.is_none()), "{:?}", status.items);
+        for key in ["occupied", "rename", "delete", "attrs"] {
+            assert_eq!(client.get_object("drv", key, Default::default()).await.unwrap().body.as_ref(), b"competing");
+        }
+        assert_eq!(client.head_object("drv", "renamed", Default::default()).await.unwrap_err().status(), Some(404));
+        for key in ["missing-cli-source", "missing-mount-source"] {
+            assert_eq!(client.head_object("drv", key, Default::default()).await.unwrap_err().status(), Some(404), "missing bytes never become an empty object");
+        }
+        assert_eq!(client.list_versions("drv", "folder/", false).await.unwrap().len(), 1, "guarded mkdir does not replace a competing folder");
+        q.close().await;
     }
 }

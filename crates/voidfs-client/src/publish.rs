@@ -4,7 +4,9 @@
 //!
 //! **The `412` rule** (item 3's design): when the object changed since the change was based on
 //! it, the local version is published anyway, since every version stays in the history, and the
-//! conflict is recorded. A put first checks whether the version it collided with is its own,
+//! conflict is recorded. Mount edits instead keep their guard and fail for reconciliation,
+//! preserving both the competing remote version and the local overlay. A put first checks
+//! whether the version it collided with is its own,
 //! written by an attempt whose answer was lost: each put carries a marker naming its entry.
 
 use std::collections::BTreeMap;
@@ -168,12 +170,15 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 /// one change of another kind.
 pub(crate) async fn publish(ctx: &Ctx, run: &[Entry], guard: Guard) -> Outcome {
     let first = &run[0];
+    if first.mount && (guard == Guard::None || guard == Guard::Absent && !matches!(first.op, Op::Put | Op::Folder)) {
+        return Outcome::Failed { error: "the mount edit has no published base object".into(), transient: false };
+    }
     let r = match first.op {
         Op::Put => put(ctx, run, guard).await,
         Op::Write | Op::Truncate => patch(ctx, run, guard).await,
         Op::Rename => rename(ctx, first, guard).await,
         Op::Delete => delete(ctx, first, guard).await,
-        Op::Folder => folder(ctx, first).await,
+        Op::Folder => folder(ctx, first, guard).await,
         Op::Attrs => attrs(ctx, first, guard).await,
     };
     match r {
@@ -238,22 +243,28 @@ async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
     {
         return done(Some(xattrs_after(ctx, e, &e.attrs, v).await?), None);
     }
-    let src = e.source.clone().ok_or_else(|| Outcome::Failed { error: "a put without bytes".into(), transient: false })?;
-    let size = match blocking(move || Ok(std::fs::metadata(&src)?.len())).await {
-        Ok(n) => n,
-        Err(err) => return Err(Outcome::Failed { error: format!("{}: {err}", e.key), transient: false }),
+    let size = match e.source.clone() {
+        Some(src) => match blocking(move || Ok(std::fs::metadata(&src)?.len())).await {
+            Ok(n) => n,
+            Err(err) => return Err(Outcome::Failed { error: format!("{}: {err}", e.key), transient: false }),
+        },
+        None if e.mount && e.size == 0 => 0,
+        None => return Err(Outcome::Failed { error: "a put without bytes".into(), transient: false }),
     };
     // A new file is new bytes, which an ordinary put sends as fast.
-    if run.len() == 1 && size >= ctx.direct_from && guard != Guard::Absent
+    if run.len() == 1 && size > 0 && size >= ctx.direct_from && guard != Guard::Absent
         && let Some(o) = direct(ctx, e, size, &guard).await?
     {
         return Ok(o);
     }
-    if run.len() == 1 && size >= ctx.multipart_from {
+    if run.len() == 1 && size > 0 && size >= ctx.multipart_from {
         return multipart(ctx, e, size, guard).await;
     }
     // Small enough to hold: the put, with the writes after it applied.
-    let mut body = read_all(e.source.clone().unwrap()).await?;
+    let mut body = match e.source.clone() {
+        Some(src) => read_all(src).await?,
+        None => Vec::new(),
+    };
     for w in &run[1..] {
         apply(&mut body, w).await?;
     }
@@ -268,6 +279,8 @@ async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
             // Our own put, answered after we stopped waiting, or someone else's.
             if let Some(v) = landed(ctx, e).await? {
                 (v, None)
+            } else if e.mount {
+                return Err(err.into());
             } else {
                 let w = ctx.stop.or(ctx.client.put_object(&e.drive, &e.key, body, put_opts(ctx, e, attrs, &Guard::None))).await??;
                 (w.version_id, conflict(&err))
@@ -333,7 +346,7 @@ async fn patch(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
             ctx.sent.store(total, Ordering::Relaxed);
             done(Some(w.version_id), None)
         }
-        Err(err) if is_412(&err) => {
+        Err(err) if is_412(&err) && !e.mount => {
             // The local version is the base with these edits: build it, and put it.
             let base = guard.version().unwrap_or_default();
             let o = ctx.stop.or(ctx.client.get_object(&e.drive, &e.key, ReadOptions { version_id: Some(base), ..Default::default() })).await??;
@@ -353,7 +366,7 @@ async fn rename(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
     let opts = |g: &Guard| RenameOptions { replace: e.replace, if_version: g.version(), if_match: None };
     match ctx.stop.or(ctx.client.rename(&e.drive, &e.key, &to, opts(&guard))).await? {
         Ok(w) => done(Some(w.version_id), None),
-        Err(err) if is_412(&err) => {
+        Err(err) if is_412(&err) && !e.mount => {
             let w = ctx.stop.or(ctx.client.rename(&e.drive, &e.key, &to, opts(&Guard::None))).await??;
             done(Some(w.version_id), conflict(&err))
         }
@@ -367,7 +380,7 @@ async fn delete(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
     let pre = |g: &Guard| Preconditions { if_version: g.version(), if_match: None };
     match ctx.stop.or(ctx.client.delete_object(&e.drive, &e.key, pre(&guard))).await? {
         Ok(v) => done(v, None),
-        Err(err) if is_412(&err) => {
+        Err(err) if is_412(&err) && !e.mount => {
             let v = ctx.stop.or(ctx.client.delete_object(&e.drive, &e.key, pre(&Guard::None))).await??;
             done(v, conflict(&err))
         }
@@ -375,11 +388,35 @@ async fn delete(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
     }
 }
 
-async fn folder(ctx: &Ctx, e: &Entry) -> Step<Outcome> {
-    let key = if e.key.ends_with('/') { e.key.clone() } else { format!("{}/", e.key) };
-    let opts = PutOptions { mtime: e.attrs.mtime.clone(), mode: e.attrs.mode, ..Default::default() };
-    let w = ctx.stop.or(ctx.client.put_object(&e.drive, &key, Bytes::new(), opts)).await??;
-    done(Some(w.version_id), None)
+async fn folder(ctx: &Ctx, entry: &Entry, guard: Guard) -> Step<Outcome> {
+    if !entry.mount {
+        let key = if entry.key.ends_with('/') { entry.key.clone() } else { format!("{}/", entry.key) };
+        let opts = PutOptions { mtime: entry.attrs.mtime.clone(), mode: entry.attrs.mode, ..Default::default() };
+        let w = ctx.stop.or(ctx.client.put_object(&entry.drive, &key, Bytes::new(), opts)).await??;
+        return done(Some(w.version_id), None);
+    }
+    let mut e = entry.clone();
+    if !e.key.ends_with('/') {
+        e.key.push('/');
+    }
+    if ctx.may_have_landed && let Some(v) = landed(ctx, &e).await? {
+        return done(Some(xattrs_after(ctx, &e, &e.attrs, v).await?), None);
+    }
+    let (version, clash) = match ctx.stop.or(ctx.client.put_object(&e.drive, &e.key, Bytes::new(), put_opts(ctx, &e, &e.attrs, &guard))).await? {
+        Ok(w) => (w.version_id, None),
+        Err(err) if is_412(&err) => {
+            if let Some(v) = landed(ctx, &e).await? {
+                (v, None)
+            } else if e.mount {
+                return Err(err.into());
+            } else {
+                let w = ctx.stop.or(ctx.client.put_object(&e.drive, &e.key, Bytes::new(), put_opts(ctx, &e, &e.attrs, &Guard::None))).await??;
+                (w.version_id, conflict(&err))
+            }
+        }
+        Err(err) => return Err(err.into()),
+    };
+    done(Some(xattrs_after(ctx, &e, &e.attrs, version).await?), clash)
 }
 
 async fn attrs(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
@@ -395,7 +432,7 @@ async fn attrs(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
     let pre = |g: &Guard| Preconditions { if_version: g.version(), if_match: None };
     match ctx.stop.or(ctx.client.set_attributes(&e.drive, &e.key, update(), pre(&guard))).await? {
         Ok(w) => done(Some(w.version_id), None),
-        Err(err) if is_412(&err) => {
+        Err(err) if is_412(&err) && !e.mount => {
             let w = ctx.stop.or(ctx.client.set_attributes(&e.drive, &e.key, update(), pre(&Guard::None))).await??;
             done(Some(w.version_id), conflict(&err))
         }
@@ -507,6 +544,7 @@ async fn direct(ctx: &Ctx, e: &Entry, size: u64, guard: &Guard) -> Step<Option<O
         Ok(w) => (w.version_id, None),
         Err(err) if is_412(&err) => match landed(ctx, e).await? {
             Some(v) => (v, None),
+            None if e.mount => return Err(err.into()),
             None => match ctx.stop.or(commit(&Guard::None)).await? {
                 Ok(w) => (w.version_id, conflict(&err)),
                 Err(again) if stands(&again) => return Err(again.into()),
@@ -527,6 +565,9 @@ fn part_size(ctx: &Ctx, size: u64) -> u64 {
 /// A large file in parts. The upload's id and each finished part are recorded as they happen,
 /// so that a publish stopped by a pause or a restart goes on from where it was.
 async fn multipart(ctx: &Ctx, e: &Entry, size: u64, guard: Guard) -> Step<Outcome> {
+    if e.mount && guard == Guard::Absent {
+        return Err(Outcome::Failed { error: "a new mount file needs an absence guard unsupported by multipart completion".into(), transient: false });
+    }
     let src = e.source.clone().unwrap_or_default();
     let ps = part_size(ctx, size);
     let count = size.div_ceil(ps).max(1) as u32;
@@ -605,7 +646,7 @@ async fn multipart(ctx: &Ctx, e: &Entry, size: u64, guard: Guard) -> Step<Outcom
     let guard = if guard == Guard::Absent { Guard::None } else { guard };
     let (version, clash) = match ctx.stop.or(ctx.client.complete_multipart_upload(&e.drive, &e.key, &id, &parts, pre(&guard))).await? {
         Ok(w) => (w.version_id, None),
-        Err(err) if is_412(&err) => {
+        Err(err) if is_412(&err) && !e.mount => {
             let w = ctx.stop.or(ctx.client.complete_multipart_upload(&e.drive, &e.key, &id, &parts, pre(&Guard::None))).await??;
             (w.version_id, conflict(&err))
         }

@@ -831,7 +831,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - **Status (2026-10-04):** items 1–6 of 6 done.
 5. **Writable macOS drive** (Phase 2).
    - The ordered deliverables, adapter/bridge decisions and validation gates are in the
-     [step 5 plan](step-5-macos.md). Its namespace and snapshot-read slices are implemented;
+     [step 5 plan](step-5-macos.md). Its namespace, snapshot-read and local namespace-mutation slices are implemented;
      no writable adapter exists yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
@@ -857,8 +857,13 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      inode's namespace path first; fallback attribute/deleted listings resolve object identity
      within a shared per-read budget of 16 listing calls and a 2-second resolution deadline.
      Budget exhaustion returns `EAGAIN`; a failed `404` key found again returns `ESTALE`.
-     This prerequisite fix precedes slice 3's staged writes. Any future recursive removal represented by one retained
-     parent needs a separate addressing decision for its children. Writes, staged recovery and adapters remain pending.
+     Slice 3 now supplies empty-file create, mkdir, unlink, merged-empty rmdir, rename and binary
+     xattrs in a durable local overlay, atomically journaled with version/absence guards. Paused
+     renames retain their remote base paths; pending names/maps survive feed invalidation and restart.
+     Mount publishes keep their guards on conflict. Remote rename replacement is a guarded delete
+     followed by an exclusive rename, while the local replacement is atomic. Publication reconciliation
+     remains slice 4. Any future recursive removal represented by one retained parent needs a separate
+     addressing decision for its children. Staged file writes, full recovery and adapters remain pending.
      The read-only transport/adapter may proceed alongside writable core slices after the
      snapshot/restart checks and the user's signed-bundle probe. The accepted direction is FSKit first, SMB evaluation on gate
      failure, the Rust daemon/socket with a thin Swift XPC bridge, and verified whole shards

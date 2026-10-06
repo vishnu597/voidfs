@@ -14,6 +14,13 @@ use bytes::Bytes;
 
 use crate::{Cache, Connectivity, Content, Error, Invalidation, Link, Reader, Store};
 
+#[path = "mount_mutations.rs"]
+mod mutations;
+#[path = "mount_xattrs.rs"]
+mod xattrs;
+pub use mutations::RenameMode;
+pub use xattrs::XattrMode;
+
 pub type Ino = u64;
 pub type Fh = u64;
 pub type Result<T> = std::result::Result<T, FsError>;
@@ -65,6 +72,12 @@ pub enum FsError {
     Permission,
     #[error("invalid name")]
     InvalidName,
+    #[error("invalid argument")]
+    InvalidArgument,
+    #[error("extended attribute not found")]
+    NoAttr,
+    #[error("extended attributes exceed the size limit")]
+    TooLarge,
     #[error("ambiguous Unicode name")]
     Ambiguous,
     #[error("namespace changed during enumeration; retry")]
@@ -81,6 +94,11 @@ impl FsError {
             Self::IsDir => libc::EISDIR, Self::NotDir => libc::ENOTDIR, Self::NoSpace => libc::ENOSPC,
             Self::ReadOnly => libc::EROFS, Self::Unsupported => libc::EOPNOTSUPP, Self::Stale => libc::ESTALE,
             Self::Offline => libc::ENETDOWN, Self::Permission => libc::EACCES, Self::InvalidName => libc::EINVAL,
+            Self::InvalidArgument => libc::EINVAL, Self::TooLarge => libc::E2BIG,
+            Self::NoAttr => {
+                #[cfg(target_os = "macos")] { libc::ENOATTR }
+                #[cfg(not(target_os = "macos"))] { libc::ENODATA }
+            },
             Self::Ambiguous => libc::EILSEQ, Self::Again => libc::EAGAIN, Self::BadHandle => libc::EBADF, Self::Io(_) => libc::EIO,
         }
     }
@@ -98,6 +116,10 @@ impl From<Error> for FsError {
     }
 }
 
+impl From<rusqlite::Error> for FsError {
+    fn from(e: rusqlite::Error) -> Self { Error::from(e).into() }
+}
+
 fn sdk_error(e: &voidfs_sdk::Error) -> FsError {
     match e.status() {
         Some(404) => FsError::NotFound, Some(401 | 403) => FsError::Permission,
@@ -106,7 +128,7 @@ fn sdk_error(e: &voidfs_sdk::Error) -> FsError {
     }
 }
 
-struct Node { ino: Ino, entry: FolderEntry, generation: u64, sync: Sync }
+struct Node { ino: Ino, entry: FolderEntry, generation: u64, sync: Sync, entry_id: Option<i64>, remote_key: Option<String> }
 
 impl Node {
     fn attr(&self) -> Result<Attr> {
@@ -129,13 +151,13 @@ fn decode_json(s: &str) -> rusqlite::Result<FolderEntry> {
 }
 
 fn node(c: &Connection, drive: &str, ino: Ino) -> rusqlite::Result<Option<Node>> {
-    c.query_row("SELECT attrs, generation, sync FROM mount_inodes WHERE ino=?1 AND drive=?2", params![ino, drive], |r| {
+    c.query_row("SELECT attrs, generation, sync, entry_id, remote_key FROM mount_inodes WHERE ino=?1 AND drive=?2", params![ino, drive], |r| {
         let sync: String = r.get(2)?;
         let sync = match sync.as_str() {
             "saved" => Sync::Saved, "pending" => Sync::Pending, "saving" => Sync::Saving, "conflict" => Sync::Conflict, "error" => Sync::Error,
             _ => return Err(rusqlite::Error::InvalidQuery),
         };
-        Ok(Node { ino, entry: decode_json(&r.get::<_, String>(0)?)?, generation: r.get(1)?, sync })
+        Ok(Node { ino, entry: decode_json(&r.get::<_, String>(0)?)?, generation: r.get(1)?, sync, entry_id: r.get(3)?, remote_key: r.get(4)? })
     }).optional()
 }
 
@@ -185,6 +207,19 @@ fn affected_inodes(c: &Connection, drive: &str, root: Ino, changes: &[Invalidati
             }
             Invalidation::Object(key) => (key, false), Invalidation::Subtree(key) => (key, true),
         };
+        let mut bases = vec![key.clone()];
+        bases.extend(key.match_indices('/').map(|(end, _)| key[..=end].to_owned()));
+        let prefix = if key.is_empty() { String::new() } else { format!("{}/", key.trim_end_matches('/')) };
+        let end = prefix.strip_suffix('/').map(|p| format!("{p}0"));
+        let mut q = c.prepare("SELECT ino FROM mount_inodes INDEXED BY mount_pending_remote_key
+            WHERE drive=?1 AND sync<>'saved' AND remote_key IN (SELECT value FROM json_each(?2))
+            UNION SELECT ino FROM mount_inodes INDEXED BY mount_pending_remote_key
+            WHERE drive=?1 AND sync<>'saved' AND ?3 AND remote_key>=?4 AND (?5 IS NULL OR remote_key<?5)")?;
+        let origins = q.query_map(params![drive, serde_json::to_string(&bases).expect("JSON"), subtree, prefix, end], |r| r.get::<_, Ino>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for ino in origins {
+            affected.extend(descendants(c, ino)?);
+            if let Some(path) = chain(c, drive, root, ino)? { affected.extend(path.into_iter().map(|(at, _)| at)); }
+        }
         let mut at = root;
         affected.insert(root);
         let mut components = key.split('/').peekable();
@@ -232,17 +267,64 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 255 && name != "." && name != ".." && !name.contains(['/', '\0'])
 }
 
+fn mutation_node(c: &Connection, drive: &str, root: Ino, ino: Ino, offline: bool) -> Result<(Node, String)> {
+    if ino == 0 || ino > i64::MAX as u64 { return Err(FsError::Stale); }
+    let path = chain(c, drive, root, ino)?.ok_or(FsError::Stale)?;
+    for (dir, _) in path.iter().take(path.len() - 1) { mutation_listing(c, drive, root, *dir, offline)?; }
+    let n = node(c, drive, ino)?.ok_or(FsError::Stale)?;
+    let mut key = path.into_iter().skip(1).map(|(_, name)| name).collect::<Vec<_>>().join("/");
+    if n.entry.kind == Kind::Folder && !key.is_empty() { key.push('/'); }
+    Ok((n, key))
+}
+
+fn mutation_listing(c: &Connection, drive: &str, root: Ino, dir: Ino, offline: bool) -> Result<()> {
+    let n = node(c, drive, dir)?.ok_or(FsError::Stale)?;
+    if n.entry.kind != Kind::Folder { return Err(FsError::NotDir); }
+    let (listed, seq): (bool, Option<u64>) = c.query_row("SELECT listed, seq FROM mount_dirs WHERE ino=?1", [dir], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let local = dir != root && n.entry.object_id.is_empty();
+    if offline && seq.is_none() && !local { return Err(FsError::Offline); }
+    if !offline && !listed { return Err(FsError::Again); }
+    Ok(())
+}
+
+fn mutation_base(n: &Node) -> Result<crate::journal::StoredBase> {
+    if let Some(id) = n.entry_id { return Ok(crate::journal::StoredBase::Entry(id)); }
+    n.entry.version_id.clone().filter(|s| !s.is_empty()).map(crate::journal::StoredBase::Version).ok_or(FsError::Again)
+}
+
+fn save_node(c: &Connection, n: &Node) -> Result<()> {
+    let sync = match n.sync { Sync::Saved => "saved", Sync::Pending => "pending", Sync::Saving => "saving", Sync::Conflict => "conflict", Sync::Error => "error" };
+    c.execute("UPDATE mount_inodes SET attrs=?2, generation=?3, sync=?4 WHERE ino=?1", params![n.ino, serde_json::to_string(&n.entry).expect("JSON"), n.generation, sync])?;
+    Ok(())
+}
+
+fn remote_path(c: &Connection, drive: &str, root: Ino, ino: Ino) -> Result<String> {
+    let path = chain(c, drive, root, ino)?.ok_or(FsError::Stale)?;
+    for (index, (at, _)) in path.iter().enumerate().rev() {
+        if let Some(n) = node(c, drive, *at)? && let Some(key) = n.remote_key {
+            let suffix = path.iter().skip(index + 1).map(|(_, name)| name.as_str()).collect::<Vec<_>>().join("/");
+            let mut key = if suffix.is_empty() { key } else { format!("{}{suffix}", key) };
+            if node(c, drive, ino)?.is_some_and(|n| n.entry.kind == Kind::Folder) && !key.ends_with('/') { key.push('/'); }
+            return Ok(key);
+        }
+    }
+    let mut key = path.into_iter().skip(1).map(|(_, name)| name).collect::<Vec<_>>().join("/");
+    if !key.is_empty() && node(c, drive, ino)?.is_some_and(|n| n.entry.kind == Kind::Folder) { key.push('/'); }
+    Ok(key)
+}
+
 struct Handle { attr: Attr, reader: tokio::sync::Mutex<Reader> }
 struct Handles { next: u64, entries: std::collections::HashMap<Fh, Arc<Handle>> }
 
 /// One drive's persistent namespace. The caller supplies its feed invalidations; opening a
 /// session distrusts persisted metadata online and retains complete snapshots for offline use.
 /// `drive` must be a stable canonical drive identifier, rather than a reusable display alias.
-/// Opens bind immutable remote versions; this session makes no remote mutations.
+/// Opens bind immutable remote versions. Writable namespaces durably queue guarded mutations.
 pub struct Session {
     store: Arc<Store>, client: Client, drive: String, root: Ino, connectivity: Connectivity,
     cache: Cache, generation: u32, handles: Mutex<Handles>,
     refresh: Mutex<HashMap<Ino, Weak<tokio::sync::Mutex<()>>>>,
+    queue: Option<crate::Queue>,
 }
 
 impl Session {
@@ -271,7 +353,16 @@ impl Session {
             Ok((root, generation))
         })).await.map_err(Error::from)??;
         Ok(Self { store, client, drive: drive.to_owned(), root, connectivity, cache, generation,
-            handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()) })
+            handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()), queue: None })
+    }
+
+    /// A writable namespace on the daemon's existing queue and state store. File writes follow
+    /// in the staged-data slice; read-only sessions retain their existing constructor.
+    pub async fn new_writable(store: Arc<Store>, client: Client, cache: Cache, queue: crate::Queue, drive: &str, connectivity: Connectivity) -> Result<Self> {
+        if !queue.uses_store(&store) { return Err(FsError::InvalidArgument); }
+        let mut session = Self::new(store, client, cache, drive, connectivity).await?;
+        session.queue = Some(queue);
+        Ok(session)
     }
 
     pub fn root(&self) -> Ino { self.root }
@@ -314,6 +405,57 @@ impl Session {
         self.db(move |c, d, _| node(c, d, ino)).await?.ok_or(FsError::Stale)?.attr()
     }
 
+    async fn prepare_mutation(&self, ino: Ino) -> Result<()> {
+        for _ in 0..4 {
+            self.ancestors(ino).await?;
+            let offline = self.connectivity.link() == Link::Offline;
+            let state = self.db(move |c, d, root| {
+                let tx = c.transaction()?;
+                let state: Result<(Node, String)> = (|| {
+                    let (mut n, key) = mutation_node(&tx, d, root, ino, offline)?;
+                    if n.remote_key.is_none() && !n.entry.object_id.is_empty() {
+                        let remote = remote_path(&tx, d, root, ino)?;
+                        tx.execute("UPDATE mount_inodes SET remote_key=?2, generation=generation+1 WHERE ino=?1", params![ino, remote])?;
+                        n.remote_key = Some(remote);
+                        n.generation += 1;
+                    }
+                    Ok((n, key))
+                })();
+                if state.is_ok() { tx.commit()?; }
+                Ok(state)
+            }).await??;
+            let (n, key) = state;
+            if ino == self.root || n.entry_id.is_some() || n.entry.version_id.as_ref().is_some_and(|v| !v.is_empty()) { return Ok(()); }
+            if offline { return Err(FsError::Offline); }
+            let base_key = n.remote_key.as_deref().unwrap_or(&key);
+            let attrs = match self.client.attributes(&self.drive, base_key, Default::default()).await {
+                Err(e) if e.status() == Some(404) && base_key != key => self.client.attributes(&self.drive, &key, Default::default()).await,
+                result => result,
+            }.map_err(|e| sdk_error(&e))?;
+            if attrs.object_id != n.entry.object_id || attrs.kind != n.entry.kind { return Err(FsError::Again); }
+            let Some(version) = attrs.version_id.filter(|s| !s.is_empty()) else { return Err(FsError::Unsupported); };
+            let accepted = self.db(move |c, d, root| {
+                let tx = c.transaction()?;
+                let state = (|| {
+                    let (mut current, current_key) = mutation_node(&tx, d, root, ino, offline)?;
+                    if current.generation != n.generation || current_key != key { return Err(FsError::Again); }
+                    current.entry.version_id = Some(version);
+                    current.entry.mtime = attrs.mtime;
+                    current.entry.mode = attrs.mode;
+                    current.entry.has_xattrs = !attrs.xattrs.is_empty();
+                    current.generation += 1;
+                    current.attr()?;
+                    save_node(&tx, &current)?;
+                    Ok(())
+                })();
+                if state.is_ok() { tx.commit()?; }
+                Ok(state)
+            }).await?;
+            match accepted { Err(FsError::Again) => continue, other => return other }
+        }
+        Err(FsError::Again)
+    }
+
     /// Binds attributes and content from one accepted namespace snapshot. IDs are never reused.
     pub async fn open(&self, ino: Ino, write: bool) -> Result<Fh> {
         if write { return Err(FsError::ReadOnly); }
@@ -325,18 +467,20 @@ impl Session {
                 let Some(path) = chain(&tx, d, root, ino)? else { return Ok(Err(FsError::Stale)); };
                 for (dir, _) in path.iter().take(path.len() - 1) {
                     let (listed, seq): (bool, Option<u64>) = tx.query_row("SELECT listed, seq FROM mount_dirs WHERE ino=?1", [dir], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                    if offline && seq.is_none() { return Ok(Err(FsError::Offline)); }
+                    if offline && seq.is_none() && (*dir == root || node(&tx, d, *dir)?.is_none_or(|n| !n.entry.object_id.is_empty())) { return Ok(Err(FsError::Offline)); }
                     if !offline && !listed { return Ok(Err(FsError::Again)); }
                 }
                 let n = node(&tx, d, ino)?.ok_or(rusqlite::Error::InvalidQuery)?;
-                let key = path.into_iter().skip(1).map(|(_, name)| name).collect::<Vec<_>>().join("/");
+                let key = remote_path(&tx, d, root, ino).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 Ok(Ok((n, key)))
             }).await?;
             let (n, key) = match snapshot { Err(FsError::Again) => continue, other => other? };
             let attr = n.attr()?;
             match attr.kind { Kind::Folder => return Err(FsError::IsDir), Kind::File => {}, _ => return Err(FsError::Unsupported) }
-            let content = Content { drive: self.drive.clone(), key, version_id: attr.version_id.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot version".into()))?,
-                etag: attr.etag.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot ETag".into()))?, size: attr.size };
+            let local = n.entry.object_id.is_empty() && attr.size == 0 && n.sync != Sync::Saved;
+            let version_id = if local { format!("local:{}", attr.ino) } else { attr.version_id.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot version".into()))? };
+            let etag = if local { format!("local:{}", attr.ino) } else { attr.etag.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot ETag".into()))? };
+            let content = Content { drive: self.drive.clone(), key, version_id, etag, size: attr.size };
             let reader = self.cache.reader(content).with_connectivity(self.connectivity.clone());
             let mut handles = self.handles.lock().unwrap_or_else(|p| p.into_inner());
             if handles.next > u32::MAX as u64 { return Err(FsError::Io("file handle space exhausted".into())); }
@@ -462,15 +606,48 @@ impl Session {
                 let Some(path) = chain(c, d, root, dir)? else { return Ok(None); };
                 let (generation, listed, seq): (u64, bool, Option<u64>) = c.query_row("SELECT generation, listed, seq FROM mount_dirs WHERE ino=?1", [dir], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?.unwrap_or((0, false, None));
                 let key = path.into_iter().skip(1).map(|(_, n)| format!("{n}/")).collect::<String>();
-                Ok(Some((n.entry.kind, key, generation, listed, seq)))
+                let remote = remote_path(c, d, root, dir).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                Ok(Some((n.entry.kind, key, remote, generation, listed, seq, n.entry.object_id, n.sync)))
             }).await?.ok_or(FsError::Stale)?;
-            let (kind, key, generation, listed, seq) = state;
+            let (kind, key, mut remote, generation, listed, seq, object_id, sync) = state;
             if kind != Kind::Folder { return Err(FsError::NotDir); }
             if listed { return Ok(()); }
+            if dir != self.root && object_id.is_empty() {
+                let accepted = self.db(move |c, _, _| c.execute("UPDATE mount_dirs SET listed=1, generation=generation+1 WHERE ino=?1 AND generation=?2", params![dir, generation])).await?;
+                if accepted == 1 { return Ok(()); }
+                continue;
+            }
             if self.connectivity.link() == Link::Offline {
                 return if seq.is_some() { Ok(()) } else { Err(FsError::Offline) };
             }
-            let Some((entries, seq)) = self.listing(&key).await? else { continue; };
+            let bound_version = if sync != Sync::Saved && dir != self.root {
+                let matches = |attrs: &voidfs_sdk::Attributes| attrs.kind == Kind::Folder && attrs.object_id == object_id;
+                let attrs = match self.client.attributes(&self.drive, &remote, Default::default()).await {
+                    Ok(attrs) if matches(&attrs) => attrs,
+                    result if remote != key && (result.as_ref().is_ok_and(|attrs| !matches(attrs)) || result.as_ref().is_err_and(|e| e.status() == Some(404))) => {
+                        let attrs = self.client.attributes(&self.drive, &key, Default::default()).await.map_err(|e| sdk_error(&e))?;
+                        if !matches(&attrs) { return Err(FsError::Again); }
+                        remote = key.clone();
+                        attrs
+                    }
+                    Ok(_) => return Err(FsError::Again),
+                    Err(e) => return Err(sdk_error(&e)),
+                };
+                Some(attrs.version_id)
+            } else { None };
+            let listing = match self.listing(&remote).await {
+                Err(FsError::NotFound) if remote != key => { remote = key.clone(); self.listing(&remote).await },
+                result => result,
+            }?;
+            let Some((entries, seq)) = listing else { continue; };
+            if let Some(version) = bound_version {
+                match self.client.attributes(&self.drive, &remote, Default::default()).await {
+                    Ok(attrs) if attrs.kind == Kind::Folder && attrs.object_id == object_id && attrs.version_id == version => {},
+                    Ok(_) => continue,
+                    Err(e) if e.status() == Some(404) => continue,
+                    Err(e) => return Err(sdk_error(&e)),
+                }
+            }
             let accepted = self.db(move |c, d, root| {
                 let tx = c.transaction()?;
                 let current: u64 = tx.query_row("SELECT generation FROM mount_dirs WHERE ino=?1", [dir], |r| r.get(0))?;
@@ -485,9 +662,10 @@ impl Session {
                 tx.execute("DELETE FROM mount_names WHERE parent=?1", [dir])?;
                 for e in entries {
                     let json = serde_json::to_string(&e).expect("JSON");
-                    tx.execute("INSERT INTO mount_inodes(drive, object_id, attrs) VALUES (?1, ?2, ?3)
-                        ON CONFLICT(drive, object_id) DO UPDATE SET generation=generation+(attrs<>excluded.attrs), attrs=excluded.attrs
-                        WHERE sync='saved'", params![d, e.object_id, json])?;
+                    let remote_key = format!("{remote}{}", e.name);
+                    tx.execute("INSERT INTO mount_inodes(drive, object_id, attrs, remote_key) VALUES (?1, ?2, ?3, ?4)
+                        ON CONFLICT(drive, object_id) DO UPDATE SET generation=generation+(attrs<>excluded.attrs OR remote_key IS NOT excluded.remote_key), attrs=excluded.attrs, remote_key=excluded.remote_key
+                        WHERE sync='saved'", params![d, e.object_id, json, remote_key])?;
                     let ino: Ino = tx.query_row("SELECT ino FROM mount_inodes WHERE drive=?1 AND object_id=?2", params![d, e.object_id], |r| r.get(0))?;
                     tx.execute("DELETE FROM mount_names WHERE ino=?1", [ino])?;
                     let name = e.name.trim_end_matches('/');
@@ -531,7 +709,7 @@ impl Session {
             if !valid_name(e.name.trim_end_matches('/')) || e.name.ends_with('/') != (e.kind == Kind::Folder)
                 || e.name.ends_with("//") || e.object_id.is_empty() || !names.insert(e.name.trim_end_matches('/')) || !ids.insert(&e.object_id)
             { return Err(FsError::Io("invalid or duplicate directory entry".into())); }
-            Node { ino: 0, entry: e.clone(), generation: 0, sync: Sync::Saved }.attr()?;
+            Node { ino: 0, entry: e.clone(), generation: 0, sync: Sync::Saved, entry_id: None, remote_key: None }.attr()?;
         }
         Ok(Some((entries, seq)))
     }
@@ -674,7 +852,7 @@ mod tests {
                     assert_eq!(equivalent_names(c, 1, &normalized)?, candidates);
                     lookup_after.push(start.elapsed());
                 }
-                println!("entries={count} invalidation_queries_before={} after=6 invalidation_ms_before={:.3} after={:.3} lookup_ms_before={:.3} after={:.3}",
+                println!("entries={count} invalidation_queries_before={} after=7 invalidation_ms_before={:.3} after={:.3} lookup_ms_before={:.3} after={:.3}",
                     3 * count + 6, median(invalidation_before), median(invalidation_after), median(lookup_before), median(lookup_after));
                 Ok(())
             }).unwrap();
