@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use voidfs_client::mount::{FsError, Session};
-use voidfs_client::{Connectivity, Invalidation, Store};
+use voidfs_client::{ApiFetcher, Cache, CacheConfig, Connectivity, Invalidation, Store};
 use voidfs_sdk::{Client, Config};
 
 struct Answer {
@@ -28,6 +28,8 @@ struct FixtureState {
     answers: Mutex<VecDeque<Answer>>,
     requests: Mutex<Vec<HashMap<String, String>>>,
     requested: Notify,
+    delay: Mutex<Duration>,
+    route_by_prefix: Mutex<bool>,
 }
 
 struct Fixture {
@@ -46,6 +48,8 @@ impl Fixture {
             answers: Mutex::new(answers.into()),
             requests: Mutex::new(Vec::new()),
             requested: Notify::new(),
+            delay: Mutex::new(Duration::ZERO),
+            route_by_prefix: Mutex::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -65,6 +69,13 @@ impl Fixture {
         }).unwrap()
     }
 
+    async fn session(&self, store: Arc<Store>, connectivity: Connectivity) -> Session {
+        let client = self.client();
+        let cache = Cache::open(store.clone(), Arc::new(ApiFetcher::new(client.clone()).with_connectivity(connectivity.clone())),
+            CacheConfig { min_free_bytes: 0, ..Default::default() }).await.unwrap();
+        Session::new(store, client, cache, "drv", connectivity).await.unwrap()
+    }
+
     fn requests(&self) -> Vec<HashMap<String, String>> {
         self.state.requests.lock().unwrap().clone()
     }
@@ -81,10 +92,19 @@ impl Fixture {
 }
 
 async fn answer(State(state): State<Arc<FixtureState>>, Query(query): Query<HashMap<String, String>>) -> Response {
+    let prefix = query.get("prefix").cloned().unwrap_or_default();
     state.requests.lock().unwrap().push(query);
-    let answer = state.answers.lock().unwrap().pop_front();
+    let answer = {
+        let mut answers = state.answers.lock().unwrap();
+        if *state.route_by_prefix.lock().unwrap() {
+            let position = answers.iter().position(|a| a.page["prefix"].as_str() == Some(prefix.as_str()));
+            position.and_then(|i| answers.remove(i))
+        } else { answers.pop_front() }
+    };
+    let delay = *state.delay.lock().unwrap();
     state.requested.notify_one();
     let Some(answer) = answer else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    if !delay.is_zero() { tokio::time::sleep(delay).await; }
     if let Some(gate) = answer.gate { gate.notified().await; }
     Json(answer.page).into_response()
 }
@@ -153,7 +173,7 @@ async fn malformed_listing_keeps_the_last_complete_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let connectivity = Connectivity::default();
-        let session = Session::new(store, fixture.client(), "drv", connectivity.clone()).await.unwrap();
+        let session = fixture.session(store, connectivity.clone()).await;
         let before = session.readdir(session.root(), None, 100).await.unwrap();
         session.invalidate(&[Invalidation::All]).await.unwrap();
         let result = session.readdir(session.root(), None, 100).await;
@@ -177,7 +197,7 @@ async fn changing_sequence_between_pages_restarts_the_whole_listing() {
         page(2, vec![entry("fresh", "object-fresh")], None).into(),
     ]).await;
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::new(Arc::new(Store::open(dir.path()).unwrap()), fixture.client(), "drv", Connectivity::default()).await.unwrap();
+    let session = fixture.session(Arc::new(Store::open(dir.path()).unwrap()), Connectivity::default()).await;
     let rows = session.readdir(session.root(), None, 100).await.unwrap();
     assert_eq!(rows.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["fresh"]);
     let requests = fixture.requests();
@@ -193,7 +213,7 @@ async fn consistent_pages_populate_one_complete_listing() {
         page(4, vec![entry("b", "object-b")], None).into(),
     ]).await;
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::new(Arc::new(Store::open(dir.path()).unwrap()), fixture.client(), "drv", Connectivity::default()).await.unwrap();
+    let session = fixture.session(Arc::new(Store::open(dir.path()).unwrap()), Connectivity::default()).await;
     let rows = session.readdir(session.root(), None, 100).await.unwrap();
     assert_eq!(rows.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     assert_ne!(rows[0].1.ino, rows[1].1.ino);
@@ -210,7 +230,7 @@ async fn continuous_page_churn_returns_again_after_bounded_retries() {
     }
     let fixture = Fixture::new(answers).await;
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::new(Arc::new(Store::open(dir.path()).unwrap()), fixture.client(), "drv", Connectivity::default()).await.unwrap();
+    let session = fixture.session(Arc::new(Store::open(dir.path()).unwrap()), Connectivity::default()).await;
     assert_eq!(session.readdir(session.root(), None, 100).await.unwrap_err(), FsError::Again);
     assert_eq!(fixture.requests().len(), 8);
 }
@@ -222,7 +242,7 @@ async fn repeated_continuation_token_fails_without_unbounded_requests() {
         page(1, vec![entry("b", "object-b")], Some("a")).into(),
     ]).await;
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::new(Arc::new(Store::open(dir.path()).unwrap()), fixture.client(), "drv", Connectivity::default()).await.unwrap();
+    let session = fixture.session(Arc::new(Store::open(dir.path()).unwrap()), Connectivity::default()).await;
     assert!(matches!(session.readdir(session.root(), None, 100).await, Err(FsError::Io(_))));
     assert_eq!(fixture.requests().len(), 2, "the repeated token must be rejected before requesting it again");
 }
@@ -235,7 +255,7 @@ async fn invalidation_during_a_fetch_rejects_the_old_response() {
         page(2, vec![entry("fresh", "object-fresh")], None).into(),
     ]).await;
     let dir = tempfile::tempdir().unwrap();
-    let session = Arc::new(Session::new(Arc::new(Store::open(dir.path()).unwrap()), fixture.client(), "drv", Connectivity::default()).await.unwrap());
+    let session = Arc::new(fixture.session(Arc::new(Store::open(dir.path()).unwrap()), Connectivity::default()).await);
     let listing = tokio::spawn({
         let session = session.clone();
         async move { session.readdir(session.root(), None, 100).await }
@@ -257,8 +277,8 @@ async fn two_sessions_cannot_replace_a_newer_listing_with_an_old_response() {
     ]).await;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path()).unwrap());
-    let first = Arc::new(Session::new(store.clone(), fixture.client(), "drv", Connectivity::default()).await.unwrap());
-    let second = Session::new(store, fixture.client(), "drv", Connectivity::default()).await.unwrap();
+    let first = Arc::new(fixture.session(store.clone(), Connectivity::default()).await);
+    let second = fixture.session(store, Connectivity::default()).await;
     let pending = tokio::spawn({
         let first = first.clone();
         async move { first.readdir(first.root(), None, 100).await }
@@ -284,8 +304,8 @@ async fn a_late_source_listing_cannot_move_an_object_back_from_its_destination()
     ]).await;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path()).unwrap());
-    let first = Arc::new(Session::new(store.clone(), fixture.client(), "drv", Connectivity::default()).await.unwrap());
-    let second = Session::new(store, fixture.client(), "drv", Connectivity::default()).await.unwrap();
+    let first = Arc::new(fixture.session(store.clone(), Connectivity::default()).await);
+    let second = fixture.session(store, Connectivity::default()).await;
     first.readdir(first.root(), None, 100).await.unwrap();
     let src = first.lookup(first.root(), "src").await.unwrap().ino;
     let dest = first.lookup(first.root(), "dest").await.unwrap().ino;
@@ -312,11 +332,100 @@ async fn a_listing_cannot_relink_an_ancestor_as_its_own_descendant() {
         folder_page("a/b/", 1, vec![folder("loop/", "object-a")]).into(),
     ]).await;
     let dir = tempfile::tempdir().unwrap();
-    let session = Session::new(Arc::new(Store::open(dir.path()).unwrap()), fixture.client(), "drv", Connectivity::default()).await.unwrap();
+    let session = fixture.session(Arc::new(Store::open(dir.path()).unwrap()), Connectivity::default()).await;
     let a = session.lookup(session.root(), "a").await.unwrap().ino;
     let b = session.lookup(a, "b").await.unwrap().ino;
     assert!(matches!(session.readdir(b, None, 100).await, Err(FsError::Io(_))), "cyclic entries must be rejected atomically");
     assert_eq!(session.lookup(session.root(), "a").await.unwrap().ino, a);
     assert_eq!(session.lookup(a, "b").await.unwrap().ino, b);
     assert_eq!(fixture.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn different_directory_refreshes_overlap_and_one_directory_shares_its_fetch() {
+    let gate = Arc::new(Notify::new());
+    let fixture = Fixture::new(vec![
+        page(1, vec![folder("a/", "object-a"), folder("b/", "object-b")], None).into(),
+        Answer { page: folder_page("a/", 1, vec![entry("one", "object-one")]), gate: Some(gate.clone()) },
+        folder_page("b/", 1, vec![entry("two", "object-two")]).into(),
+    ]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = Arc::new(fixture.session(Arc::new(Store::open(dir.path()).unwrap()), Connectivity::default()).await);
+    let rows = session.readdir(session.root(), None, 100).await.unwrap();
+    let a = rows[0].1.ino;
+    let b = rows[1].1.ino;
+    let first = tokio::spawn({ let session = session.clone(); async move { session.readdir(a, None, 100).await } });
+    fixture.wait_for_requests(2).await;
+    let same = tokio::spawn({ let session = session.clone(); async move { session.readdir(a, None, 100).await } });
+    let different = tokio::spawn({ let session = session.clone(); async move { session.readdir(b, None, 100).await } });
+    let other = tokio::time::timeout(Duration::from_secs(2), different).await.expect("b must finish while a's listing is gated").unwrap().unwrap();
+    assert_eq!(other[0].0, "two");
+    gate.notify_one();
+    let first = first.await.unwrap().unwrap();
+    assert_eq!(same.await.unwrap().unwrap(), first);
+    assert_eq!(first[0].0, "one");
+    assert_eq!(fixture.requests().len(), 3, "two callers of a must share one listing");
+}
+
+#[tokio::test]
+async fn subtree_invalidation_visits_only_effective_descendants_and_their_ancestors() {
+    let fixture = Fixture::new(vec![
+        page(1, vec![folder("a/", "object-a"), folder("b/", "object-b")], None).into(),
+        folder_page("a/", 1, vec![folder("sub/", "object-sub"), entry("file", "object-file")]).into(),
+        folder_page("a/sub/", 1, vec![entry("leaf", "object-leaf")]).into(),
+        folder_page("b/", 1, vec![entry("other", "object-other")]).into(),
+        page(2, vec![folder("a/", "object-a"), folder("b/", "object-b")], None).into(),
+    ]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let session = fixture.session(Arc::new(Store::open(dir.path()).unwrap()), Connectivity::default()).await;
+    let a = session.lookup(session.root(), "a").await.unwrap().ino;
+    let b = session.lookup(session.root(), "b").await.unwrap().ino;
+    let sub = session.lookup(a, "sub").await.unwrap().ino;
+    let file = session.lookup(a, "file").await.unwrap().ino;
+    let leaf = session.lookup(sub, "leaf").await.unwrap().ino;
+    let other = session.lookup(b, "other").await.unwrap();
+    let affected = session.invalidate(&[Invalidation::Subtree("a/".into())]).await.unwrap();
+    let mut expected = vec![session.root(), a, sub, file, leaf];
+    expected.sort_unstable();
+    assert_eq!(affected, expected);
+    assert_eq!(session.lookup(b, "other").await.unwrap(), other);
+    assert_eq!(fixture.requests().len(), 5, "b's complete listing stays fresh");
+    assert_eq!(session.invalidate(&[Invalidation::Object("b/new".into())]).await.unwrap(), vec![session.root(), b]);
+}
+
+#[tokio::test]
+#[ignore = "reproducible PR measurement: cargo test -p voidfs-client --test mount_listing directory_listing_measurement_10k_and_100k -- --ignored --nocapture"]
+async fn directory_listing_measurement_10k_and_100k() {
+    fn median(mut samples: Vec<Duration>) -> f64 { samples.sort_unstable(); samples[samples.len() / 2].as_secs_f64() * 1000.0 }
+    for count in [10_000, 100_000] {
+        let mut entries = vec![folder("a/", "object-a"), folder("b/", "object-b")];
+        entries.extend((0..count).map(|i| entry(&format!("file-{i:06}"), &format!("object-{i:06}"))));
+        let mut answers = vec![page(1, entries, None).into()];
+        for _ in 0..6 { answers.extend([folder_page("a/", 1, Vec::new()).into(), folder_page("b/", 1, Vec::new()).into()]); }
+        let fixture = Fixture::new(answers).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let session = fixture.session(store.clone(), Connectivity::default()).await;
+        let rows = session.readdir(session.root(), None, 2).await.unwrap();
+        let (a, b) = (rows[0].1.ino, rows[1].1.ino);
+        *fixture.state.delay.lock().unwrap() = Duration::from_millis(100);
+        *fixture.state.route_by_prefix.lock().unwrap() = true;
+        let c = rusqlite::Connection::open(store.dir().join("state.sqlite")).unwrap();
+        let mut before = Vec::new(); let mut after = Vec::new();
+        for _ in 0..3 {
+            c.execute("UPDATE mount_dirs SET listed=0 WHERE ino IN (?1, ?2)", rusqlite::params![a, b]).unwrap();
+            let start = std::time::Instant::now();
+            // The previous single session mutex let these same calls run only one at a time.
+            session.readdir(a, None, 1).await.unwrap();
+            session.readdir(b, None, 1).await.unwrap();
+            before.push(start.elapsed());
+            c.execute("UPDATE mount_dirs SET listed=0 WHERE ino IN (?1, ?2)", rusqlite::params![a, b]).unwrap();
+            let start = std::time::Instant::now();
+            // Route the synthetic responses by the request prefix, regardless of task ordering.
+            let results = tokio::join!(session.readdir(a, None, 1), session.readdir(b, None, 1));
+            results.0.unwrap(); results.1.unwrap();
+            after.push(start.elapsed());
+        }
+        println!("entries={count} two_listings_with_100ms_server_delay_ms_before={:.3} after={:.3}", median(before), median(after));
+    }
 }

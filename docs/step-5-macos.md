@@ -1,7 +1,7 @@
 # Step 5: a writable macOS drive
 
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
-5 October. Item 1 has begun with the Rust mount namespace. The later deliverables remain an
+5 October. Item 1 has begun with the Rust mount namespace and read-only snapshot handles. The later deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
 
@@ -33,10 +33,9 @@ The adapter boundary already exists in
 `DaemonConfig.adapters`; an empty list returns `NoAdapter`. The first adapter is the current
 default. A remembered mount names its adapter explicitly.
 
-This is enough to attach an adapter, but **a durable upload queue is not yet a mounted local
-filesystem**. There is no complete local namespace overlay, open-handle table or read path that
-combines unpublished writes with a remote base. Those belong in the shared Rust core before
-writable FSKit or SMB callbacks are added.
+The core now supplies a persistent namespace and read-only snapshot handles. A complete local
+overlay and a read path combining unpublished writes with a remote base remain to be built in
+the shared Rust core before writable FSKit or SMB callbacks are added.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
@@ -304,12 +303,14 @@ scenario pass, and a results page records build/OS identities, cold/warm listing
 time from server commit to visible change, crash/disk-full/offline/conflict behavior and remaining
 limits. Credential fallback must pass even when a backend cannot mint scoped storage credentials.
 
-## 3. First implementation slice
+## 3. Implementation slices
 
-Item 1 has started; the architecture and integrity choices above no longer block it. Finish its
-namespace, snapshot handles, staged writes, guarded publication and recovery in separate slices.
-Then connect a read-only transport slice of item 2 and item 3 at a user-owned mountpoint. In
-parallel, establish the signed-bundle probe on voidfs's own Apple team and the compatibility rig.
+Item 1 has started; the architecture and integrity choices above no longer block it. Its
+namespace and snapshot handles come first, followed by staged writes, guarded publication and
+recovery in separate slices. Once snapshot/coherence and restart behavior are demonstrated,
+item 2's read-only transport and item 3's read-only adapter may proceed alongside those writable
+core slices, at a user-owned mountpoint. Establish the signed-bundle probe on voidfs's own Apple
+team before the sandboxed bridge and adapter, and the compatibility rig in parallel.
 Only after snapshot/coherence and restart behavior are demonstrated should writable callbacks
 land. Pieces, `/Volumes`, UI and distribution follow the same core; each remains a separate
 reviewable deliverable.
@@ -332,11 +333,11 @@ Retries are bounded and return `EAGAIN` when the namespace keeps changing. Async
 persists stale state, increments generations and returns known affected inodes and directories.
 The caller supplies feed invalidations; the session does not start a watcher. Opening a session
 marks persisted directories stale for online refresh. Offline metadata is served only from a
-previously complete directory snapshot; uncached names fail promptly. Enumeration keeps remote
+previously complete directory snapshot; folders never listed fail promptly. Enumeration keeps remote
 names and byte order, with an exclusive name cursor within the current generation.
 Adapters must track invalidations and restart enumeration when the directory generation changes.
 
-This slice has no open handles, file reads or writes, staged-data recovery, cache integration,
+The original namespace slice had no open handles, file reads or writes, staged-data recovery, cache integration,
 daemon transport or FSKit adapter. Item 1's save, open-unlink and byte-recovery exit criteria are
 still pending, and no step 5 item is complete.
 
@@ -346,6 +347,58 @@ races, overlays and tombstones, Unicode ambiguity and errno mapping. Each regres
 fail with its relevant behavior broken. Workspace tests, clippy, spec validation and memory, fs
 and versitygw interoperability remain required before the pull request is complete; results belong
 in the pull request after they run.
+
+### Open handles and snapshot reads, 5 October
+
+`Session::new` now receives the daemon core's shared `Cache`. Read-only `open` refreshes the
+inode's ancestors and captures its object identity, version id, ETag, size and attributes together
+from an accepted namespace generation. A feed invalidation that wins before capture forces a
+retry. A handle keeps those attributes and bytes after remote overwrites, renames and file
+deletions; a new open observes refreshed metadata. Write opens return `EROFS`, directories return
+`EISDIR`, and symlinks expose their stored target through `readlink`.
+
+Handle ids combine a durable session epoch from the state database with a monotonic counter.
+The epoch advances transactionally when a session starts and is available to a future reconnect
+handshake. Closed or unknown handles from the current epoch return `EBADF`; handles from a
+previous session return `ESTALE`. Exhaustion is an error instead of reusing an id. Each handle
+owns one `Cache::reader` behind an async mutex, preserving sequential read-ahead while making
+concurrent reads correct. Reads stop at the captured size, including empty and past-EOF reads.
+Closing releases the table's reference; a read already in progress may finish.
+
+The reader checks connectivity only after checking the cache: verified memory/disk blocks
+remain available offline, while misses and queued read-ahead fail before asking a fetcher.
+Content mismatches are logged; a mismatch at the bound object's own key returns `EIO`.
+Both `ApiFetcher` and `BucketFetcher` use this path; direct reads retain whole-shard integrity
+checks and the existing API fallback where scoped bucket access is unavailable.
+
+Retaining a version does not make its original key a permanent address: a rename removes that
+key from the current namespace. On a version-read `404`, the session finds the bound `object_id`
+through existing attribute listings, or its final deleted key through the deleted listing, and
+retries the same version and ETag at that key. A scan validates page prefixes, continuation
+tokens and a consistent drive sequence, including a final root check; retries are bounded. This
+identity lookup also handles a version mismatch when another object replaces the original key:
+only finding the bound object at a different key permits retry; a mismatch at its own key remains `EIO`.
+The fallback can traverse a whole drive after an unseen cross-directory move. It changes no server
+or wire protocol behavior. The current API removes folders only after their children are gone.
+If later work introduces a recursive removal represented by one retained parent, a cold
+path-addressed read of its children would need an object-addressing decision: the retained parent
+alone does not expose their versions through the existing API. Cached blocks remain readable.
+
+This slice also addresses the namespace review: a missing name in a complete offline listing
+returns `ENOENT`, reserving offline creates for the writable slice; folders never listed still
+return `ENETDOWN`. Migration 5 stores indexed NFC forms for names without changing their remote
+bytes. Equivalent lookup probes only matching rows and still rejects ambiguity. Feed
+invalidation follows indexed parent/name relationships and traverses only an affected subtree,
+instead of reconstructing every inode's ancestor chain. Directory refresh locks are per inode,
+so unrelated folders may list concurrently while generation checks reject stale answers.
+
+Validation covers snapshot data and attributes after overwrite, rename and file deletion, EOF,
+concurrent and sequential reads, cached/uncached offline reads, stale handles across restart,
+symlinks, namespace generation races, relocation scans and both fetchers. Each new regression
+test must fail with its behavior broken; timing-sensitive breaks run at least three times.
+Namespace measurements at 10,000 and 100,000 entries record query counts and lookup/listing
+times in the pull request. Staged writes, guarded publish, conflicts, recovery, daemon session
+RPCs and the Swift/FSKit adapter remain pending; no step 5 item is complete.
 
 Accounts, web, search, previews, video review, Linux/Windows mounts, server locking, retention and
 encryption remain in their later steps. Cloud benchmark runs and new provider credentials do not

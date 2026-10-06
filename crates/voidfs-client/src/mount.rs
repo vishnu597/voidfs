@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The adapter-independent namespace. Remote names remain byte-exact; equivalent Unicode
-//! lookups are accepted only when unambiguous. Mutations and open handles follow in later slices.
+//! lookups are accepted only when unambiguous. Open handles read immutable remote snapshots.
 
-use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use unicode_normalization::UnicodeNormalization;
 use voidfs_sdk::{Client, FolderEntry, Kind};
 
-use crate::{Connectivity, Error, Invalidation, Link, Store};
+use bytes::Bytes;
+
+use crate::{Cache, Connectivity, Content, Error, Invalidation, Link, Reader, Store};
 
 pub type Ino = u64;
+pub type Fh = u64;
 pub type Result<T> = std::result::Result<T, FsError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +57,8 @@ pub enum FsError {
     Unsupported,
     #[error("stale inode")]
     Stale,
+    #[error("bad file handle")]
+    BadHandle,
     #[error("the server can't be reached")]
     Offline,
     #[error("permission denied")]
@@ -76,7 +81,7 @@ impl FsError {
             Self::IsDir => libc::EISDIR, Self::NotDir => libc::ENOTDIR, Self::NoSpace => libc::ENOSPC,
             Self::ReadOnly => libc::EROFS, Self::Unsupported => libc::EOPNOTSUPP, Self::Stale => libc::ESTALE,
             Self::Offline => libc::ENETDOWN, Self::Permission => libc::EACCES, Self::InvalidName => libc::EINVAL,
-            Self::Ambiguous => libc::EILSEQ, Self::Again => libc::EAGAIN, Self::Io(_) => libc::EIO,
+            Self::Ambiguous => libc::EILSEQ, Self::Again => libc::EAGAIN, Self::BadHandle => libc::EBADF, Self::Io(_) => libc::EIO,
         }
     }
 }
@@ -141,6 +146,67 @@ fn names(c: &Connection, parent: Ino) -> rusqlite::Result<Vec<(String, Ino)>> {
     q.query_map([parent], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
 }
 
+const EQUIVALENT_NAMES: &str = "SELECT ino FROM mount_overlay INDEXED BY mount_overlay_nfc WHERE parent=?1 AND nfc=?2 AND ino IS NOT NULL
+        UNION ALL SELECT ino FROM mount_names n INDEXED BY mount_names_nfc WHERE parent=?1 AND nfc=?2 AND NOT EXISTS
+        (SELECT 1 FROM mount_overlay o WHERE o.parent=n.parent AND o.name=n.name) LIMIT 2";
+
+fn equivalent_names(c: &Connection, parent: Ino, nfc: &str) -> rusqlite::Result<Vec<Ino>> {
+    let mut q = c.prepare(EQUIVALENT_NAMES)?;
+    q.query_map(params![parent, nfc], |r| r.get(0))?.collect()
+}
+
+const NAMED_CHILD: &str = "SELECT ino FROM mount_overlay WHERE parent=?1 AND name=?2
+        UNION ALL SELECT ino FROM mount_names n WHERE parent=?1 AND name=?2 AND NOT EXISTS
+        (SELECT 1 FROM mount_overlay o WHERE o.parent=n.parent AND o.name=n.name) LIMIT 1";
+
+fn named_child(c: &Connection, parent: Ino, name: &str) -> rusqlite::Result<Option<Ino>> {
+    c.query_row(NAMED_CHILD,
+        params![parent, name], |r| r.get::<_, Option<Ino>>(0)).optional().map(Option::flatten)
+}
+
+const DESCENDANTS: &str = "WITH RECURSIVE children(ino) AS (
+        SELECT ?1 UNION SELECT o.ino FROM mount_overlay o JOIN children p ON o.parent=p.ino WHERE o.ino IS NOT NULL
+        UNION SELECT n.ino FROM mount_names n JOIN children p ON n.parent=p.ino WHERE NOT EXISTS
+        (SELECT 1 FROM mount_overlay o WHERE o.parent=n.parent AND o.name=n.name)) SELECT ino FROM children";
+
+fn descendants(c: &Connection, ino: Ino) -> rusqlite::Result<Vec<Ino>> {
+    let mut q = c.prepare(DESCENDANTS)?;
+    q.query_map([ino], |r| r.get(0))?.collect()
+}
+
+fn affected_inodes(c: &Connection, drive: &str, root: Ino, changes: &[Invalidation]) -> rusqlite::Result<BTreeSet<Ino>> {
+    let mut affected = BTreeSet::new();
+    for change in changes {
+        let (key, subtree) = match change {
+            Invalidation::All => {
+                let mut q = c.prepare("SELECT ino FROM mount_inodes WHERE drive=?1")?;
+                affected.extend(q.query_map([drive], |r| r.get::<_, Ino>(0))?.collect::<rusqlite::Result<Vec<_>>>()?);
+                continue;
+            }
+            Invalidation::Object(key) => (key, false), Invalidation::Subtree(key) => (key, true),
+        };
+        let mut at = root;
+        affected.insert(root);
+        let mut components = key.split('/').peekable();
+        while let Some(name) = components.next() {
+            if name.is_empty() {
+                if components.peek().is_none() && subtree { affected.extend(descendants(c, at)?); }
+                break;
+            }
+            let Some(ino) = named_child(c, at, name)? else { break; };
+            let directory = c.query_row("SELECT 1 FROM mount_dirs WHERE ino=?1", [ino], |_| Ok(())).optional()?.is_some();
+            if components.peek().is_none() {
+                if !directory { affected.insert(ino); }
+                break;
+            }
+            if !directory { break; }
+            affected.insert(ino);
+            at = ino;
+        }
+    }
+    Ok(affected)
+}
+
 fn parent(c: &Connection, ino: Ino) -> rusqlite::Result<Option<(Ino, String)>> {
     c.query_row("SELECT parent, name FROM mount_overlay WHERE ino=?1 UNION ALL
         SELECT parent, name FROM mount_names n WHERE ino=?1 AND NOT EXISTS
@@ -166,20 +232,24 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 255 && name != "." && name != ".." && !name.contains(['/', '\0'])
 }
 
+struct Handle { attr: Attr, reader: tokio::sync::Mutex<Reader> }
+struct Handles { next: u64, entries: std::collections::HashMap<Fh, Arc<Handle>> }
+
 /// One drive's persistent namespace. The caller supplies its feed invalidations; opening a
 /// session distrusts persisted metadata online and retains complete snapshots for offline use.
 /// `drive` must be a stable canonical drive identifier, rather than a reusable display alias.
-/// This slice serves metadata only, and makes no remote mutations.
+/// Opens bind immutable remote versions; this session makes no remote mutations.
 pub struct Session {
     store: Arc<Store>, client: Client, drive: String, root: Ino, connectivity: Connectivity,
-    refresh: tokio::sync::Mutex<()>,
+    cache: Cache, generation: u32, handles: Mutex<Handles>,
+    refresh: Mutex<HashMap<Ino, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl Session {
-    pub async fn new(store: Arc<Store>, client: Client, drive: &str, connectivity: Connectivity) -> Result<Self> {
+    pub async fn new(store: Arc<Store>, client: Client, cache: Cache, drive: &str, connectivity: Connectivity) -> Result<Self> {
         let d = drive.to_owned();
         let s = store.clone();
-        let root = tokio::task::spawn_blocking(move || s.with(|c| {
+        let (root, generation) = tokio::task::spawn_blocking(move || s.with(|c| {
             let tx = c.transaction()?;
             let root = match tx.query_row("SELECT ino FROM mount_roots WHERE drive=?1", [&d], |r| r.get::<_, Ino>(0)).optional()? {
                 Some(ino) => ino,
@@ -194,13 +264,20 @@ impl Session {
                 }
             };
             tx.execute("UPDATE mount_dirs SET listed=0, generation=generation+1 WHERE ino IN (SELECT ino FROM mount_inodes WHERE drive=?1)", [&d])?;
+            let generation: u32 = tx.query_row("INSERT INTO meta(key, value) VALUES ('mount_session', '1')
+                ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1 WHERE CAST(value AS INTEGER)<4294967295
+                RETURNING value", [], |r| r.get::<_, String>(0)?.parse().map_err(|_| rusqlite::Error::InvalidQuery))?;
             tx.commit()?;
-            Ok(root)
+            Ok((root, generation))
         })).await.map_err(Error::from)??;
-        Ok(Self { store, client, drive: drive.to_owned(), root, connectivity, refresh: tokio::sync::Mutex::new(()) })
+        Ok(Self { store, client, drive: drive.to_owned(), root, connectivity, cache, generation,
+            handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()) })
     }
 
     pub fn root(&self) -> Ino { self.root }
+
+    /// Durable session epoch for adapters' reconnect handshakes. Handles use its high 32 bits.
+    pub fn generation(&self) -> u32 { self.generation }
 
     async fn db<T: Send + 'static>(&self, f: impl FnOnce(&mut Connection, &str, Ino) -> rusqlite::Result<T> + Send + 'static) -> Result<T> {
         let s = self.store.clone();
@@ -221,12 +298,10 @@ impl Session {
         if !valid_name(name) { return Err(FsError::InvalidName); }
         self.ancestors(parent).await?;
         self.refresh_dir(parent).await?;
-        let name = name.to_owned();
-        let children = self.db(move |c, _, _| names(c, parent)).await?;
         let normalized: String = name.nfc().collect();
-        let candidates: Vec<Ino> = children.iter().filter(|(n, _)| n.nfc().eq(normalized.chars())).map(|(_, ino)| *ino).collect();
+        let candidates = self.db(move |c, _, _| equivalent_names(c, parent, &normalized)).await?;
         if candidates.len() > 1 { return Err(FsError::Ambiguous); }
-        let ino = candidates.first().copied().ok_or(if self.connectivity.link() == Link::Offline { FsError::Offline } else { FsError::NotFound })?;
+        let ino = candidates.first().copied().ok_or(FsError::NotFound)?;
         self.cached_attr(ino).await
     }
 
@@ -237,6 +312,97 @@ impl Session {
 
     async fn cached_attr(&self, ino: Ino) -> Result<Attr> {
         self.db(move |c, d, _| node(c, d, ino)).await?.ok_or(FsError::Stale)?.attr()
+    }
+
+    /// Binds attributes and content from one accepted namespace snapshot. IDs are never reused.
+    pub async fn open(&self, ino: Ino, write: bool) -> Result<Fh> {
+        if write { return Err(FsError::ReadOnly); }
+        for _ in 0..4 {
+            self.ancestors(ino).await?;
+            let offline = self.connectivity.link() == Link::Offline;
+            let snapshot = self.db(move |c, d, root| {
+                let tx = c.transaction()?;
+                let Some(path) = chain(&tx, d, root, ino)? else { return Ok(Err(FsError::Stale)); };
+                for (dir, _) in path.iter().take(path.len() - 1) {
+                    let (listed, seq): (bool, Option<u64>) = tx.query_row("SELECT listed, seq FROM mount_dirs WHERE ino=?1", [dir], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    if offline && seq.is_none() { return Ok(Err(FsError::Offline)); }
+                    if !offline && !listed { return Ok(Err(FsError::Again)); }
+                }
+                let n = node(&tx, d, ino)?.ok_or(rusqlite::Error::InvalidQuery)?;
+                let key = path.into_iter().skip(1).map(|(_, name)| name).collect::<Vec<_>>().join("/");
+                Ok(Ok((n, key)))
+            }).await?;
+            let (n, key) = match snapshot { Err(FsError::Again) => continue, other => other? };
+            let attr = n.attr()?;
+            match attr.kind { Kind::Folder => return Err(FsError::IsDir), Kind::File => {}, _ => return Err(FsError::Unsupported) }
+            let content = Content { drive: self.drive.clone(), key, version_id: attr.version_id.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot version".into()))?,
+                etag: attr.etag.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot ETag".into()))?, size: attr.size };
+            let reader = self.cache.reader(content).with_connectivity(self.connectivity.clone());
+            let mut handles = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+            if handles.next > u32::MAX as u64 { return Err(FsError::Io("file handle space exhausted".into())); }
+            let fh = (u64::from(self.generation) << 32) | handles.next;
+            handles.next += 1;
+            handles.entries.insert(fh, Arc::new(Handle { attr, reader: tokio::sync::Mutex::new(reader) }));
+            return Ok(fh);
+        }
+        Err(FsError::Again)
+    }
+
+    fn check_handle(&self, fh: Fh) -> Result<()> {
+        let generation = fh >> 32;
+        if generation > 0 && generation < u64::from(self.generation) { return Err(FsError::Stale); }
+        if generation != u64::from(self.generation) { return Err(FsError::BadHandle); }
+        Ok(())
+    }
+
+    fn handle(&self, fh: Fh) -> Result<Arc<Handle>> {
+        self.check_handle(fh)?;
+        self.handles.lock().unwrap_or_else(|p| p.into_inner()).entries.get(&fh).cloned().ok_or(FsError::BadHandle)
+    }
+
+    /// The attributes bound at open, independent of later namespace changes.
+    pub fn handle_attr(&self, fh: Fh) -> Result<Attr> { Ok(self.handle(fh)?.attr.clone()) }
+
+    pub async fn read(&self, fh: Fh, offset: u64, len: u64) -> Result<Bytes> {
+        let handle = self.handle(fh)?;
+        let mut reader = handle.reader.lock().await;
+        if offset >= handle.attr.size || len == 0 { return Ok(Bytes::new()); }
+        let len = len.min(handle.attr.size - offset);
+        for _ in 0..4 {
+            match reader.read(offset, len).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(Error::Fetch(e)) if e.status() == Some(404) => {
+                    // Versions are retained, but the API addresses moved versions at their new key.
+                    let id = handle.attr.object_id.as_deref().ok_or(FsError::Stale)?;
+                    let key = crate::mount_resolve::locate(&self.client, &self.drive, id, &self.connectivity).await?.ok_or(FsError::Stale)?;
+                    reader.relocate(key);
+                }
+                Err(e) => {
+                    if matches!(e, Error::Changed { .. }) {
+                        eprintln!("voidfs mount snapshot read: {e}");
+                        if let Some(id) = handle.attr.object_id.as_deref()
+                            && let Ok(Some(key)) = crate::mount_resolve::locate(&self.client, &self.drive, id, &self.connectivity).await
+                            && key != reader.content().key
+                        { reader.relocate(key); continue; }
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        Err(FsError::Again)
+    }
+
+    /// A read already in progress retains its handle; later calls see EBADF.
+    pub async fn close(&self, fh: Fh) -> Result<()> {
+        self.check_handle(fh)?;
+        self.handles.lock().unwrap_or_else(|p| p.into_inner()).entries.remove(&fh).ok_or(FsError::BadHandle)?;
+        Ok(())
+    }
+
+    pub async fn readlink(&self, ino: Ino) -> Result<String> {
+        let attr = self.getattr(ino).await?;
+        if attr.kind != Kind::Symlink { return Err(FsError::InvalidName); }
+        attr.target.ok_or_else(|| FsError::Io("missing symlink target".into()))
     }
 
     /// Names are byte-exact, case-sensitive and ordered by UTF-8 bytes. `after` is an exclusive
@@ -253,7 +419,14 @@ impl Session {
     }
 
     async fn refresh_dir(&self, dir: Ino) -> Result<()> {
-        let _refresh = self.refresh.lock().await;
+        let lock = {
+            let mut locks = self.refresh.lock().unwrap_or_else(|p| p.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks.get(&dir).and_then(Weak::upgrade).unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+            locks.insert(dir, Arc::downgrade(&lock));
+            lock
+        };
+        let _refresh = lock.lock().await;
         for _ in 0..4 {
             let state = self.db(move |c, d, root| {
                 let Some(n) = node(c, d, dir)? else { return Ok(None); };
@@ -288,7 +461,9 @@ impl Session {
                         WHERE sync='saved'", params![d, e.object_id, json])?;
                     let ino: Ino = tx.query_row("SELECT ino FROM mount_inodes WHERE drive=?1 AND object_id=?2", params![d, e.object_id], |r| r.get(0))?;
                     tx.execute("DELETE FROM mount_names WHERE ino=?1", [ino])?;
-                    tx.execute("INSERT INTO mount_names VALUES (?1, ?2, ?3)", params![dir, e.name.trim_end_matches('/'), ino])?;
+                    let name = e.name.trim_end_matches('/');
+                    let nfc: String = name.nfc().collect();
+                    tx.execute("INSERT INTO mount_names(parent, name, ino, nfc) VALUES (?1, ?2, ?3, ?4)", params![dir, name, ino, nfc])?;
                     if e.kind == Kind::Folder { tx.execute("INSERT OR IGNORE INTO mount_dirs(ino) VALUES (?1)", [ino])?; }
                 }
                 tx.execute("UPDATE mount_dirs SET listed=1, seq=?2, generation=generation+1 WHERE ino=?1", params![dir, seq])?;
@@ -338,27 +513,10 @@ impl Session {
         let changes = changes.to_vec();
         self.db(move |c, d, root| {
             let tx = c.transaction()?;
-            let mut q = tx.prepare("SELECT ino FROM mount_inodes WHERE drive=?1")?;
-            let inodes = q.query_map([d], |r| r.get::<_, Ino>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(q);
-            let mut affected = BTreeSet::new();
-            for ino in inodes {
-                let n = node(&tx, d, ino)?.ok_or(rusqlite::Error::InvalidQuery)?;
-                let path = chain(&tx, d, root, ino)?;
-                let key = path.map(|p| {
-                    let mut key = p.into_iter().skip(1).map(|(_, n)| n).collect::<Vec<_>>().join("/");
-                    if n.entry.kind == Kind::Folder && !key.is_empty() { key.push('/'); }
-                    key
-                });
-                if changes.iter().any(|change| match change {
-                    Invalidation::All => true,
-                    Invalidation::Object(k) => key.as_ref().is_some_and(|p| p == k || n.entry.kind == Kind::Folder && k.starts_with(p)),
-                    Invalidation::Subtree(k) => key.as_ref().is_some_and(|p| p.starts_with(k) || n.entry.kind == Kind::Folder && k.starts_with(p)),
-                }) {
-                    affected.insert(ino);
-                    tx.execute("UPDATE mount_dirs SET listed=0, generation=generation+1 WHERE ino=?1", [ino])?;
-                    tx.execute("UPDATE mount_inodes SET generation=generation+1 WHERE ino=?1", [ino])?;
-                }
+            let affected = affected_inodes(&tx, d, root, &changes)?;
+            for ino in &affected {
+                tx.execute("UPDATE mount_dirs SET listed=0, generation=generation+1 WHERE ino=?1", [ino])?;
+                tx.execute("UPDATE mount_inodes SET generation=generation+1 WHERE ino=?1", [ino])?;
             }
             tx.commit()?;
             Ok(affected.into_iter().collect())
@@ -376,13 +534,133 @@ mod tests {
             size: Some(size), etag: Some("\"etag\"".into()), mtime: None, mode: Some("0600".into()), has_xattrs: false, target: None }
     }
 
+    #[test]
+    fn namespace_queries_search_the_name_and_parent_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.with(|c| {
+            let mut q = c.prepare(&format!("EXPLAIN QUERY PLAN {EQUIVALENT_NAMES}"))?;
+            let plan = q.query_map(params![1u64, "café"], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?.join("\n");
+            assert!(plan.contains("mount_names_nfc (parent=? AND nfc=?)"), "{plan}");
+            assert!(plan.contains("mount_overlay_nfc (parent=? AND nfc=?)"), "{plan}");
+            let mut q = c.prepare(&format!("EXPLAIN QUERY PLAN {NAMED_CHILD}"))?;
+            let plan = q.query_map(params![1u64, "file"], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?.join("\n");
+            assert!(plan.contains("SEARCH n USING PRIMARY KEY (parent=? AND name=?)"), "{plan}");
+            let mut q = c.prepare(&format!("EXPLAIN QUERY PLAN {DESCENDANTS}"))?;
+            let plan = q.query_map([1u64], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?.join("\n");
+            assert!(plan.contains("SEARCH n USING PRIMARY KEY (parent=?)"), "{plan}");
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn indexed_equivalent_lookup_keeps_byte_exact_overlay_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.with(|c| {
+            c.execute("INSERT INTO mount_inodes(ino, drive, attrs) VALUES (1, 'drv', '{}'), (2, 'drv', '{}'), (3, 'drv', '{}'), (4, 'drv', '{}')", [])?;
+            c.execute("INSERT INTO mount_names VALUES (1, 'café', 2, 'café'), (1, ?1, 3, 'café')", ["cafe\u{301}"])?;
+            assert_eq!(equivalent_names(c, 1, "café")?.len(), 2);
+            c.execute("INSERT INTO mount_overlay VALUES (1, 'café', NULL, 'café')", [])?;
+            assert_eq!(equivalent_names(c, 1, "café")?, vec![3]);
+            assert_eq!(named_child(c, 1, "café")?, None);
+            c.execute("UPDATE mount_overlay SET ino=4 WHERE parent=1 AND name='café'", [])?;
+            let mut matches = equivalent_names(c, 1, "café")?; matches.sort_unstable();
+            assert_eq!(matches, vec![3, 4], "a local spelling collides with a distinct equivalent remote spelling");
+            c.execute("INSERT INTO mount_overlay VALUES (1, ?1, NULL, 'café')", ["cafe\u{301}"])?;
+            assert_eq!(equivalent_names(c, 1, "café")?, vec![4]);
+            Ok(())
+        }).unwrap();
+    }
+
+    fn legacy_affected(c: &Connection, root: Ino, key: &str) -> rusqlite::Result<BTreeSet<Ino>> {
+        let mut q = c.prepare("SELECT ino FROM mount_inodes WHERE drive='drv'")?;
+        let inodes = q.query_map([], |r| r.get::<_, Ino>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(q);
+        let mut affected = BTreeSet::new();
+        for ino in inodes {
+            let n = node(c, "drv", ino)?.ok_or(rusqlite::Error::InvalidQuery)?;
+            let path = chain(c, "drv", root, ino)?;
+            let full_key = path.map(|p| {
+                let mut key = p.into_iter().skip(1).map(|(_, n)| n).collect::<Vec<_>>().join("/");
+                if n.entry.kind == Kind::Folder && !key.is_empty() { key.push('/'); }
+                key
+            });
+            if full_key.as_ref().is_some_and(|p| p == key || n.entry.kind == Kind::Folder && key.starts_with(p)) { affected.insert(ino); }
+        }
+        Ok(affected)
+    }
+
+    #[test]
+    #[ignore = "reproducible PR measurement: cargo test -p voidfs-client --lib namespace_measurement_10k_and_100k -- --ignored --nocapture"]
+    fn namespace_measurement_10k_and_100k() {
+        fn median(mut samples: Vec<std::time::Duration>) -> f64 { samples.sort_unstable(); samples[samples.len() / 2].as_secs_f64() * 1000.0 }
+        for count in [10_000, 100_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            store.with(|c| {
+                let tx = c.transaction()?;
+                let mut folder = entry("", "", 0); folder.kind = Kind::Folder;
+                tx.execute("INSERT INTO mount_inodes(ino, drive, attrs) VALUES (1, 'drv', ?1)", [serde_json::to_string(&folder).unwrap()])?;
+                tx.execute("INSERT INTO mount_dirs(ino, listed, seq) VALUES (1, 1, 1)", [])?;
+                for i in 0..count {
+                    let name = format!("file-{i:06}");
+                    tx.execute("INSERT INTO mount_inodes(ino, drive, object_id, attrs) VALUES (?1, 'drv', ?2, ?3)",
+                        params![i + 2, name, serde_json::to_string(&entry(&name, &name, 8)).unwrap()])?;
+                    tx.execute("INSERT INTO mount_names VALUES (1, ?1, ?2, ?1)", params![name, i + 2])?;
+                }
+                tx.commit()?;
+                let key = format!("file-{:06}", count - 1);
+                let change = [Invalidation::Object(key.clone())];
+                let expected = BTreeSet::from([1, count as u64 + 1]);
+                let mut invalidation_before = Vec::new(); let mut invalidation_after = Vec::new();
+                let mut lookup_before = Vec::new(); let mut lookup_after = Vec::new();
+                for _ in 0..3 {
+                    let start = std::time::Instant::now();
+                    let tx = c.transaction()?;
+                    let affected = legacy_affected(&tx, 1, &key)?;
+                    assert_eq!(affected, expected);
+                    for ino in affected {
+                        tx.execute("UPDATE mount_dirs SET listed=0, generation=generation+1 WHERE ino=?1", [ino])?;
+                        tx.execute("UPDATE mount_inodes SET generation=generation+1 WHERE ino=?1", [ino])?;
+                    }
+                    tx.commit()?;
+                    invalidation_before.push(start.elapsed());
+                    let start = std::time::Instant::now();
+                    let tx = c.transaction()?;
+                    let affected = affected_inodes(&tx, "drv", 1, &change)?;
+                    assert_eq!(affected, expected);
+                    for ino in affected {
+                        tx.execute("UPDATE mount_dirs SET listed=0, generation=generation+1 WHERE ino=?1", [ino])?;
+                        tx.execute("UPDATE mount_inodes SET generation=generation+1 WHERE ino=?1", [ino])?;
+                    }
+                    tx.commit()?;
+                    invalidation_after.push(start.elapsed());
+                    let start = std::time::Instant::now();
+                    let normalized: String = key.nfc().collect();
+                    let candidates = names(c, 1)?.iter().filter(|(n, _)| n.nfc().eq(normalized.chars())).map(|(_, ino)| *ino).collect::<Vec<_>>();
+                    assert_eq!(candidates, vec![count as u64 + 1]);
+                    lookup_before.push(start.elapsed());
+                    let start = std::time::Instant::now();
+                    assert_eq!(equivalent_names(c, 1, &normalized)?, candidates);
+                    lookup_after.push(start.elapsed());
+                }
+                println!("entries={count} invalidation_queries_before={} after=6 invalidation_ms_before={:.3} after={:.3} lookup_ms_before={:.3} after={:.3}",
+                    3 * count + 6, median(invalidation_before), median(invalidation_after), median(lookup_before), median(lookup_after));
+                Ok(())
+            }).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn local_names_and_tombstones_override_the_remote_snapshot_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let conn = Connectivity::default();
         let client = Client::new(Config { endpoint: "http://localhost:9".into(), access_key_id: "test".into(), secret_access_key: "test".into(), ..Default::default() }).unwrap();
-        let s = Session::new(store.clone(), client.clone(), "drv", conn.clone()).await.unwrap();
+        let cache = Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone()).with_connectivity(conn.clone())),
+            crate::CacheConfig { min_free_bytes: 0, ..Default::default() }).await.unwrap();
+        let s = Session::new(store.clone(), client.clone(), cache, "drv", conn.clone()).await.unwrap();
         let root = s.root();
         let (remote, local) = store.with(|c| {
             for (id, size) in [("remote", 10), ("local", 20)] {
@@ -391,12 +669,12 @@ mod tests {
             }
             let local = c.last_insert_rowid() as Ino;
             let remote = local - 1;
-            c.execute("INSERT INTO mount_names VALUES (?1, 'name', ?2)", params![root, remote])?;
-            c.execute("INSERT INTO mount_overlay VALUES (?1, 'name', ?2)", params![root, local])?;
-            c.execute("INSERT INTO mount_overlay VALUES (?1, 'gone', NULL)", [root])?;
+            c.execute("INSERT INTO mount_names VALUES (?1, 'name', ?2, 'name')", params![root, remote])?;
+            c.execute("INSERT INTO mount_overlay VALUES (?1, 'name', ?2, 'name')", params![root, local])?;
+            c.execute("INSERT INTO mount_overlay VALUES (?1, 'gone', NULL, 'gone')", [root])?;
             let gone = serde_json::to_string(&entry("gone", "gone", 30)).unwrap();
             c.execute("INSERT INTO mount_inodes(drive, object_id, attrs) VALUES ('drv', 'gone', ?1)", [gone])?;
-            c.execute("INSERT INTO mount_names VALUES (?1, 'gone', ?2)", params![root, c.last_insert_rowid()])?;
+            c.execute("INSERT INTO mount_names VALUES (?1, 'gone', ?2, 'gone')", params![root, c.last_insert_rowid()])?;
             c.execute("UPDATE mount_dirs SET listed=1, seq=1 WHERE ino=?1", [root])?;
             Ok((remote, local))
         }).unwrap();
@@ -409,7 +687,9 @@ mod tests {
         drop(store);
         for _ in 0..3 { conn.unanswered(); }
         let store = Arc::new(Store::open(dir.path()).unwrap());
-        let s = Session::new(store, client, "drv", conn).await.unwrap();
+        let cache = Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone()).with_connectivity(conn.clone())),
+            crate::CacheConfig { min_free_bytes: 0, ..Default::default() }).await.unwrap();
+        let s = Session::new(store, client, cache, "drv", conn).await.unwrap();
         assert_eq!(s.root(), root);
         assert_eq!(s.readdir(root, None, 100).await.unwrap(), rows);
         assert_eq!(s.lookup(root, "name").await.unwrap().size, 20);

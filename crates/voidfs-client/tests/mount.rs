@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use common::{Proxy, client_for, server};
 use voidfs_client::mount::{FsError, Session, Sync};
-use voidfs_client::{Connectivity, Invalidation, Link, Store};
+use voidfs_client::{ApiFetcher, Cache, CacheConfig, Connectivity, Invalidation, Link, Store};
 use voidfs_sdk::{AttributesUpdate, Client, Config, Kind, PutOptions, RenameOptions};
 use voidfs_server::test_server::TestServer;
 
@@ -36,12 +36,18 @@ impl Fixture {
     }
 
     async fn session(&self, drive: &str) -> Session {
-        Session::new(self.store.clone(), self.client.clone(), drive, self.connectivity.clone()).await.unwrap()
+        session(self.store.clone(), self.client.clone(), drive, self.connectivity.clone()).await
     }
 
     async fn put(&self, key: &str, body: &'static str) {
         self.remote.put_object("drv", key, body, Default::default()).await.unwrap();
     }
+}
+
+async fn session(store: Arc<Store>, client: Client, drive: &str, connectivity: Connectivity) -> Session {
+    let cache = Cache::open(store.clone(), Arc::new(ApiFetcher::new(client.clone()).with_connectivity(connectivity.clone())),
+        CacheConfig { min_free_bytes: 0, ..Default::default() }).await.unwrap();
+    Session::new(store, client, cache, drive, connectivity).await.unwrap()
 }
 
 fn objects(keys: &[&str]) -> Vec<Invalidation> {
@@ -199,7 +205,7 @@ async fn reopening_keeps_inodes_and_distrusts_old_metadata_online() {
     drop(f.store);
     let reopened = Arc::new(Store::open(f.state.path()).unwrap());
     f.proxy.clear();
-    let ns = Session::new(reopened, f.client, "drv", f.connectivity).await.unwrap();
+    let ns = session(reopened, f.client, "drv", f.connectivity).await;
     assert_eq!(ns.root(), root);
     let after = ns.getattr(before.ino).await.unwrap();
     assert_eq!((after.ino, after.object_id, after.size), (before.ino, before.object_id, 7));
@@ -306,7 +312,7 @@ async fn symlink_attributes_keep_the_target_and_do_not_behave_as_a_directory() {
     }));
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
     let dir = tempfile::tempdir().unwrap();
-    let ns = Session::new(Arc::new(Store::open(dir.path()).unwrap()), client_for(&endpoint, Config::default()), "drv", Connectivity::default()).await.unwrap();
+    let ns = session(Arc::new(Store::open(dir.path()).unwrap()), client_for(&endpoint, Config::default()), "drv", Connectivity::default()).await;
     let link = ns.lookup(ns.root(), "link").await.unwrap();
     assert_eq!((link.kind, link.size, link.mode, link.target.as_deref()), (Kind::Symlink, 3, 0o777, Some("foo")));
     assert!(link.has_xattrs);
@@ -331,13 +337,13 @@ async fn offline_reopening_serves_complete_snapshots_and_fails_uncached_lookups_
     drop(ns);
     drop(f.store);
     let reopened = Arc::new(Store::open(f.state.path()).unwrap());
-    let ns = Session::new(reopened, f.client, "drv", f.connectivity.clone()).await.unwrap();
+    let ns = session(reopened, f.client, "drv", f.connectivity.clone()).await;
     f.proxy.clear();
     assert_eq!(ns.root(), root);
     assert_eq!(ns.lookup(cached, "file").await.unwrap(), file);
     assert_eq!(ns.getattr(file.ino).await.unwrap(), file);
     assert_eq!(ns.readdir(cached, None, 10).await.unwrap()[0], ("file".into(), file));
-    assert_eq!(ns.lookup(cached, "missing").await.unwrap_err(), FsError::Offline);
+    assert_eq!(ns.lookup(cached, "missing").await.unwrap_err(), FsError::NotFound);
     assert_eq!(ns.lookup(uncached, "file").await.unwrap_err(), FsError::Offline);
     assert_eq!(ns.readdir(uncached, None, 10).await.unwrap_err(), FsError::Offline);
     assert!(f.proxy.seen().is_empty(), "offline metadata never waits for the network");

@@ -6,12 +6,12 @@ virtual-host addressing and then health checks and metrics, and on 2026-10-01 fo
 S3's bandwidth in the local benchmark, then coalesced shard fetches, and then for the start of
 step 4 (the scorecard refreshed, SpaceFS 0.2.333 looked at again, the Rust SDK, then the CLI),
 and then for the Mac apps head to head; provider follow-ups and the step 5 plan added on
-2026-10-04, with step 5 decisions and its first namespace slice on 2026-10-05. The first was taken
+2026-10-04, with step 5 decisions, namespace and snapshot-read slices on 2026-10-05. The first was taken
 on 2026-09-27.*
 
 Sources:
-- the voidfs code on `origin/main` at `8b1c6e2` (step 4 through R2 storage credentials merged),
-  plus this change's mount namespace slice and secret-help regression tests;
+- the voidfs code on `origin/main` at `3465b57` (step 4 and the first mount namespace slice merged),
+  plus this change's snapshot reads and namespace scaling fixes;
 - the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
 - the benchmark results in [`bench/results/`](../bench/results/);
 - SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog, read again on 28
@@ -100,10 +100,11 @@ billing or plans), this page says so.
     conformance cases. AWS also passes all four after correcting the read role's bucket ARNs;
     required reads return 200 and forbidden operations return 403. The
     [AWS guide](aws-storage-credentials.md) records the initial failure and successful rerun.
-  - Step 5 has begun with the [mount namespace](step-5-macos.md#namespace-slice-5-october):
-    persistent inodes, lookup, attributes and directory listings. FSKit first, the Swift XPC
-    bridge and verified whole shards are accepted; no step 5 item is complete. Snapshot handles,
-    local writes and the writable mount remain pending. Steps 6–10 have not started.
+  - Step 5 has begun with the [mount core](step-5-macos.md#open-handles-and-snapshot-reads-5-october):
+    persistent inodes, lookup, attributes and directory listings, plus read-only snapshot
+    handles through the shared cache with offline reads and restart detection. FSKit first,
+    the Swift XPC bridge and verified whole shards are accepted; no step 5 item is complete.
+    Local writes, recovery and the writable mount remain pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -828,7 +829,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - **Status (2026-10-04):** items 1–6 of 6 done.
 5. **Writable macOS drive** (Phase 2).
    - The ordered deliverables, adapter/bridge decisions and validation gates are in the
-     [step 5 plan](step-5-macos.md). Its namespace slice is implemented; no writable adapter exists yet.
+     [step 5 plan](step-5-macos.md). Its namespace and snapshot-read slices are implemented;
+     no writable adapter exists yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
@@ -846,9 +848,14 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
    - **Status (2026-10-05):** item 1 begun; no completed item yet. The mount session has a
-     persistent namespace with stable inodes, lookup/getattr/readdir, generation invalidation
-     and complete offline directory snapshots. Open handles, reads/writes, staged recovery and
-     adapters remain pending. The accepted direction is FSKit first, SMB evaluation on gate
+     persistent namespace with stable inodes, indexed equivalent-name lookup, per-directory
+     refreshes, generation invalidation and complete offline directory snapshots. Read-only
+     handles bind attributes and bytes to a retained version through the shared cache, preserve
+     read-ahead and reject handles from earlier sessions. Existing listings relocate renamed
+     or deleted files by object identity. Any future recursive removal represented by one retained
+     parent needs a separate addressing decision for its children. Writes, staged recovery and adapters remain pending.
+     The read-only transport/adapter may proceed alongside writable core slices after the
+     snapshot/restart checks and the user's signed-bundle probe. The accepted direction is FSKit first, SMB evaluation on gate
      failure, the Rust daemon/socket with a thin Swift XPC bridge, and verified whole shards
      until an authenticated-pieces RFC. New writes will use NFC names; conflicts keep both
      versions locally until resolution. Writes will survive daemon crashes in staging, with
