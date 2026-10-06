@@ -1,8 +1,8 @@
 # Step 5: a writable macOS drive
 
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
-5 October; local namespace changes added 6 October. Item 1 has begun with the Rust mount
-namespace, snapshot handles and durable namespace mutations. The later deliverables remain an
+5 October; local namespace changes and staged file data added 6 October. Item 1 has begun with
+the Rust mount namespace, snapshot handles, durable namespace mutations and staged writes. The later deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
 
@@ -34,9 +34,10 @@ The adapter boundary already exists in
 `DaemonConfig.adapters`; an empty list returns `NoAdapter`. The first adapter is the current
 default. A remembered mount names its adapter explicitly.
 
-The core now supplies a persistent namespace, read-only snapshot handles and a writable local
-namespace overlay. Staged file data and a read path combining unpublished writes with a remote base remain to be built in
-the shared Rust core before writable FSKit or SMB callbacks are added.
+The core now supplies a persistent namespace, snapshot handles, a writable local namespace
+overlay and staged file data. Reads combine shared unpublished edits with each handle's remote
+snapshot. Daemon session RPCs and a shared per-drive feed are next; publication reconciliation,
+full kill-point recovery and writable FSKit or SMB callbacks remain later work.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
@@ -49,13 +50,15 @@ the shared Rust core before writable FSKit or SMB callbacks are added.
 
 The adapter, bridge and integrity choices are settled. The other recommendations preserve the
 existing plan or describe implementation requirements. The user also accepted these item 1
-policies on 5 October; writes and conflict handling arrive in later slices.
+policies on 5 October. Local writes are implemented below; full conflict handling remains a
+later slice.
 
 | Decision | Accepted policy |
 |---|---|
 | Names | New writes store NFC names, with equivalent NFD lookups, using the approved `unicode-normalization` dependency. Existing remote names stay byte-exact. If multiple names normalize alike, lookup reports ambiguity rather than choosing one. Names remain case-sensitive. |
 | Conflicts | Preserve the local saved data and remote version locally until the user resolves the conflict. Do not automatically publish a conflict sibling visible to other clients. |
 | Write acknowledgement | `write` returns after staging bytes that survive a daemon or extension crash. `fsync`, `F_FULLFSYNC` and `close` flush bytes and metadata to disk. Cloud publication has separate status. |
+| Files that stay open | **Accepted 6 October: publish after two seconds without writes**, as well as on fsync and close, so an application does not defer cloud publication merely by keeping a file open. |
 
 ### Platform evidence, checked 4 October
 
@@ -316,11 +319,11 @@ Only after snapshot/coherence and restart behavior are demonstrated should writa
 land. Pieces, `/Volumes`, UI and distribution follow the same core; each remains a separate
 reviewable deliverable.
 
-Slice 3 is split into local namespace changes (implemented below) and staged file data (next):
+Slice 3 is split into local namespace changes and staged file data (both implemented below):
 `write`, `truncate`, `fsync`, durable close, merged reads, disk admission and staged-file leases.
-After both parts, build item 2's Rust session RPCs and shared per-drive feed. Full publication
-reconciliation/conflict states and kill-point recovery remain slices 4 and 5. Publishing data
-for files that stay open still needs a user decision before the file-data part selects a quiet-period policy.
+Next, build item 2's Rust session RPCs and shared per-drive feed. Full publication
+reconciliation/conflict states and kill-point recovery remain slices 4 and 5. The user selected
+a two-second quiet period for publishing files that stay open, alongside fsync and close.
 
 ### Namespace slice, 5 October
 
@@ -361,7 +364,7 @@ in the pull request after they run.
 inode's ancestors and captures its object identity, version id, ETag, size and attributes together
 from an accepted namespace generation. A feed invalidation that wins before capture forces a
 retry. A handle keeps those attributes and bytes after remote overwrites, renames and file
-deletions; a new open observes refreshed metadata. Write opens return `EROFS`, directories return
+deletions; a new open observes refreshed metadata. Read-only sessions reject write opens with `EROFS`, directories return
 `EISDIR`, and symlinks expose their stored target through `readlink`.
 
 Handle ids combine a durable session epoch from the state database with a monotonic counter.
@@ -434,8 +437,8 @@ and time budgets, sequence churn, and same-key termination. No step 5 item is co
 
 `Session::new_writable` receives the daemon's existing `Queue` and requires the same `Store`.
 It adds exclusive empty-file `create`, `mkdir`, `unlink`, empty-directory `rmdir`, and `rename`
-with replacement or exclusivity. Exchange returns `EOPNOTSUPP`; file write opens still return
-`EROFS` until staged data arrives. The existing constructor keeps a read-only namespace.
+with replacement or exclusivity. Exchange returns `EOPNOTSUPP`. This slice covers namespace
+mutations; staged file data is described below. The existing constructor keeps a read-only namespace.
 Each acknowledged edit changes the overlay, inode metadata and guarded journal entries in one
 SQLite `FULL` transaction. The queue installs that committed work before waking its publisher.
 New names are NFC, existing remote source names stay byte-exact, and ambiguous equivalent
@@ -481,12 +484,110 @@ snapshots through both fetchers, restart, concurrent creates, transaction rollba
 snapshots and generation races, and competing remote guards. Each new test must fail with its
 behavior broken; race/churn breaks run three times. No step 5 item is complete.
 
-Local validation: 547 workspace tests pass (6 ignored), workspace clippy passes with warnings
+Namespace-slice validation: 547 workspace tests pass (6 ignored), workspace clippy passes with warnings
 denied, and spec/credential-script checks plus memory, fs and versitygw interoperability pass.
 The 45 new tests were each seen to fail under targeted defects: 94 isolated failure runs also
 exercise the existing queue dependency regression, with race/restart breaks repeated three times.
 The namespace suite passes three final consecutive runs. Local boto3 checks skip because it is
 unavailable; CI requires them and also covers MinIO and Docker Compose.
+
+### Staged file data, 6 October
+
+Writable sessions now implement `open(..., true)`, `write`, `truncate`, `fsync` and durable
+close. `Session::new_writable` uses the existing shared `Store`, `Cache` and `Queue` with default
+`StagingConfig`; `Session::new_writable_with_config` accepts a different free-space reserve,
+an injectable volume free-space check and an optional quiet period. The defaults keep 256 MiB
+free and queue changes after two seconds without writes. A caller can disable the timer with
+`quiet_period: None`; fsync and writable close still queue changes. Read-only sessions continue
+to reject write opens with `EROFS`; a write through a read-only handle returns `EBADF`.
+
+A writable session exclusively owns its drive within the Store. A second writer or a separate
+read-only alias returns `EAGAIN` while that owner lives; an existing read-only session also blocks
+a new writer. Read-only sessions can still coexist with each other. Adapters must share the
+writable Session to observe one local byte view. Its ownership lease remains with any owned
+flush task until that task finishes, so cancellation cannot admit a second stale staging map.
+
+Migration 7 persists a staged record per inode: the remote base captured at first write, its
+path, logical size, remote visibility cutoff, local extents, dirty ranges and flush revisions.
+Base timestamps use RFC3339, including dates before 1970.
+One append-only byte file per inode implements the sparse staging view. Writes append their
+bytes before a SQLite `NORMAL` transaction records the extent changes and new inode attributes.
+Overwrites split or replace logical ranges without changing earlier physical bytes, so a
+partial write or failed metadata commit preserves every prior acknowledgement. Adjacent ranges
+merge when they are also adjacent in the byte file. Sparse growth stores no bytes for holes.
+Truncation clips local ranges and lowers the visible remote cutoff; subsequent growth returns
+zeros for that discarded region instead of reviving old bytes.
+
+The shared local view is visible immediately through earlier handles, lookup, getattr and
+directory listings. A handle keeps its own immutable remote reader for untouched gaps; local
+ranges override it, and gaps beyond the visible remote base return zeros. Cached remote bytes
+remain readable offline, while an uncached remote gap fails promptly. All remote gaps share
+one relocation request and time budget in a read callback. Local creates and writes work offline
+under complete cached parents or locally created directories. Reopening the state
+restores acknowledged names, staged bytes and the remote base even if the previous session
+never closed or fsynced its handle.
+
+`write` acknowledges process-crash durability after the byte write and the `NORMAL` commit;
+it does not flush the file for each write. Fsync and writable close synchronize staged bytes
+and their directory and parent state directory, then commit metadata and frozen publication
+entries using the original SQLite `FULL` connection with `fullfsync` enabled. The accepted
+`F_FULLFSYNC` adapter callback will use this same core
+flush path. Local disk completion and remote cloud completion remain separate states.
+Cancellation cannot abandon the owned flush task between journal commit and its runtime state
+update. Staging admission is serialized across inodes and checks the configured reserve plus
+incoming physical bytes and metadata room before recording a mutation. `ENOSPC` or transaction
+failure acknowledges no new bytes. An unused appended tail is retained after a metadata error
+because its commit outcome can be uncertain after a late disk error.
+
+Publication receives immutable files owned by the journal, preserving them across restart and
+separating them from later appends to the live staged file. Contiguous new-file data uses a
+frozen full put; existing files and sparse new-file edits use bounded write ranges, a truncation
+when needed and the final logical size. Untouched remote gaps are not downloaded to publish an
+edit. Patching preserves existing content type, flags, metadata and xattrs; a new-file full put
+carries its complete local xattr map. Queue coalescing bounds both the encoded patch body and
+the logical size of an in-memory put, including sparse holes. The guard comes from the writable handle's captured version or retained journal lineage,
+so a newer remote version cannot become an accidental overwrite base. Mount guard failures keep
+the local staged bytes and block dependent entries. Rename preserves the inode and flushes to
+its current linked name. An open-unlinked or replaced handle can still read and write its own
+bytes; its later flush does not publish another object at the old name. Atomic save through a
+temporary file and rename-over retains the replaced object's bytes for its earlier handles.
+
+Dirty bytes mark an inode `pending`; durable queue handoff marks it `saving`. Successful upload
+still leaves `saving` until slice 4 binds published identities and versions, clears overlays and
+reconciles saved/conflict/error states. Mutable staged logs remain retained so open handles and
+pending work keep their bytes. Compaction of obsolete append ranges and removal of physical
+orphans are not implemented yet. Full kill-point recovery across publication and cleanup also
+remains slice 5. No step 5 item is complete.
+
+Validation covers overlapping writes, sparse gaps, shrink/regrow, earlier-handle reads,
+offline cache misses, restart before fsync, remote guard conflicts, atomic rename-over,
+open-unlink, frozen queue snapshots, failed byte/metadata writes, low-space admission, close and
+cancellation races, and quiet-period publication, including delayed timer rechecks after a
+successful flush or a newer write following a failed attempt.
+The ignored staging benchmark measures 1 GiB in 1 MiB writes and 10,000 files of 4 KiB, with
+successful `NORMAL` staging and `FULL` flush commits counted by `Session::staging_commits`.
+On the local Mac debug build, with uploads paused, the quiet timer disabled and an injectable
+free-space check allowing admission, the measurements are:
+
+| Workload | Total time | Mean write acknowledgement | p50 / p99 / maximum | NORMAL / FULL staging commits |
+| --- | --- | --- | --- | --- |
+| 1 GiB in 1 MiB writes | 0.572 s | 558 microseconds | 168 / 3,139 / 133,320 microseconds | 1,024 / 0 |
+| 10,000 files of 4 KiB | 247.879 s | 539 microseconds | 342 / 3,672 / 9,767 microseconds | 10,000 / 10,000 |
+
+The first total covers write acknowledgements without a final fsync. The second covers each
+create, open, write and durable close, including another 10,000 FULL namespace-create commits;
+its latency columns measure the write calls alone. Close latency was not separately measured.
+These are local staging measurements, not cloud publication throughput. Reproduce with
+`cargo test -p voidfs-client --locked --test mount_writes staged_write_throughput_one_gib_and_ten_thousand_small_files -- --ignored --exact --nocapture`.
+
+Staged-data validation: 587 workspace tests pass (7 ignored), workspace clippy passes with
+warnings denied, spec validation passes 55 cases / 420 steps, and the five credential-script
+tests pass. Memory, fs and versitygw interoperability pass with both addressing styles and
+the existing admin, aws-chunked, curl and rclone checks. Local boto3 checks skip because it is
+unavailable; CI requires them and also covers MinIO and Docker Compose. Each of the 40 new
+regular tests and the ignored benchmark was seen to fail under targeted runtime defects:
+81 isolated failure runs, with restart, race and timing defects repeated three times. The
+four cancellation, ownership and timer tests pass three consecutive restored runs.
 
 Accounts, web, search, previews, video review, Linux/Windows mounts, server locking, retention and
 encryption remain in their later steps. Cloud benchmark runs and new provider credentials do not

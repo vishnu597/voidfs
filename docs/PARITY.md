@@ -7,12 +7,12 @@ S3's bandwidth in the local benchmark, then coalesced shard fetches, and then fo
 step 4 (the scorecard refreshed, SpaceFS 0.2.333 looked at again, the Rust SDK, then the CLI),
 and then for the Mac apps head to head; provider follow-ups and the step 5 plan added on
 2026-10-04, with step 5 decisions, namespace and snapshot-read slices on 2026-10-05, and bounded
-moved-snapshot resolution on 2026-10-06. The first was taken
+moved-snapshot resolution, local namespace changes and staged file writes on 2026-10-06. The first was taken
 on 2026-09-27.*
 
 Sources:
-- the voidfs code on `origin/main` at `831cfba` (step 4, mount namespace and snapshot reads merged),
-  plus this change's namespace-first, bounded moved-snapshot resolution;
+- the voidfs code on `origin/main` at `3f8d15d` (local namespace changes merged),
+  plus this change's staged file writes;
 - the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
 - the benchmark results in [`bench/results/`](../bench/results/);
 - SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog, read again on 28
@@ -101,12 +101,15 @@ billing or plans), this page says so.
     conformance cases. AWS also passes all four after correcting the read role's bucket ARNs;
     required reads return 200 and forbidden operations return 403. The
     [AWS guide](aws-storage-credentials.md) records the initial failure and successful rerun.
-  - Step 5 has begun with the [mount core](step-5-macos.md#open-handles-and-snapshot-reads-5-october):
+  - Step 5 has begun with the [mount core](step-5-macos.md#staged-file-data-6-october):
     persistent inodes, lookup, attributes and directory listings, plus read-only snapshot
     handles through the shared cache with offline reads and restart detection. Moved reads use
-    the namespace first and a bounded fallback scan. FSKit first,
+    the namespace first and a bounded fallback scan. Durable local namespace/xattr edits and
+    staged file writes now share that core. Local edits are visible before upload, including to
+    earlier handles; open files queue edits after two seconds without writes. FSKit first,
     the Swift XPC bridge and verified whole shards are accepted; no step 5 item is complete.
-    Local writes, recovery and the writable mount remain pending. Steps 6–10 have not started.
+    Publication reconciliation, full recovery, daemon session RPCs and the writable mount remain
+    pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -831,7 +834,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - **Status (2026-10-04):** items 1–6 of 6 done.
 5. **Writable macOS drive** (Phase 2).
    - The ordered deliverables, adapter/bridge decisions and validation gates are in the
-     [step 5 plan](step-5-macos.md). Its namespace, snapshot-read and local namespace-mutation slices are implemented;
+     [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation and staged file-data slices are implemented;
      no writable adapter exists yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
@@ -861,15 +864,25 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      xattrs in a durable local overlay, atomically journaled with version/absence guards. Paused
      renames retain their remote base paths; pending names/maps survive feed invalidation and restart.
      Mount publishes keep their guards on conflict. Remote rename replacement is a guarded delete
-     followed by an exclusive rename, while the local replacement is atomic. Publication reconciliation
-     remains slice 4. Any future recursive removal represented by one retained parent needs a separate
-     addressing decision for its children. Staged file writes, full recovery and adapters remain pending.
+     followed by an exclusive rename, while the local replacement is atomic. File writes append
+     bytes before committing logical extents and inode metadata on a separate SQLite `NORMAL`
+     connection; fsync and writable close flush bytes and commit metadata at `FULL`. Reads merge
+     shared local ranges with each handle's bound remote base and zero-filled gaps. Shrink/regrow
+     never revives discarded bytes. Frozen snapshots enter the existing guarded queue, and files
+     that stay open also flush after two seconds without writes. A 256 MiB default local reserve
+     refuses further staging with `ENOSPC`; configuration supplies an injectable free-space check.
+     Unlinked handles retain their local bytes without publishing later changes. Queued files
+     retain `saving` until slice 4 reconciles identities, overlays and final states. Mutable staging
+     logs remain retained; safe compaction and orphan cleanup are not implemented yet. Any future
+     recursive removal represented by one retained parent needs a separate addressing decision
+     for its children. Full recovery and adapters remain pending. The next slice adds Rust session
+     RPCs in the daemon and a shared per-drive feed.
      The read-only transport/adapter may proceed alongside writable core slices after the
      snapshot/restart checks and the user's signed-bundle probe. The accepted direction is FSKit first, SMB evaluation on gate
      failure, the Rust daemon/socket with a thin Swift XPC bridge, and verified whole shards
-     until an authenticated-pieces RFC. New writes will use NFC names; conflicts keep both
-     versions locally until resolution. Writes will survive daemon crashes in staging, with
-     disk flush on fsync/F_FULLFSYNC/close and separate cloud status.
+     until an authenticated-pieces RFC. New names use NFC; complete conflict reconciliation
+     remains pending. Writes survive process crashes in staging, with disk flush on
+     fsync/F_FULLFSYNC/close and separate cloud status.
 6. **Accounts and web app** (Phase 3).
    - Passwordless email sign-in, workspaces and roles.
    - Keys minted and revoked within a minute, with drive allowlists.

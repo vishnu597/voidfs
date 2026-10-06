@@ -18,21 +18,27 @@ use crate::{Cache, Connectivity, Content, Error, Invalidation, Link, Reader, Sto
 mod mutations;
 #[path = "mount_xattrs.rs"]
 mod xattrs;
+#[path = "mount_stage.rs"]
+mod stage;
+#[path = "mount_data.rs"]
+mod data;
 pub use mutations::RenameMode;
 pub use xattrs::XattrMode;
+pub use stage::StagingConfig;
 
 pub type Ino = u64;
 pub type Fh = u64;
 pub type Result<T> = std::result::Result<T, FsError>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Sync { Saved, Pending, Saving, Conflict, Error }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Attr {
     pub ino: Ino,
     pub kind: Kind,
     pub size: u64,
+    #[serde(with = "stage::mtime")]
     pub mtime: SystemTime,
     pub mode: u32,
     pub generation: u64,
@@ -118,6 +124,10 @@ impl From<Error> for FsError {
 
 impl From<rusqlite::Error> for FsError {
     fn from(e: rusqlite::Error) -> Self { Error::from(e).into() }
+}
+
+impl From<std::io::Error> for FsError {
+    fn from(e: std::io::Error) -> Self { Error::from(e).into() }
 }
 
 fn sdk_error(e: &voidfs_sdk::Error) -> FsError {
@@ -313,7 +323,15 @@ fn remote_path(c: &Connection, drive: &str, root: Ino, ino: Ino) -> Result<Strin
     Ok(key)
 }
 
-struct Handle { attr: Attr, reader: tokio::sync::Mutex<Reader> }
+struct Handle { attr: Attr, reader: tokio::sync::Mutex<Reader>, write: bool, closed: std::sync::atomic::AtomicBool }
+struct ReadResolution { budget: crate::mount_resolve::Budget, remaining: Duration, failed: HashSet<String> }
+impl Default for ReadResolution {
+    fn default() -> Self { Self { budget: Default::default(), remaining: Duration::from_secs(2), failed: HashSet::new() } }
+}
+struct Closing<'a> { handle: &'a Handle, complete: bool }
+impl Drop for Closing<'_> {
+    fn drop(&mut self) { if !self.complete { self.handle.closed.store(false, std::sync::atomic::Ordering::Release); } }
+}
 struct Handles { next: u64, entries: std::collections::HashMap<Fh, Arc<Handle>> }
 
 /// One drive's persistent namespace. The caller supplies its feed invalidations; opening a
@@ -325,10 +343,16 @@ pub struct Session {
     cache: Cache, generation: u32, handles: Mutex<Handles>,
     refresh: Mutex<HashMap<Ino, Weak<tokio::sync::Mutex<()>>>>,
     queue: Option<crate::Queue>,
+    data: Arc<data::Staged>,
 }
 
 impl Session {
     pub async fn new(store: Arc<Store>, client: Client, cache: Cache, drive: &str, connectivity: Connectivity) -> Result<Self> {
+        let lease = store.mount_session(drive, false).ok_or(FsError::Again)?;
+        Self::new_inner(store, client, cache, drive, connectivity, lease).await
+    }
+
+    async fn new_inner(store: Arc<Store>, client: Client, cache: Cache, drive: &str, connectivity: Connectivity, lease: Arc<crate::store::MountLease>) -> Result<Self> {
         let d = drive.to_owned();
         let s = store.clone();
         let (root, generation) = tokio::task::spawn_blocking(move || s.with(|c| {
@@ -352,16 +376,24 @@ impl Session {
             tx.commit()?;
             Ok((root, generation))
         })).await.map_err(Error::from)??;
+        let data = data::Staged::load(store.clone(), drive.to_owned(), root, None, StagingConfig::default(), lease).await?;
         Ok(Self { store, client, drive: drive.to_owned(), root, connectivity, cache, generation,
-            handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()), queue: None })
+            handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()), queue: None, data })
     }
 
-    /// A writable namespace on the daemon's existing queue and state store. File writes follow
-    /// in the staged-data slice; read-only sessions retain their existing constructor.
+    /// A writable session on the daemon's queue and state store. One writer owns each drive;
+    /// adapters share that session so their handles see the same local bytes.
     pub async fn new_writable(store: Arc<Store>, client: Client, cache: Cache, queue: crate::Queue, drive: &str, connectivity: Connectivity) -> Result<Self> {
+        Self::new_writable_with_config(store, client, cache, queue, drive, connectivity, StagingConfig::default()).await
+    }
+
+    pub async fn new_writable_with_config(store: Arc<Store>, client: Client, cache: Cache, queue: crate::Queue, drive: &str, connectivity: Connectivity, cfg: StagingConfig) -> Result<Self> {
         if !queue.uses_store(&store) { return Err(FsError::InvalidArgument); }
-        let mut session = Self::new(store, client, cache, drive, connectivity).await?;
+        let lease = store.mount_session(drive, true).ok_or(FsError::Again)?;
+        let mut session = Self::new_inner(store, client, cache, drive, connectivity, lease.clone()).await?;
+        session.data = data::Staged::load(session.store.clone(), drive.to_owned(), session.root, Some(queue.clone()), cfg, lease).await?;
         session.queue = Some(queue);
+        session.data.restart_timers();
         Ok(session)
     }
 
@@ -458,7 +490,10 @@ impl Session {
 
     /// Binds attributes and content from one accepted namespace snapshot. IDs are never reused.
     pub async fn open(&self, ino: Ino, write: bool) -> Result<Fh> {
-        if write { return Err(FsError::ReadOnly); }
+        if write {
+            if self.queue.is_none() { return Err(FsError::ReadOnly); }
+            self.prepare_mutation(ino).await?;
+        }
         for _ in 0..4 {
             self.ancestors(ino).await?;
             let offline = self.connectivity.link() == Link::Offline;
@@ -477,16 +512,17 @@ impl Session {
             let (n, key) = match snapshot { Err(FsError::Again) => continue, other => other? };
             let attr = n.attr()?;
             match attr.kind { Kind::Folder => return Err(FsError::IsDir), Kind::File => {}, _ => return Err(FsError::Unsupported) }
-            let local = n.entry.object_id.is_empty() && attr.size == 0 && n.sync != Sync::Saved;
-            let version_id = if local { format!("local:{}", attr.ino) } else { attr.version_id.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot version".into()))? };
-            let etag = if local { format!("local:{}", attr.ino) } else { attr.etag.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot ETag".into()))? };
-            let content = Content { drive: self.drive.clone(), key, version_id, etag, size: attr.size };
+            let (base, key) = match self.data.file(ino) { Some(file) => { let state = file.state.lock().await; (state.record.base.clone(), state.record.key.clone()) }, None => (attr.clone(), key) };
+            let local = base.object_id.is_none() && n.sync != Sync::Saved;
+            let version_id = if local { format!("local:{}", attr.ino) } else { base.version_id.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot version".into()))? };
+            let etag = if local { format!("local:{}", attr.ino) } else { base.etag.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot ETag".into()))? };
+            let content = Content { drive: self.drive.clone(), key, version_id, etag, size: base.size };
             let reader = self.cache.reader(content).with_connectivity(self.connectivity.clone());
             let mut handles = self.handles.lock().unwrap_or_else(|p| p.into_inner());
             if handles.next > u32::MAX as u64 { return Err(FsError::Io("file handle space exhausted".into())); }
             let fh = (u64::from(self.generation) << 32) | handles.next;
             handles.next += 1;
-            handles.entries.insert(fh, Arc::new(Handle { attr, reader: tokio::sync::Mutex::new(reader) }));
+            handles.entries.insert(fh, Arc::new(Handle { attr: base, reader: tokio::sync::Mutex::new(reader), write, closed: std::sync::atomic::AtomicBool::new(false) }));
             return Ok(fh);
         }
         Err(FsError::Again)
@@ -505,7 +541,18 @@ impl Session {
     }
 
     /// The attributes bound at open, independent of later namespace changes.
-    pub fn handle_attr(&self, fh: Fh) -> Result<Attr> { Ok(self.handle(fh)?.attr.clone()) }
+    pub fn handle_attr(&self, fh: Fh) -> Result<Attr> {
+        let handle = self.handle(fh)?;
+        let mut attr = handle.attr.clone();
+        if let Some(file) = self.data.file(attr.ino) {
+            let local = file.attr.lock().unwrap_or_else(|p| p.into_inner());
+            attr.size = local.size;
+            attr.mtime = local.mtime;
+            attr.generation = local.generation;
+            attr.sync = local.sync;
+        }
+        Ok(attr)
+    }
 
     async fn snapshot_key(&self, attr: &Attr, failed: &HashSet<String>, budget: &mut crate::mount_resolve::Budget) -> Result<String> {
         let id = attr.object_id.as_deref().ok_or(FsError::Stale)?;
@@ -535,22 +582,54 @@ impl Session {
 
     pub async fn read(&self, fh: Fh, offset: u64, len: u64) -> Result<Bytes> {
         let handle = self.handle(fh)?;
+        let mut resolution = ReadResolution::default();
+        if let Some(file) = self.data.file(handle.attr.ino) {
+            let state = file.state.clone().lock_owned().await;
+            if offset >= state.record.size || len == 0 { return Ok(Bytes::new()); }
+            let len = len.min(state.record.size - offset);
+            let mut body = vec![0u8; usize::try_from(len).map_err(|_| FsError::InvalidArgument)?];
+            let end = offset + len;
+            let mut at = offset;
+            for extent in &state.record.extents {
+                if extent.end <= offset || extent.start >= end { continue; }
+                let start = extent.start.max(offset);
+                if at < start { self.read_gap(&handle, at, start.min(state.record.remote_size), offset, &mut body, &mut resolution).await?; }
+                let stop = extent.end.min(end);
+                let path = state.path.clone();
+                let physical = extent.physical + start - extent.start;
+                let bytes = tokio::task::spawn_blocking(move || stage::read_range(&path, physical, stop - start)).await.map_err(Error::from)??;
+                body[(start - offset) as usize..(stop - offset) as usize].copy_from_slice(&bytes);
+                at = stop;
+            }
+            if at < end { self.read_gap(&handle, at, end.min(state.record.remote_size), offset, &mut body, &mut resolution).await?; }
+            return Ok(Bytes::from(body));
+        }
+        self.read_remote(&handle, offset, len, &mut resolution).await
+    }
+
+    async fn read_gap(&self, handle: &Handle, start: u64, end: u64, offset: u64, body: &mut [u8], resolution: &mut ReadResolution) -> Result<()> {
+        let end = end.min(handle.attr.size);
+        if start < end {
+            let bytes = self.read_remote(handle, start, end - start, resolution).await?;
+            body[(start - offset) as usize..(end - offset) as usize].copy_from_slice(&bytes);
+        }
+        Ok(())
+    }
+
+    async fn read_remote(&self, handle: &Handle, offset: u64, len: u64, resolution: &mut ReadResolution) -> Result<Bytes> {
         let mut reader = handle.reader.lock().await;
         if offset >= handle.attr.size || len == 0 { return Ok(Bytes::new()); }
         let len = len.min(handle.attr.size - offset);
-        let mut budget = crate::mount_resolve::Budget::default();
-        let mut remaining = Duration::from_secs(2);
-        let mut failed = HashSet::new();
         for _ in 0..4 {
             match reader.read(offset, len).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => {
                     let missing = matches!(&e, Error::Fetch(e) if e.status() == Some(404));
                     if missing || matches!(e, Error::Changed { .. }) {
-                        if !failed.insert(reader.content().key.clone()) { return Err(if missing { FsError::Stale } else { e.into() }); }
+                        if !resolution.failed.insert(reader.content().key.clone()) { return Err(if missing { FsError::Stale } else { e.into() }); }
                         let start = tokio::time::Instant::now();
-                        let key = tokio::time::timeout(remaining, self.snapshot_key(&handle.attr, &failed, &mut budget)).await.map_err(|_| FsError::Again)?;
-                        remaining = remaining.saturating_sub(start.elapsed());
+                        let key = tokio::time::timeout(resolution.remaining, self.snapshot_key(&handle.attr, &resolution.failed, &mut resolution.budget)).await.map_err(|_| FsError::Again)?;
+                        resolution.remaining = resolution.remaining.saturating_sub(start.elapsed());
                         match key {
                             Ok(key) => { reader.relocate(key); continue; }
                             Err(error) if missing || error == FsError::Again => return Err(error),
@@ -567,8 +646,14 @@ impl Session {
 
     /// A read already in progress retains its handle; later calls see EBADF.
     pub async fn close(&self, fh: Fh) -> Result<()> {
-        self.check_handle(fh)?;
+        let handle = self.handle(fh)?;
+        if handle.closed.swap(true, std::sync::atomic::Ordering::AcqRel) { return Err(FsError::BadHandle); }
+        let mut closing = Closing { handle: &handle, complete: false };
+        if handle.write && let Some(file) = self.data.file(handle.attr.ino) {
+            self.data.flush(handle.attr.ino, file).await?;
+        }
         self.handles.lock().unwrap_or_else(|p| p.into_inner()).entries.remove(&fh).ok_or(FsError::BadHandle)?;
+        closing.complete = true;
         Ok(())
     }
 

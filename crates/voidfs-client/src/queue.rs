@@ -319,6 +319,52 @@ impl Queue {
         Arc::ptr_eq(&self.0.store, store)
     }
 
+    /// Freezes one range of a mount's staging file into bytes the journal owns. The caller
+    /// holds the inode's mutation lock until its entries adopt this path in mount_transaction.
+    pub(crate) async fn mount_copy(&self, source: PathBuf, offset: u64, length: u64) -> crate::mount::Result<PathBuf> {
+        let dir = self.0.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let end = offset.checked_add(length).ok_or(crate::mount::FsError::InvalidArgument)?;
+            let mut src = std::fs::File::open(&source)?;
+            let source_size = src.metadata()?.len();
+            if source_size < end {
+                return Err(crate::mount::FsError::Io("a mount snapshot range is past the staging file".into()));
+            }
+            src.seek(SeekFrom::Start(offset))?;
+            let mut raw = [0u8; 12];
+            std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
+            let path = dir.join(hex::encode(raw));
+            let result = (|| {
+                let dest = if offset == 0 && length == source_size {
+                    if std::fs::copy(&source, &path)? != length {
+                        return Err(crate::mount::FsError::Io("a mount snapshot source changed size".into()));
+                    }
+                    std::fs::File::open(&path)?
+                } else {
+                    let mut dest = std::fs::File::options().create_new(true).write(true).open(&path)?;
+                    let mut left = length;
+                    let mut buf = vec![0u8; (length.min(MIB) as usize).max(1)];
+                    while left != 0 {
+                        let n = left.min(buf.len() as u64) as usize;
+                        src.read_exact(&mut buf[..n])?;
+                        dest.write_all(&buf[..n])?;
+                        left -= n as u64;
+                    }
+                    dest
+                };
+                dest.sync_all()?;
+                std::fs::File::open(&dir)?.sync_all()?;
+                Ok::<_, crate::mount::FsError>(())
+            })();
+            if let Err(err) = result {
+                let _ = std::fs::remove_file(&path);
+                return Err(err);
+            }
+            Ok(path)
+        }).await.map_err(crate::Error::from).map_err(crate::mount::FsError::from)?
+    }
+
     /// Makes namespace changes and their journal entries durable together. Holding the queue
     /// lock across the commit keeps the publisher from observing only half of a local edit.
     pub(crate) async fn mount_transaction<T: Send + 'static>(
@@ -835,7 +881,9 @@ impl Queue {
             taken.insert(*id);
             // A put takes the writes after it, writes take the writes after them.
             if matches!(e.op, Op::Put | Op::Write | Op::Truncate) && (e.op != Op::Put || e.size < self.0.cfg.multipart_from) {
-                let mut body = e.size;
+                let patch = e.op != Op::Put;
+                let mut body = e.size.saturating_add(if patch { 12 + if e.op == Op::Write { 16 } else { 0 } } else { 0 });
+                let mut logical = e.size;
                 for next in &ids[i + 1..] {
                     let n = &st.pending[next];
                     if !depends(e, n) {
@@ -844,10 +892,13 @@ impl Queue {
                     let fits = n.drive == e.drive && n.key == e.key && matches!(n.op, Op::Write | Op::Truncate) && !st.paused(n) && n.state == State::Queued && n.batch == e.batch && n.mount == e.mount;
                     // A patch's truncate goes last: writes after it start a run of their own.
                     let after_truncate = e.op != Op::Put && run.last().is_some_and(|l: &Entry| l.op == Op::Truncate);
-                    if !fits || after_truncate || body + n.size > 64 * MIB || run.len() >= 10_000 {
+                    let added = n.size.saturating_add(if patch && n.op == Op::Write { 16 } else { 0 });
+                    let next_size = match n.op { Op::Write => logical.max(n.offset.saturating_add(n.size)), Op::Truncate => n.length, _ => logical };
+                    if !fits || after_truncate || body.saturating_add(added) > 64 * MIB || !patch && next_size > 64 * MIB || run.len() >= 10_000 {
                         break;
                     }
-                    body += n.size;
+                    body += added;
+                    logical = next_size;
                     taken.insert(n.id);
                     run.push(n.clone());
                 }
@@ -1083,6 +1134,142 @@ mod tests {
     fn local_inode(tx: &rusqlite::Transaction<'_>) -> crate::mount::Result<u64> {
         tx.execute("INSERT INTO mount_inodes(drive, attrs) VALUES ('d', '{}')", []).map_err(crate::Error::from)?;
         Ok(tx.last_insert_rowid() as u64)
+    }
+
+    #[tokio::test]
+    async fn mount_snapshot_is_frozen_and_owned_by_the_journal_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let source = staging.path().join("file");
+        std::fs::write(&source, b"snapshot").unwrap();
+        let q = paused(dir.path()).await;
+        let frozen = q.mount_copy(source.clone(), 0, 8).await.unwrap();
+        assert_eq!(frozen.parent().unwrap(), dir.path().join("journal"));
+        assert_eq!(std::fs::read(&frozen).unwrap(), b"snapshot");
+        std::fs::write(&source, b"replacement bytes").unwrap();
+        assert_eq!(std::fs::read(&frozen).unwrap(), b"snapshot", "later staging writes do not change the queued source");
+        let path = frozen.clone();
+        q.mount_transaction(move |tx| {
+            let mut e = Entry::new("d", "file", Op::Put, StoredBase::Absent);
+            e.mount_ino = Some(local_inode(tx)?);
+            e.source = Some(path);
+            e.staged = true;
+            e.size = 8;
+            Ok(((), vec![e]))
+        }).await.unwrap();
+        q.close().await;
+        drop(q);
+        let q = paused(dir.path()).await;
+        let entry = q.store().with(|c| journal::all(c)).unwrap().pop().unwrap();
+        assert_eq!(entry.source.as_ref(), Some(&frozen));
+        assert!(entry.staged);
+        assert_eq!(std::fs::read(&frozen).unwrap(), b"snapshot", "queue startup keeps adopted source bytes");
+        q.cancel(Scope::All).await.unwrap();
+        assert!(!frozen.exists(), "the journal cleans up its frozen source after cancellation");
+        assert!(source.exists(), "the mount still owns its mutable staging file");
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn mount_snapshot_copies_exact_ranges_larger_than_its_buffer() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let source = staging.path().join("sparse");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(64 * MIB).unwrap();
+        let bytes: Vec<u8> = (0..3 * MIB + 17).map(|n| (n % 251) as u8).collect();
+        file.write_all_at(&bytes, 17 * MIB + 3).unwrap();
+        let q = paused(dir.path()).await;
+        let frozen = q.mount_copy(source, 17 * MIB + 3, bytes.len() as u64).await.unwrap();
+        assert_eq!(std::fs::metadata(&frozen).unwrap().len(), bytes.len() as u64);
+        assert_eq!(std::fs::read(&frozen).unwrap(), bytes);
+        q.close().await;
+        drop(q);
+        let q = paused(dir.path()).await;
+        assert!(!frozen.exists(), "an unadopted snapshot is removed at queue startup");
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn mount_snapshot_rejects_short_and_overflowing_ranges_without_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let source = staging.path().join("short");
+        std::fs::write(&source, b"data").unwrap();
+        let q = paused(dir.path()).await;
+        assert!(q.mount_copy(source.clone(), 3, 2).await.is_err());
+        assert_eq!(q.mount_copy(source.clone(), u64::MAX, 1).await, Err(crate::mount::FsError::InvalidArgument));
+        assert_eq!(std::fs::read_dir(dir.path().join("journal")).unwrap().count(), 0);
+        let frozen = q.mount_copy(source, 4, 0).await.unwrap();
+        assert_eq!(std::fs::metadata(frozen).unwrap().len(), 0);
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn mount_patch_coalescing_counts_encoded_body_at_size_boundary() {
+        for (last, expected) in [(8 * MIB, 7), (8 * MIB - 12 - 8 * 16, 8)] {
+            let dir = tempfile::tempdir().unwrap();
+            let q = paused(dir.path()).await;
+            q.mount_transaction(move |_| {
+                let entries = (0..8).map(|i| {
+                    let mut e = Entry::new("d", "file", Op::Write, if i == 0 { StoredBase::Version("base".into()) } else { StoredBase::Any });
+                    e.offset = i * 8 * MIB;
+                    e.size = if i == 7 { last } else { 8 * MIB };
+                    e.length = e.size;
+                    e
+                }).collect();
+                Ok(((), entries))
+            }).await.unwrap();
+            let mut state = QState { pending: q.st().pending.clone(), ..Default::default() };
+            let (runs, retry) = q.select(&mut state);
+            assert!(retry.is_none());
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].len(), expected, "VFSP headers consume the same request-body budget as edit bytes");
+            let encoded = 12 + runs[0].iter().map(|e| e.size + 16).sum::<u64>();
+            assert!(encoded <= voidfs_core::patch::MAX_BODY as u64);
+            if expected == 8 { assert_eq!(encoded, voidfs_core::patch::MAX_BODY as u64); }
+            else {
+                let last = state.pending.values().last().unwrap();
+                assert_eq!(last.state, State::Queued);
+                assert_eq!(last.base, StoredBase::Entry(runs[0].last().unwrap().id), "the next run is guarded by its predecessor's published version");
+            }
+            q.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mount_sparse_changes_do_not_expand_a_coalesced_put_past_body_budget() {
+        for op in [Op::Write, Op::Truncate] {
+            for (size, expected) in [(1024 * MIB, 1), (64 * MIB, 2)] {
+                let dir = tempfile::tempdir().unwrap();
+                let q = paused(dir.path()).await;
+                q.mount_transaction(move |_| {
+                    let create = Entry::new("d", "file", Op::Put, StoredBase::Absent);
+                    let mut edit = Entry::new("d", "file", op, StoredBase::Any);
+                    if op == Op::Write { edit.offset = size - 1; edit.size = 1; }
+                    else { edit.length = size; }
+                    Ok(((), vec![create, edit]))
+                }).await.unwrap();
+                let mut state = QState { pending: q.st().pending.clone(), ..Default::default() };
+                let (runs, retry) = q.select(&mut state);
+                assert!(retry.is_none());
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0].len(), expected, "a sparse edit's logical size bounds the coalesced put's allocation");
+                if expected == 1 {
+                    let create = runs[0][0].id;
+                    let edit = state.pending.values().last().unwrap();
+                    assert_eq!(edit.state, State::Queued);
+                    assert_eq!(edit.base, StoredBase::Entry(create));
+                    state.pending.remove(&create);
+                    let (runs, _) = q.select(&mut state);
+                    assert_eq!(runs.len(), 1);
+                    assert_eq!(runs[0].len(), 1);
+                    assert_eq!(runs[0][0].op, op, "large gaps stay server-side instead of becoming a put body");
+                }
+                q.close().await;
+            }
+        }
     }
 
     #[tokio::test]

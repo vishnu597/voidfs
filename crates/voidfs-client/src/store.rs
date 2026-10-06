@@ -63,12 +63,20 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX mount_pending_remote_key ON mount_inodes(drive, remote_key) WHERE sync<>'saved';
      CREATE TABLE mount_xattrs(ino INTEGER PRIMARY KEY REFERENCES mount_inodes(ino), version TEXT,
          attrs TEXT NOT NULL, dirty INTEGER NOT NULL DEFAULT 0);",
+    // 7: acknowledged mount bytes and their immutable remote base.
+    "CREATE TABLE mount_staged(ino INTEGER PRIMARY KEY REFERENCES mount_inodes(ino), path TEXT NOT NULL, record TEXT NOT NULL);",
 ];
+
+pub(crate) struct MountLease { write: bool }
 
 pub struct Store {
     dir: PathBuf,
     conn: Mutex<Connection>,
+    normal: Mutex<Connection>,
+    access: Mutex<()>,
+    staging: Mutex<()>,
     _lock: File,
+    mount_writers: Mutex<std::collections::HashMap<String, Vec<std::sync::Weak<MountLease>>>>,
 }
 
 impl Store {
@@ -83,6 +91,8 @@ impl Store {
         // FULL: the journal's entries are durable once a transaction returns (item 3's design).
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "fullfsync", true)?;
+        conn.pragma_update(None, "checkpoint_fullfsync", true)?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         let version = usize::try_from(version).unwrap_or(usize::MAX);
@@ -106,11 +116,26 @@ impl Store {
             tx.pragma_update(None, "user_version", i as i64 + 1)?;
             tx.commit()?;
         }
-        Ok(Store { dir: dir.to_owned(), conn: Mutex::new(conn), _lock: lock })
+        let normal = Connection::open(dir.join("state.sqlite"))?;
+        normal.pragma_update(None, "synchronous", "NORMAL")?;
+        normal.pragma_update(None, "fullfsync", true)?;
+        normal.pragma_update(None, "checkpoint_fullfsync", true)?;
+        normal.pragma_update(None, "foreign_keys", true)?;
+        Ok(Store { dir: dir.to_owned(), conn: Mutex::new(conn), normal: Mutex::new(normal), access: Mutex::new(()), staging: Mutex::new(()), _lock: lock, mount_writers: Mutex::new(Default::default()) })
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub(crate) fn mount_session(&self, drive: &str, write: bool) -> Option<std::sync::Arc<MountLease>> {
+        let mut writers = self.mount_writers.lock().unwrap_or_else(|p| p.into_inner());
+        writers.retain(|_, leases| { leases.retain(|lease| lease.strong_count() > 0); !leases.is_empty() });
+        let leases = writers.entry(drive.to_owned()).or_default();
+        if leases.iter().filter_map(std::sync::Weak::upgrade).any(|lease| write || lease.write) { return None; }
+        let lease = std::sync::Arc::new(MountLease { write });
+        leases.push(std::sync::Arc::downgrade(&lease));
+        Some(lease)
     }
 
     /// This state's own id, made once: it names what this client wrote, so that it can tell its
@@ -138,8 +163,19 @@ impl Store {
 
     /// Runs `f` on the connection. It blocks: async callers run it on a blocking thread.
     pub(crate) fn with<T>(&self, f: impl FnOnce(&mut Connection) -> rusqlite::Result<T>) -> Result<T> {
+        let _access = self.access.lock().unwrap_or_else(|p| p.into_inner());
         let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         Ok(f(&mut conn)?)
+    }
+
+    pub(crate) fn with_normal<T>(&self, f: impl FnOnce(&mut Connection) -> rusqlite::Result<T>) -> Result<T> {
+        let _access = self.access.lock().unwrap_or_else(|p| p.into_inner());
+        let mut conn = self.normal.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(f(&mut conn)?)
+    }
+
+    pub(crate) fn staging(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.staging.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -244,5 +280,33 @@ mod tests {
         drop(s);
         let s = Store::open(dir.path()).unwrap();
         assert_eq!(s.with(|c| c.query_row("SELECT dirty FROM mount_xattrs WHERE ino=1", [], |r| r.get::<_, u64>(0))).unwrap(), 0);
+    }
+
+    #[test]
+    fn staged_data_migration_preserves_namespace_lineage_and_uses_a_separate_normal_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        for sql in &MIGRATIONS[..6] { c.execute_batch(sql).unwrap(); }
+        c.pragma_update(None, "user_version", 6).unwrap();
+        c.execute("INSERT INTO mount_inodes(ino, drive, attrs, entry_id, remote_key) VALUES (1, 'drive', '{}', 9, 'old/file')", []).unwrap();
+        c.execute("INSERT INTO mount_xattrs(ino, version, attrs, dirty) VALUES (1, 'version', '{}', 1)", []).unwrap();
+        drop(c);
+        let s = Store::open(dir.path()).unwrap();
+        s.with(|c| {
+            assert_eq!(c.query_row("SELECT entry_id, remote_key FROM mount_inodes WHERE ino=1", [], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))?, (9, "old/file".into()));
+            assert_eq!(c.query_row("SELECT version, dirty FROM mount_xattrs WHERE ino=1", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?, ("version".into(), 1));
+            assert_eq!(c.query_row("SELECT count(*) FROM mount_staged", [], |r| r.get::<_, u64>(0))?, 0);
+            assert_eq!(c.pragma_query_value(None, "synchronous", |r| r.get::<_, u64>(0))?, 2);
+            Ok(())
+        }).unwrap();
+        s.with_normal(|c| {
+            assert_eq!(c.pragma_query_value(None, "synchronous", |r| r.get::<_, u64>(0))?, 1);
+            c.execute("INSERT INTO mount_staged(ino, path, record) VALUES (1, '/staged/file', '{}')", [])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(s.with(|c| c.query_row("SELECT path FROM mount_staged WHERE ino=1", [], |r| r.get::<_, String>(0))).unwrap(), "/staged/file");
+        drop(s);
+        let s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.with_normal(|c| c.query_row("SELECT count(*) FROM mount_staged", [], |r| r.get::<_, u64>(0))).unwrap(), 1);
     }
 }
