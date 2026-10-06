@@ -282,6 +282,11 @@ struct Landed {
 }
 
 impl Landed {
+    fn for_write(at: Instant, took: Duration, answered: usize) -> Option<Self> {
+        let bound = (took / HOLD_SHARE).min(HOLD_MAX);
+        (bound >= TIMER_TICK).then_some(Self { at, bound, answered })
+    }
+
     /// Whether `w` was queued while the next entry could wait for it.
     fn caught(&self, w: &Waiting) -> bool {
         w.queued > self.at && w.queued <= self.at + self.bound
@@ -1352,7 +1357,6 @@ impl Pool {
                 caught += batch.iter().filter(|w| l.caught(w)).count();
             }
             let (rest, landed) = self.commit_batch(&d, &mut cadence, batch).await;
-            let landed = landed.filter(|l| l.bound >= TIMER_TICK);
             drop(cadence);
             {
                 let mut q = d.queue.lock().unwrap();
@@ -1501,11 +1505,11 @@ impl Pool {
                         let (pool, d, seen) = (self.clone(), d.clone(), self.clock.mono());
                         tokio::spawn(async move { pool.checkpoint(&d, state, seen, &mut last).await });
                     }
-                    let landed = Landed { at: Instant::now(), bound: (took / HOLD_SHARE).min(HOLD_MAX), answered: held.len() };
+                    let landed = Landed::for_write(Instant::now(), took, held.len());
                     for (w, answer) in held {
                         let _ = w.reply.send(answer);
                     }
-                    return (rest, Some(landed));
+                    return (rest, landed);
                 }
                 // Another authority wrote this sequence number: catch up, and plan everything
                 // again against what it wrote (format §7.2).
@@ -2955,29 +2959,18 @@ mod tests {
 
     /// An entry written in less than 4 ms is not held: a timer would take a tick, more than a
     /// quarter of the entry.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn quick_entries_are_not_held() {
-        let mem = Arc::new(MemStore::new(Clock::System));
-        let pool = inline_pool(&mem).await;
-        let d = pool.create_drive("d", None).await.unwrap();
-        let one = held(b"one");
-        let writes = slow_log(&mem, Duration::from_millis(1));
-        let tasks: Vec<_> = (0..4)
-            .map(|c| {
-                let (pool, d, one) = (pool.clone(), d.clone(), one.clone());
-                tokio::spawn(async move {
-                    for r in 0..10 {
-                        pool.commit(&d, put_plan(&format!("c{c}-{r}"), &one, Precondition::default(), &Arc::default())).await.unwrap();
-                        think(Duration::from_micros(300)).await;
-                    }
-                })
-            })
-            .collect();
-        for t in tasks {
-            t.await.unwrap();
+    #[test]
+    fn quick_entries_are_not_held() {
+        let at = Instant::now();
+        for took in [Duration::ZERO, Duration::from_nanos(1), Duration::from_millis(1), Duration::from_nanos(3_999_999)] {
+            assert!(Landed::for_write(at, took, 4).is_none(), "an entry written in {took:?} cannot pay for a timer tick");
         }
-        assert!(writes.begun.load(Ordering::SeqCst) > 0);
-        assert_eq!(pool.metrics.hold.get_sample_count(), 0);
+        for (took, bound) in [(Duration::from_millis(4), Duration::from_millis(1)),
+            (Duration::from_millis(6), Duration::from_micros(1500)), (Duration::from_millis(8), HOLD_MAX),
+            (Duration::from_secs(1), HOLD_MAX)] {
+            let landed = Landed::for_write(at, took, 4).expect("a timer tick fits within a quarter of the write");
+            assert_eq!((landed.at, landed.bound, landed.answered), (at, bound, 4));
+        }
     }
 
     /// A client writing alone never waits for a hold: the entry after its last one waits for its

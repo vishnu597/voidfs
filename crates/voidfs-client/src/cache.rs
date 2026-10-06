@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore, oneshot};
 
 use crate::error::{Error, Result};
+use crate::{Connectivity, Link};
 use crate::fetch::{Content, Fetch};
 use crate::store::Store;
 
@@ -276,6 +277,10 @@ impl Cache {
 
     /// Reads `len` bytes at `offset` of `c`, fewer where it ends.
     pub async fn read(&self, c: &Content, offset: u64, len: u64) -> Result<Bytes> {
+        self.read_connected(c, offset, len, None).await
+    }
+
+    async fn read_connected(&self, c: &Content, offset: u64, len: u64, conn: Option<&Connectivity>) -> Result<Bytes> {
         if offset >= c.size || len == 0 {
             return Ok(Bytes::new());
         }
@@ -285,7 +290,7 @@ impl Cache {
         let part = |i: u64| {
             let lo = offset.max(i * bs) - i * bs;
             let hi = end.min((i + 1) * bs) - i * bs;
-            self.read_block(c, i, lo, hi)
+            self.read_block_connected(c, i, lo, hi, conn)
         };
         if first == last {
             return part(first).await;
@@ -300,7 +305,7 @@ impl Cache {
 
     /// A reader of `c` that reads ahead while it is read forward.
     pub fn reader(&self, c: Content) -> Reader {
-        Reader { cache: self.clone(), content: c, next: 0, last_start: 0, ahead: 0, requested_to: 0, started: false }
+        Reader { cache: self.clone(), content: c, connectivity: None, next: 0, last_start: 0, ahead: 0, requested_to: 0, started: false }
     }
 
     fn block_len(&self, c: &Content, index: u64) -> u64 {
@@ -310,6 +315,10 @@ impl Cache {
 
     /// Bytes `lo..hi` of block `index`.
     async fn read_block(&self, c: &Content, index: u64, lo: u64, hi: u64) -> Result<Bytes> {
+        self.read_block_connected(c, index, lo, hi, None).await
+    }
+
+    async fn read_block_connected(&self, c: &Content, index: u64, lo: u64, hi: u64, conn: Option<&Connectivity>) -> Result<Bytes> {
         let key = BlockKey::of(c, index);
         let on_disk = {
             let mut st = self.state();
@@ -332,7 +341,8 @@ impl Cache {
                 Err(_) => self.drop_block(&key).await,
             }
         }
-        let block = self.fill(c, key, false).await?;
+        if let Some(conn) = conn { conn.check()?; }
+        let block = self.fill(c, key, false, conn.cloned()).await?;
         Ok(block.slice(lo as usize..hi as usize))
     }
 
@@ -389,7 +399,7 @@ impl Cache {
 
     /// The block, fetched once however many readers want it. The fetch runs as its own task, so
     /// a reader that gives up doesn't stop it, and read-ahead runs while nobody waits.
-    fn fill(&self, c: &Content, key: BlockKey, ahead: bool) -> Fill {
+    fn fill(&self, c: &Content, key: BlockKey, ahead: bool, conn: Option<Connectivity>) -> Fill {
         let mut fills = self.0.fills.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(f) = fills.get(&key) {
             return f.clone();
@@ -401,7 +411,7 @@ impl Cache {
         let busy = self.0.busy.clone();
         busy.n.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
-            let r = this.fetch(&c, &k, ahead).await;
+            let r = this.fetch(&c, &k, ahead, conn.as_ref()).await;
             if let Ok(b) = &r {
                 this.remember(&k, b.clone());
             }
@@ -426,9 +436,11 @@ impl Cache {
         f
     }
 
-    async fn fetch(&self, c: &Content, key: &BlockKey, ahead: bool) -> Result<Bytes> {
+    async fn fetch(&self, c: &Content, key: &BlockKey, ahead: bool, conn: Option<&Connectivity>) -> Result<Bytes> {
+        if let Some(conn) = conn { conn.check()?; }
         let _ahead = if ahead { Some(self.0.prefetch_permits.acquire().await.map_err(|_| Error::Invalid("closed".into()))?) } else { None };
         let _permit = self.0.fetch_permits.acquire().await.map_err(|_| Error::Invalid("closed".into()))?;
+        if let Some(conn) = conn { conn.check()?; }
         let offset = key.index * self.0.cfg.block_size;
         let len = self.block_len(c, key.index);
         let b = self.0.fetcher.fetch(c, offset, len).await?;
@@ -547,6 +559,11 @@ impl Cache {
 
     /// Fetches `c`'s block `index` in the background, unless the cache has it or is fetching it.
     pub fn prefetch(&self, c: &Content, index: u64) {
+        self.prefetch_connected(c, index, None);
+    }
+
+    fn prefetch_connected(&self, c: &Content, index: u64, conn: Option<&Connectivity>) {
+        if conn.is_some_and(|c| c.link() == Link::Offline) { return; }
         if index * self.0.cfg.block_size >= c.size {
             return;
         }
@@ -557,7 +574,7 @@ impl Cache {
                 return;
             }
         }
-        drop(self.fill(c, key, true));
+        drop(self.fill(c, key, true, conn.cloned()));
     }
 
     /// Fetches every block of `c` the cache lacks, `fetches` at a time: a pinned file kept whole.
@@ -724,6 +741,7 @@ fn load(store: &Store, dir: &Path) -> Result<(Lru<DiskEntry>, u64, Pins)> {
 pub struct Reader {
     cache: Cache,
     content: Content,
+    connectivity: Option<Connectivity>,
     next: u64,
     last_start: u64,
     ahead: u64,
@@ -733,8 +751,21 @@ pub struct Reader {
 }
 
 impl Reader {
+    /// Cached blocks remain readable offline; misses and queued read-ahead check this link.
+    pub fn with_connectivity(mut self, conn: Connectivity) -> Self {
+        self.connectivity = Some(conn);
+        self
+    }
+
     pub fn content(&self) -> &Content {
         &self.content
+    }
+
+    pub(crate) fn relocate(&mut self, key: String) {
+        self.content.key = key;
+        self.started = false;
+        self.ahead = 0;
+        self.requested_to = 0;
     }
 
     pub async fn read(&mut self, offset: u64, len: u64) -> Result<Bytes> {
@@ -754,11 +785,11 @@ impl Reader {
             let from = (self.next / bs).max(self.requested_to);
             let until = self.next.saturating_add(self.ahead).div_ceil(bs).min(blocks);
             for i in from..until {
-                self.cache.prefetch(&self.content, i);
+                self.cache.prefetch_connected(&self.content, i, self.connectivity.as_ref());
             }
             self.requested_to = self.requested_to.max(until);
         }
-        self.cache.read(&self.content, offset, len).await
+        self.cache.read_connected(&self.content, offset, len, self.connectivity.as_ref()).await
     }
 }
 

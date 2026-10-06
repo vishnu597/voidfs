@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::Connection;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Error, Result};
 
@@ -48,6 +49,12 @@ const MIGRATIONS: &[&str] = &[
          ino INTEGER NOT NULL UNIQUE REFERENCES mount_inodes(ino), PRIMARY KEY(parent, name)) WITHOUT ROWID;
      CREATE TABLE mount_overlay(parent INTEGER NOT NULL REFERENCES mount_inodes(ino), name TEXT NOT NULL,
          ino INTEGER REFERENCES mount_inodes(ino), PRIMARY KEY(parent, name)) WITHOUT ROWID;",
+    // 5: indexed equivalent-name lookup and parent traversal for feed invalidation.
+    "ALTER TABLE mount_names ADD COLUMN nfc TEXT NOT NULL DEFAULT '';
+     ALTER TABLE mount_overlay ADD COLUMN nfc TEXT NOT NULL DEFAULT '';
+     CREATE INDEX mount_names_nfc ON mount_names(parent, nfc);
+     CREATE INDEX mount_overlay_nfc ON mount_overlay(parent, nfc);
+     CREATE INDEX mount_overlay_ino ON mount_overlay(ino);",
 ];
 
 pub struct Store {
@@ -77,6 +84,17 @@ impl Store {
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
             let tx = conn.transaction()?;
             tx.execute_batch(sql)?;
+            if i == 4 {
+                for table in ["mount_names", "mount_overlay"] {
+                    let mut q = tx.prepare(&format!("SELECT parent, name FROM {table}"))?;
+                    let rows = q.query_map([], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    drop(q);
+                    for (parent, name) in rows {
+                        let nfc: String = name.nfc().collect();
+                        tx.execute(&format!("UPDATE {table} SET nfc=?3 WHERE parent=?1 AND name=?2"), rusqlite::params![parent, name, nfc])?;
+                    }
+                }
+            }
             tx.pragma_update(None, "user_version", i as i64 + 1)?;
             tx.commit()?;
         }
@@ -170,6 +188,27 @@ mod tests {
         assert_eq!(remembered[0].mountpoint, "/mount");
         s.with(|c| c.execute("INSERT INTO mount_inodes(drive, attrs) VALUES ('drv', '{}')", [])).unwrap();
         let version: i64 = s.with(|c| c.pragma_query_value(None, "user_version", |r| r.get(0))).unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn indexed_names_migration_backfills_remote_and_local_unicode_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        for sql in &MIGRATIONS[..4] { c.execute_batch(sql).unwrap(); }
+        c.pragma_update(None, "user_version", 4).unwrap();
+        c.execute("INSERT INTO mount_inodes(ino, drive, attrs) VALUES (1, 'drv', '{}'), (2, 'drv', '{}')", []).unwrap();
+        c.execute("INSERT INTO mount_names VALUES (1, ?1, 2)", ["cafe\u{301}"]).unwrap();
+        c.execute("INSERT INTO mount_overlay VALUES (1, ?1, NULL)", ["cafe\u{301}"]).unwrap();
+        drop(c);
+        let s = Store::open(dir.path()).unwrap();
+        for table in ["mount_names", "mount_overlay"] {
+            let (name, nfc): (String, String) = s.with(|c| c.query_row(&format!("SELECT name, nfc FROM {table}"), [], |r| Ok((r.get(0)?, r.get(1)?)))).unwrap();
+            assert_eq!(name, "cafe\u{301}");
+            assert_eq!(nfc, "café");
+        }
+        drop(s);
+        let s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.with(|c| c.query_row("SELECT count(*) FROM mount_overlay WHERE ino IS NULL AND nfc='café'", [], |r| r.get::<_, u64>(0))).unwrap(), 1);
     }
 }

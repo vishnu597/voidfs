@@ -109,13 +109,16 @@ void daemon info                      # its build, what its journal holds unpubl
 - `void daemon install` (macOS) writes a launchd agent, so that the daemon and its remembered
   mounts come back at login; `void daemon uninstall` removes it.
 
-Step 5 has started with the Rust mount namespace in
+Step 5 has started with the Rust mount core in
 [`voidfs-client::mount`](crates/voidfs-client/src/mount.rs): persistent inode identities,
 lookup, attributes and directory listings, with feed invalidation and complete cached listings
-offline. Open handles, file reads/writes and the Mac adapter follow in later slices. The accepted
+offline, plus read-only handles that keep one version's attributes and bytes through the shared
+cache after overwrite, rename or file deletion. Cached bytes remain readable offline, and handles
+from a previous session return `ESTALE`. Writes, recovery and the Mac adapter follow in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#namespace-slice-5-october) for the current scope and decisions.
+[step 5 plan](docs/step-5-macos.md#open-handles-and-snapshot-reads-5-october) for the current scope
+and decisions.
 
 ### The Rust SDK
 
@@ -380,7 +383,7 @@ nothing on either port does. The drives' state, which the server serves from, st
 | [`crates/voidfs-server`](crates/voidfs-server/) | The S3 server: storage backends, commit log, checkpoints, forks, SigV4, change feed |
 | [`crates/voidfs-sdk`](crates/voidfs-sdk/) | The Rust SDK: the AWS SDK for S3 plus typed calls for the extensions |
 | [`crates/voidfs-cli`](crates/voidfs-cli/) | `void`, the command line, on the SDK |
-| [`crates/voidfs-client`](crates/voidfs-client/) | The client core: block cache with read-ahead through the server or bucket, write journal and upload queue, change feed and connectivity, and the mount namespace with persistent inodes and metadata operations |
+| [`crates/voidfs-client`](crates/voidfs-client/) | The client core: block cache with read-ahead through the server or bucket, write journal and upload queue, change feed and connectivity, and the mount core with persistent inodes, metadata operations and snapshot reads |
 | [`crates/voidfs-daemon`](crates/voidfs-daemon/) | The per-user daemon `void daemon run` runs: the client core behind a Unix socket, with HTTP and JSON over it |
 | [`crates/voidfs-conformance`](crates/voidfs-conformance/) | Runs the conformance suite against any endpoint |
 | [`crates/voidfs-bench`](crates/voidfs-bench/), [`bench/`](bench/) | SpaceFS's 49 benchmark scenarios, run through voidfs and against the bare bucket; scripts and results |
