@@ -1,7 +1,8 @@
 # Step 5: a writable macOS drive
 
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
-5 October. Item 1 has begun with the Rust mount namespace and read-only snapshot handles. The later deliverables remain an
+5 October; moved-snapshot resolution updated 6 October. Item 1 has begun with the Rust mount
+namespace and read-only snapshot handles. The later deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
 
@@ -367,19 +368,18 @@ Closing releases the table's reference; a read already in progress may finish.
 
 The reader checks connectivity only after checking the cache: verified memory/disk blocks
 remain available offline, while misses and queued read-ahead fail before asking a fetcher.
-Content mismatches are logged; a mismatch at the bound object's own key returns `EIO`.
+Content mismatches are logged; a confirmed mismatch at the bound object's own key returns `EIO`.
 Both `ApiFetcher` and `BucketFetcher` use this path; direct reads retain whole-shard integrity
 checks and the existing API fallback where scoped bucket access is unavailable.
 
 Retaining a version does not make its original key a permanent address: a rename removes that
-key from the current namespace. On a version-read `404`, the session finds the bound `object_id`
-through existing attribute listings, or its final deleted key through the deleted listing, and
-retries the same version and ETag at that key. A scan validates page prefixes, continuation
-tokens and a consistent drive sequence, including a final root check; retries are bounded. This
-identity lookup also handles a version mismatch when another object replaces the original key:
-only finding the bound object at a different key permits retry; a mismatch at its own key remains `EIO`.
-The fallback can traverse a whole drive after an unseen cross-directory move. It changes no server
-or wire protocol behavior. The current API removes folders only after their children are gone.
+key from the current namespace. After a version-read `404` or content mismatch, the session first
+refreshes the inode's ancestors and retries the same version and ETag at the namespace's current
+path when it differs. A bounded fallback uses existing attribute/deleted listings for a move
+the namespace has not seen; its limits are recorded below. A confirmed mismatch at the bound
+object's own key remains `EIO`; inconclusive resolution that exhausts a budget returns `EAGAIN`.
+This changes no server or wire protocol behavior. The current API removes
+folders only after their children are gone.
 If later work introduces a recursive removal represented by one retained parent, a cold
 path-addressed read of its children would need an object-addressing decision: the retained parent
 alone does not expose their versions through the existing API. Cached blocks remain readable.
@@ -399,6 +399,30 @@ test must fail with its behavior broken; timing-sensitive breaks run at least th
 Namespace measurements at 10,000 and 100,000 entries record query counts and lookup/listing
 times in the pull request. Staged writes, guarded publish, conflicts, recovery, daemon session
 RPCs and the Swift/FSKit adapter remain pending; no step 5 item is complete.
+
+### Moved snapshot resolution, 6 October
+
+This is a small prerequisite fix before slice 3's staged writes. `404` and content-mismatch
+recovery first refresh the bound inode's ancestors and read its current namespace path by object
+identity. A delivered rename can therefore resolve without traversing unrelated folders or the
+deleted listing. Relocation changes only the reader's key: the handle retains the version, ETag,
+size and attributes captured at open.
+
+The fallback reads deleted entries one page at a time, then traverses attribute listings. Each
+fallback allows up to four sequence attempts, all charged to the same per-read budget of 16
+logical listing calls across relocations, including initial and final root checks. SDK retries
+inside a listing call may make additional HTTP requests. A shared budget of 2 seconds spent on
+resolution bounds namespace refresh and fallback work; ordinary data fetches do not consume it.
+Exhausting either budget returns
+`EAGAIN`, without claiming the object is absent. Page prefixes, continuation tokens and a stable
+drive sequence are checked before accepting a fallback result.
+
+If a `404` resolves to the key that just failed, the read stops with `ESTALE`; it does not repeat
+the scan. A confirmed content mismatch at the bound object's own key remains `EIO`; inconclusive
+resolution that exhausts a budget returns `EAGAIN`. Cached bytes remain
+readable offline; an uncached read still fails promptly. Validation must cover namespace-first
+relocation for both fetchers, immutable snapshot attributes, paginated deleted entries, request
+and time budgets, sequence churn, and same-key termination. No step 5 item is complete.
 
 Accounts, web, search, previews, video review, Linux/Windows mounts, server locking, retention and
 encryption remain in their later steps. Cloud benchmark runs and new provider credentials do not

@@ -377,6 +377,15 @@ pub struct FolderEntry {
     pub target: Option<String>,
 }
 
+/// One page of objects deleted and still retained (§4.10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedPage {
+    pub deleted: Vec<DeletedEntry>,
+    #[serde(default)]
+    pub next_continuation_token: Option<String>,
+}
+
 /// An object deleted and still retained (§4.10).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

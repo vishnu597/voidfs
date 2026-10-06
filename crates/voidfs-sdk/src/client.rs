@@ -859,19 +859,19 @@ impl Client {
         Ok(listing)
     }
 
+    /// One page of objects deleted and still retained, under `prefix` (§4.10).
+    pub async fn list_deleted_page(&self, drive: &str, prefix: &str, continuation_token: Option<&str>) -> Result<DeletedPage> {
+        let req = Req::new(Method::GET, drive_path(drive)).query("x-voidfs-deleted", "").query_opt("prefix", (!prefix.is_empty()).then(|| prefix.to_owned()))
+            .query_opt("continuation-token", continuation_token.map(str::to_owned));
+        self.execute(req).await?.json()
+    }
+
     /// Objects deleted and still retained, under `prefix`, every page (§4.10).
     pub async fn list_deleted(&self, drive: &str, prefix: &str) -> Result<Vec<DeletedEntry>> {
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Page {
-            deleted: Vec<DeletedEntry>,
-            next_continuation_token: Option<String>,
-        }
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let req = Req::new(Method::GET, drive_path(drive)).query("x-voidfs-deleted", "").query_opt("prefix", (!prefix.is_empty()).then(|| prefix.to_owned())).query_opt("continuation-token", token.take());
-            let page: Page = self.execute(req).await?.json()?;
+            let page = self.list_deleted_page(drive, prefix, token.as_deref()).await?;
             out.extend(page.deleted);
             match page.next_continuation_token {
                 Some(t) => token = Some(t),
@@ -980,5 +980,40 @@ mod tests {
         assert_eq!(object_meta(200, &h).unwrap().size, 3);
         h.remove("x-amz-version-id");
         assert!(matches!(object_meta(200, &h), Err(Error::Decode(_))));
+    }
+
+    #[tokio::test]
+    async fn deleted_pages_return_one_page_and_the_collector_keeps_following_tokens() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use axum::extract::{Query, State};
+        type Requests = Arc<Mutex<Vec<HashMap<String, String>>>>;
+        let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route("/drv", axum::routing::get(|State(requests): State<Requests>, Query(query): Query<HashMap<String, String>>| async move {
+            let later = query.get("continuation-token").map(String::as_str) == Some("next+/=");
+            requests.lock().unwrap().push(query);
+            axum::Json(serde_json::json!({ "deleted": [{ "key": if later { "second" } else { "first" }, "objectId": if later { "o-2" } else { "o-1" },
+                "deletedAt": "2026-01-01T00:00:00Z", "lastVersionId": "1.0", "size": 5 }], "nextContinuationToken": if later { None } else { Some("next+/=") } }))
+        })).with_state(requests.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = Client::new(Config { endpoint, access_key_id: "fixture".into(), secret_access_key: "fixture".into(), max_attempts: 1, ..Default::default() }).unwrap();
+        let first = client.list_deleted_page("drv", "parent/", None).await.unwrap();
+        assert_eq!((first.deleted.len(), first.deleted[0].key.as_str(), first.next_continuation_token.as_deref()), (1, "first", Some("next+/=")));
+        assert_eq!(requests.lock().unwrap().len(), 1, "one-page API must not consume the next page");
+        let second = client.list_deleted_page("drv", "parent/", first.next_continuation_token.as_deref()).await.unwrap();
+        assert_eq!((second.deleted[0].key.as_str(), second.next_continuation_token), ("second", None));
+        let all = client.list_deleted("drv", "").await.unwrap();
+        assert_eq!(all.into_iter().map(|entry| entry.key).collect::<Vec<_>>(), ["first", "second"]);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests.iter().all(|query| query.contains_key("x-voidfs-deleted")));
+        assert_eq!(requests[0].get("prefix").map(String::as_str), Some("parent/"));
+        assert_eq!(requests[1].get("continuation-token").map(String::as_str), Some("next+/="));
+        assert!(!requests[2].contains_key("prefix"));
+        assert!(!requests[2].contains_key("continuation-token"));
+        assert_eq!(requests[3].get("continuation-token").map(String::as_str), Some("next+/="));
+        server.abort();
     }
 }

@@ -6,12 +6,13 @@ virtual-host addressing and then health checks and metrics, and on 2026-10-01 fo
 S3's bandwidth in the local benchmark, then coalesced shard fetches, and then for the start of
 step 4 (the scorecard refreshed, SpaceFS 0.2.333 looked at again, the Rust SDK, then the CLI),
 and then for the Mac apps head to head; provider follow-ups and the step 5 plan added on
-2026-10-04, with step 5 decisions, namespace and snapshot-read slices on 2026-10-05. The first was taken
+2026-10-04, with step 5 decisions, namespace and snapshot-read slices on 2026-10-05, and bounded
+moved-snapshot resolution on 2026-10-06. The first was taken
 on 2026-09-27.*
 
 Sources:
-- the voidfs code on `origin/main` at `3465b57` (step 4 and the first mount namespace slice merged),
-  plus this change's snapshot reads and namespace scaling fixes;
+- the voidfs code on `origin/main` at `831cfba` (step 4, mount namespace and snapshot reads merged),
+  plus this change's namespace-first, bounded moved-snapshot resolution;
 - the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
 - the benchmark results in [`bench/results/`](../bench/results/);
 - SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog, read again on 28
@@ -102,7 +103,8 @@ billing or plans), this page says so.
     [AWS guide](aws-storage-credentials.md) records the initial failure and successful rerun.
   - Step 5 has begun with the [mount core](step-5-macos.md#open-handles-and-snapshot-reads-5-october):
     persistent inodes, lookup, attributes and directory listings, plus read-only snapshot
-    handles through the shared cache with offline reads and restart detection. FSKit first,
+    handles through the shared cache with offline reads and restart detection. Moved reads use
+    the namespace first and a bounded fallback scan. FSKit first,
     the Swift XPC bridge and verified whole shards are accepted; no step 5 item is complete.
     Local writes, recovery and the writable mount remain pending. Steps 6–10 have not started.
 
@@ -847,12 +849,15 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
-   - **Status (2026-10-05):** item 1 begun; no completed item yet. The mount session has a
+   - **Status (2026-10-06):** item 1 begun; no completed item yet. The mount session has a
      persistent namespace with stable inodes, indexed equivalent-name lookup, per-directory
      refreshes, generation invalidation and complete offline directory snapshots. Read-only
      handles bind attributes and bytes to a retained version through the shared cache, preserve
-     read-ahead and reject handles from earlier sessions. Existing listings relocate renamed
-     or deleted files by object identity. Any future recursive removal represented by one retained
+     read-ahead and reject handles from earlier sessions. Moved snapshot reads refresh the
+     inode's namespace path first; fallback attribute/deleted listings resolve object identity
+     within a shared per-read budget of 16 listing calls and a 2-second resolution deadline.
+     Budget exhaustion returns `EAGAIN`; a failed `404` key found again returns `ESTALE`.
+     This prerequisite fix precedes slice 3's staged writes. Any future recursive removal represented by one retained
      parent needs a separate addressing decision for its children. Writes, staged recovery and adapters remain pending.
      The read-only transport/adapter may proceed alongside writable core slices after the
      snapshot/restart checks and the user's signed-bundle probe. The accepted direction is FSKit first, SMB evaluation on gate
