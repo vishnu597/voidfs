@@ -55,6 +55,14 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX mount_names_nfc ON mount_names(parent, nfc);
      CREATE INDEX mount_overlay_nfc ON mount_overlay(parent, nfc);
      CREATE INDEX mount_overlay_ino ON mount_overlay(ino);",
+    // 6: local namespace publication lineage and complete extended-attribute snapshots.
+    "ALTER TABLE mount_inodes ADD COLUMN entry_id INTEGER;
+     ALTER TABLE mount_inodes ADD COLUMN remote_key TEXT;
+     ALTER TABLE entries ADD COLUMN mount INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE entries ADD COLUMN mount_ino INTEGER;
+     CREATE INDEX mount_pending_remote_key ON mount_inodes(drive, remote_key) WHERE sync<>'saved';
+     CREATE TABLE mount_xattrs(ino INTEGER PRIMARY KEY REFERENCES mount_inodes(ino), version TEXT,
+         attrs TEXT NOT NULL, dirty INTEGER NOT NULL DEFAULT 0);",
 ];
 
 pub struct Store {
@@ -210,5 +218,31 @@ mod tests {
         drop(s);
         let s = Store::open(dir.path()).unwrap();
         assert_eq!(s.with(|c| c.query_row("SELECT count(*) FROM mount_overlay WHERE ino IS NULL AND nfc='café'", [], |r| r.get::<_, u64>(0))).unwrap(), 1);
+    }
+
+    #[test]
+    fn writable_namespace_migration_preserves_existing_overlay_and_queue_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        for sql in &MIGRATIONS[..5] { c.execute_batch(sql).unwrap(); }
+        c.pragma_update(None, "user_version", 5).unwrap();
+        c.execute("INSERT INTO mount_inodes(ino, drive, attrs, generation, sync) VALUES (1, 'drv', '{}', 7, 'pending')", []).unwrap();
+        c.execute("INSERT INTO mount_overlay(parent, name, ino, nfc) VALUES (1, 'gone', NULL, 'gone')", []).unwrap();
+        c.execute("INSERT INTO entries(drive, key, op, base, state, created) VALUES ('drv', 'file', 'delete', 'v:old', 'queued', 1)", []).unwrap();
+        drop(c);
+        let s = Store::open(dir.path()).unwrap();
+        s.with(|c| {
+            let inode: (u64, String, Option<i64>, Option<String>) = c.query_row("SELECT generation, sync, entry_id, remote_key FROM mount_inodes WHERE ino=1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            assert_eq!(inode, (7, "pending".into(), None, None));
+            assert_eq!(c.query_row("SELECT count(*) FROM mount_overlay WHERE name='gone' AND ino IS NULL AND nfc='gone'", [], |r| r.get::<_, u64>(0))?, 1);
+            let entry: (String, String, bool, Option<u64>) = c.query_row("SELECT base, state, mount, mount_ino FROM entries", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            assert_eq!(entry, ("v:old".into(), "queued".into(), false, None));
+            assert_eq!(c.query_row("SELECT count(*) FROM mount_xattrs", [], |r| r.get::<_, u64>(0))?, 0);
+            c.execute("INSERT INTO mount_xattrs(ino, attrs) VALUES (1, '{}')", [])?;
+            Ok(())
+        }).unwrap();
+        drop(s);
+        let s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.with(|c| c.query_row("SELECT dirty FROM mount_xattrs WHERE ino=1", [], |r| r.get::<_, u64>(0))).unwrap(), 0);
     }
 }

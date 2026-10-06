@@ -1,8 +1,8 @@
 # Step 5: a writable macOS drive
 
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
-5 October; moved-snapshot resolution updated 6 October. Item 1 has begun with the Rust mount
-namespace and read-only snapshot handles. The later deliverables remain an
+5 October; local namespace changes added 6 October. Item 1 has begun with the Rust mount
+namespace, snapshot handles and durable namespace mutations. The later deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
 
@@ -34,8 +34,8 @@ The adapter boundary already exists in
 `DaemonConfig.adapters`; an empty list returns `NoAdapter`. The first adapter is the current
 default. A remembered mount names its adapter explicitly.
 
-The core now supplies a persistent namespace and read-only snapshot handles. A complete local
-overlay and a read path combining unpublished writes with a remote base remain to be built in
+The core now supplies a persistent namespace, read-only snapshot handles and a writable local
+namespace overlay. Staged file data and a read path combining unpublished writes with a remote base remain to be built in
 the shared Rust core before writable FSKit or SMB callbacks are added.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
@@ -316,6 +316,12 @@ Only after snapshot/coherence and restart behavior are demonstrated should writa
 land. Pieces, `/Volumes`, UI and distribution follow the same core; each remains a separate
 reviewable deliverable.
 
+Slice 3 is split into local namespace changes (implemented below) and staged file data (next):
+`write`, `truncate`, `fsync`, durable close, merged reads, disk admission and staged-file leases.
+After both parts, build item 2's Rust session RPCs and shared per-drive feed. Full publication
+reconciliation/conflict states and kill-point recovery remain slices 4 and 5. Publishing data
+for files that stay open still needs a user decision before the file-data part selects a quiet-period policy.
+
 ### Namespace slice, 5 October
 
 [`voidfs-client::mount::Session`](../crates/voidfs-client/src/mount.rs) supplies `lookup`,
@@ -423,6 +429,64 @@ resolution that exhausts a budget returns `EAGAIN`. Cached bytes remain
 readable offline; an uncached read still fails promptly. Validation must cover namespace-first
 relocation for both fetchers, immutable snapshot attributes, paginated deleted entries, request
 and time budgets, sequence churn, and same-key termination. No step 5 item is complete.
+
+### Local namespace changes, 6 October
+
+`Session::new_writable` receives the daemon's existing `Queue` and requires the same `Store`.
+It adds exclusive empty-file `create`, `mkdir`, `unlink`, empty-directory `rmdir`, and `rename`
+with replacement or exclusivity. Exchange returns `EOPNOTSUPP`; file write opens still return
+`EROFS` until staged data arrives. The existing constructor keeps a read-only namespace.
+Each acknowledged edit changes the overlay, inode metadata and guarded journal entries in one
+SQLite `FULL` transaction. The queue installs that committed work before waking its publisher.
+New names are NFC, existing remote source names stay byte-exact, and ambiguous equivalent
+names fail. Directory generations advance on edits; rename keeps the source inode. Complete
+offline snapshots and locally created directories admit mutations; unknown remote parents fail
+offline. `rmdir` checks the merged remote/local view and the queue orders child deletions first.
+
+Migration 6 stores each inode's latest journal entry and remote base path, complete binary xattr
+maps, and a mount-specific journal policy. `getxattr`, `listxattr`, `setxattr` (set/create/replace)
+and `removexattr` retain empty values, enforce the 64 KiB combined raw name/value limit, and use
+`ENOATTR` on macOS (`ENODATA` elsewhere) for missing attributes. Remote maps are read at the
+bound version and accepted only if inode identity, generation and path still match. Dirty maps
+and namespace overlays survive feed invalidation and restart. A paused local rename retains its
+remote base path for cold reads and directory/xattr refreshes, including unseen descendants.
+Pending folder refreshes verify identity and version before and after listing, so a replacement
+at the old path cannot contribute children to the locally renamed inode.
+Feed events also route through indexed pending remote origins, including subtree events for
+items moved out of that subtree locally. Events at the old path conservatively invalidate the
+pending local subtree and its current ancestors even when a tombstone hides the old name.
+
+New names publish under an absence guard; edits use a retained version or the published version
+of an earlier journal entry. Mount entries never retry `412` without their guard. A failed guard
+retains the pending overlay and blocks dependent work; queue status exposes the failure. The
+CLI queue retains its existing policy. Referenced lineage survives clearing finished entries.
+Mount queue dependencies also compare NFC spellings, so removing a decomposed remote name
+finishes before publishing a replacement at its NFC spelling.
+Folder listings that omit a version require an identity-checked attributes lookup to bind one
+before mutation; a folder whose attributes supply no version returns `EOPNOTSUPP` rather than
+publish without a guard.
+
+Rename replacement is atomic locally. The current wire rename guards only its source, so remote
+replacement queues a guarded destination delete followed by an exclusive guarded source rename.
+A changed destination prevents its deletion; a destination created between the two requests
+prevents the rename. This is two remote commits: if the delete succeeds and the source guard then
+fails, the remote destination stays deleted with its history retained, while the local replacement
+remains pending. Folder replacement requires an empty destination. Full publish reconciliation
+(binding a new object's identity/version, clearing the overlay, and `saving`/`saved`/`conflict`
+states) remains slice 4; successful uploads in this slice keep the local inode pending.
+
+Validation covers paused uploads and resumed publication, NFC/raw remote names, native errors,
+merged emptiness and child-first deletion, rename identity and replacement, cold open/unlinked
+snapshots through both fetchers, restart, concurrent creates, transaction rollback, xattr
+snapshots and generation races, and competing remote guards. Each new test must fail with its
+behavior broken; race/churn breaks run three times. No step 5 item is complete.
+
+Local validation: 547 workspace tests pass (6 ignored), workspace clippy passes with warnings
+denied, and spec/credential-script checks plus memory, fs and versitygw interoperability pass.
+The 45 new tests were each seen to fail under targeted defects: 94 isolated failure runs also
+exercise the existing queue dependency regression, with race/restart breaks repeated three times.
+The namespace suite passes three final consecutive runs. Local boto3 checks skip because it is
+unavailable; CI requires them and also covers MinIO and Docker Compose.
 
 Accounts, web, search, previews, video review, Linux/Windows mounts, server locking, retention and
 encryption remain in their later steps. Cloud benchmark runs and new provider credentials do not
