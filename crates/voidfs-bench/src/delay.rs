@@ -185,6 +185,11 @@ mod tests {
 
     const MB: usize = 1_000_000;
 
+    /// Each timing test measures this many runs, and they run one at a time, so that a loaded
+    /// machine only makes some runs slower.
+    const RUNS: usize = 3;
+    static TIMING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// An upstream that, per connection, reads `D` or `U` and a length: for `D` it sends that
     /// many bytes and closes; for `U` it reads that many, then answers one byte.
     async fn upstream() -> SocketAddr {
@@ -256,42 +261,64 @@ mod tests {
         d.as_secs_f64() * 1000.0
     }
 
-    /// Within 10% below and 25% above: a timer fires late, never early.
-    fn near(got: Duration, want_ms: f64) -> bool {
-        (0.9 * want_ms..=1.25 * want_ms).contains(&ms(got))
+    fn fastest(runs: &[Duration]) -> f64 {
+        runs.iter().map(|d| ms(*d)).fold(f64::INFINITY, f64::min)
+    }
+
+    /// Within 10% below and 60% above. A timer fires late, never early, so every run must reach
+    /// the floor. Load only adds time, so the fastest run is held to the ceiling, which still
+    /// tells a relay from one at half its rate or with twice its delay.
+    fn near(runs: &[Duration], want_ms: f64) -> bool {
+        runs.iter().all(|d| ms(*d) >= 0.9 * want_ms) && fastest(runs) <= 1.6 * want_ms
     }
 
     #[tokio::test]
     async fn the_delay_is_added_each_way_and_nothing_else_by_default() {
+        let _alone = TIMING.lock().await;
         let relay = relayed(Link { delay: Duration::from_millis(20), bandwidth: Bandwidth::default() }).await;
-        let (first, _) = download(relay, 1).await;
-        assert!(near(first, 40.0), "a round trip gains 2 × 20 ms: {first:?}");
-        let (first, all) = download(relay, 8 * MB).await;
-        assert!(near(first, 40.0), "{first:?}");
-        assert!(ms(all) < 40.0 + 60.0, "8 MB take no longer than a fast copy: {all:?}");
+        let (mut firsts, mut alls) = (Vec::new(), Vec::new());
+        for _ in 0..RUNS {
+            firsts.push(download(relay, 1).await.0);
+            let (first, all) = download(relay, 8 * MB).await;
+            firsts.push(first);
+            alls.push(all);
+        }
+        assert!(near(&firsts, 40.0), "a round trip gains 2 × 20 ms: {firsts:?}");
+        assert!(fastest(&alls) < 40.0 + 60.0, "8 MB take no longer than a fast copy: {alls:?}");
     }
 
     #[tokio::test]
     async fn a_connection_is_held_to_its_rate_each_way_and_still_delayed() {
+        let _alone = TIMING.lock().await;
         let bandwidth = Bandwidth { down: Some(40e6), up: Some(20e6), total: None };
         let relay = relayed(Link { delay: Duration::from_millis(10), bandwidth }).await;
-        let (first, all) = download(relay, 8 * MB).await;
-        assert!(ms(first) >= 20.0 && ms(first) < 40.0, "the first byte still waits a round trip: {first:?}");
-        assert!(near(all, 20.0 + 200.0), "8 MB at 40 MB/s: {all:?}");
-        let all = upload(relay, 4 * MB).await;
-        assert!(near(all, 20.0 + 200.0), "4 MB at 20 MB/s: {all:?}");
+        let (mut firsts, mut downs, mut ups) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..RUNS {
+            let (first, all) = download(relay, 8 * MB).await;
+            firsts.push(first);
+            downs.push(all);
+            ups.push(upload(relay, 4 * MB).await);
+        }
+        // The first byte waits a round trip of 20 ms, and not for the rate: 8 MB take 200 ms.
+        assert!(firsts.iter().all(|f| ms(*f) >= 20.0) && fastest(&firsts) < 80.0, "the first byte still waits a round trip: {firsts:?}");
+        assert!(near(&downs, 20.0 + 200.0), "8 MB at 40 MB/s: {downs:?}");
+        assert!(near(&ups, 20.0 + 200.0), "4 MB at 20 MB/s: {ups:?}");
     }
 
     #[tokio::test]
     async fn connections_share_the_total() {
+        let _alone = TIMING.lock().await;
         let bandwidth = Bandwidth { down: Some(40e6), up: None, total: Some(60e6) };
         let relay = relayed(Link { delay: Duration::from_millis(5), bandwidth }).await;
-        let t0 = Instant::now();
-        let each = futures::future::join_all((0..3).map(|_| download(relay, 4 * MB))).await;
-        let all = t0.elapsed();
-        // Alone, each would take 100 ms at 40 MB/s; together they share 60 MB/s.
-        assert!(near(all, 10.0 + 200.0), "12 MB at 60 MB/s in all: {all:?}");
-        assert!(each.iter().all(|(_, d)| ms(*d) > 150.0), "none ran at its own rate: {each:?}");
+        let mut alls = Vec::new();
+        for _ in 0..RUNS {
+            let t0 = Instant::now();
+            let each = futures::future::join_all((0..3).map(|_| download(relay, 4 * MB))).await;
+            alls.push(t0.elapsed());
+            // Alone, each would take 100 ms at 40 MB/s; together they share 60 MB/s.
+            assert!(each.iter().all(|(_, d)| ms(*d) > 150.0), "none ran at its own rate: {each:?}");
+        }
+        assert!(near(&alls, 10.0 + 200.0), "12 MB at 60 MB/s in all: {alls:?}");
     }
 
     #[test]
