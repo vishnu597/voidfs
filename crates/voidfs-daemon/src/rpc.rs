@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, HttpBody, to_bytes};
@@ -124,7 +123,7 @@ impl Access {
 
 pub(crate) struct Calls {
     active: Mutex<HashMap<String, Arc<Access>>>,
-    next: AtomicU64,
+    next: Mutex<u64>,
     calls: Arc<Semaphore>,
     sessions: Arc<Semaphore>,
     watches: Arc<Semaphore>,
@@ -132,7 +131,7 @@ pub(crate) struct Calls {
 
 impl Calls {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { active: Mutex::new(HashMap::new()), next: AtomicU64::new(1), calls: Arc::new(Semaphore::new(fs::MAX_CALLS)),
+        Arc::new(Self { active: Mutex::new(HashMap::new()), next: Mutex::new(1), calls: Arc::new(Semaphore::new(fs::MAX_CALLS)),
             sessions: Arc::new(Semaphore::new(fs::MAX_SESSIONS)), watches: Arc::new(Semaphore::new(fs::MAX_WATCHES)) })
     }
 
@@ -222,7 +221,12 @@ async fn create(State(s): State<Arc<Shared>>, request: Request) -> Result<Respon
     let slot = s.rpc.sessions.clone().try_acquire_owned().map_err(|_| Failure::busy())?;
     let drive = s.sessions.drive(&s, &new.drive).await?;
     if !drive.pinned { return Err(FsError::Offline.into()); }
-    let serial = s.rpc.next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1)).map_err(|_| Failure::busy())?;
+    let serial = {
+        let mut next = s.rpc.next.lock().unwrap_or_else(|p| p.into_inner());
+        let serial = *next;
+        *next = serial.checked_add(1).ok_or_else(Failure::busy)?;
+        serial
+    };
     let generation = drive.core.generation();
     let id = format!("{generation:08x}-{serial:016x}");
     let info = fs::SessionInfo { version: fs::VERSION, id: id.clone(), drive: drive.drive.clone(), root: drive.core.root(), generation,
