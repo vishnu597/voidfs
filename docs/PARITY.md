@@ -7,12 +7,13 @@ S3's bandwidth in the local benchmark, then coalesced shard fetches, and then fo
 step 4 (the scorecard refreshed, SpaceFS 0.2.333 looked at again, the Rust SDK, then the CLI),
 and then for the Mac apps head to head; provider follow-ups and the step 5 plan added on
 2026-10-04, with step 5 decisions, namespace and snapshot-read slices on 2026-10-05, and bounded
-moved-snapshot resolution, local namespace changes and staged file writes on 2026-10-06. The first was taken
+moved-snapshot resolution, local namespace changes and staged file writes on 2026-10-06, and
+Rust daemon sessions/shared feeds on 2026-10-07. The first was taken
 on 2026-09-27.*
 
 Sources:
-- the voidfs code on `origin/main` at `3f8d15d` (local namespace changes merged),
-  plus this change's staged file writes;
+- the voidfs code on `origin/main` at `d8ed49a` (staged file writes merged),
+  plus this change's Rust daemon session RPCs and shared feeds;
 - the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
 - the benchmark results in [`bench/results/`](../bench/results/);
 - SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog, read again on 28
@@ -108,7 +109,8 @@ billing or plans), this page says so.
     staged file writes now share that core. Local edits are visible before upload, including to
     earlier handles; open files queue edits after two seconds without writes. FSKit first,
     the Swift XPC bridge and verified whole shards are accepted; no step 5 item is complete.
-    Publication reconciliation, full recovery, daemon session RPCs and the writable mount remain
+    Rust session RPCs now share one core/feed per stable drive across mounts and observers.
+    Publication reconciliation, full recovery, the Swift bridge and the writable mount remain
     pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -834,7 +836,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - **Status (2026-10-04):** items 1–6 of 6 done.
 5. **Writable macOS drive** (Phase 2).
    - The ordered deliverables, adapter/bridge decisions and validation gates are in the
-     [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation and staged file-data slices are implemented;
+     [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation, staged file-data and Rust daemon-session slices are implemented;
      no writable adapter exists yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
@@ -852,7 +854,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
-   - **Status (2026-10-06):** item 1 begun; no completed item yet. The mount session has a
+   - **Status (2026-10-07):** items 1 and 2 begun; no completed item yet. The mount session has a
      persistent namespace with stable inodes, indexed equivalent-name lookup, per-directory
      refreshes, generation invalidation and complete offline directory snapshots. Read-only
      handles bind attributes and bytes to a retained version through the shared cache, preserve
@@ -875,8 +877,11 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      retain `saving` until slice 4 reconciles identities, overlays and final states. Mutable staging
      logs remain retained; safe compaction and orphan cleanup are not implemented yet. Any future
      recursive removal represented by one retained parent needs a separate addressing decision
-     for its children. Full recovery and adapters remain pending. The next slice adds Rust session
-     RPCs in the daemon and a shared per-drive feed.
+     for its children. Bounded Rust session RPCs now run over the existing daemon socket, with
+     binary data, per-consumer handle ownership/read-only policy and persisted generation
+     handshakes. Mounts and RPC clients share one stable-ID core and feed watcher; committed
+     metadata invalidations precede observer notifications, and reconnect/gaps trigger full resync.
+     Full recovery, the signed Swift bridge and adapters remain pending.
      The read-only transport/adapter may proceed alongside writable core slices after the
      snapshot/restart checks and the user's signed-bundle probe. The accepted direction is FSKit first, SMB evaluation on gate
      failure, the Rust daemon/socket with a thin Swift XPC bridge, and verified whole shards

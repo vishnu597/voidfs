@@ -122,11 +122,13 @@ snapshots to the upload queue. Files that stay open also queue their changes aft
 without writes. Moved snapshot reads first refresh the inode's
 namespace path, then use a bounded listing fallback for moves the namespace has not seen.
 Cached bytes remain readable offline, and handles from a previous session return `ESTALE`.
-Publication reconciliation, full recovery, daemon session RPCs and the Mac adapter follow in
-later slices. The accepted
+The daemon now shares one filesystem core and feed watcher per stable drive across mounts and
+Rust socket sessions. `DaemonClient::session` supplies generation handshakes, bounded metadata
+calls, binary reads/writes, and an invalidation stream. Publication reconciliation, full recovery
+and the Swift/FSKit bridge and adapter follow in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#staged-file-data-6-october) for the current scope
+[step 5 plan](docs/step-5-macos.md#rust-daemon-sessions-7-october) for the current scope
 and decisions.
 
 ### The Rust SDK
@@ -393,7 +395,7 @@ nothing on either port does. The drives' state, which the server serves from, st
 | [`crates/voidfs-sdk`](crates/voidfs-sdk/) | The Rust SDK: the AWS SDK for S3 plus typed calls for the extensions |
 | [`crates/voidfs-cli`](crates/voidfs-cli/) | `void`, the command line, on the SDK |
 | [`crates/voidfs-client`](crates/voidfs-client/) | The client core: block cache with read-ahead through the server or bucket, write journal and upload queue, change feed and connectivity, and the mount core with persistent inodes, snapshot reads, durable namespace/xattr mutations and staged file writes |
-| [`crates/voidfs-daemon`](crates/voidfs-daemon/) | The per-user daemon `void daemon run` runs: the client core behind a Unix socket, with HTTP and JSON over it |
+| [`crates/voidfs-daemon`](crates/voidfs-daemon/) | The per-user daemon: one core/feed per drive, control and bounded filesystem RPCs over a Unix socket, with a typed Rust session client |
 | [`crates/voidfs-conformance`](crates/voidfs-conformance/) | Runs the conformance suite against any endpoint |
 | [`crates/voidfs-bench`](crates/voidfs-bench/), [`bench/`](bench/) | SpaceFS's 49 benchmark scenarios, run through voidfs and against the bare bucket; scripts and results |
 | [`tests/interop/`](tests/interop/) | Checks with stock S3 clients (boto3, rclone); `run.sh` runs them and the conformance suite over each kind of store |

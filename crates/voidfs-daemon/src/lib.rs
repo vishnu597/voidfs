@@ -16,10 +16,14 @@ mod mounts;
 mod server;
 mod settings;
 mod uploads;
+mod fs_client;
+mod sessions;
+mod rpc;
 
 use std::path::{Path, PathBuf};
 
 pub use client::{ClientError, DaemonClient, UploadWatch};
+pub use fs_client::{FsClient, FsClientError, InvalidationWatch};
 pub use mounts::{Adapter, Core, MountSpec, Mounted};
 pub use server::{Daemon, DaemonConfig, Error};
 pub use settings::Settings;

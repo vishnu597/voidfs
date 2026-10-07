@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use voidfs_sdk::{Change, Client, Kind};
+use voidfs_sdk::{Change, ChangeWatchEvent, Client, Kind};
 
 use crate::connectivity::Connectivity;
 
@@ -83,9 +83,19 @@ impl FeedWatch {
     /// Watches `drive` from position `since` (a listing's `seq`). `conn`, if given, learns from
     /// the stream whether the server is there.
     pub fn start(client: Client, drive: &str, since: u64, conn: Option<Connectivity>) -> FeedWatch {
+        Self::start_mode(client, drive, since, conn, false)
+    }
+
+    /// Watches with a full invalidation on every reopened stream, including idle reconnects.
+    /// Such events retain the last delivered sequence position.
+    pub fn start_with_resync(client: Client, drive: &str, since: u64, conn: Option<Connectivity>) -> FeedWatch {
+        Self::start_mode(client, drive, since, conn, true)
+    }
+
+    fn start_mode(client: Client, drive: &str, since: u64, conn: Option<Connectivity>, resync: bool) -> FeedWatch {
         let (tx, rx) = mpsc::channel(256);
         let drive = drive.to_owned();
-        let task = tokio::spawn(run(client, drive, since, conn, tx));
+        let task = tokio::spawn(run(client, drive, since, conn, tx, resync));
         FeedWatch { rx, task }
     }
 
@@ -95,12 +105,18 @@ impl FeedWatch {
     }
 }
 
-async fn run(client: Client, drive: String, since: u64, conn: Option<Connectivity>, tx: mpsc::Sender<FeedEvent>) {
+async fn run(client: Client, drive: String, since: u64, conn: Option<Connectivity>, tx: mpsc::Sender<FeedEvent>, resync: bool) {
     let mut watch = client.watch_changes(&drive, since);
     let mut failures: u32 = 0;
     loop {
-        let event = match watch.next().await {
-            Ok(batch) => {
+        let event = match watch.next_event().await {
+            Ok(ChangeWatchEvent::Connected { since, reconnect }) => {
+                failures = 0;
+                if let Some(c) = &conn { c.answered(false); }
+                if !reconnect || !resync { continue; }
+                FeedEvent { drive: drive.clone(), seq: since, invalidations: vec![Invalidation::All] }
+            },
+            Ok(ChangeWatchEvent::Changes(batch)) => {
                 failures = 0;
                 if let Some(c) = &conn {
                     c.answered(false);

@@ -11,6 +11,14 @@ use crate::sign::drive_path;
 use crate::types::ChangeBatch;
 use crate::{Client, Error, Result, retry};
 
+/// A stream opening, or one batch of its changes. Reconnects can invalidate cached metadata
+/// immediately, even when the reopened stream has no new changes to deliver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChangeWatchEvent {
+    Connected { since: u64, reconnect: bool },
+    Changes(ChangeBatch),
+}
+
 /// A drive's changes as they are published, from a position on. It keeps the position of the
 /// last batch it delivered, and reconnects from there when the stream breaks.
 ///
@@ -26,6 +34,7 @@ pub struct ChangeWatch {
     ready: VecDeque<ChangeBatch>,
     /// Streams in a row that broke before anything arrived.
     broken: u32,
+    connected_once: bool,
 }
 
 impl std::fmt::Debug for ChangeWatch {
@@ -36,7 +45,7 @@ impl std::fmt::Debug for ChangeWatch {
 
 impl ChangeWatch {
     pub(crate) fn new(client: Client, drive: String, since: u64) -> ChangeWatch {
-        ChangeWatch { client, drive, last: since, stream: None, parser: EventParser::default(), ready: VecDeque::new(), broken: 0 }
+        ChangeWatch { client, drive, last: since, stream: None, parser: EventParser::default(), ready: VecDeque::new(), broken: 0, connected_once: false }
     }
 
     /// The position of the last batch delivered, or the one the watch started from.
@@ -52,9 +61,16 @@ impl ChangeWatch {
     /// The next batch of changes, waiting for one.
     pub async fn next(&mut self) -> Result<ChangeBatch> {
         loop {
+            if let ChangeWatchEvent::Changes(batch) = self.next_event().await? { return Ok(batch); }
+        }
+    }
+
+    /// The next stream connection or batch. Unlike `next`, an idle reconnect is observable.
+    pub async fn next_event(&mut self) -> Result<ChangeWatchEvent> {
+        loop {
             if let Some(b) = self.ready.pop_front() {
                 self.last = b.seq;
-                return Ok(b);
+                return Ok(ChangeWatchEvent::Changes(b));
             }
             let Some(stream) = self.stream.as_mut() else {
                 if self.broken > 0 {
@@ -70,7 +86,9 @@ impl ChangeWatch {
                 let resp = self.client.execute_streaming(&req, Patience::Stream).await?;
                 self.stream = Some(resp);
                 self.parser = EventParser::default();
-                continue;
+                let reconnect = self.connected_once;
+                self.connected_once = true;
+                return Ok(ChangeWatchEvent::Connected { since: self.last, reconnect });
             };
             // The server sends a comment every 15 s; silence much longer than that is a dead stream.
             let silence = self.client.config().timeout.max(Duration::from_secs(45));

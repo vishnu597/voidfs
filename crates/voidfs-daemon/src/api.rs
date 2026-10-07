@@ -19,11 +19,16 @@
 //! - `GET /v1/mounts`: [`Mounts`], the mount table and the remembered mounts.
 //! - `POST /v1/mounts`: [`NewMount`]; mounts a drive with an adapter and remembers it; answers
 //!   [`Mount`].
+//! - `/v1/fs`: bounded filesystem sessions, binary I/O and invalidations; see [`fs`].
 //! - `POST /v1/mounts/unmount`: [`Unmount`]; unmounts and forgets; answers [`Unmounted`].
 //!
-//! An error is `{"error": {"code", "message"}}`, with a 4xx or 5xx status.
+//! A control error is `{"error": {"code", "message"}}`, with a 4xx or 5xx status.
+//! Filesystem errors also carry native `errno`.
 
 use serde::{Deserialize, Serialize};
+
+#[path = "fs_api.rs"]
+pub mod fs;
 
 /// The build a daemon runs, as `void version` prints it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

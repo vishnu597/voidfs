@@ -93,10 +93,12 @@ pub(crate) struct Shared {
     access_key_id: String,
     pub(crate) client: voidfs_sdk::Client,
     pub(crate) queue: Queue,
-    cache: Cache,
+    pub(crate) cache: Cache,
     conn: Connectivity,
     pub(crate) store: Arc<Store>,
     pub(crate) mounts: Mounts,
+    pub(crate) sessions: crate::sessions::Sessions,
+    pub(crate) rpc: Arc<crate::rpc::Calls>,
     /// Set when a client asks the daemon to stop.
     stop_asked: watch::Sender<bool>,
     /// Set when the daemon starts stopping: streams end.
@@ -194,6 +196,8 @@ impl Daemon {
             conn,
             store: store.clone(),
             mounts: Mounts::new(cfg.adapters.clone(), cfg.mount_root.clone()),
+            sessions: crate::sessions::Sessions::new(),
+            rpc: crate::rpc::Calls::new(),
             stop_asked: watch::Sender::new(false),
             closing: watch::Sender::new(false),
             samples: Mutex::new(VecDeque::new()),
@@ -225,6 +229,7 @@ impl Daemon {
             .route("/v1/uploads/clear", post(crate::uploads::clear))
             .route("/v1/mounts", get(crate::mounts::list).post(crate::mounts::mount))
             .route("/v1/mounts/unmount", post(crate::mounts::unmount))
+            .nest("/v1/fs", crate::rpc::routes(shared.clone()))
             .fallback(not_found)
             .with_state(shared.clone());
         let (shutdown, mut rx) = watch::channel(false);
@@ -280,6 +285,8 @@ impl Daemon {
             let _ = server.await;
         }
         shared.mounts.detach_all().await;
+        shared.rpc.shutdown().await;
+        shared.sessions.shutdown().await;
         shared.queue.close().await;
         shared.cache.settle().await;
         probe.abort();
@@ -292,11 +299,11 @@ impl Daemon {
     }
 }
 
-pub(crate) struct Failure(pub StatusCode, pub String, pub String);
+pub(crate) struct Failure(pub StatusCode, pub String, pub String, pub Option<i32>);
 
 impl Failure {
     pub(crate) fn new(status: StatusCode, code: &str, message: impl Into<String>) -> Failure {
-        Failure(status, code.into(), message.into())
+        Failure(status, code.into(), message.into(), None)
     }
 }
 
@@ -309,6 +316,13 @@ impl IntoResponse for Failure {
 impl From<voidfs_client::Error> for Failure {
     fn from(e: voidfs_client::Error) -> Failure {
         Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", e.to_string())
+    }
+}
+
+impl From<voidfs_client::mount::FsError> for Failure {
+    fn from(e: voidfs_client::mount::FsError) -> Failure {
+        let failure = crate::rpc::Failure::from(e);
+        Failure(failure.status, failure.error.code, failure.error.message, Some(failure.error.errno))
     }
 }
 
@@ -330,8 +344,8 @@ async fn not_found(method: Method, uri: Uri) -> Failure {
 
 impl Shared {
     /// The client core, for an adapter.
-    pub(crate) fn core(&self) -> Core {
-        Core { client: self.client.clone(), cache: self.cache.clone(), queue: self.queue.clone(), connectivity: self.conn.clone() }
+    pub(crate) fn core(&self, session: Arc<voidfs_client::mount::Session>) -> Core {
+        Core { client: self.client.clone(), cache: self.cache.clone(), queue: self.queue.clone(), connectivity: self.conn.clone(), session }
     }
 
     pub(crate) fn connectivity(&self) -> &Connectivity {

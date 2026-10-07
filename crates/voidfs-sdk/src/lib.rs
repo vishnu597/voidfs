@@ -70,7 +70,7 @@ pub use bandwidth::Bandwidth;
 pub use client::{Client, Config, DEFAULT_ENDPOINT, DEFAULT_REGION, ObjectStream, Observation, Observe};
 pub use direct::{DIRECT_MIN_BYTES, PlannedShard, UploadPlan};
 pub use error::{Error, Result, ServiceError};
-pub use feed::ChangeWatch;
+pub use feed::{ChangeWatch, ChangeWatchEvent};
 pub use storage::Storage;
 pub use types::*;
 
