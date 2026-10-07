@@ -38,10 +38,12 @@ fn key(parent: &str, name: &str, folder: bool) -> Result<String> {
     Ok(key)
 }
 
-fn overlay(c: &Connection, parent: Ino, name: &str, ino: Option<Ino>) -> Result<()> {
+fn overlay(c: &Connection, parent: Ino, name: &str, ino: Option<Ino>, owner: Ino) -> Result<()> {
     let nfc: String = name.nfc().collect();
     c.execute("INSERT INTO mount_overlay(parent, name, ino, nfc) VALUES (?1, ?2, ?3, ?4)
         ON CONFLICT(parent, name) DO UPDATE SET ino=excluded.ino, nfc=excluded.nfc", params![parent, name, ino, nfc])?;
+    c.execute("INSERT INTO mount_overlay_publications(parent, name, ino) VALUES (?1, ?2, ?3)
+        ON CONFLICT(parent, name) DO UPDATE SET ino=excluded.ino, entry_id=NULL", params![parent, name, owner])?;
     Ok(())
 }
 
@@ -97,8 +99,9 @@ impl Session {
                 let ino = tx.last_insert_rowid() as Ino;
                 if kind == Kind::Folder { tx.execute("INSERT INTO mount_dirs(ino, listed) VALUES (?1, 1)", [ino])?; }
                 tx.execute("INSERT INTO mount_xattrs(ino, attrs, dirty) VALUES (?1, '{}', 1)", [ino])?;
-                overlay(tx, parent, &name, Some(ino))?;
+                overlay(tx, parent, &name, Some(ino), ino)?;
                 changed(tx, parent)?;
+                publication::inherit(tx,&drive,root,ino)?;
                 let mut entry = Entry::new(&drive, &key, if kind == Kind::Folder { Op::Folder } else { Op::Put }, StoredBase::Absent);
                 entry.mount_ino = Some(ino);
                 entry.attrs = Attrs { mode: Some(mode), mtime: attrs.mtime.clone(), ..Default::default() };
@@ -146,8 +149,8 @@ impl Session {
                 } else if n.entry.kind == Kind::Folder { return Err(FsError::IsDir); }
                 let key = key(&parent_key, &actual, folder)?;
                 let entry = entry(&drive, &key, Op::Delete, &n)?;
-                overlay(tx, parent, &actual, None)?;
-                n.sync = Sync::Pending;
+                overlay(tx, parent, &actual, None, n.ino)?;
+                n.sync = publication::pending(tx, n.ino)?;
                 n.generation += 1;
                 save_node(tx, &n)?;
                 changed(tx, parent)?;
@@ -211,8 +214,8 @@ impl Session {
                         if !names(tx, old.ino)?.is_empty() { return Err(FsError::NotEmpty); }
                     } else if n.entry.kind == Kind::Folder { return Err(FsError::NotDir); }
                     entries.push(entry(&drive, &key(&to_key, &name, old.entry.kind == Kind::Folder)?, Op::Delete, &old)?);
-                    overlay(tx, to_parent, &name, None)?;
-                    old.sync = Sync::Pending;
+                    overlay(tx, to_parent, &name, None, old.ino)?;
+                    old.sync = publication::pending(tx, old.ino)?;
                     old.generation += 1;
                     save_node(tx, &old)?;
                 }
@@ -220,10 +223,10 @@ impl Session {
                 rename.to_key = Some(to.clone());
                 rename.replace = false;
                 entries.push(rename);
-                overlay(tx, from_parent, &actual, None)?;
-                overlay(tx, to_parent, &to_name, Some(n.ino))?;
+                overlay(tx, from_parent, &actual, None, n.ino)?;
+                overlay(tx, to_parent, &to_name, Some(n.ino), n.ino)?;
                 n.entry.name = if n.entry.kind == Kind::Folder { format!("{to_name}/") } else { to_name };
-                n.sync = Sync::Pending;
+                n.sync = publication::pending(tx, n.ino)?;
                 n.generation += 1;
                 save_node(tx, &n)?;
                 changed(tx, from_parent)?;

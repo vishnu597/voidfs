@@ -157,7 +157,7 @@ async fn handle(State(st): State<Arc<ProxyState>>, req: axum::extract::Request) 
     }
     let mut out = Response::builder().status(resp.status().as_u16());
     for (k, v) in resp.headers() {
-        if !matches!(k.as_str(), "content-length" | "transfer-encoding" | "connection") {
+        if !matches!(k.as_str(), "transfer-encoding" | "connection") && (k.as_str() != "content-length" || parts.method == reqwest::Method::HEAD) {
             out = out.header(k, v);
         }
     }

@@ -2,8 +2,9 @@
 
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
 5 October; local namespace changes and staged file data added 6 October; Rust daemon sessions
-and shared feeds added 7 October. Items 1 and 2 have begun with
-the Rust mount namespace, snapshot handles, durable namespace mutations and staged writes. The later deliverables remain an
+and shared feeds, guarded publication and retained conflicts added 7 October. Items 1 and 2 have
+begun with the Rust mount namespace, snapshot handles, durable namespace mutations, staged writes
+and publication reconciliation. The later deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
 
@@ -37,9 +38,9 @@ default. A remembered mount names its adapter explicitly.
 
 The core now supplies a persistent namespace, snapshot handles, a writable local namespace
 overlay and staged file data. Reads combine shared unpublished edits with each handle's remote
-snapshot. The daemon now supplies bounded Rust session RPCs and one shared per-drive feed;
-publication reconciliation, full kill-point recovery, the Swift bridge and writable FSKit or SMB
-callbacks remain later work.
+snapshot. The daemon now supplies bounded Rust session RPCs and one shared per-drive feed.
+Guarded publication reconciles exact acknowledgements and retains conflicting versions locally;
+full kill-point recovery, the Swift bridge and writable FSKit or SMB callbacks remain later work.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
@@ -52,8 +53,8 @@ callbacks remain later work.
 
 The adapter, bridge and integrity choices are settled. The other recommendations preserve the
 existing plan or describe implementation requirements. The user also accepted these item 1
-policies on 5 October. Local writes are implemented below; full conflict handling remains a
-later slice.
+policies on 5 October. Local writes and guarded publication are implemented below; conflict
+resolution UI remains a later deliverable.
 
 | Decision | Accepted policy |
 |---|---|
@@ -323,8 +324,9 @@ reviewable deliverable.
 
 Slice 3 is split into local namespace changes and staged file data (both implemented below):
 `write`, `truncate`, `fsync`, durable close, merged reads, disk admission and staged-file leases.
-Item 2's Rust session RPCs and shared per-drive feed are now implemented below. Full publication
-reconciliation/conflict states and kill-point recovery remain slices 4 and 5. The user selected
+Item 2's Rust session RPCs and shared per-drive feed are now implemented below. Publication
+reconciliation and retained conflict states are now implemented as slice 4; full kill-point
+recovery remains slice 5. The user selected
 a two-second quiet period for publishing files that stay open, alongside fsync and close.
 
 ### Namespace slice, 5 October
@@ -718,11 +720,88 @@ tests and two strengthened existing tests received 47 isolated runtime failure p
 restart, cancellation and race cases repeated three times, and passed after restoration. Local
 interoperability passes on memory, filesystem and versitygw in both addressing styles; boto3
 remains unavailable locally. Legacy name-only remembered records require explicit remounts.
-Guarded publication and conflict reconciliation remain the next core slice, followed by full
-kill-point recovery. The signed-bundle probe still precedes the Swift bridge and FSKit adapter.
+Guarded publication and conflict reconciliation are implemented below; full kill-point recovery
+is the next core slice. The signed-bundle probe still precedes the Swift bridge and FSKit adapter.
 
 Accounts, web, search, previews, video review, Linux/Windows mounts, server locking, retention and
 encryption remain in their later steps. Cloud benchmark runs and new provider credentials do not
 block local mount/core development. Passing step 4 with storage-credential cases skipped is not
 proof of the direct bucket path; step 5 must exercise both direct reads when supported and the
 already-built server fallback.
+
+
+### Guarded publication and conflict reconciliation, 7 October
+
+Slice 4 reconciles the existing mount journal after publication. The core reads HEAD and full
+attributes at the **acknowledged version**, validates object identity/version/kind against the
+local inode, and commits journal completion with durable inode state in one SQLite transaction.
+Clean saves adopt remote identity, size, mtime, mode and the full xattr map; clear only namespace overlay cells owned by
+those entries; and transition to `saved`. A remote listing that observes a newly published object
+before its acknowledgement is folded back onto the original local inode. Folder moves rebase
+cached descendant remote paths, including children with later pending edits.
+
+Writes, truncation, namespace changes and xattrs accepted during an upload keep their newer local
+state. Publication holds staged-writer leases while capturing/reconciling, applies in-memory
+changes only after the transaction commits, and emits inode metadata notifications afterwards.
+`Queue::settle` includes this final reconciliation. Clean staging detaches from fresh opens;
+existing handles retain the immutable local layers they saw. A subsequent write through such a
+handle uses its latest own acknowledged version as a guard, while an untouched earlier handle
+keeps the original snapshot guard after an external refresh. A stale writable handle cannot
+join a live stage created from a newer external version: its write returns `ESTALE` before
+changing bytes or metadata. Restart reconstructs the stage guard from its original base or a
+proven own publication, rather than an unrelated namespace refresh. Shrink/regrow still clips
+prior layers so discarded bytes cannot return.
+
+Guard rejection (`412`), rename destination collision (`409`) and a missing source (`404`) produce
+`conflict`, while other permanent errors produce `error`. Competing file byte snapshots are
+written and synchronized under the private state directory before the conflict transaction;
+folder snapshots retain metadata without allocating a byte file;
+local attributes/xattrs and exact remote attributes/xattrs are persisted with them. `Session::conflict`
+returns the retained metadata and `read_conflict` supplies bounded reads (at most 8 MiB) of each
+file side without exposing filesystem paths. A blocked child resolves to the directly rejected
+owner (`Conflict.ino`), preserving its own regular local reads; folder conflict reads return
+`EISDIR`. The owner dependency survives later moves, cancellation and restart. A deleted remote
+object is an explicit absent side, including `412` without a current version when HEAD confirms
+absence. An unversioned delete response is accepted only after confirming
+the source is absent; a folder that acquired children stays in conflict. Local snapshots of
+a remotely moved base use the existing namespace-first, 16-request/2-second relocation bound.
+Later local edits retain the conflict state and its first snapshots. Queue resume, cancel,
+clear-finished and restart cannot remove the predecessor's guard or publish a conflict sibling.
+The CLI publisher retains its existing overwrite/conflict-copy policy.
+
+Snapshot capture can fail, for example when the network or local disk becomes unavailable.
+The conflict records that failure and snapshot availability explicitly, retaining fetched
+remote metadata even when its content capture fails; original staged/journal
+sources remain retained and the mutation stays blocked. Conflict selection/resolution UI and
+snapshot cleanup are later work. Mutable stage compaction, orphan collection and complete
+process kill-point recovery are slice 5; this slice does not complete step 5 item 1.
+
+
+Acknowledged data PUTs that still need xattrs persist that phase before the attribute request.
+Retries finish only those xattrs, then reconcile the final exact version. A lost attribute reply
+is accepted only when pinned before/after identity, ETag, size and complete expected attributes
+match; a competing edit still conflicts. Upgrading prior mount state replays completed saves
+with known versions through metadata reconciliation without repeating the mutation, and recovers
+overlay ownership from persisted inode/name/journal evidence. Unprovable legacy overlays remain
+local; broader interrupted-state repair and cleanup belong to slice 5.
+
+A mount PUT with an ambiguous reply and no durable acknowledgement fails closed as a conflict,
+even when a current version inherits its journal marker. Marker-only matching cannot distinguish
+a later foreign edit. Exact recovery of that pre-acknowledgement window remains slice 5; the
+existing CLI marker policy is unchanged.
+
+Malformed publication metadata and permanent reconciliation failures produce visible `error`
+without repeating acknowledged data; transient database failures retain the completion retry.
+
+Guarded-publication validation: 664 workspace tests pass (8 ignored), and workspace clippy
+passes with warnings denied. The 36 new tests and one strengthened existing test each received
+a targeted runtime failure proof: 101 isolated failing runs, with race, restart and cancellation
+defects repeated three times. All restored tests pass. Spec validation passes 55 cases / 420
+steps, and the five credential-script tests pass. Local memory, fs and versitygw interoperability
+passes conformance, stock S3 checks, aws-chunked and rclone in both addressing styles. Local
+boto3 is unavailable; CI supplies boto3 and checks MinIO and Docker Compose as well.
+
+Next is slice 5: process kill points around staging, publication and reconciliation; a seeded
+filesystem model with restarts; repair of ambiguous interrupted state; and safe staged-file
+compaction and orphan cleanup. Retained snapshots and open-handle leases must survive those
+cleanup rules. The signed-bundle probe still precedes the Swift bridge and FSKit adapter.

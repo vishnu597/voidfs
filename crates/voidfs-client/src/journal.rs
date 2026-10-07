@@ -219,6 +219,10 @@ pub(crate) struct Entry {
     /// Bytes to send.
     pub size: u64,
     pub version: Option<String>,
+    /// A successful mount mutation awaiting exact-version reconciliation, never resent.
+    pub published_version: Option<String>,
+    pub published_key: Option<String>,
+    pub published_attrs: bool,
     pub conflict: Option<String>,
     pub error: Option<String>,
     pub upload_id: Option<String>,
@@ -251,6 +255,9 @@ impl Entry {
             sent: 0,
             size: 0,
             version: None,
+            published_version: None,
+            published_key: None,
+            published_attrs: false,
             conflict: None,
             error: None,
             upload_id: None,
@@ -270,7 +277,7 @@ pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-const COLUMNS: &str = "id, drive, key, op, base, source, staged, stamp, pos, length, to_key, overwrite, attrs, batch, state, paused, sent, size, version, conflict, error, upload_id, created, mount, mount_ino";
+const COLUMNS: &str = "id, drive, key, op, base, source, staged, stamp, pos, length, to_key, overwrite, attrs, batch, state, paused, sent, size, version, conflict, error, upload_id, created, mount, mount_ino, published_version, published_key, published_attrs";
 
 fn from_row(r: &Row) -> rusqlite::Result<Entry> {
     let attrs: Option<String> = r.get(12)?;
@@ -301,6 +308,9 @@ fn from_row(r: &Row) -> rusqlite::Result<Entry> {
         created: r.get(22)?,
         mount: r.get(23)?,
         mount_ino: r.get(24)?,
+        published_version: r.get(25)?,
+        published_key: r.get(26)?,
+        published_attrs: r.get(27)?,
     })
 }
 
@@ -339,8 +349,8 @@ pub(crate) fn insert(c: &Connection, e: &mut Entry) -> rusqlite::Result<()> {
 /// Writes the fields that change as an entry is published.
 pub(crate) fn update(c: &Connection, e: &Entry) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE entries SET state = ?2, paused = ?3, sent = ?4, size = ?5, version = ?6, conflict = ?7, error = ?8, upload_id = ?9, stamp = ?10, base = ?11 WHERE id = ?1",
-        params![e.id, e.state.as_str(), e.paused, e.sent as i64, e.size as i64, e.version, e.conflict, e.error, e.upload_id, e.stamp.map(|s| s.encode()), e.base.encode()],
+        "UPDATE entries SET state = ?2, paused = ?3, sent = ?4, size = ?5, version = ?6, conflict = ?7, error = ?8, upload_id = ?9, stamp = ?10, base = ?11, published_version=?12, published_key=?13, published_attrs=?14 WHERE id = ?1",
+        params![e.id, e.state.as_str(), e.paused, e.sent as i64, e.size as i64, e.version, e.conflict, e.error, e.upload_id, e.stamp.map(|s| s.encode()), e.base.encode(), e.published_version, e.published_key, e.published_attrs],
     )?;
     Ok(())
 }

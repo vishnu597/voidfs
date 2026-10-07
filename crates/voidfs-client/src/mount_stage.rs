@@ -167,7 +167,7 @@ impl Stage {
                 n.entry.size = Some(next.size);
                 n.entry.mtime = Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
                 n.generation = n.generation.checked_add(1).filter(|g| *g <= i64::MAX as u64).ok_or(FsError::InvalidArgument)?;
-                n.sync = Sync::Pending;
+                n.sync = publication::pending(&tx, ino)?;
                 save_node(&tx, &n)?;
                 tx.execute("INSERT INTO mount_staged(ino, path, record) VALUES (?1, ?2, ?3)
                     ON CONFLICT(ino) DO UPDATE SET path=excluded.path, record=excluded.record", params![ino, path, record])?;

@@ -127,11 +127,14 @@ Rust socket sessions. `DaemonClient::session` supplies generation handshakes, bo
 calls, binary reads/writes, and an invalidation stream. New remembered mounts retain stable drive
 IDs; older records require an explicit remount. Local adapter and RPC edits notify peers offline
 without broad resync for attribute changes.
-Random session IDs are bound to verified Unix peer credentials. Publication reconciliation, full recovery
-and the Swift/FSKit bridge and adapter follow in later slices. The accepted
+Random session IDs are bound to verified Unix peer credentials. Guarded publication now reconciles
+exact acknowledged versions into inode identities, names and xattrs, preserving edits accepted
+during upload and snapshots held by earlier handles. Conflicts retain both versions locally,
+including complete xattrs, and keep later edits guarded. Full recovery, the Swift XPC bridge
+and the FSKit adapter follow in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#rust-daemon-sessions-7-october) for the current scope
+[step 5 plan](docs/step-5-macos.md#guarded-publication-and-conflict-reconciliation-7-october) for the current scope
 and decisions.
 
 ### The Rust SDK
