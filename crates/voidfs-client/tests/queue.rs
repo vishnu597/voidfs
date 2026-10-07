@@ -197,7 +197,12 @@ async fn a_restart_goes_on_with_a_multipart_upload() {
         let q = open(dir.path(), &c, QueueConfig { parts_at_once: 1, ..config() }).await;
         q.set_bandwidth(Some(10 * MIB)).await.unwrap();
         q.import("big", vec![Import { path: src.clone(), drive: "drv".into(), key: "big.bin".into() }]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(1700)).await;
+        // Stopped once two parts are up, however fast the machine is.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while q.status().await.unwrap().batches[0].sent < 2 * 5 * MIB {
+            assert!(Instant::now() < deadline, "two parts didn't go up");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         q.close().await;
     }
     let done_before = count(&p, "PUT", "partNumber=");
