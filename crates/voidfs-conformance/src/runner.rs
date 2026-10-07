@@ -356,6 +356,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_token_cases_other_shard_list_differs_whatever_the_nonce() {
+        let suite = crate::cases::load(crate::CASES_JSON).unwrap();
+        let case = suite.cases.iter().find(|c| c.id == "direct-upload-token").unwrap();
+        let step = case.steps.iter().find(|s| s.name.as_deref() == Some("another shard list")).unwrap();
+        let Some(Body::Commit(form)) = &step.request.as_ref().unwrap().body else { panic!("a commit") };
+        let (offset, text) = form.edit.clone().unwrap();
+        let end = offset as usize + text.len();
+        // The seeded bytes are the same prefix whatever the size, so the edited range is enough.
+        for nonce in 0..4096u64 {
+            let before = crate::cases::seeded_bytes(form.seed ^ nonce, end as u64);
+            assert_ne!(&before[offset as usize..end], text.as_bytes(), "with nonce {nonce} the edit changes nothing, so the commit would be accepted");
+        }
+    }
+
+    #[test]
     fn held_count_case_accepts_an_edit_of_a_single_shard_but_still_checks_dedup() {
         let suite = crate::cases::load(crate::CASES_JSON).unwrap();
         let case = suite.cases.iter().find(|c| c.id == "direct-upload-held-counts").unwrap();

@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
@@ -17,6 +17,7 @@ use voidfs_server::test_server::{ADMIN_KEY_ID, ADMIN_SECRET, TestServer};
 struct Fake {
     refuse: AtomicBool,
     seen: Arc<Mutex<Vec<Invalidation>>>,
+    sessions: Mutex<Vec<Weak<voidfs_client::mount::Session>>>,
 }
 
 struct FakeMount {
@@ -29,13 +30,14 @@ impl Adapter for Fake {
         "fake"
     }
 
-    fn mount<'a>(&'a self, spec: &'a MountSpec, _core: &'a Core) -> BoxFuture<'a, Result<Arc<dyn Mounted>, String>> {
+    fn mount<'a>(&'a self, spec: &'a MountSpec, core: &'a Core) -> BoxFuture<'a, Result<Arc<dyn Mounted>, String>> {
         Box::pin(async move {
             if self.refuse.load(Ordering::SeqCst) {
                 return Err("the fake refuses".into());
             }
             let marker = spec.mountpoint.join(".mounted");
             std::fs::write(&marker, &spec.drive).map_err(|e| e.to_string())?;
+            self.sessions.lock().unwrap().push(Arc::downgrade(&core.session));
             Ok(Arc::new(FakeMount { marker, seen: self.seen.clone() }) as Arc<dyn Mounted>)
         })
     }
@@ -187,4 +189,53 @@ async fn a_mount_without_an_adapter_or_that_fails_is_not_remembered() {
     assert_eq!(c.unmount(&mp.display().to_string()).await.unwrap().unmounted, [mp.display().to_string()]);
     assert!(c.mounts().await.unwrap().remembered.is_empty(), "forgotten");
     d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mounts_and_rpc_sessions_share_one_core_and_release_it_after_the_last_consumer() {
+    let server = TestServer::start().await.unwrap();
+    let remote = voidfs_sdk::Client::new(sdk(&server)).unwrap();
+    remote.create_drive("footage", Default::default()).await.unwrap();
+    remote.put_object("footage", "data", "old", Default::default()).await.unwrap();
+    let id = remote.describe_drive("footage").await.unwrap().drive_id;
+    let dir = state_dir("shared");
+    let first = dir.path().join("mnt/a");
+    let second = dir.path().join("mnt/b");
+    let fake = Arc::new(Fake::default());
+    let (d, c) = start(&server, dir.path(), vec![fake.clone()]).await;
+    c.mount(&new_mount("footage", &first)).await.unwrap();
+    c.mount(&new_mount(&id, &second)).await.unwrap();
+    let rpc = c.session("footage", true).await.unwrap();
+    let weak = {
+        let sessions = fake.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(Weak::ptr_eq(&sessions[0], &sessions[1]), "both adapters receive the same namespace and handle table");
+        sessions[0].clone()
+    };
+    let core = weak.upgrade().unwrap();
+    assert_eq!((core.root(), core.generation()), (rpc.info().root, rpc.info().generation));
+    let initial = rpc.lookup(rpc.info().root, "data").await.unwrap();
+    assert_eq!(core.lookup(core.root(), "data").await.unwrap(), initial);
+    drop(core);
+    let mut watch = rpc.watch().await.unwrap();
+    let initial_event = tokio::time::timeout(Duration::from_secs(15), watch.next()).await.unwrap().unwrap().unwrap();
+    assert!(initial_event.resync);
+    let changed = remote.put_object("footage", "data", "new", Default::default()).await.unwrap();
+    until("the single core refreshes RPC and both adapters", async || {
+        let status = c.status().await.unwrap();
+        status.mounts.len() == 2 && status.mounts.iter().all(|mount| mount.feed.as_ref().is_some_and(|feed| feed.seq > initial_event.seq))
+            && rpc.lookup(rpc.info().root, "data").await.unwrap().version_id.as_ref() == Some(&changed.version_id)
+    }).await;
+    let status = c.status().await.unwrap();
+    assert_eq!(status.mounts[0].feed, status.mounts[1].feed, "both mounts expose the shared watcher state");
+    assert!(fake.seen.lock().unwrap().iter().filter(|change| **change == Invalidation::Object("data".into())).count() >= 2);
+    c.unmount(first.to_str().unwrap()).await.unwrap();
+    assert!(weak.upgrade().is_some());
+    rpc.release().await.unwrap();
+    drop(watch);
+    assert!(weak.upgrade().is_some(), "the remaining adapter retains the shared namespace");
+    c.unmount(second.to_str().unwrap()).await.unwrap();
+    until("the last mount releases the namespace and feed lease", async || weak.upgrade().is_none()).await;
+    d.stop().await;
+    drop(voidfs_client::Store::open(dir.path()).unwrap());
 }

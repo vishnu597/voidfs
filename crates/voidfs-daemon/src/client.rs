@@ -37,7 +37,7 @@ impl std::error::Error for ClientError {}
 /// Talks to the daemon on one socket. Cloning shares its connections.
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     socket: PathBuf,
 }
 
@@ -51,11 +51,11 @@ impl DaemonClient {
         &self.socket
     }
 
-    fn url(path: &str) -> String {
+    pub(crate) fn url(path: &str) -> String {
         format!("http://localhost{path}")
     }
 
-    fn sent(&self, e: reqwest::Error) -> ClientError {
+    pub(crate) fn sent(&self, e: reqwest::Error) -> ClientError {
         if e.is_connect() {
             let why = std::error::Error::source(&e).map_or_else(|| e.to_string(), |s| s.to_string());
             ClientError::NotRunning { socket: self.socket.clone(), why }

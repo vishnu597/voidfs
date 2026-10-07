@@ -1,7 +1,8 @@
 # Step 5: a writable macOS drive
 
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
-5 October; local namespace changes and staged file data added 6 October. Item 1 has begun with
+5 October; local namespace changes and staged file data added 6 October; Rust daemon sessions
+and shared feeds added 7 October. Items 1 and 2 have begun with
 the Rust mount namespace, snapshot handles, durable namespace mutations and staged writes. The later deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
@@ -30,14 +31,15 @@ The extension in `apps/macos` is a read-only spike using its own Swift HTTP clie
 The adapter boundary already exists in
 [`crates/voidfs-daemon/src/mounts.rs`](../crates/voidfs-daemon/src/mounts.rs):
 `Adapter::mount(MountSpec, Core)` returns a `Mounted`, which receives invalidations and unmounts.
-`Core` contains the SDK client, cache, queue and connectivity. Builds supply adapters through
+`Core` contains the SDK client, cache, queue, connectivity and the shared per-drive `Session`. Builds supply adapters through
 `DaemonConfig.adapters`; an empty list returns `NoAdapter`. The first adapter is the current
 default. A remembered mount names its adapter explicitly.
 
 The core now supplies a persistent namespace, snapshot handles, a writable local namespace
 overlay and staged file data. Reads combine shared unpublished edits with each handle's remote
-snapshot. Daemon session RPCs and a shared per-drive feed are next; publication reconciliation,
-full kill-point recovery and writable FSKit or SMB callbacks remain later work.
+snapshot. The daemon now supplies bounded Rust session RPCs and one shared per-drive feed;
+publication reconciliation, full kill-point recovery, the Swift bridge and writable FSKit or SMB
+callbacks remain later work.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
@@ -126,7 +128,7 @@ upload queue or remembered-mount store.
 - Bound request sizes, concurrent calls and read-ahead; carry binary read/write data without
   JSON expansion. Keep controls responsive during transfers and support cancellation safely.
 - Add a per-drive feed subscription shared across mounts and observers where practical. The
-  current mount table starts a watcher per mount; avoid extra watchers in the Swift bridge.
+  mount table now shares one watcher per stable drive; avoid extra watchers in the Swift bridge.
   Send monotonic metadata generations and a full-resync signal after a feed gap/reconnect.
 - Add a Swift launchd agent with the tested App Group Mach-service prefix. It forwards to the
   Rust daemon's user-only socket and relays invalidations. It owns no journal or publisher.
@@ -321,7 +323,7 @@ reviewable deliverable.
 
 Slice 3 is split into local namespace changes and staged file data (both implemented below):
 `write`, `truncate`, `fsync`, durable close, merged reads, disk admission and staged-file leases.
-Next, build item 2's Rust session RPCs and shared per-drive feed. Full publication
+Item 2's Rust session RPCs and shared per-drive feed are now implemented below. Full publication
 reconciliation/conflict states and kill-point recovery remain slices 4 and 5. The user selected
 a two-second quiet period for publishing files that stay open, alongside fsync and close.
 
@@ -588,6 +590,107 @@ unavailable; CI requires them and also covers MinIO and Docker Compose. Each of 
 regular tests and the ignored benchmark was seen to fail under targeted runtime defects:
 81 isolated failure runs, with restart, race and timing defects repeated three times. The
 four cancellation, ownership and timer tests pass three consecutive restored runs.
+
+### Rust daemon sessions, 7 October
+
+`voidfs-daemon` now owns a weak registry of filesystem cores keyed by stable drive ID. Each
+live drive has one writable `mount::Session`, the existing daemon Store/Cache/Queue, and one
+`FeedWatch`, shared by all its mounts and logical RPC sessions. The registry resolves display
+aliases online on each attach so alias reuse cannot attach a consumer to the wrong core. An
+atomic, synchronized `drive-aliases.json` memo supports known identities offline; it is bounded
+at 4,096 mappings and 1 MiB and may discard older mappings when full. Unknown offline identities
+can bootstrap a read-only mount, but RPC session creation returns `Offline` until identity is
+resolved. That provisional core stays read-only after reconnect; reopen after connection to get
+a pinned writable core. If the provisional name was already an ID, its read-only mount must
+release the same-drive lease before a writable reopen. Existing known-ID sessions stay pinned
+when the display alias changes. CLI upload queue addressing retains its existing policy.
+
+`Core.session` gives adapters the shared local byte view. Adapters enforce `MountSpec.read_only`
+at their boundary; RPC consumers enforce their own policy even though they share the writable
+core. The feed first commits `Session::invalidate`, then notifies every mounted observer and
+socket watcher. Metadata generations increase within that core; remote sequence positions do
+not decrease. Local RPC writes/truncation notify after their bytes/metadata are visible. Each
+watch starts with a full resync, including resubscription. Remote reconnects (even idle ones),
+expired history, broadcast lag and oversized events produce `All` instead of pretending that
+incremental metadata is complete. Existing `ChangeWatch::next` keeps its batch-only contract;
+`next_event` exposes stream connections for consumers needing resync.
+
+The user-only Unix socket now has `/v1/fs` beside the existing controls. The typed Rust API is
+`DaemonClient::session(drive, read_only) -> FsClient`, with `FsClientError` retaining status,
+code, message and native errno. The local filesystem wire version is 1 and is independent of
+the object protocol and format.
+
+| Method and path | Request / response |
+| --- | --- |
+| `POST /v1/fs/sessions` | `{version, drive, readOnly}` → `{version, id, drive, root, generation, metadataGeneration, readOnly, maxIo, maxEntries}` |
+| `POST /v1/fs/{id}/lookup` | `{parent, name}` → `Attr` |
+| `POST …/getattr`, `…/readlink` | `{ino}` → `Attr` or `{target}` |
+| `POST …/readdir` | `{ino, after, limit}` → `{entries: [[name, Attr], …], generation}` |
+| `POST …/open` | `{ino, write}` → `{fh, attr}` |
+| `POST …/handle_attr` | `{fh}` → `Attr` |
+| `GET …/read?fh=&offset=&length=` | raw `application/octet-stream` bytes |
+| `PUT …/write?fh=&offset=` | raw `application/octet-stream` bytes → `{written}` |
+| `POST …/truncate`, `…/fsync`, `…/close` | `{fh, size}` for truncate, otherwise `{fh}` → `{}` |
+| `POST …/release` | `{}` → `{}`; closes all of that consumer's handles |
+| `GET …/watch` | NDJSON `{generation, seq, resync, invalidations, inodes}` |
+
+Every session route requires `x-voidfs-generation` from creation. `SessionInfo.generation` is
+the persisted core epoch; `metadataGeneration`, watch generations and page generations count
+drive-wide invalidations within that core. `Attr.generation` is the inode-local metadata
+generation. Session IDs are opaque; handle IDs retain the core's persisted epoch/counter. Old sessions/generations/handles return `ESTALE`
+after restart. A different logical consumer's handle returns `EBADF`, and a read-only consumer's
+write/truncate/open-for-write returns `EROFS`. Errors are `{error: {code, message, errno}}` with
+a non-success status. Backend error codes/messages are clipped at UTF-8 boundaries to 256/4,096
+bytes, keeping error frames within the response limit. JSON wrappers use camelCase; nested `Attr` keeps its existing Rust serde
+shape (`object_id`, `version_id`, `has_xattrs`, RFC3339 `mtime`, and `Saved`/`Pending`/`Saving`/
+`Conflict`/`Error` sync values). Invalidations are `{kind: "object", key}`, `{kind: "subtree", key}`
+or `{kind: "all"}`. An enumeration cursor is exclusive UTF-8 name order; clients restart it
+after metadata invalidation, and a page racing an invalidation returns `EAGAIN`.
+
+Admission bounds are 32 active drives, 256 logical sessions, 1,024 handles per consumer, 32
+in-flight calls, 64 watches, 8 MiB binary I/O, 256 directory entries, 64 KiB request JSON and
+1 MiB response JSON. A 64-event broadcast ring never grows for a slow consumer. Events collapse
+to full resync above 64 KiB, 1,024 invalidations or 4,096 inode IDs. Admission happens before
+reading a request body and remains held through owned core work and response transmission;
+long-lived watches use their separate limit. Controls retain their existing admission path.
+The Rust client bounds successful/error bodies and NDJSON buffering, checks negotiated limits
+and rejects malformed framing or regressing event generations. Ordinary calls time out after
+30 seconds; an established watch may remain idle indefinitely.
+
+Clients must explicitly `release`; socket disconnect or dropping a Rust client does not release
+its logical session. A lost creation response can leave a session until daemon shutdown, within
+the session cap; a lost open response retains its handle until release, within the handle cap.
+Accepted core work runs in an owned task so cancellation cannot skip staging
+or post-write notification. Release waits for accepted calls, closes handles and ends watches;
+if a close fails, failed handles and their session remain available for retry. The last mounted
+or RPC consumer drops its shared core/feed; daemon stop drains handles and ends observers before
+closing the queue/store. Stopping cancels queued creation and read-only network bootstrap
+requests, while any owned filesystem/DB work finishes. This slice exposes staged file-data
+helpers, but namespace/xattr RPCs,
+the Swift XPC service, app-container migration and FSKit callbacks remain separate work.
+No step 5 item is complete. The signed-bundle probe remains a user prerequisite for the Mac
+bridge/adapter; guarded publication reconciliation and full recovery remain core slices 4–5.
+
+On the local Mac debug build, 1,000 warmed calls through the real Unix socket measured:
+
+| Call | Mean | p50 | p99 | Maximum |
+| --- | --- | --- | --- | --- |
+| Warm `getattr` | 296.447 µs | 290.958 µs | 376.709 µs | 4.109 ms |
+| Cache-hit 4 KiB read | 109.982 µs | 107.416 µs | 153.459 µs | 194.791 µs |
+
+Reproduce with `cargo test -p voidfs-daemon --locked --test sessions measure_warm_metadata_and_cached_read_socket_hops -- --ignored --exact --nocapture`.
+These measure the socket and Rust core, excluding Swift/XPC, FSKit and cold cloud reads. The
+spike comparison remains part of the Mac bridge validation; these numbers impose no performance
+gate and justify no direct-file optimization yet.
+
+Validation for this slice: `cargo test --workspace --locked` passed 612 tests with 8 ignored,
+and `cargo clippy --workspace --all-targets --locked -- -D warnings` passed. The 25 new regular
+tests and one opt-in benchmark received runtime failure proofs (58 isolated failing runs in
+total, with timing/restart cases repeated three times), then passed with the implementation
+restored. The conformance validator passed 55 cases/420 steps; credential scripts passed 5
+tests. Local interoperability passed against memory, filesystem and versitygw backends with
+both addressing styles. Local boto3 checks were skipped because it is unavailable; CI covers
+boto3, MinIO and Compose interoperability.
 
 Accounts, web, search, previews, video review, Linux/Windows mounts, server locking, retention and
 encryption remain in their later steps. Cloud benchmark runs and new provider credentials do not

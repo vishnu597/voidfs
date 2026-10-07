@@ -11,10 +11,11 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use chrono::{SecondsFormat, Utc};
 use futures::future::BoxFuture;
-use voidfs_client::{Cache, Connectivity, FeedWatch, Invalidation, Queue, Remembered, Store};
+use voidfs_client::{Cache, Connectivity, Invalidation, Queue, Remembered, Store};
 
 use crate::api;
 use crate::server::{Answer, Failure, Shared};
+use crate::sessions::DriveSession;
 
 /// A drive to mount, and where.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +33,8 @@ pub struct Core {
     pub cache: Cache,
     pub queue: Queue,
     pub connectivity: Connectivity,
+    /// Shared writable core. Adapters enforce each mount's read-only policy at their boundary.
+    pub session: Arc<voidfs_client::mount::Session>,
 }
 
 /// Mounts drives: FSKit, SMB or FUSE (step 5).
@@ -50,13 +53,6 @@ pub trait Mounted: Send + Sync + 'static {
     fn unmount(self: Arc<Self>) -> BoxFuture<'static, Result<(), String>>;
 }
 
-#[derive(Clone, Debug, Default)]
-struct FeedState {
-    seq: u64,
-    events: u64,
-    last: Option<String>,
-}
-
 enum Is {
     Mounting,
     Mounted(Arc<dyn Mounted>),
@@ -68,8 +64,7 @@ struct Live {
     adapter: String,
     since: String,
     is: Is,
-    feed: Arc<Mutex<FeedState>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    drive: Option<Arc<DriveSession>>,
 }
 
 impl Live {
@@ -79,10 +74,7 @@ impl Live {
             Is::Mounted(_) => ("mounted", None),
             Is::Failed(e) => ("failed", Some(e.clone())),
         };
-        let feed = matches!(self.is, Is::Mounted(_)).then(|| {
-            let f = self.feed.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            api::Feed { seq: f.seq, events: f.events, last_event: f.last }
-        });
+        let feed = self.drive.as_ref().filter(|_| matches!(self.is, Is::Mounted(_))).map(|d| d.feed());
         api::Mount {
             drive: self.spec.drive.clone(),
             mountpoint: self.spec.mountpoint.display().to_string(),
@@ -143,47 +135,26 @@ impl Mounts {
 
     /// Mounts `spec` with `adapter` and starts watching its drive; the entry for its mountpoint
     /// is updated as it goes.
-    async fn attach(s: &Shared, spec: &MountSpec, adapter: &Arc<dyn Adapter>) -> Result<(), Failure> {
-        // The feed's position now; with no answer from the server (offline, at login), the
-        // drive mounts all the same, and its feed starts from the beginning once it answers.
-        let seq = match s.client.list_folder_page(&spec.drive, "", None).await {
-            Ok(page) => page.seq,
-            Err(e) if e.status().is_none() => 0,
-            Err(e) => return Err(e.into()),
-        };
-        let handle = adapter.mount(spec, &s.core()).await.map_err(|m| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "MountFailed", m))?;
-        let mut watch = FeedWatch::start(s.client.clone(), &spec.drive, seq, Some(s.connectivity().clone()));
-        let feed = Arc::new(Mutex::new(FeedState { seq, ..Default::default() }));
-        let task = tokio::spawn({
-            let (feed, handle) = (feed.clone(), handle.clone());
-            async move {
-                while let Some(e) = watch.next().await {
-                    {
-                        let mut f = feed.lock().unwrap_or_else(|p| p.into_inner());
-                        f.seq = e.seq;
-                        f.events += 1;
-                        f.last = Some(now());
-                    }
-                    handle.invalidate(&e.invalidations);
-                }
-            }
-        });
+    async fn attach(s: &Shared, spec: &MountSpec, adapter: &Arc<dyn Adapter>, drive: Option<Arc<DriveSession>>) -> Result<(), Failure> {
+        let drive = match drive { Some(drive) => drive, None => s.sessions.drive(s, &spec.drive).await? };
+        let effective = MountSpec { read_only: spec.read_only || !drive.pinned, ..spec.clone() };
+        let handle = adapter.mount(&effective, &s.core(drive.core.clone())).await.map_err(|m| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "MountFailed", m))?;
+        drive.observe(handle.clone());
         let unwanted = {
             let mut live = s.mounts.live();
             match live.iter_mut().find(|l| l.spec.mountpoint == spec.mountpoint) {
                 Some(l) => {
+                    l.spec.read_only = effective.read_only;
                     l.is = Is::Mounted(handle);
-                    l.feed = feed;
-                    l.task = Some(task);
+                    l.drive = Some(drive);
                     l.since = now();
                     None
                 }
-                None => Some((task, handle)),
+                None => Some(handle),
             }
         };
         // Unmounted meanwhile: let go of it.
-        if let Some((task, handle)) = unwanted {
-            task.abort();
+        if let Some(handle) = unwanted {
             let _ = handle.unmount().await;
         }
         Ok(())
@@ -198,12 +169,12 @@ impl Mounts {
                 Ok(_) => Is::Mounting,
                 Err(f) => Is::Failed(f.2.clone()),
             };
-            s.mounts.live().push(Live { spec: spec.clone(), adapter: r.adapter.clone(), since: now(), is, feed: Arc::default(), task: None });
+            s.mounts.live().push(Live { spec: spec.clone(), adapter: r.adapter.clone(), since: now(), is, drive: None });
             let Ok(adapter) = adapter else { continue };
             let s = s.clone();
             tokio::spawn(async move {
                 let _op = s.mounts.ops.lock().await;
-                if let Err(f) = Mounts::attach(&s, &spec, &adapter).await
+                if let Err(f) = Mounts::attach(&s, &spec, &adapter, None).await
                     && let Some(l) = s.mounts.live().iter_mut().find(|l| l.spec.mountpoint == spec.mountpoint)
                 {
                     l.is = Is::Failed(f.2);
@@ -217,9 +188,6 @@ impl Mounts {
         let _op = self.ops.lock().await;
         let live: Vec<Live> = std::mem::take(&mut *self.live());
         for l in live {
-            if let Some(t) = l.task {
-                t.abort();
-            }
             if let Is::Mounted(h) = l.is {
                 let _ = h.unmount().await;
             }
@@ -247,7 +215,8 @@ pub(crate) async fn mount(State(s): State<Arc<Shared>>, Json(m): Json<api::NewMo
     let bad = |m: String| Failure::new(StatusCode::BAD_REQUEST, "InvalidArgument", m);
     let _op = s.mounts.ops.lock().await;
     let adapter = s.mounts.adapter(m.adapter.as_deref())?;
-    let drive = s.drive(&m.drive).await?;
+    let session = s.sessions.drive(&s, &m.drive).await?;
+    let drive = session.drive.clone();
     let mountpoint = match &m.mountpoint {
         Some(p) => PathBuf::from(key(p)),
         None => s.mounts.root.as_ref().map(|r| r.join(&drive)).ok_or_else(|| bad("no HOME for the default mountpoint: name one".into()))?,
@@ -263,9 +232,9 @@ pub(crate) async fn mount(State(s): State<Arc<Shared>>, Json(m): Json<api::NewMo
     {
         let mut live = s.mounts.live();
         live.retain(|l| l.spec.mountpoint != mountpoint);
-        live.push(Live { spec: spec.clone(), adapter: adapter.name().into(), since: now(), is: Is::Mounting, feed: Arc::default(), task: None });
+        live.push(Live { spec: spec.clone(), adapter: adapter.name().into(), since: now(), is: Is::Mounting, drive: None });
     }
-    if let Err(f) = Mounts::attach(&s, &spec, &adapter).await {
+    if let Err(f) = Mounts::attach(&s, &spec, &adapter, Some(session)).await {
         s.mounts.live().retain(|l| l.spec.mountpoint != mountpoint);
         return Err(f);
     }
@@ -287,15 +256,12 @@ pub(crate) async fn unmount(State(s): State<Arc<Shared>>, Json(u): Json<api::Unm
     let remembered = blocking(move || voidfs_client::mounts::remembered(&store)).await?;
     let gone: Vec<Live> = {
         let mut live = s.mounts.live();
-        let (gone, kept) = std::mem::take(&mut *live).into_iter().partition(|l| names(&l.spec.drive, &l.spec.mountpoint.display().to_string()));
+        let (gone, kept) = std::mem::take(&mut *live).into_iter().partition(|l| names(&l.spec.drive, &l.spec.mountpoint.display().to_string()) || l.drive.as_ref().is_some_and(|d| d.id == target));
         *live = kept;
         gone
     };
     let mut unmounted: Vec<String> = Vec::new();
     for l in gone {
-        if let Some(t) = l.task {
-            t.abort();
-        }
         if let Is::Mounted(h) = l.is
             && let Err(e) = h.unmount().await
         {
@@ -303,7 +269,8 @@ pub(crate) async fn unmount(State(s): State<Arc<Shared>>, Json(u): Json<api::Unm
         }
         unmounted.push(l.spec.mountpoint.display().to_string());
     }
-    for r in remembered.into_iter().filter(|r| names(&r.drive, &r.mountpoint)) {
+    let forgotten = remembered.into_iter().filter(|r| names(&r.drive, &r.mountpoint) || unmounted.contains(&r.mountpoint)).collect::<Vec<_>>();
+    for r in forgotten {
         let store = s.store.clone();
         let mp = r.mountpoint.clone();
         blocking(move || voidfs_client::mounts::forget(&store, &mp)).await?;

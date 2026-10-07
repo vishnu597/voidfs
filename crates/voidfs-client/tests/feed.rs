@@ -90,6 +90,21 @@ async fn a_broken_stream_reconnects_and_misses_nothing() {
     assert!(streams[1].contains(&format!("since={}", got[0].seq)), "from the last position delivered: {streams:?}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resync_watch_invalidates_an_idle_drive_when_its_stream_reopens() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(|| async { ([("content-type", "text/event-stream")], ": keep-alive\n\n") });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let client = client_for(&endpoint, Config { max_attempts: 1, timeout: Duration::from_millis(300), ..Default::default() });
+    let mut watch = FeedWatch::start_with_resync(client, "drv", 17, None);
+    let event = tokio::time::timeout(Duration::from_secs(5), watch.next()).await.expect("idle reconnect invalidation").unwrap();
+    assert_eq!(event, FeedEvent { drive: "drv".into(), seq: 17, invalidations: vec![Invalidation::All] });
+    drop(watch);
+    server.abort();
+    let _ = server.await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_changes_relist_the_drive_and_watch_on() {
     let s = server().await;
