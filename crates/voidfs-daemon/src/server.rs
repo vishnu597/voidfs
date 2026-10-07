@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::connect_info::Connected;
 use axum::http::{Method, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -85,6 +87,7 @@ impl DaemonConfig {
 pub(crate) struct Shared {
     build: Build,
     pid: u32,
+    uid: u32,
     started: Instant,
     started_at: String,
     socket: PathBuf,
@@ -124,6 +127,37 @@ const LOCK_WAIT: Duration = Duration::from_secs(2);
 const DRAIN_WAIT: Duration = Duration::from_secs(5);
 /// The rate is over this many of the last samples, a second apart.
 const RATE_SAMPLES: usize = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Owner { uid: u32, pid: u32 }
+
+#[derive(Clone, Copy)]
+struct Peer { uid: Option<u32>, pid: Option<u32> }
+
+impl Connected<axum::serve::IncomingStream<'_, tokio::net::UnixListener>> for Peer {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+        match stream.io().peer_cred() {
+            Ok(credentials) => Self { uid: Some(credentials.uid()), pid: credentials.pid().and_then(|pid| u32::try_from(pid).ok()).filter(|pid| *pid > 0) },
+            Err(_) => Self { uid: None, pid: None },
+        }
+    }
+}
+
+fn owner(request: &Request, uid: u32) -> Result<Owner, voidfs_client::mount::FsError> {
+    let peer = request.extensions().get::<ConnectInfo<Peer>>().ok_or(voidfs_client::mount::FsError::Permission)?.0;
+    match (peer.uid, peer.pid) {
+        (Some(peer_uid), Some(pid)) if peer_uid == uid && pid > 0 => Ok(Owner { uid, pid }),
+        _ => Err(voidfs_client::mount::FsError::Permission),
+    }
+}
+
+async fn authenticate(State(s): State<Arc<Shared>>, mut request: Request, next: Next) -> Response {
+    match owner(&request, s.uid) {
+        Ok(owner) => { request.extensions_mut().insert(owner); next.run(request).await },
+        Err(error) if request.uri().path().starts_with("/v1/fs/") => crate::rpc::Failure::from(error).into_response(),
+        Err(error) => Failure::from(error).into_response(),
+    }
+}
 
 async fn open_store(dir: &Path) -> Result<Arc<Store>, Error> {
     let deadline = Instant::now() + LOCK_WAIT;
@@ -170,6 +204,9 @@ impl Daemon {
         // The journal holds copies of the user's bytes, and daemon.json a secret.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(io)?;
         let store = open_store(&dir).await?;
+        let (own_socket, own_peer) = tokio::net::UnixStream::pair().map_err(io)?;
+        let uid = own_socket.peer_cred().map_err(io)?.uid();
+        drop((own_socket, own_peer));
         let socket = cfg.socket.clone().unwrap_or_else(|| crate::socket_path(&dir));
         let listener = bind(&socket)?;
         let opened = Daemon::open_core(&cfg, &store).await;
@@ -184,6 +221,7 @@ impl Daemon {
         let shared = Arc::new(Shared {
             build: cfg.build.clone(),
             pid: std::process::id(),
+            uid,
             started: Instant::now(),
             started_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             socket: socket.clone(),
@@ -231,10 +269,11 @@ impl Daemon {
             .route("/v1/mounts/unmount", post(crate::mounts::unmount))
             .nest("/v1/fs", crate::rpc::routes(shared.clone()))
             .fallback(not_found)
+            .layer(middleware::from_fn_with_state(shared.clone(), authenticate))
             .with_state(shared.clone());
         let (shutdown, mut rx) = watch::channel(false);
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
+            let _ = axum::serve(listener, app.into_make_service_with_connect_info::<Peer>())
                 .with_graceful_shutdown(async move {
                     let _ = rx.wait_for(|s| *s).await;
                 })
@@ -409,4 +448,21 @@ async fn info(State(s): State<Arc<Shared>>) -> Answer<api::Info> {
 async fn stop(State(s): State<Arc<Shared>>) -> (StatusCode, Json<api::Stopping>) {
     s.stop_asked.send_replace(true);
     (StatusCode::ACCEPTED, Json(api::Stopping { stopping: true, pid: s.pid }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_peer_credentials_are_required_and_checked_against_daemon_uid() {
+        let mut request = Request::builder().header("x-voidfs-peer-uid", "42").header("x-voidfs-peer-pid", "7").body(axum::body::Body::empty()).unwrap();
+        assert!(matches!(owner(&request, 42), Err(voidfs_client::mount::FsError::Permission)), "HTTP headers cannot supply socket credentials");
+        for peer in [Peer { uid: None, pid: None }, Peer { uid: Some(43), pid: Some(7) }, Peer { uid: Some(42), pid: None }, Peer { uid: Some(42), pid: Some(0) }] {
+            request.extensions_mut().insert(ConnectInfo(peer));
+            assert!(matches!(owner(&request, 42), Err(voidfs_client::mount::FsError::Permission)), "missing credentials, another UID, and missing PID must be refused");
+        }
+        request.extensions_mut().insert(ConnectInfo(Peer { uid: Some(42), pid: Some(7) }));
+        assert_eq!(owner(&request, 42).unwrap(), Owner { uid: 42, pid: 7 });
+    }
 }

@@ -57,6 +57,10 @@ fn entry(drive: &str, key: &str, op: Op, n: &Node) -> Result<Entry> {
     Ok(entry)
 }
 
+fn invalidation(key: String, folder: bool) -> Invalidation {
+    if folder { Invalidation::Subtree(key) } else { Invalidation::Object(key) }
+}
+
 impl Session {
     async fn prepare_parent(&self, ino: Ino) -> Result<()> {
         self.ancestors(ino).await?;
@@ -73,7 +77,7 @@ impl Session {
     }
 
     async fn create_node(&self, parent: Ino, name: &str, mode: u32, kind: Kind) -> Result<Attr> {
-        let queue = self.queue.as_ref().ok_or(FsError::ReadOnly)?;
+        if self.queue.is_none() { return Err(FsError::ReadOnly); }
         let name = local_name(name)?;
         if mode > 0o7777 { return Err(FsError::InvalidArgument); }
         for _ in 0..4 {
@@ -82,7 +86,7 @@ impl Session {
             let root = self.root;
             let name = name.clone();
             let offline = self.connectivity.link() == Link::Offline;
-            let result = queue.mount_transaction(move |tx| {
+            let result = self.local_transaction(move |tx| {
                 let parent_key = directory(tx, &drive, root, parent, offline)?;
                 if child(tx, &drive, parent, &name)?.is_some() { return Err(FsError::Exists); }
                 let key = key(&parent_key, &name, kind == Kind::Folder)?;
@@ -99,7 +103,8 @@ impl Session {
                 entry.mount_ino = Some(ino);
                 entry.attrs = Attrs { mode: Some(mode), mtime: attrs.mtime.clone(), ..Default::default() };
                 let attr = node(tx, &drive, ino)?.ok_or(FsError::Stale)?.attr()?;
-                Ok((attr, vec![entry]))
+                let change = LocalChange { invalidations: vec![invalidation(key, kind == Kind::Folder)], inodes: vec![parent, ino], namespace: true };
+                Ok(((attr, change), vec![entry]))
             }).await;
             match result { Err(FsError::Again) => continue, other => return other }
         }
@@ -116,7 +121,7 @@ impl Session {
     }
 
     async fn remove_node(&self, parent: Ino, name: &str, folder: bool) -> Result<()> {
-        let queue = self.queue.as_ref().ok_or(FsError::ReadOnly)?;
+        if self.queue.is_none() { return Err(FsError::ReadOnly); }
         let name = local_name(name)?;
         for _ in 0..4 {
             self.prepare_parent(parent).await?;
@@ -130,7 +135,7 @@ impl Session {
             let root = self.root;
             let name = name.clone();
             let offline = self.connectivity.link() == Link::Offline;
-            let result = queue.mount_transaction(move |tx| {
+            let result = self.local_transaction(move |tx| {
                 let parent_key = directory(tx, &drive, root, parent, offline)?;
                 let (actual, mut n) = child(tx, &drive, parent, &name)?.ok_or(FsError::NotFound)?;
                 if n.ino != candidate.ino { return Err(FsError::Again); }
@@ -146,7 +151,8 @@ impl Session {
                 n.generation += 1;
                 save_node(tx, &n)?;
                 changed(tx, parent)?;
-                Ok(((), vec![entry]))
+                let change = LocalChange { invalidations: vec![invalidation(key, folder)], inodes: vec![parent, n.ino], namespace: true };
+                Ok((((), change), vec![entry]))
             }).await;
             match result { Err(FsError::Again) => continue, other => return other }
         }
@@ -156,7 +162,7 @@ impl Session {
     /// Replaces atomically in the local view. Cloud replacement deletes the destination under
     /// its guard, then renames exclusively because the wire operation guards only the source.
     pub async fn rename(&self, from_parent: Ino, from_name: &str, to_parent: Ino, to_name: &str, how: RenameMode) -> Result<()> {
-        let queue = self.queue.as_ref().ok_or(FsError::ReadOnly)?;
+        if self.queue.is_none() { return Err(FsError::ReadOnly); }
         if how == RenameMode::Swap { return Err(FsError::Unsupported); }
         let from_name = local_name(from_name)?;
         let to_name = local_name(to_name)?;
@@ -181,19 +187,23 @@ impl Session {
             let from_name = from_name.clone();
             let to_name = to_name.clone();
             let offline = self.connectivity.link() == Link::Offline;
-            let result = queue.mount_transaction(move |tx| {
+            let result = self.local_transaction(move |tx| {
                 let from_key = directory(tx, &drive, root, from_parent, offline)?;
                 let to_key = directory(tx, &drive, root, to_parent, offline)?;
                 let (actual, mut n) = child(tx, &drive, from_parent, &from_name)?.ok_or(FsError::NotFound)?;
                 if n.ino != source.ino { return Err(FsError::Again); }
                 let destination = child(tx, &drive, to_parent, &to_name)?;
                 if destination.as_ref().map(|(_, n)| n.ino) != target.as_ref().map(|(_, n)| n.ino) { return Err(FsError::Again); }
-                if destination.as_ref().is_some_and(|(_, other)| other.ino == n.ino) { return Ok(((), vec![])); }
+                if destination.as_ref().is_some_and(|(_, other)| other.ino == n.ino) {
+                    return Ok((((), LocalChange { invalidations: Vec::new(), inodes: Vec::new(), namespace: true }), vec![]));
+                }
                 if n.entry.kind == Kind::Folder && chain(tx, &drive, root, to_parent)?.ok_or(FsError::Stale)?.iter().any(|(at, _)| *at == n.ino) { return Err(FsError::InvalidArgument); }
                 let from = key(&from_key, &actual, n.entry.kind == Kind::Folder)?;
                 let to = key(&to_key, &to_name, n.entry.kind == Kind::Folder)?;
                 let mut entries = Vec::new();
+                let mut inodes = vec![from_parent, to_parent, n.ino];
                 if let Some((name, mut old)) = destination {
+                    inodes.push(old.ino);
                     if how == RenameMode::Exclusive { return Err(FsError::Exists); }
                     if old.entry.kind == Kind::Folder {
                         if n.entry.kind != Kind::Folder { return Err(FsError::IsDir); }
@@ -207,7 +217,7 @@ impl Session {
                     save_node(tx, &old)?;
                 }
                 let mut rename = entry(&drive, &from, Op::Rename, &n)?;
-                rename.to_key = Some(to);
+                rename.to_key = Some(to.clone());
                 rename.replace = false;
                 entries.push(rename);
                 overlay(tx, from_parent, &actual, None)?;
@@ -218,7 +228,11 @@ impl Session {
                 save_node(tx, &n)?;
                 changed(tx, from_parent)?;
                 if to_parent != from_parent { changed(tx, to_parent)?; }
-                Ok(((), entries))
+                inodes.sort_unstable();
+                inodes.dedup();
+                let folder = n.entry.kind == Kind::Folder;
+                let change = LocalChange { invalidations: vec![invalidation(from, folder), invalidation(to, folder)], inodes, namespace: true };
+                Ok((((), change), entries))
             }).await;
             match result { Err(FsError::Again) => continue, other => return other }
         }

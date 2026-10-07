@@ -75,6 +75,8 @@ async fn answer<T: DeserializeOwned>(client: &DaemonClient, response: reqwest::R
     serde_json::from_slice(&body).map_err(|e| FsClientError::Failed(format!("the daemon's filesystem answer: {e}")))
 }
 
+/// A logical session owned by the process that created it. Clones and new socket connections
+/// work within that process; another process must create its own session.
 #[derive(Clone, Debug)]
 pub struct FsClient { client: DaemonClient, info: fs::SessionInfo }
 

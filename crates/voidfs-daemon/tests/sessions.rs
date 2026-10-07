@@ -346,8 +346,8 @@ async fn local_mutations_notify_other_sessions_after_the_new_bytes_are_visible()
     let mut watch = reader.watch().await.unwrap();
     let initial = next(&mut watch).await;
     writer.write(rw, 1, Bytes::from_static(b"X")).await.unwrap();
-    let event = matching(&mut watch, |event| event.generation > initial.generation && event.inodes.contains(&ino)).await;
-    assert!(event.resync && event.invalidations.contains(&fs::Invalidation::All));
+    let event = matching(&mut watch, |event| event.generation > initial.generation && event.inodes.contains(&ino) && event.invalidations.contains(&fs::Invalidation::Object("data".into()))).await;
+    assert!(!event.resync && event.invalidations == [fs::Invalidation::Object("data".into())]);
     assert_eq!(reader.read(old, 0, 4).await.unwrap(), Bytes::from_static(b"aXcd"));
     writer.truncate(rw, 2).await.unwrap();
     let resized = matching(&mut watch, |next| next.generation > event.generation && next.inodes.contains(&ino)).await;

@@ -144,7 +144,7 @@ impl Session {
     }
 
     async fn change_xattr(&self, ino: Ino, name: String, value: Option<(Vec<u8>, XattrMode)>) -> Result<()> {
-        let queue = self.queue.as_ref().ok_or(FsError::ReadOnly)?;
+        if self.queue.is_none() { return Err(FsError::ReadOnly); }
         if ino == self.root { return Err(FsError::Unsupported); }
         for _ in 0..4 {
             match self.prepare_mutation(ino).await { Err(FsError::Again) => continue, other => other? }
@@ -156,7 +156,7 @@ impl Session {
             let offline = self.connectivity.link() == Link::Offline;
             let name = name.clone();
             let value = value.clone();
-            let result = queue.mount_transaction(move |tx| {
+            let result = self.local_transaction(move |tx| {
                 let (mut current, current_key) = mutation_node(tx, &drive, root, ino, offline)?;
                 if current_key != key || !same_snapshot(&snapshot, &current) { return Err(FsError::Again); }
                 let m = memo(tx, ino)?.ok_or_else(|| FsError::Io("missing complete extended attribute snapshot".into()))?;
@@ -184,7 +184,8 @@ impl Session {
                 save_node(tx, &current)?;
                 save_memo(tx, ino, &current.entry.version_id, &attrs, true)?;
                 entry.mount_ino = Some(ino);
-                Ok(((), vec![entry]))
+                let change = notify::attribute(tx, &drive, root, ino)?;
+                Ok((((), change), vec![entry]))
             }).await;
             match result { Err(FsError::Again) => continue, other => return other }
         }

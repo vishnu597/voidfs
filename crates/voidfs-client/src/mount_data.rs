@@ -18,10 +18,11 @@ pub(super) struct Staged {
     files: Mutex<HashMap<Ino, Arc<File>>>, creation: tokio::sync::Mutex<()>,
     normal_commits: AtomicU64, full_commits: AtomicU64,
     _lease: Arc<crate::store::MountLease>,
+    local: Arc<notify::Observer>,
 }
 
 impl Staged {
-    pub async fn load(store: Arc<Store>, drive: String, root: Ino, queue: Option<crate::Queue>, cfg: StagingConfig, lease: Arc<crate::store::MountLease>) -> Result<Arc<Self>> {
+    pub async fn load(store: Arc<Store>, drive: String, root: Ino, queue: Option<crate::Queue>, cfg: StagingConfig, lease: Arc<crate::store::MountLease>, local: Arc<notify::Observer>) -> Result<Arc<Self>> {
         let (s, d) = (store.clone(), drive.clone());
         let files = tokio::task::spawn_blocking(move || {
             let stages = stage::load_all(&s, &d)?;
@@ -30,7 +31,7 @@ impl Staged {
                 Ok((ino, Arc::new(File { state: Arc::new(tokio::sync::Mutex::new(state)), attr: Mutex::new(attr), timer: AtomicBool::new(false), touched: Mutex::new(tokio::time::Instant::now()) })))
             }).collect::<Result<HashMap<_, _>>>()
         }).await.map_err(Error::from)??;
-        Ok(Arc::new(Self { store, drive, root, queue, cfg, files: Mutex::new(files), creation: tokio::sync::Mutex::new(()), normal_commits: AtomicU64::new(0), full_commits: AtomicU64::new(0), _lease: lease }))
+        Ok(Arc::new(Self { store, drive, root, queue, cfg, files: Mutex::new(files), creation: tokio::sync::Mutex::new(()), normal_commits: AtomicU64::new(0), full_commits: AtomicU64::new(0), _lease: lease, local }))
     }
 
     pub fn file(&self, ino: Ino) -> Option<Arc<File>> { self.files.lock().unwrap_or_else(|p| p.into_inner()).get(&ino).cloned() }
@@ -175,6 +176,7 @@ impl Staged {
         let version = record.base.version_id.clone();
         let result = queue.mount_transaction(move |tx| {
             let mut n = node(tx, &drive, ino)?.ok_or(FsError::Stale)?;
+            let previous = n.sync;
             let linked = chain(tx, &drive, root, ino)?;
             if let Some(path) = linked {
                 let key = path.into_iter().skip(1).map(|(_, name)| name).collect::<Vec<_>>().join("/");
@@ -198,14 +200,17 @@ impl Staged {
             } else { entries.clear(); }
             tx.execute("UPDATE mount_staged SET record=?2 WHERE ino=?1", params![ino, json])?;
             save_node(tx, &n)?;
-            Ok((n.attr()?, entries))
+            let change = if n.sync != previous { Some(notify::attribute(tx, &drive, root, ino)?) } else { None };
+            Ok(((n.attr()?, change), entries))
         }).await;
-        let attr = result?;
+        let (attr, change) = result?;
         if attr.sync != Sync::Saving { clean(&sources).await; }
         let mut state = state;
         state.record = record;
         *file.attr.lock().unwrap_or_else(|p| p.into_inner()) = attr;
         self.full_commits.fetch_add(1, Ordering::Relaxed);
+        drop(state);
+        if let Some(change) = change { self.local.send(change); }
         Ok(())
     }
 }
@@ -261,13 +266,16 @@ impl Session {
         let file = self.data.ensure(&handle).await?;
         let mut state = file.state.clone().lock_owned().await;
         if handle.closed.load(Ordering::Acquire) { return Err(FsError::BadHandle); }
-        let (store, drive, cfg, view, len, ino, data) = (self.store.clone(), self.drive.clone(), self.data.cfg.clone(), file.clone(), bytes.len(), handle.attr.ino, self.data.clone());
+        let (store, drive, cfg, view, len, ino, data, root) = (self.store.clone(), self.drive.clone(), self.data.cfg.clone(), file.clone(), bytes.len(), handle.attr.ino, self.data.clone(), self.root);
         let attr = tokio::task::spawn_blocking(move || {
             let attr = state.append(&store, &drive, ino, offset, &bytes, &cfg)?;
             *view.attr.lock().unwrap_or_else(|p| p.into_inner()) = attr.clone();
             *view.touched.lock().unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
             data.normal_commits.fetch_add(1, Ordering::Relaxed);
             data.schedule(ino, &view);
+            drop(state);
+            let change = store.with(|c| notify::attribute(c, &drive, root, ino)).unwrap_or_else(|_| LocalChange { invalidations: Vec::new(), inodes: vec![ino], namespace: false });
+            data.local.send(change);
             Ok::<_, FsError>(attr)
         }).await.map_err(Error::from)??;
         self.data.schedule(attr.ino, &file);
@@ -282,13 +290,16 @@ impl Session {
         let mut state = file.state.clone().lock_owned().await;
         if handle.closed.load(Ordering::Acquire) { return Err(FsError::BadHandle); }
         if size == state.record.size { return Ok(()); }
-        let (store, drive, cfg, view, ino, data) = (self.store.clone(), self.drive.clone(), self.data.cfg.clone(), file.clone(), handle.attr.ino, self.data.clone());
+        let (store, drive, cfg, view, ino, data, root) = (self.store.clone(), self.drive.clone(), self.data.cfg.clone(), file.clone(), handle.attr.ino, self.data.clone(), self.root);
         let attr = tokio::task::spawn_blocking(move || {
             let attr = state.truncate(&store, &drive, ino, size, &cfg)?;
             *view.attr.lock().unwrap_or_else(|p| p.into_inner()) = attr.clone();
             *view.touched.lock().unwrap_or_else(|p| p.into_inner()) = tokio::time::Instant::now();
             data.normal_commits.fetch_add(1, Ordering::Relaxed);
             data.schedule(ino, &view);
+            drop(state);
+            let change = store.with(|c| notify::attribute(c, &drive, root, ino)).unwrap_or_else(|_| LocalChange { invalidations: Vec::new(), inodes: vec![ino], namespace: false });
+            data.local.send(change);
             Ok::<_, FsError>(attr)
         }).await.map_err(Error::from)??;
         self.data.schedule(attr.ino, &file);

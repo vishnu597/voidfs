@@ -65,6 +65,8 @@ const MIGRATIONS: &[&str] = &[
          attrs TEXT NOT NULL, dirty INTEGER NOT NULL DEFAULT 0);",
     // 7: acknowledged mount bytes and their immutable remote base.
     "CREATE TABLE mount_staged(ino INTEGER PRIMARY KEY REFERENCES mount_inodes(ino), path TEXT NOT NULL, record TEXT NOT NULL);",
+    // 8: remembered mounts follow stable drive identity across alias reuse.
+    "ALTER TABLE mounts ADD COLUMN drive_id TEXT;",
 ];
 
 pub(crate) struct MountLease { write: bool }

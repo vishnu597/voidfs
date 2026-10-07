@@ -49,6 +49,8 @@ pub trait Adapter: Send + Sync + 'static {
 pub trait Mounted: Send + Sync + 'static {
     /// What the drive's change feed made stale, for the adapter to tell the kernel.
     fn invalidate(&self, _changes: &[Invalidation]) {}
+    /// Local edits also name inode attributes, including open files without a linked path.
+    fn local_change(&self, change: &voidfs_client::mount::LocalChange) { self.invalidate(&change.invalidations); }
     /// Unmounts it.
     fn unmount(self: Arc<Self>) -> BoxFuture<'static, Result<(), String>>;
 }
@@ -137,7 +139,7 @@ impl Mounts {
     /// is updated as it goes.
     async fn attach(s: &Shared, spec: &MountSpec, adapter: &Arc<dyn Adapter>, drive: Option<Arc<DriveSession>>) -> Result<(), Failure> {
         let drive = match drive { Some(drive) => drive, None => s.sessions.drive(s, &spec.drive).await? };
-        let effective = MountSpec { read_only: spec.read_only || !drive.pinned, ..spec.clone() };
+        let effective = MountSpec { drive: drive.drive(), read_only: spec.read_only || !drive.pinned, ..spec.clone() };
         let handle = adapter.mount(&effective, &s.core(drive.core.clone())).await.map_err(|m| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "MountFailed", m))?;
         drive.observe(handle.clone());
         let unwanted = {
@@ -145,6 +147,7 @@ impl Mounts {
             match live.iter_mut().find(|l| l.spec.mountpoint == spec.mountpoint) {
                 Some(l) => {
                     l.spec.read_only = effective.read_only;
+                    l.spec.drive = effective.drive.clone();
                     l.is = Is::Mounted(handle);
                     l.drive = Some(drive);
                     l.since = now();
@@ -174,7 +177,14 @@ impl Mounts {
             let s = s.clone();
             tokio::spawn(async move {
                 let _op = s.mounts.ops.lock().await;
-                if let Err(f) = Mounts::attach(&s, &spec, &adapter, None).await
+                let result = async {
+                    let drive = s.sessions.remembered(&s, &r).await?;
+                    let remembered = Remembered { drive: drive.drive(), drive_id: drive.pinned.then(|| drive.id.clone()), ..r };
+                    let store = s.store.clone();
+                    blocking(move || voidfs_client::mounts::remember(&store, &remembered)).await?;
+                    Mounts::attach(&s, &spec, &adapter, Some(drive)).await
+                }.await;
+                if let Err(f) = result
                     && let Some(l) = s.mounts.live().iter_mut().find(|l| l.spec.mountpoint == spec.mountpoint)
                 {
                     l.is = Is::Failed(f.2);
@@ -216,7 +226,8 @@ pub(crate) async fn mount(State(s): State<Arc<Shared>>, Json(m): Json<api::NewMo
     let _op = s.mounts.ops.lock().await;
     let adapter = s.mounts.adapter(m.adapter.as_deref())?;
     let session = s.sessions.drive(&s, &m.drive).await?;
-    let drive = session.drive.clone();
+    let drive = session.drive();
+    let drive_id = session.pinned.then(|| session.id.clone());
     let mountpoint = match &m.mountpoint {
         Some(p) => PathBuf::from(key(p)),
         None => s.mounts.root.as_ref().map(|r| r.join(&drive)).ok_or_else(|| bad("no HOME for the default mountpoint: name one".into()))?,
@@ -238,7 +249,7 @@ pub(crate) async fn mount(State(s): State<Arc<Shared>>, Json(m): Json<api::NewMo
         s.mounts.live().retain(|l| l.spec.mountpoint != mountpoint);
         return Err(f);
     }
-    let r = Remembered { mountpoint: mountpoint.display().to_string(), drive, adapter: adapter.name().into(), read_only: m.read_only };
+    let r = Remembered { mountpoint: mountpoint.display().to_string(), drive, drive_id, adapter: adapter.name().into(), read_only: m.read_only };
     let store = s.store.clone();
     blocking(move || voidfs_client::mounts::remember(&store, &r)).await?;
     let view = s.mounts.live().iter().find(|l| l.spec.mountpoint == mountpoint).map(Live::api);
@@ -269,7 +280,7 @@ pub(crate) async fn unmount(State(s): State<Arc<Shared>>, Json(u): Json<api::Unm
         }
         unmounted.push(l.spec.mountpoint.display().to_string());
     }
-    let forgotten = remembered.into_iter().filter(|r| names(&r.drive, &r.mountpoint) || unmounted.contains(&r.mountpoint)).collect::<Vec<_>>();
+    let forgotten = remembered.into_iter().filter(|r| names(&r.drive, &r.mountpoint) || r.drive_id.as_deref() == Some(&target) || unmounted.contains(&r.mountpoint)).collect::<Vec<_>>();
     for r in forgotten {
         let store = s.store.clone();
         let mp = r.mountpoint.clone();

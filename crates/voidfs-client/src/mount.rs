@@ -22,9 +22,12 @@ mod xattrs;
 mod stage;
 #[path = "mount_data.rs"]
 mod data;
+#[path = "mount_notify.rs"]
+mod notify;
 pub use mutations::RenameMode;
 pub use xattrs::XattrMode;
 pub use stage::StagingConfig;
+pub use notify::LocalChange;
 
 pub type Ino = u64;
 pub type Fh = u64;
@@ -344,6 +347,7 @@ pub struct Session {
     refresh: Mutex<HashMap<Ino, Weak<tokio::sync::Mutex<()>>>>,
     queue: Option<crate::Queue>,
     data: Arc<data::Staged>,
+    local: Arc<notify::Observer>,
 }
 
 impl Session {
@@ -376,9 +380,10 @@ impl Session {
             tx.commit()?;
             Ok((root, generation))
         })).await.map_err(Error::from)??;
-        let data = data::Staged::load(store.clone(), drive.to_owned(), root, None, StagingConfig::default(), lease).await?;
+        let local = Arc::new(notify::Observer::default());
+        let data = data::Staged::load(store.clone(), drive.to_owned(), root, None, StagingConfig::default(), lease, local.clone()).await?;
         Ok(Self { store, client, drive: drive.to_owned(), root, connectivity, cache, generation,
-            handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()), queue: None, data })
+            handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()), queue: None, data, local })
     }
 
     /// A writable session on the daemon's queue and state store. One writer owns each drive;
@@ -391,7 +396,7 @@ impl Session {
         if !queue.uses_store(&store) { return Err(FsError::InvalidArgument); }
         let lease = store.mount_session(drive, true).ok_or(FsError::Again)?;
         let mut session = Self::new_inner(store, client, cache, drive, connectivity, lease.clone()).await?;
-        session.data = data::Staged::load(session.store.clone(), drive.to_owned(), session.root, Some(queue.clone()), cfg, lease).await?;
+        session.data = data::Staged::load(session.store.clone(), drive.to_owned(), session.root, Some(queue.clone()), cfg, lease, session.local.clone()).await?;
         session.queue = Some(queue);
         session.data.restart_timers();
         Ok(session)
