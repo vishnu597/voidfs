@@ -12,8 +12,8 @@ Rust daemon sessions/shared feeds on 2026-10-07. The first was taken
 on 2026-09-27.*
 
 Sources:
-- the voidfs code on `origin/main` at `d8ed49a` (staged file writes merged),
-  plus this change's Rust daemon session RPCs and shared feeds;
+- the voidfs code on `origin/main` at `4b4d62d` (Rust daemon sessions merged),
+  plus this change's stable remembered identities, local notifications and socket ownership fixes;
 - the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
 - the benchmark results in [`bench/results/`](../bench/results/);
 - SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog, read again on 28
@@ -109,7 +109,8 @@ billing or plans), this page says so.
     staged file writes now share that core. Local edits are visible before upload, including to
     earlier handles; open files queue edits after two seconds without writes. FSKit first,
     the Swift XPC bridge and verified whole shards are accepted; no step 5 item is complete.
-    Rust session RPCs now share one core/feed per stable drive across mounts and observers.
+    Rust session RPCs share one core/feed per stable drive across mounts and observers. Remembered
+    mounts pin stable IDs; local edits notify peers offline, and sessions authenticate Unix peers.
     Publication reconciliation, full recovery, the Swift bridge and the writable mount remain
     pending. Steps 6–10 have not started.
 

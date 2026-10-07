@@ -124,7 +124,10 @@ namespace path, then use a bounded listing fallback for moves the namespace has 
 Cached bytes remain readable offline, and handles from a previous session return `ESTALE`.
 The daemon now shares one filesystem core and feed watcher per stable drive across mounts and
 Rust socket sessions. `DaemonClient::session` supplies generation handshakes, bounded metadata
-calls, binary reads/writes, and an invalidation stream. Publication reconciliation, full recovery
+calls, binary reads/writes, and an invalidation stream. New remembered mounts retain stable drive
+IDs; older records require an explicit remount. Local adapter and RPC edits notify peers offline
+without broad resync for attribute changes.
+Random session IDs are bound to verified Unix peer credentials. Publication reconciliation, full recovery
 and the Swift/FSKit bridge and adapter follow in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the

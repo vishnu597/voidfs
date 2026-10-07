@@ -598,9 +598,15 @@ live drive has one writable `mount::Session`, the existing daemon Store/Cache/Qu
 `FeedWatch`, shared by all its mounts and logical RPC sessions. The registry resolves display
 aliases online on each attach so alias reuse cannot attach a consumer to the wrong core. An
 atomic, synchronized `drive-aliases.json` memo supports known identities offline; it is bounded
-at 4,096 mappings and 1 MiB and may discard older mappings when full. Unknown offline identities
-can bootstrap a read-only mount, but RPC session creation returns `Offline` until identity is
-resolved. That provisional core stays read-only after reconnect; reopen after connection to get
+at 4,096 mappings and 1 MiB, evicts individual old identities under pressure, and removes stale
+aliases when a rename, alias reuse or deletion is learned. Stable-ID records remove contradictory
+legacy aliases on load. Migration 8 saves a stable ID beside each remembered mount's display
+name; restoration resolves that ID and can use it offline even after memo eviction. A remembered
+record without a stable ID requires an explicit remount, including a provisional offline mount
+after restart: a current alias memo cannot prove its original target. Reusing a live core refreshes
+its display alias before a new mount is saved. Unknown offline identities can bootstrap a read-only mount, but RPC
+session creation returns `Offline` before creating a core, changing epochs or writing namespace
+rows until identity is resolved. That provisional core stays read-only after reconnect; reopen after connection to get
 a pinned writable core. If the provisional name was already an ID, its read-only mount must
 release the same-drive lease before a writable reopen. Existing known-ID sessions stay pinned
 when the display alias changes. CLI upload queue addressing retains its existing policy.
@@ -609,13 +615,24 @@ when the display alias changes. CLI upload queue addressing retains its existing
 at their boundary; RPC consumers enforce their own policy even though they share the writable
 core. The feed first commits `Session::invalidate`, then notifies every mounted observer and
 socket watcher. Metadata generations increase within that core; remote sequence positions do
-not decrease. Local RPC writes/truncation notify after their bytes/metadata are visible. Each
-watch starts with a full resync, including resubscription. Remote reconnects (even idle ones),
+not decrease. The shared core emits `LocalChange` after committed local writes, truncation,
+namespace/xattr edits and changed flush status, whether called through an adapter or RPC. Owned
+mutation tasks preserve delivery if callers cancel. These updates target object keys and inode
+IDs, including open-unlinked inodes, and reach every mount and socket observer while offline.
+Adapters implement `Mounted::local_change` to invalidate inode attributes as well as linked keys;
+its default forwards linked invalidations. Attribute-only edits do not request a drive resync or
+advance the independent namespace generation used by enumeration. Each watch starts with a full resync, including resubscription. Remote reconnects (even idle ones),
 expired history, broadcast lag and oversized events produce `All` instead of pretending that
 incremental metadata is complete. Existing `ChangeWatch::next` keeps its batch-only contract;
 `next_event` exposes stream connections for consumers needing resync.
 
-The user-only Unix socket now has `/v1/fs` beside the existing controls. The typed Rust API is
+The user-only Unix socket now has `/v1/fs` beside the existing controls. Kernel Unix peer
+credentials authenticate the daemon's effective UID and a nonzero PID before dispatch. Each
+filesystem session belongs to its creating UID/PID, including watches and release; fresh and
+pooled connections from that process work, and another process is refused even if it knows the
+ID. Session IDs contain 256 bits from the OS random source, with collision rejection. Controls
+remain available to processes of the daemon's user. Signed app identity and protection against
+same-user debugging or memory access belong to the later Mac bridge security work. The typed Rust API is
 `DaemonClient::session(drive, read_only) -> FsClient`, with `FsClientError` retaining status,
 code, message and native errno. The local filesystem wire version is 1 and is independent of
 the object protocol and format.
@@ -635,8 +652,9 @@ the object protocol and format.
 | `GET …/watch` | NDJSON `{generation, seq, resync, invalidations, inodes}` |
 
 Every session route requires `x-voidfs-generation` from creation. `SessionInfo.generation` is
-the persisted core epoch; `metadataGeneration`, watch generations and page generations count
-drive-wide invalidations within that core. `Attr.generation` is the inode-local metadata
+the persisted core epoch; `metadataGeneration` and watch generations order all drive-wide
+notifications within that core. Page generations count namespace changes and remote metadata
+invalidation independently, so a data/attribute edit does not force `readdir` to retry. `Attr.generation` is the inode-local metadata
 generation. Session IDs are opaque; handle IDs retain the core's persisted epoch/counter. Old sessions/generations/handles return `ESTALE`
 after restart. A different logical consumer's handle returns `EBADF`, and a read-only consumer's
 write/truncate/open-for-write returns `EROFS`. Errors are `{error: {code, message, errno}}` with
@@ -645,7 +663,8 @@ bytes, keeping error frames within the response limit. JSON wrappers use camelCa
 shape (`object_id`, `version_id`, `has_xattrs`, RFC3339 `mtime`, and `Saved`/`Pending`/`Saving`/
 `Conflict`/`Error` sync values). Invalidations are `{kind: "object", key}`, `{kind: "subtree", key}`
 or `{kind: "all"}`. An enumeration cursor is exclusive UTF-8 name order; clients restart it
-after metadata invalidation, and a page racing an invalidation returns `EAGAIN`.
+when its namespace generation changes; a page racing a namespace change or remote invalidation
+returns `EAGAIN`. Local attribute-only edits preserve page generations.
 
 Admission bounds are 32 active drives, 256 logical sessions, 1,024 handles per consumer, 32
 in-flight calls, 64 watches, 8 MiB binary I/O, 256 directory entries, 64 KiB request JSON and
@@ -691,6 +710,16 @@ restored. The conformance validator passed 55 cases/420 steps; credential script
 tests. Local interoperability passed against memory, filesystem and versitygw backends with
 both addressing styles. Local boto3 checks were skipped because it is unavailable; CI covers
 boto3, MinIO and Compose interoperability.
+
+Daemon follow-up validation: the six identity, local coherence, bounded-state and session
+ownership fixes pass 628 workspace tests (8 ignored), workspace clippy with warnings denied,
+the 55-case/420-step spec validator and all five credential-script checks. The 15 new regular
+tests and two strengthened existing tests received 47 isolated runtime failure proofs, with
+restart, cancellation and race cases repeated three times, and passed after restoration. Local
+interoperability passes on memory, filesystem and versitygw in both addressing styles; boto3
+remains unavailable locally. Legacy name-only remembered records require explicit remounts.
+Guarded publication and conflict reconciliation remain the next core slice, followed by full
+kill-point recovery. The signed-bundle probe still precedes the Swift bridge and FSKit adapter.
 
 Accounts, web, search, previews, video review, Linux/Windows mounts, server locking, retention and
 encryption remain in their later steps. Cloud benchmark runs and new provider credentials do not

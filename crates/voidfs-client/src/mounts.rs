@@ -14,6 +14,9 @@ pub struct Remembered {
     pub mountpoint: String,
     /// The drive's alias.
     pub drive: String,
+    /// The stable identity, absent in older remembered mounts and provisional offline mounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_id: Option<String>,
     pub adapter: String,
     pub read_only: bool,
 }
@@ -21,8 +24,8 @@ pub struct Remembered {
 /// Every remembered mount, by mountpoint.
 pub fn remembered(store: &Store) -> Result<Vec<Remembered>> {
     store.with(|c| {
-        c.prepare("SELECT mountpoint, drive, adapter, read_only FROM mounts ORDER BY mountpoint")?
-            .query_map([], |r| Ok(Remembered { mountpoint: r.get(0)?, drive: r.get(1)?, adapter: r.get(2)?, read_only: r.get(3)? }))?
+        c.prepare("SELECT mountpoint, drive, adapter, read_only, drive_id FROM mounts ORDER BY mountpoint")?
+            .query_map([], |r| Ok(Remembered { mountpoint: r.get(0)?, drive: r.get(1)?, adapter: r.get(2)?, read_only: r.get(3)?, drive_id: r.get(4)? }))?
             .collect()
     })
 }
@@ -31,8 +34,8 @@ pub fn remembered(store: &Store) -> Result<Vec<Remembered>> {
 pub fn remember(store: &Store, m: &Remembered) -> Result<()> {
     store.with(|c| {
         c.execute(
-            "INSERT OR REPLACE INTO mounts(mountpoint, drive, adapter, read_only, created) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![m.mountpoint, m.drive, m.adapter, m.read_only, crate::journal::now_ms()],
+            "INSERT OR REPLACE INTO mounts(mountpoint, drive, adapter, read_only, created, drive_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![m.mountpoint, m.drive, m.adapter, m.read_only, crate::journal::now_ms(), m.drive_id],
         )
         .map(drop)
     })
@@ -51,7 +54,7 @@ mod tests {
     fn mounts_are_remembered_across_opens_until_forgotten() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
-        let m = Remembered { mountpoint: "/Users/a/voidfs/footage".into(), drive: "footage".into(), adapter: "fskit".into(), read_only: false };
+        let m = Remembered { mountpoint: "/Users/a/voidfs/footage".into(), drive: "footage".into(), drive_id: Some("stable-footage".into()), adapter: "fskit".into(), read_only: false };
         remember(&s, &m).unwrap();
         remember(&s, &Remembered { read_only: true, ..m.clone() }).unwrap();
         drop(s);

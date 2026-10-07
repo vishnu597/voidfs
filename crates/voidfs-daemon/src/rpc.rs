@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, HttpBody, to_bytes};
@@ -20,7 +21,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, watch};
 use voidfs_client::mount::FsError;
 
 use crate::api::fs;
-use crate::server::Shared;
+use crate::server::{Owner, Shared};
 use crate::sessions::DriveSession;
 
 pub(crate) struct Failure { pub status: StatusCode, pub error: fs::FsError }
@@ -89,6 +90,7 @@ fn clip(value: &mut String, maximum: usize) {
 }
 
 struct Access {
+    owner: Owner,
     drive: Arc<DriveSession>,
     read_only: bool,
     handles: Mutex<HashMap<u64, OwnedSemaphorePermit>>,
@@ -123,7 +125,6 @@ impl Access {
 
 pub(crate) struct Calls {
     active: Mutex<HashMap<String, Arc<Access>>>,
-    next: Mutex<u64>,
     calls: Arc<Semaphore>,
     sessions: Arc<Semaphore>,
     watches: Arc<Semaphore>,
@@ -131,7 +132,7 @@ pub(crate) struct Calls {
 
 impl Calls {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { active: Mutex::new(HashMap::new()), next: Mutex::new(1), calls: Arc::new(Semaphore::new(fs::MAX_CALLS)),
+        Arc::new(Self { active: Mutex::new(HashMap::new()), calls: Arc::new(Semaphore::new(fs::MAX_CALLS)),
             sessions: Arc::new(Semaphore::new(fs::MAX_SESSIONS)), watches: Arc::new(Semaphore::new(fs::MAX_WATCHES)) })
     }
 
@@ -139,6 +140,7 @@ impl Calls {
         let generation: u32 = request.headers().get("x-voidfs-generation").and_then(|h| h.to_str().ok()).and_then(|h| h.parse().ok()).ok_or_else(Failure::invalid)?;
         let access = self.active.lock().unwrap_or_else(|p| p.into_inner()).get(id).cloned()
             .ok_or_else(|| Failure::new(StatusCode::CONFLICT, "StaleSession", FsError::Stale))?;
+        if request.extensions().get::<Owner>() != Some(&access.owner) { return Err(FsError::Permission.into()); }
         if generation != access.drive.core.generation() { return Err(Failure::new(StatusCode::CONFLICT, "StaleGeneration", FsError::Stale)); }
         Ok(access)
     }
@@ -213,33 +215,34 @@ fn answer<T: Serialize>(value: T) -> Result<Response, Failure> {
 
 async fn create(State(s): State<Arc<Shared>>, request: Request) -> Result<Response, Failure> {
     let permit = permit(&request);
+    let owner = *request.extensions().get::<Owner>().ok_or(FsError::Permission)?;
     let new: fs::NewSession = json(request).await?;
     tokio::spawn(async move {
     let _permit = permit;
     if new.version != fs::VERSION { return Err(Failure::new(StatusCode::UPGRADE_REQUIRED, "UnsupportedVersion", FsError::Unsupported)); }
     if new.drive.is_empty() || new.drive.len() > 1024 || new.drive.contains(['/', '\0']) { return Err(Failure::invalid()); }
     let slot = s.rpc.sessions.clone().try_acquire_owned().map_err(|_| Failure::busy())?;
-    let drive = s.sessions.drive(&s, &new.drive).await?;
-    if !drive.pinned { return Err(FsError::Offline.into()); }
-    let serial = {
-        let mut next = s.rpc.next.lock().unwrap_or_else(|p| p.into_inner());
-        let serial = *next;
-        *next = serial.checked_add(1).ok_or_else(Failure::busy)?;
-        serial
-    };
+    let drive = s.sessions.drive_for_rpc(&s, &new.drive).await?;
     let generation = drive.core.generation();
-    let id = format!("{generation:08x}-{serial:016x}");
-    let info = fs::SessionInfo { version: fs::VERSION, id: id.clone(), drive: drive.drive.clone(), root: drive.core.root(), generation,
+    let id = session_id()?;
+    let info = fs::SessionInfo { version: fs::VERSION, id: id.clone(), drive: drive.drive(), root: drive.core.root(), generation,
         metadata_generation: drive.metadata_generation(), read_only: new.read_only, max_io: fs::MAX_IO, max_entries: fs::MAX_ENTRIES };
-    let access = Arc::new(Access { drive, read_only: new.read_only, handles: Mutex::new(HashMap::new()), slots: Arc::new(Semaphore::new(fs::MAX_HANDLES)),
+    let access = Arc::new(Access { owner, drive, read_only: new.read_only, handles: Mutex::new(HashMap::new()), slots: Arc::new(Semaphore::new(fs::MAX_HANDLES)),
         gate: Arc::new(RwLock::new(())), closed: watch::Sender::new(false), _slot: slot });
     {
         let mut active = s.rpc.active.lock().unwrap_or_else(|p| p.into_inner());
         if *s.closing.borrow() { return Err(Failure::busy()); }
+        if active.contains_key(&id) { return Err(Failure::busy()); }
         active.insert(id, access);
     }
     answer(info)
     }).await.map_err(|e| Failure::from(FsError::Io(e.to_string())))?
+}
+
+fn session_id() -> Result<String, Failure> {
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes)).map_err(|error| FsError::Io(error.to_string()))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 async fn call(State(s): State<Arc<Shared>>, Path((id, op)): Path<(String, String)>, request: Request) -> Result<Response, Failure> {
@@ -263,9 +266,9 @@ async fn call(State(s): State<Arc<Shared>>, Path((id, op)): Path<(String, String
         "readdir" => {
             let q: fs::ReadDir = decode(&bytes)?;
             if q.limit == 0 || q.limit > fs::MAX_ENTRIES || q.after.as_ref().is_some_and(|s| s.len() > 1024) { return Err(Failure::invalid()); }
-            let generation = access.drive.metadata_generation();
+            let generation = access.drive.namespace_generation();
             let entries = core.readdir(q.ino, q.after.as_deref(), q.limit).await?;
-            if generation != access.drive.metadata_generation() { return Err(FsError::Again.into()); }
+            if generation != access.drive.namespace_generation() { return Err(FsError::Again.into()); }
             answer(fs::ReadDirReply { entries, generation })
         },
         "open" => {
@@ -288,9 +291,7 @@ async fn call(State(s): State<Arc<Shared>>, Path((id, op)): Path<(String, String
             let q: fs::Truncate = decode(&bytes)?;
             access.writable()?;
             access.handle(q.fh)?;
-            let ino = core.handle_attr(q.fh)?.ino;
             core.truncate(q.fh, q.size).await?;
-            access.drive.notify_local(ino);
             answer(fs::Empty::default())
         },
         "fsync" => { let q: fs::Handle = decode(&bytes)?; access.handle(q.fh)?; core.fsync(q.fh).await?; answer(fs::Empty::default()) },
@@ -336,9 +337,7 @@ async fn write(State(s): State<Arc<Shared>>, Path(id): Path<String>, request: Re
     if *access.closed.borrow() { return Err(Failure::new(StatusCode::CONFLICT, "StaleSession", FsError::Stale)); }
     tokio::spawn(async move {
     let (_gate, _permit) = (gate, permit);
-    let ino = access.drive.core.handle_attr(q[0])?.ino;
     let written = access.drive.core.write(q[0], q[1], bytes).await?;
-    access.drive.notify_local(ino);
     answer(fs::Written { written })
     }).await.map_err(|e| Failure::from(FsError::Io(e.to_string())))?
 }
