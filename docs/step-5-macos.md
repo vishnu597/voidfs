@@ -995,3 +995,11 @@ modification time of an existing file or folder.
 | Writes admitted within the disk reserve, `ENOSPC` without acknowledging, pending/saving/conflict/error states | `reserve_admission_returns_enospc_before_bytes_or_metadata_change`; `Sync` |
 | Queue guards and the `412` policy; both versions kept on a conflict; no later unguarded overwrite | [Guarded publication](#guarded-publication-and-conflict-reconciliation-7-october); `mount_publication.rs` |
 | Done when: save, rename, open-unlink and crash recovery against a temporary store; reads agree with the overlay while paused; kill points over staged bytes, metadata, publish and cleanup, with a published entry held open | [Recovery](#recovery-8-october)'s kill-point table and model test; `killed_after_reconciling_a_publication_held_open_leaves_no_orphans` |
+
+Capabilities validation: 693 workspace tests pass (9 ignored), and workspace clippy passes with
+warnings denied. The three new tests and the two changed ones (the errno mapping and the typed
+client's refusals) were each seen to fail with their code broken: eight breaks, 12 isolated
+failing runs. Spec validation passes 55 cases / 420 steps, and the five credential-script tests
+pass. Local memory, fs and versitygw interoperability passes conformance, stock S3 checks,
+aws-chunked and rclone; boto3 is unavailable locally, and CI supplies it and checks MinIO and
+Docker Compose.
