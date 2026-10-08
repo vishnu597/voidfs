@@ -114,8 +114,11 @@ billing or plans), this page says so.
     mounts pin stable IDs; local edits notify peers offline, and sessions authenticate Unix peers.
     Guarded publication reconciles exact acknowledgements and retains local/remote conflicts.
     [Recovery](step-5-macos.md#recovery-8-october) survives process kills at each step, knows a
-    lost put reply as its own, compacts staging and removes what nothing needs.
-    Full recovery, the Swift bridge and the writable mount remain pending. Steps 6–10 have not started.
+    lost put reply as its own, compacts staging and removes what nothing needs. The core
+    [advertises](step-5-macos.md#capabilities-8-october) what it doesn't support (hard links,
+    exchange, cloning, cross-machine locks), refused with `ENOTSUP`, through the daemon's session
+    reply too. Item 1 lacks only setting mode and mtime on existing files, so no step 5 item is
+    complete yet. The Swift bridge and the writable mount remain pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -842,7 +845,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - The ordered deliverables, adapter/bridge decisions and validation gates are in the
      [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation,
      staged file-data, Rust daemon-session, guarded-publication and recovery slices are
-     implemented; no writable adapter exists yet.
+     implemented, and the core advertises its capabilities; no writable adapter exists yet.
+     Item 1 lacks only setting mode and mtime on existing files.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
