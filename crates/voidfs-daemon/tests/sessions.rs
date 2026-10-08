@@ -242,6 +242,33 @@ async fn version_generation_and_json_schema_are_checked_before_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_body_still_being_sent_gets_its_typed_refusal() {
+    let f = Fixture::new("drain", &[("data", Bytes::from_static(b"original"))]).await;
+    let session = f.client.session("drive", false).await.unwrap();
+    let fh = session.open(session.lookup(session.info().root, "data").await.unwrap().ino, true).await.unwrap().fh;
+    let (socket, id, generation) = (f.daemon.socket().to_owned(), session.info().id.clone(), session.info().generation);
+    let response = tokio::task::spawn_blocking(move || {
+        let length = fs::MAX_IO as usize + 1;
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        write!(stream, "PUT /v1/fs/{id}/write?fh={fh}&offset=0 HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\nx-voidfs-generation: {generation}\r\ncontent-type: application/octet-stream\r\ncontent-length: {length}\r\n\r\n").unwrap();
+        // Long enough for a daemon that refuses before reading to answer and close.
+        std::thread::sleep(Duration::from_millis(300));
+        stream.write_all(&vec![42; length]).expect("the daemon reads the rest of a body it refuses, so the client can send it");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        response
+    }).await.unwrap();
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+    let error: fs::FsErrorBody = serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!((error.error.code.as_str(), error.error.errno), ("TooLarge", FsError::InvalidArgument.errno()));
+    assert_eq!(session.read(fh, 0, 16).await.unwrap(), Bytes::from_static(b"original"));
+    session.close(fh).await.unwrap();
+    session.release().await.unwrap();
+    f.daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_io_and_page_limits_refuse_work_without_changing_bytes() {
     let f = Fixture::new("limits", &[("data", Bytes::from_static(b"original"))]).await;
     let session = f.client.session("drive", false).await.unwrap();

@@ -270,7 +270,7 @@ impl Staged {
             let change = if n.sync != previous { Some(notify::attribute(tx, &drive, root, ino)?) } else { None };
             Ok(((n.attr()?, change, !entries.is_empty()), entries))
         }).await;
-        let (attr, change, queued) = result?;
+        let (attr, change, queued) = match result { Ok(result) => result, Err(error) => { clean(&sources).await; return Err(error); } };
         if !queued { clean(&sources).await; }
         let mut state = state;
         state.record = record;
@@ -297,6 +297,10 @@ impl Prepared {
             let handles = registered.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
             registered.retain(|handle| handle.strong_count() > 0);
             for report in reports {
+                // An unlinked file's open handles keep writing its live stage, whose bytes no
+                // publication holds; the last close discards it.
+                let open = handles.iter().any(|handle| handle.attr.ino == report.ino && !handle.closed.load(Ordering::Acquire));
+                let retire = report.clean && (report.linked || !open);
                 let file = self.files.iter().find(|(ino, _, _)| *ino == report.ino).map(|(_, file, _)| file);
                 if let Some(file) = file { *file.attr.lock().unwrap_or_else(|p| p.into_inner()) = report.attr.clone(); }
                 if let Some(file) = file && let Some(published) = &report.published && let Some(key) = self.keys.get(&report.ino) {
@@ -309,12 +313,12 @@ impl Prepared {
                     if let Some(published) = &report.published && let Some(key) = self.keys.get(&report.ino) {
                         *handle.published.lock().unwrap_or_else(|p| p.into_inner()) = Some((published.clone(), key.clone()));
                     }
-                    if report.clean && let Some(file) = file {
+                    if retire && let Some(file) = file {
                         let mut frozen = handle.frozen.lock().unwrap_or_else(|p| p.into_inner());
                         if !frozen.last().is_some_and(|previous| Arc::ptr_eq(previous, file)) { frozen.push(file.clone()); }
                     }
                 }
-                if report.clean && let Some(file) = file {
+                if retire && let Some(file) = file {
                     let mut files = self.staged.files.lock().unwrap_or_else(|p| p.into_inner());
                     if files.get(&report.ino).is_some_and(|active| Arc::ptr_eq(active, file)) { files.remove(&report.ino); }
                 }
@@ -507,7 +511,7 @@ mod tests {
             tx.execute("DELETE FROM mount_staged WHERE ino=?1", [ino])?;
             tx.commit()
         }).unwrap();
-        prepared.apply(vec![publication::Report { ino, attr: published.clone(), published: Some(published), clean: true }]);
+        prepared.apply(vec![publication::Report { ino, attr: published.clone(), published: Some(published), clean: true, linked: true }]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -866,6 +870,20 @@ mod tests {
         assert_eq!(loaded[&ino].record.flushed, 1);
         assert_eq!(reopened.read(fh, 0, 5).await.unwrap(), b"later"[..]);
         reopened.fsync(fh).await.unwrap();
+        queue.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_flush_commit_removes_the_copies_it_froze() {
+        let (dir, session, queue, fh) = fixture().await;
+        let journal = || std::fs::read_dir(dir.path().join("journal")).unwrap().count();
+        assert_eq!(journal(), 0);
+        session.store.with(|c| c.execute_batch("CREATE TRIGGER refuse_flush BEFORE INSERT ON entries BEGIN SELECT RAISE(ABORT, 'test failure'); END")).unwrap();
+        assert!(matches!(session.fsync(fh).await, Err(FsError::Io(_))));
+        assert_eq!(journal(), 0, "a copy frozen for a commit that failed belongs to no entry");
+        session.store.with(|c| c.execute_batch("DROP TRIGGER refuse_flush")).unwrap();
+        session.fsync(fh).await.unwrap();
+        assert_eq!(journal(), 1);
         queue.close().await;
     }
 

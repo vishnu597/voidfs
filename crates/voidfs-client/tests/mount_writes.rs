@@ -360,6 +360,33 @@ async fn close_flushes_dirty_bytes_and_does_not_invalidate_other_handles() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_unlinked_file_keeps_its_bytes_after_its_removal_publishes() {
+    for (backend, existing) in [(Backend::Api, true), (Backend::Api, false), (Backend::Bucket, true)] {
+        let f = Fixture::new(backend).await;
+        let ns = f.session().await;
+        let (expected, fh) = if existing {
+            let (_, fh) = file(&f, &ns).await;
+            (&b"first56789aX"[..], fh)
+        } else {
+            let ino = ns.create(ns.root(), "file", 0o644).await.unwrap().ino;
+            (&b"firstX"[..], ns.open(ino, true).await.unwrap())
+        };
+        ns.write(fh, 0, Bytes::from_static(b"first")).await.unwrap();
+        ns.unlink(ns.root(), "file").await.unwrap();
+        ns.fsync(fh).await.unwrap();
+        f.publish().await;
+        assert!(f.body("file").await.is_none());
+        f.queue.pause(Scope::All).await.unwrap();
+        ns.write(fh, expected.len() as u64 - 1, Bytes::from_static(b"X")).await.unwrap();
+        assert_eq!(ns.read(fh, 0, u64::MAX).await.unwrap(), Bytes::from_static(expected), "existing {existing}: the handle keeps the bytes it wrote");
+        ns.close(fh).await.unwrap();
+        f.publish().await;
+        assert!(f.body("file").await.is_none(), "nothing publishes after close");
+        f.queue.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_unlink_keeps_local_reads_and_writes_without_publishing_after_close() {
     for backend in [Backend::Api, Backend::Bucket] {
         let f = Fixture::new(backend).await;

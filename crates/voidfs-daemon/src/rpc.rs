@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
-use axum::body::{Body, HttpBody, to_bytes};
+use axum::body::{Body, HttpBody};
 use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
@@ -193,9 +193,22 @@ pub(crate) fn routes(shared: Arc<Shared>) -> Router<Arc<Shared>> {
         .route_layer(middleware::from_fn_with_state(shared, admit))
 }
 
+/// A body over `maximum` is refused after reading what is sent of it, up to as much again, so a
+/// client still sending gets the typed refusal instead of a closed connection.
 async fn body(request: Request, maximum: usize) -> Result<Bytes, Failure> {
-    if request.headers().get(header::CONTENT_LENGTH).and_then(|h| h.to_str().ok()).and_then(|h| h.parse::<u64>().ok()).is_some_and(|n| n > maximum as u64) { return Err(Failure::large()); }
-    to_bytes(request.into_body(), maximum).await.map_err(|_| Failure::large())
+    let declared = request.headers().get(header::CONTENT_LENGTH).and_then(|h| h.to_str().ok()).and_then(|h| h.parse::<u64>().ok());
+    let drain = maximum.saturating_mul(2);
+    if declared.is_some_and(|n| n > drain as u64) { return Err(Failure::large()); }
+    let mut stream = request.into_body().into_data_stream();
+    let (mut bytes, mut seen) = (Vec::new(), 0usize);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| Failure::large())?;
+        seen = seen.saturating_add(chunk.len());
+        if seen > drain { return Err(Failure::large()); }
+        if seen <= maximum { bytes.extend_from_slice(&chunk); }
+    }
+    if seen > maximum || declared.is_some_and(|n| n > maximum as u64) { return Err(Failure::large()); }
+    Ok(Bytes::from(bytes))
 }
 
 async fn json<T: DeserializeOwned>(request: Request) -> Result<T, Failure> {
@@ -385,6 +398,7 @@ async fn watch_events(State(s): State<Arc<Shared>>, Path(id): Path<String>, requ
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
 
     #[tokio::test]
     async fn bootstrap_errors_preserve_native_errno_through_the_control_error_boundary() {

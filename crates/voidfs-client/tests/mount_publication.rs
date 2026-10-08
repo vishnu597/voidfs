@@ -662,6 +662,36 @@ async fn conflict_edits_queue_controls_and_restart_never_remove_the_guard() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_the_feed_reports_first_keeps_unpublished_edits_as_a_conflict() {
+    for (flushed, nested) in [(false, false), (true, false), (false, true), (true, true)] {
+        let f = Fixture::new(Backend::Api).await;
+        let ns = f.session().await;
+        let key = if nested { "dir/file" } else { "file" };
+        f.put(key, b"0123456789ab").await;
+        let parent = if nested { ns.lookup(ns.root(), "dir").await.unwrap().ino } else { ns.root() };
+        let ino = ns.lookup(parent, "file").await.unwrap().ino;
+        let fh = ns.open(ino, true).await.unwrap();
+        ns.write(fh, 0, Bytes::from_static(b"LOCAL")).await.unwrap();
+        if flushed { ns.fsync(fh).await.unwrap(); }
+        // Another Mac removes it, and the feed reports that before this edit publishes.
+        f.remote.delete_object("drv", key, Default::default()).await.unwrap();
+        if nested { f.remote.delete_object("drv", "dir/", Default::default()).await.unwrap(); }
+        ns.invalidate(&[Invalidation::All]).await.unwrap();
+        let listed = ns.readdir(ns.root(), None, 10).await.unwrap().into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+        assert_eq!(listed, [if nested { "dir" } else { "file" }], "flushed {flushed}, nested {nested}: unpublished edits keep their path");
+        if nested { assert_eq!(ns.readdir(parent, None, 10).await.unwrap().into_iter().map(|(name, _)| name).collect::<Vec<_>>(), ["file"]); }
+        assert_eq!(ns.read(fh, 0, 64).await.unwrap(), Bytes::from_static(b"LOCAL56789ab"));
+        ns.close(fh).await.unwrap();
+        f.publish().await;
+        assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Conflict, "flushed {flushed}, nested {nested}");
+        let conflict = ns.conflict(ino).await.unwrap().unwrap();
+        assert!(conflict.remote_missing, "{conflict:?}");
+        assert_eq!(ns.read_conflict(ino, ConflictSide::Local, 0, 64).await.unwrap(), Bytes::from_static(b"LOCAL56789ab"));
+        f.queue.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn missing_remote_objects_record_absence_without_losing_local_bytes() {
     for (renamed, truncated) in [(false, false), (true, false), (false, true), (true, true)] {
         let f = Fixture::new(Backend::Api).await;
