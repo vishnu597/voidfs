@@ -254,9 +254,11 @@ async fn killed_while_compacting_keeps_exactly_the_recorded_copy() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_after_capturing_a_conflict_records_it_once_on_restart() {
     let (dir, server) = crashed("conflict", "conflict.captured", 1).await;
-    assert_eq!(files(dir.path(), "mount-conflicts", "").len(), 2, "captured, never recorded");
+    let left = files(dir.path(), "mount-conflicts", "");
+    assert_eq!(left.len(), 2, "captured, never recorded");
+    // The kill interrupted a publication, so the reopened queue publishes, and captures, at once.
     let env = Env::open(dir.path(), &server.endpoint).await;
-    assert!(files(dir.path(), "mount-conflicts", "").is_empty());
+    assert!(left.iter().all(|path| !path.exists()), "no conflict records them");
     env.publish().await;
     let ino = env.file().await;
     assert_eq!(env.session.getattr(ino).await.unwrap().sync, Sync::Conflict);
