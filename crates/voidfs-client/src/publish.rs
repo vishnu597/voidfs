@@ -85,6 +85,8 @@ impl Stop {
 
 pub(crate) enum Outcome {
     Done { version: Option<String>, conflict: Option<String> },
+    Conflict { status: u16, current_version: Option<String>, error: String },
+    Rejected { status: u16, current_version: Option<String>, error: String },
     Failed { error: String, transient: bool },
     Stopped(Why),
 }
@@ -97,6 +99,9 @@ impl From<Why> for Outcome {
 
 impl From<Error> for Outcome {
     fn from(e: Error) -> Outcome {
+        if let Error::Fetch(fetch) = &e && let Some(status) = fetch.status() {
+            return Outcome::Rejected { status, current_version: fetch.current_version_id().map(str::to_owned), error: e.to_string() };
+        }
         let transient = match &e {
             Error::Fetch(e) => e.status().is_none_or(|s| s >= 500 || s == 429),
             Error::Io(_) | Error::Db(_) => true,
@@ -134,7 +139,10 @@ pub(crate) struct Ctx {
     pub may_have_landed: bool,
     /// The multipart upload the entry has open, which the queue keeps with the entry.
     pub upload_id: Arc<std::sync::Mutex<Option<String>>>,
+    pub acknowledge: Option<Arc<Acknowledge>>,
 }
+
+pub(crate) type Acknowledge = dyn Fn(&str, &str, bool) -> Result<()> + Send + Sync;
 
 /// How long the queue takes a server's `501` to a direct upload's plan as its answer.
 const RECHECK: std::time::Duration = std::time::Duration::from_secs(600);
@@ -181,9 +189,25 @@ pub(crate) async fn publish(ctx: &Ctx, run: &[Entry], guard: Guard) -> Outcome {
         Op::Folder => folder(ctx, first, guard).await,
         Op::Attrs => attrs(ctx, first, guard).await,
     };
+    returned(first.mount, r)
+}
+
+fn returned(mount: bool, r: Step<Outcome>) -> Outcome {
     match r {
-        Ok(o) | Err(o) => o,
+        Ok(o) | Err(o @ (Outcome::Done { .. } | Outcome::Conflict { .. } | Outcome::Failed { .. } | Outcome::Stopped(_))) => o,
+        Err(Outcome::Rejected { status, current_version, error }) if mount && matches!(status, 404 | 409 | 412) => Outcome::Conflict { status, current_version, error },
+        Err(Outcome::Rejected { status, error, .. }) => Outcome::Failed { error, transient: status >= 500 || status == 429 },
     }
+}
+
+pub(crate) async fn resume_attrs(ctx: &Ctx, run: &[Entry], version: String) -> Outcome {
+    let mut e = run[0].clone();
+    if let Some(key) = &e.published_key { e.key = key.clone(); }
+    let r = match xattrs_after(ctx, &e, &e.attrs, version).await {
+        Ok(version) => done(Some(version), None),
+        Err(outcome) => Err(outcome),
+    };
+    returned(e.mount, r)
 }
 
 type Step<T> = std::result::Result<T, Outcome>;
@@ -198,6 +222,7 @@ fn conflict(e: &voidfs_sdk::Error) -> Option<String> {
 
 /// The version at the key, if its put was this entry's.
 async fn landed(ctx: &Ctx, e: &Entry) -> Step<Option<String>> {
+    if e.mount { return Ok(None); }
     match ctx.stop.or(ctx.client.head_object(&e.drive, &e.key, ReadOptions::default())).await? {
         Ok(m) if m.metadata.get(MARKER).is_some_and(|v| *v == marker(ctx, e)) => Ok(Some(m.version_id)),
         Ok(_) => Ok(None),
@@ -224,7 +249,9 @@ fn put_opts(ctx: &Ctx, e: &Entry, attrs: &Attrs, guard: &Guard) -> PutOptions {
 
 /// Sets what a put can't carry: extended attributes, as a version of their own.
 async fn xattrs_after(ctx: &Ctx, e: &Entry, attrs: &Attrs, version: String) -> Step<String> {
-    if attrs.xattrs.is_empty() && attrs.remove_xattrs.is_empty() {
+    let pending = !attrs.xattrs.is_empty() || !attrs.remove_xattrs.is_empty();
+    acknowledge(ctx, e, &version, pending).await?;
+    if !pending {
         return Ok(version);
     }
     let update = AttributesUpdate {
@@ -232,8 +259,43 @@ async fn xattrs_after(ctx: &Ctx, e: &Entry, attrs: &Attrs, version: String) -> S
         remove_xattrs: attrs.remove_xattrs.clone(),
         ..Default::default()
     };
-    let w = ctx.stop.or(ctx.client.set_attributes(&e.drive, &e.key, update, Preconditions::if_version(version))).await??;
-    Ok(w.version_id)
+    let answer = ctx.stop.or(ctx.client.set_attributes(&e.drive, &e.key, update, Preconditions::if_version(version.clone()))).await?;
+    let version = match answer {
+        Ok(w) => w.version_id,
+        Err(error) if e.mount && is_412(&error) => {
+            let Some(current) = error.current_version_id().map(str::to_owned) else { return Err(error.into()); };
+            if attrs_landed(ctx, e, attrs, &version, &current).await? { current } else { return Err(error.into()); }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    acknowledge(ctx, e, &version, false).await?;
+    Ok(version)
+}
+
+async fn acknowledge(ctx: &Ctx, e: &Entry, version: &str, attrs: bool) -> Step<()> {
+    if e.mount && let Some(acknowledge) = &ctx.acknowledge {
+        let (acknowledge, version, key) = (acknowledge.clone(), version.to_owned(), e.key.clone());
+        blocking(move || acknowledge(&version, &key, attrs)).await?;
+    }
+    Ok(())
+}
+
+async fn attrs_landed(ctx: &Ctx, e: &Entry, attrs: &Attrs, base: &str, current: &str) -> Step<bool> {
+    use base64::Engine;
+    let opts = |version: &str| ReadOptions { version_id: Some(version.to_owned()), ..Default::default() };
+    let before = ctx.stop.or(ctx.client.head_object(&e.drive, &e.key, opts(base))).await??;
+    let after = ctx.stop.or(ctx.client.head_object(&e.drive, &e.key, opts(current))).await??;
+    if before.version_id != base || after.version_id != current || before.object_id != after.object_id || before.etag != after.etag || before.size != after.size {
+        return Ok(false);
+    }
+    let mut expected = ctx.stop.or(ctx.client.attributes(&e.drive, &e.key, opts(base))).await??;
+    let actual = ctx.stop.or(ctx.client.attributes(&e.drive, &e.key, opts(current))).await??;
+    if expected.version_id.as_deref() != Some(base) || actual.version_id.as_deref() != Some(current) || expected.meta.get(MARKER) != Some(&marker(ctx, e)) { return Ok(false); }
+    for name in &attrs.remove_xattrs { expected.xattrs.remove(name); }
+    for (name, bytes) in &attrs.xattrs { expected.xattrs.insert(name.clone(), base64::engine::general_purpose::STANDARD.encode(bytes)); }
+    if attrs.mtime.is_none() { expected.mtime = actual.mtime.clone(); }
+    expected.version_id = Some(current.to_owned());
+    Ok(expected == actual)
 }
 
 async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
@@ -371,7 +433,7 @@ async fn rename(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
             done(Some(w.version_id), conflict(&err))
         }
         // Moved already, by an attempt whose answer was lost.
-        Err(err) if err.status() == Some(404) && ctx.may_have_landed => done(None, None),
+        Err(err) if err.status() == Some(404) && ctx.may_have_landed && !e.mount => done(None, None),
         Err(err) => Err(err.into()),
     }
 }

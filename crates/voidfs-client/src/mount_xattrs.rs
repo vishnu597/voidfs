@@ -180,7 +180,7 @@ impl Session {
                 if !valid_xattrs(&attrs) { return Err(FsError::TooLarge); }
                 current.entry.has_xattrs = !attrs.is_empty();
                 current.generation += 1;
-                current.sync = Sync::Pending;
+                current.sync = publication::pending(tx, ino)?;
                 save_node(tx, &current)?;
                 save_memo(tx, ino, &current.entry.version_id, &attrs, true)?;
                 entry.mount_ino = Some(ino);

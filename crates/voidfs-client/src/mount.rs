@@ -21,13 +21,16 @@ mod xattrs;
 #[path = "mount_stage.rs"]
 mod stage;
 #[path = "mount_data.rs"]
-mod data;
+pub(crate) mod data;
 #[path = "mount_notify.rs"]
 mod notify;
+#[path = "mount_publish.rs"]
+pub(crate) mod publication;
 pub use mutations::RenameMode;
 pub use xattrs::XattrMode;
 pub use stage::StagingConfig;
 pub use notify::LocalChange;
+pub use publication::{Conflict, ConflictSide};
 
 pub type Ino = u64;
 pub type Fh = u64;
@@ -326,7 +329,10 @@ fn remote_path(c: &Connection, drive: &str, root: Ino, ino: Ino) -> Result<Strin
     Ok(key)
 }
 
-struct Handle { attr: Attr, reader: tokio::sync::Mutex<Reader>, write: bool, closed: std::sync::atomic::AtomicBool }
+struct Handle {
+    attr: Attr, reader: tokio::sync::Mutex<Reader>, write: bool, closed: std::sync::atomic::AtomicBool,
+    frozen: Mutex<Vec<Arc<data::File>>>, published: Mutex<Option<(Attr, String)>>, local_attr: Mutex<Option<Attr>>,
+}
 struct ReadResolution { budget: crate::mount_resolve::Budget, remaining: Duration, failed: HashSet<String> }
 impl Default for ReadResolution {
     fn default() -> Self { Self { budget: Default::default(), remaining: Duration::from_secs(2), failed: HashSet::new() } }
@@ -396,7 +402,10 @@ impl Session {
         if !queue.uses_store(&store) { return Err(FsError::InvalidArgument); }
         let lease = store.mount_session(drive, true).ok_or(FsError::Again)?;
         let mut session = Self::new_inner(store, client, cache, drive, connectivity, lease.clone()).await?;
+        let registration = queue.mount_registration(drive).await;
         session.data = data::Staged::load(session.store.clone(), drive.to_owned(), session.root, Some(queue.clone()), cfg, lease, session.local.clone()).await?;
+        queue.register_mount_publisher(drive, Arc::downgrade(&session.data));
+        drop(registration);
         session.queue = Some(queue);
         session.data.restart_timers();
         Ok(session)
@@ -501,6 +510,7 @@ impl Session {
         }
         for _ in 0..4 {
             self.ancestors(ino).await?;
+            let _opening = self.data.opening().await;
             let offline = self.connectivity.link() == Link::Offline;
             let snapshot = self.db(move |c, d, root| {
                 let tx = c.transaction()?;
@@ -512,12 +522,14 @@ impl Session {
                 }
                 let n = node(&tx, d, ino)?.ok_or(rusqlite::Error::InvalidQuery)?;
                 let key = remote_path(&tx, d, root, ino).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                Ok(Ok((n, key)))
+                let persisted: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM mount_staged WHERE ino=?1)", [ino], |r| r.get(0))?;
+                Ok(Ok((n, key, persisted)))
             }).await?;
-            let (n, key) = match snapshot { Err(FsError::Again) => continue, other => other? };
+            let (n, key, persisted) = match snapshot { Err(FsError::Again) => continue, other => other? };
             let attr = n.attr()?;
             match attr.kind { Kind::Folder => return Err(FsError::IsDir), Kind::File => {}, _ => return Err(FsError::Unsupported) }
-            let (base, key) = match self.data.file(ino) { Some(file) => { let state = file.state.lock().await; (state.record.base.clone(), state.record.key.clone()) }, None => (attr.clone(), key) };
+            self.data.retire_saved(ino, &attr, persisted).await;
+            let (base, key, published) = match self.data.file(ino) { Some(file) => { let state = file.state.lock().await; (state.record.base.clone(), state.record.key.clone(), Some(file.guard.lock().unwrap_or_else(|p| p.into_inner()).clone())) }, None => (attr.clone(), key, None) };
             let local = base.object_id.is_none() && n.sync != Sync::Saved;
             let version_id = if local { format!("local:{}", attr.ino) } else { base.version_id.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot version".into()))? };
             let etag = if local { format!("local:{}", attr.ino) } else { base.etag.clone().filter(|s| !s.is_empty()).ok_or_else(|| FsError::Io("missing snapshot ETag".into()))? };
@@ -527,7 +539,9 @@ impl Session {
             if handles.next > u32::MAX as u64 { return Err(FsError::Io("file handle space exhausted".into())); }
             let fh = (u64::from(self.generation) << 32) | handles.next;
             handles.next += 1;
-            handles.entries.insert(fh, Arc::new(Handle { attr: base, reader: tokio::sync::Mutex::new(reader), write, closed: std::sync::atomic::AtomicBool::new(false) }));
+            let handle = Arc::new(Handle { attr: base, reader: tokio::sync::Mutex::new(reader), write, closed: std::sync::atomic::AtomicBool::new(false), frozen: Mutex::new(Vec::new()), published: Mutex::new(published), local_attr: Mutex::new(None) });
+            self.data.register(&handle);
+            handles.entries.insert(fh, handle);
             return Ok(fh);
         }
         Err(FsError::Again)
@@ -549,8 +563,11 @@ impl Session {
     pub fn handle_attr(&self, fh: Fh) -> Result<Attr> {
         let handle = self.handle(fh)?;
         let mut attr = handle.attr.clone();
-        if let Some(file) = self.data.file(attr.ino) {
-            let local = file.attr.lock().unwrap_or_else(|p| p.into_inner());
+        let local = match self.data.file(attr.ino) {
+            Some(file) => Some(file.attr.lock().unwrap_or_else(|p| p.into_inner()).clone()),
+            None => handle.local_attr.lock().unwrap_or_else(|p| p.into_inner()).clone().or_else(|| handle.frozen.lock().unwrap_or_else(|p| p.into_inner()).last().map(|file| file.attr.lock().unwrap_or_else(|p| p.into_inner()).clone())),
+        };
+        if let Some(local) = local {
             attr.size = local.size;
             attr.mtime = local.mtime;
             attr.generation = local.generation;
@@ -588,25 +605,32 @@ impl Session {
     pub async fn read(&self, fh: Fh, offset: u64, len: u64) -> Result<Bytes> {
         let handle = self.handle(fh)?;
         let mut resolution = ReadResolution::default();
-        if let Some(file) = self.data.file(handle.attr.ino) {
-            let state = file.state.clone().lock_owned().await;
-            if offset >= state.record.size || len == 0 { return Ok(Bytes::new()); }
-            let len = len.min(state.record.size - offset);
+        let opening = self.data.opening().await;
+        let frozen = handle.frozen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let file = self.data.file(handle.attr.ino);
+        let state = match file { Some(file) => Some(file.state.clone().lock_owned().await), None => None };
+        drop(opening);
+        if state.is_some() || !frozen.is_empty() {
+            let mut view = data::View::new(handle.attr.size);
+            for file in &frozen { view.overlay(&*file.state.lock().await); }
+            if let Some(state) = &state { view.overlay(state); }
+            if offset >= view.size || len == 0 { return Ok(Bytes::new()); }
+            let len = len.min(view.size - offset);
             let mut body = vec![0u8; usize::try_from(len).map_err(|_| FsError::InvalidArgument)?];
             let end = offset + len;
             let mut at = offset;
-            for extent in &state.record.extents {
+            for extent in &view.extents {
                 if extent.end <= offset || extent.start >= end { continue; }
                 let start = extent.start.max(offset);
-                if at < start { self.read_gap(&handle, at, start.min(state.record.remote_size), offset, &mut body, &mut resolution).await?; }
+                if at < start { self.read_gap(&handle, at, start.min(view.remote_size), offset, &mut body, &mut resolution).await?; }
                 let stop = extent.end.min(end);
-                let path = state.path.clone();
+                let path = extent.path.clone();
                 let physical = extent.physical + start - extent.start;
                 let bytes = tokio::task::spawn_blocking(move || stage::read_range(&path, physical, stop - start)).await.map_err(Error::from)??;
                 body[(start - offset) as usize..(stop - offset) as usize].copy_from_slice(&bytes);
                 at = stop;
             }
-            if at < end { self.read_gap(&handle, at, end.min(state.record.remote_size), offset, &mut body, &mut resolution).await?; }
+            if at < end { self.read_gap(&handle, at, end.min(view.remote_size), offset, &mut body, &mut resolution).await?; }
             return Ok(Bytes::from(body));
         }
         self.read_remote(&handle, offset, len, &mut resolution).await

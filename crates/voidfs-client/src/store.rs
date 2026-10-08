@@ -67,6 +67,22 @@ const MIGRATIONS: &[&str] = &[
     "CREATE TABLE mount_staged(ino INTEGER PRIMARY KEY REFERENCES mount_inodes(ino), path TEXT NOT NULL, record TEXT NOT NULL);",
     // 8: remembered mounts follow stable drive identity across alias reuse.
     "ALTER TABLE mounts ADD COLUMN drive_id TEXT;",
+    // 9: acknowledged publications, overlay ownership and retained competing snapshots.
+    "ALTER TABLE entries ADD COLUMN published_version TEXT;
+     ALTER TABLE entries ADD COLUMN published_key TEXT;
+     ALTER TABLE entries ADD COLUMN published_attrs INTEGER NOT NULL DEFAULT 0;
+     CREATE INDEX entries_base ON entries(base);
+     CREATE INDEX entries_mount_inode ON entries(mount_ino, id) WHERE mount=1;
+     CREATE INDEX entries_mount_version ON entries(mount_ino, version) WHERE state='done';
+     CREATE INDEX mount_inode_entry ON mount_inodes(entry_id) WHERE entry_id IS NOT NULL;
+     CREATE TABLE mount_overlay_publications(parent INTEGER NOT NULL, name TEXT NOT NULL,
+         ino INTEGER NOT NULL REFERENCES mount_inodes(ino), entry_id INTEGER, PRIMARY KEY(parent, name)) WITHOUT ROWID;
+     CREATE INDEX mount_overlay_publications_ino ON mount_overlay_publications(ino, entry_id);
+     CREATE TABLE mount_conflicts(ino INTEGER PRIMARY KEY REFERENCES mount_inodes(ino), entry_id INTEGER NOT NULL,
+         base_version TEXT, remote TEXT, remote_path TEXT, local_path TEXT, local_size INTEGER NOT NULL DEFAULT 0,
+         remote_missing INTEGER NOT NULL DEFAULT 0, error TEXT, remote_attrs TEXT, local_attrs TEXT, local_xattrs TEXT);
+     CREATE TABLE mount_conflict_blockers(ino INTEGER PRIMARY KEY REFERENCES mount_inodes(ino),
+         owner INTEGER NOT NULL REFERENCES mount_conflicts(ino) DEFERRABLE INITIALLY DEFERRED);",
 ];
 
 pub(crate) struct MountLease { write: bool }
@@ -311,4 +327,28 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         assert_eq!(s.with_normal(|c| c.query_row("SELECT count(*) FROM mount_staged", [], |r| r.get::<_, u64>(0))).unwrap(), 1);
     }
+
+    #[test]
+    fn publication_migration_preserves_existing_local_bytes_metadata_and_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        for sql in &MIGRATIONS[..8] { c.execute_batch(sql).unwrap(); }
+        c.pragma_update(None, "user_version", 8).unwrap();
+        c.execute("INSERT INTO mount_inodes(ino,drive,attrs,generation,sync,entry_id,remote_key) VALUES (1,'drive','local attributes',7,'saving',42,'old/file')", []).unwrap();
+        c.execute("INSERT INTO mount_staged(ino,path,record) VALUES (1,'/private/staged','logical extents')", []).unwrap();
+        c.execute("INSERT INTO mount_xattrs(ino,version,attrs,dirty) VALUES (1,'base','local xattrs',1)", []).unwrap();
+        c.execute("INSERT INTO entries(id,drive,key,op,base,state,created,mount,mount_ino,version) VALUES (42,'drive','new/file','rename','v:base','done',1,1,1,'acknowledged')", []).unwrap();
+        drop(c);
+        let store = Store::open(dir.path()).unwrap();
+        store.with(|c| {
+            assert_eq!(c.query_row("SELECT attrs,generation,sync,entry_id,remote_key FROM mount_inodes WHERE ino=1", [], |r| Ok((r.get::<_, String>(0)?,r.get::<_, u64>(1)?,r.get::<_, String>(2)?,r.get::<_, i64>(3)?,r.get::<_, String>(4)?)))?,
+                ("local attributes".into(),7,"saving".into(),42,"old/file".into()));
+            assert_eq!(c.query_row("SELECT path,record FROM mount_staged WHERE ino=1", [], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?)))?, ("/private/staged".into(),"logical extents".into()));
+            assert_eq!(c.query_row("SELECT version,attrs,dirty FROM mount_xattrs WHERE ino=1", [], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, bool>(2)?)))?, ("base".into(),"local xattrs".into(),true));
+            assert_eq!(c.query_row("SELECT base,version,published_version,published_attrs FROM entries WHERE id=42", [], |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, Option<String>>(2)?,r.get::<_, bool>(3)?)))?, ("v:base".into(),"acknowledged".into(),None,false));
+            assert_eq!(c.query_row("SELECT count(*) FROM mount_conflicts", [], |r| r.get::<_, u64>(0))?,0);
+            Ok(())
+        }).unwrap();
+    }
+
 }

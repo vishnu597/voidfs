@@ -32,7 +32,7 @@ use unicode_normalization::UnicodeNormalization;
 use voidfs_sdk::{Bandwidth, Client};
 
 use crate::connectivity::{Connectivity, Link};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::journal::{self, Attrs, Base, BatchId, Entry, EntryId, Op, Stamp, State, StoredBase};
 use crate::publish::{self, Ctx, Guard, Outcome, Stop, Why};
 use crate::store::Store;
@@ -197,6 +197,8 @@ struct Inner {
     direct: Arc<publish::Offered>,
     /// Set once the publisher has stopped and let go of the queue.
     stopped: Arc<(Mutex<bool>, Notify)>,
+    mount_publishers: Mutex<HashMap<String, std::sync::Weak<crate::mount::data::Staged>>>,
+    mount_registrations: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 /// The journal and the upload queue. Cloning shares it.
@@ -222,7 +224,7 @@ fn under(key: &str, prefix: &str) -> bool {
 /// Whether entry `a`, earlier, must finish before `b` may start: they touch the same name
 /// (including a file replaced by a folder), or one is a folder the other is in. Mount
 /// dependencies include equivalent Unicode spellings; ordinary queue keys remain byte-exact.
-fn depends(a: &Entry, b: &Entry) -> bool {
+pub(crate) fn depends(a: &Entry, b: &Entry) -> bool {
     a.drive == b.drive && a.keys().any(|ka| b.keys().any(|kb| {
         let mount = a.mount || b.mount;
         let ka = if mount { Cow::Owned(ka.nfc().collect::<String>()) } else { Cow::Borrowed(ka) };
@@ -239,6 +241,22 @@ impl Queue {
         let (s2, d2) = (store.clone(), dir.clone());
         let (entries, paused_all, drives, batches, bw, state_id) = blocking(move || {
             std::fs::create_dir_all(&d2)?;
+            s2.with(|c| {
+                let tx = c.transaction()?;
+                crate::mount::publication::recover_overlays(&tx)?;
+                let ids = tx.prepare("SELECT e.id FROM entries e JOIN mount_inodes n ON n.entry_id=e.id AND n.ino=e.mount_ino
+                    WHERE e.mount=1 AND e.state='done' AND e.version IS NOT NULL AND e.published_version IS NULL AND n.sync<>'saved'")?
+                    .query_map([], |r| r.get::<_, EntryId>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                for id in ids {
+                    let mut e = journal::get(&tx, id)?.ok_or(rusqlite::Error::InvalidQuery)?;
+                    e.published_version = e.version.clone();
+                    let mut key = e.to_key.clone().unwrap_or_else(|| e.key.clone());
+                    if e.op == Op::Folder && !key.ends_with('/') { key.push('/'); }
+                    e.published_key = Some(key); e.published_attrs = false; e.state = State::Queued;
+                    journal::update(&tx, &e)?;
+                }
+                tx.commit()
+            })?;
             let entries = s2.with(|c| journal::unfinished(c))?;
             let drives: Vec<String> = s2.with(|c| c.prepare("SELECT drive FROM paused_drives")?.query_map([], |r| r.get(0))?.collect())?;
             let batches: Vec<BatchId> = s2.with(|c| c.prepare("SELECT id FROM batches WHERE paused = 1")?.query_map([], |r| r.get(0))?.collect())?;
@@ -283,6 +301,8 @@ impl Queue {
             wake: Notify::new(),
             changed: Notify::new(),
             stopped: Arc::new((Mutex::new(false), Notify::new())),
+            mount_publishers: Mutex::new(HashMap::new()),
+            mount_registrations: Mutex::new(HashMap::new()),
         };
         let q = Queue(Arc::new(inner));
         if let Some(conn) = &q.0.cfg.connectivity {
@@ -317,6 +337,29 @@ impl Queue {
 
     pub(crate) fn uses_store(&self, store: &Arc<Store>) -> bool {
         Arc::ptr_eq(&self.0.store, store)
+    }
+
+    pub(crate) fn register_mount_publisher(&self, drive: &str, publisher: std::sync::Weak<crate::mount::data::Staged>) {
+        let mut publishers = self.0.mount_publishers.lock().unwrap_or_else(|p| p.into_inner());
+        publishers.retain(|_, publisher| publisher.strong_count() > 0);
+        publishers.insert(drive.to_owned(), publisher);
+    }
+
+    fn mount_publisher(&self, drive: &str) -> Option<Arc<crate::mount::data::Staged>> {
+        self.0.mount_publishers.lock().unwrap_or_else(|p| p.into_inner()).get(drive).and_then(std::sync::Weak::upgrade)
+    }
+
+    pub(crate) async fn mount_registration(&self, drive: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self.0.mount_registrations.lock().unwrap_or_else(|p| p.into_inner());
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(drive).and_then(std::sync::Weak::upgrade) { gate } else {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(drive.to_owned(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        gate.lock_owned().await
     }
 
     /// Freezes one range of a mount's staging file into bytes the journal owns. The caller
@@ -404,6 +447,7 @@ impl Queue {
                             return Ok(Err(crate::mount::FsError::Stale));
                         }
                     }
+                    crate::mount::publication::stamp(&tx, e)?;
                 }
                 tx.commit()?;
                 Ok(Ok((value, entries)))
@@ -609,7 +653,8 @@ impl Queue {
             }
             if !paused {
                 // A resume tries the scope's failed entries again, at once.
-                let ids: Vec<EntryId> = st.pending.values().filter(|e| e.state == State::Failed && in_scope(e, &scope)).map(|e| e.id).collect();
+                let blocked = s.with(|c| c.prepare("SELECT ino FROM mount_conflict_blockers UNION SELECT ino FROM mount_conflicts")?.query_map([], |r| r.get::<_, u64>(0))?.collect::<rusqlite::Result<HashSet<_>>>())?;
+                let ids: Vec<EntryId> = st.pending.values().filter(|e| e.state == State::Failed && !(e.mount && (e.conflict.is_some() || e.mount_ino.is_some_and(|ino| blocked.contains(&ino)))) && in_scope(e, &scope)).map(|e| e.id).collect();
                 for id in ids {
                     st.retry_at.remove(&id);
                     st.attempts.remove(&id);
@@ -638,38 +683,64 @@ impl Queue {
     /// Cancels: nothing in the scope is published from now on, and what was uploading stops. A
     /// change made on top of a cancelled one is cancelled with it.
     pub async fn cancel(&self, scope: Scope) -> Result<()> {
-        let this = self.clone();
-        blocking(move || {
-            let mut st = this.st();
+        let entries = {
+            let st = self.st();
             let mut gone: BTreeSet<EntryId> = st.pending.values().filter(|e| in_scope(e, &scope)).map(|e| e.id).collect();
             loop {
                 let more: Vec<EntryId> = st.pending.values().filter(|e| !gone.contains(&e.id) && matches!(e.base, StoredBase::Entry(b) if gone.contains(&b))).map(|e| e.id).collect();
-                if more.is_empty() {
-                    break;
-                }
+                if more.is_empty() { break; }
                 gone.extend(more);
             }
-            for id in gone {
-                if let Some(r) = st.running.get(&id).cloned() {
-                    // The publish stops and records the cancel itself.
-                    st.cancelled.insert(id);
+            gone.into_iter().filter_map(|id| st.pending.get(&id).cloned()).collect::<Vec<_>>()
+        };
+        let drives: BTreeSet<String> = entries.iter().filter(|e| e.mount).map(|e| e.drive.clone()).collect();
+        let mut prepared = Vec::new();
+        let mut registrations = Vec::new();
+        for drive in drives {
+            registrations.push(self.mount_registration(&drive).await);
+            if let Some(publisher) = self.mount_publisher(&drive) {
+                let run = entries.iter().filter(|e| e.drive == drive).cloned().collect::<Vec<_>>();
+                prepared.push((run.iter().filter_map(|e| e.mount_ino).collect::<HashSet<_>>(), publisher.prepare_publication(&run).await));
+            }
+        }
+        let this = self.clone();
+        let reports = blocking(move || {
+            let mut st = this.st();
+            let mut cancelled = Vec::new();
+            for entry in entries {
+                if let Some(r) = st.running.get(&entry.id).cloned() {
+                    st.cancelled.insert(entry.id);
                     r.stop.signal(Why::Cancel);
-                    continue;
-                }
-                if let Some(mut e) = st.pending.remove(&id) {
-                    e.state = State::Cancelled;
-                    this.0.store.with(|c| journal::update(c, &e))?;
-                    if e.staged
-                        && let Some(p) = &e.source
-                    {
-                        let _ = std::fs::remove_file(p);
-                    }
+                } else if let Some(e) = st.pending.get(&entry.id) {
+                    if e.published_version.is_some() { continue; }
+                    let mut e = e.clone(); e.state = State::Cancelled;
+                    cancelled.push(e);
                 }
             }
+            let reports = this.0.store.with(|c| {
+                let tx = c.transaction()?;
+                for e in &cancelled { journal::update(&tx, e)?; }
+                let mut drives = BTreeMap::<String, Vec<Entry>>::new();
+                for e in cancelled.iter().filter(|e| e.mount) { drives.entry(e.drive.clone()).or_default().push(e.clone()); }
+                let mut reports = Vec::new();
+                for run in drives.into_values() {
+                    reports.extend(crate::mount::publication::reconcile(&tx, &run, &crate::mount::publication::Completion::Cancelled).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?);
+                }
+                tx.commit()?;
+                Ok(reports)
+            })?;
+            for e in cancelled {
+                st.pending.remove(&e.id); st.attempts.remove(&e.id); st.retry_at.remove(&e.id);
+                if e.staged && let Some(p) = &e.source { let _ = std::fs::remove_file(p); }
+            }
             st.idle = false;
-            Ok(())
-        })
-        .await?;
+            Ok(reports)
+        }).await?;
+        for (inodes, prepared) in prepared {
+            let selected = reports.iter().filter(|r| inodes.contains(&r.ino)).cloned().collect();
+            prepared.apply(selected);
+        }
+        drop(registrations);
         self.0.wake.notify_one();
         self.0.changed.notify_waiters();
         Ok(())
@@ -698,6 +769,7 @@ impl Queue {
                 c.execute("WITH RECURSIVE needed(id) AS (
                     SELECT id FROM entries WHERE state NOT IN ('done', 'cancelled')
                     UNION SELECT entry_id FROM mount_inodes WHERE entry_id IS NOT NULL
+                    UNION SELECT entry_id FROM mount_conflicts
                     UNION SELECT CAST(substr(e.base, 3) AS INTEGER) FROM entries e JOIN needed n ON e.id=n.id WHERE e.base LIKE 'e:%')
                     DELETE FROM entries WHERE state IN ('done', 'cancelled') AND id NOT IN (SELECT id FROM needed)", [])?;
                 c.execute("DELETE FROM batches WHERE id NOT IN (SELECT batch FROM entries WHERE batch IS NOT NULL)", []).map(drop)
@@ -848,6 +920,10 @@ impl Queue {
 
     /// The runs that may start now, and how long until a failed one may be tried again.
     fn select(&self, st: &mut QState) -> (Vec<Vec<Entry>>, Option<Duration>) {
+        let blocked = match self.0.store.with(|c| c.prepare("SELECT ino FROM mount_conflict_blockers UNION SELECT ino FROM mount_conflicts")?.query_map([], |r| r.get::<_, u64>(0))?.collect::<rusqlite::Result<HashSet<_>>>()) {
+            Ok(blocked) => blocked,
+            Err(_) => return (Vec::new(), Some(Duration::from_secs(1))),
+        };
         let now = Instant::now();
         let mut free = self.0.cfg.uploads.saturating_sub(st.runs);
         let mut runs = Vec::new();
@@ -859,7 +935,7 @@ impl Queue {
                 break;
             }
             let e = &st.pending[id];
-            if taken.contains(id) || st.running.contains_key(id) || st.paused(e) {
+            if taken.contains(id) || st.running.contains_key(id) || st.paused(e) || e.mount && e.mount_ino.is_some_and(|ino| blocked.contains(&ino)) {
                 continue;
             }
             if e.state == State::Failed {
@@ -889,7 +965,7 @@ impl Queue {
                     if !depends(e, n) {
                         continue;
                     }
-                    let fits = n.drive == e.drive && n.key == e.key && matches!(n.op, Op::Write | Op::Truncate) && !st.paused(n) && n.state == State::Queued && n.batch == e.batch && n.mount == e.mount;
+                    let fits = n.drive == e.drive && n.key == e.key && matches!(n.op, Op::Write | Op::Truncate) && !st.paused(n) && n.state == State::Queued && n.batch == e.batch && n.mount == e.mount && n.published_version == e.published_version && n.published_attrs == e.published_attrs;
                     // A patch's truncate goes last: writes after it start a run of their own.
                     let after_truncate = e.op != Op::Put && run.last().is_some_and(|l: &Entry| l.op == Op::Truncate);
                     let added = n.size.saturating_add(if patch && n.op == Op::Write { 16 } else { 0 });
@@ -927,6 +1003,7 @@ impl Queue {
                     _ if !seen.insert(id) => return Err(crate::Error::Invalid("a journal base contains a cycle".into())),
                     Some(e) if mount && e.state == State::Done && e.version.is_none() => return Err(crate::Error::Invalid("the mount edit's base has no known published version".into())),
                     Some(e) if e.state == State::Done => return Ok(e.version.map_or(Guard::None, Guard::Version)),
+                    Some(_) if mount => return Err(crate::Error::Invalid("the mount edit's predecessor was not published".into())),
                     // Cancelled: whatever it was based on.
                     Some(e) => base = e.base,
                     None if mount => return Err(crate::Error::Invalid("the mount edit's base is missing".into())),
@@ -936,96 +1013,279 @@ impl Queue {
         }
     }
 
-    async fn run(&self, run: Vec<Entry>, r: Arc<Running>, may_have_landed: bool) {
+    async fn object(&self, e: &Entry, key: &str, version: Option<String>, published: bool) -> Result<crate::mount::publication::Object> {
+        let meta = self.0.client.head_object(&e.drive, key, voidfs_sdk::ReadOptions { version_id: version.clone(), ..Default::default() }).await?;
+        if version.as_ref().is_some_and(|v| *v != meta.version_id) {
+            return Err(Error::Changed { key: key.to_owned(), expected: version.unwrap_or_default(), got: meta.version_id });
+        }
+        let attrs = self.0.client.attributes(&e.drive, key, voidfs_sdk::ReadOptions { version_id: Some(meta.version_id.clone()), ..Default::default() }).await?;
+        if meta.object_id.as_deref() != Some(attrs.object_id.as_str()) || attrs.object_id.is_empty() || attrs.version_id.as_deref() != Some(meta.version_id.as_str()) {
+            return Err(Error::Invalid("the published object's identity or attributes did not match its exact version".into()));
+        }
+        let object = crate::mount::publication::Object { drive: e.drive.clone(), key: key.to_owned(), meta, attrs, content: None };
+        crate::mount::publication::validate(&object).map_err(|e| Error::Invalid(e.to_string()))?;
+        if published {
+            let expected = if let Some(ino) = e.mount_ino {
+                let store = self.0.store.clone(); let drive = e.drive.clone();
+                let json = blocking(move || store.with(|c| c.query_row("SELECT attrs FROM mount_inodes WHERE ino=?1 AND drive=?2", rusqlite::params![ino, drive], |r| r.get::<_, String>(0)))).await?;
+                serde_json::from_str::<voidfs_sdk::FolderEntry>(&json).map_err(|e| Error::Invalid(e.to_string()))?.kind
+            } else if e.op == Op::Folder || e.key.ends_with('/') { voidfs_sdk::Kind::Folder } else { voidfs_sdk::Kind::File };
+            if object.meta.kind != expected { return Err(Error::Invalid("the published object's kind differs from the local edit".into())); }
+        }
+        Ok(object)
+    }
+
+    async fn competing(&self, e: &Entry, key: &str, version: Option<String>, opposite_kind: bool) -> Result<crate::mount::publication::Object> {
+        match self.object(e, key, version.clone(), false).await {
+            Err(Error::Fetch(error)) if opposite_kind && error.status() == Some(404) && !key.is_empty() => {
+                let alternative = if key.ends_with('/') { key.trim_end_matches('/').to_owned() } else { format!("{key}/") };
+                self.object(e, &alternative, version, false).await
+            }
+            result => result,
+        }
+    }
+
+    fn metadata_retryable(error: &Error) -> bool {
+        match error {
+            Error::Fetch(error) => matches!(&**error, voidfs_sdk::Error::Transport { .. }) || error.status().is_some_and(|s| s >= 500 || s == 429),
+            Error::Io(_) | Error::Db(_) => true,
+            _ => false,
+        }
+    }
+
+    fn permanent_completion_error(error: &Error) -> bool {
+        let Error::Db(database) = error else { return false; };
+        let rusqlite::Error::ToSqlConversionFailure(cause) = database.as_ref() else { return false; };
+        cause.downcast_ref::<crate::mount::FsError>().is_some_and(|error| !matches!(error, crate::mount::FsError::Io(message) if message.starts_with("state database:")))
+    }
+
+    fn acknowledge(&self, run: &[Entry], version: &str, key: &str, attrs: bool) -> Result<()> {
+        let mut st = self.st();
+        let mut entries = Vec::new();
+        for e in run {
+            if let Some(p) = st.pending.get(&e.id) {
+                let mut p = p.clone();
+                p.published_version = Some(version.to_owned());
+                p.published_key = Some(key.to_owned());
+                p.published_attrs = attrs;
+                entries.push(p);
+            }
+        }
+        self.0.store.with(|c| {
+            let tx = c.transaction()?;
+            for e in &entries { journal::update(&tx, e)?; }
+            tx.commit()?;
+            Ok(())
+        })?;
+        for e in entries { st.pending.insert(e.id, e); }
+        Ok(())
+    }
+
+    async fn run(&self, mut run: Vec<Entry>, r: Arc<Running>, may_have_landed: bool) {
         let this = self.clone();
         let base = run[0].base.clone();
         let mount = run[0].mount;
         let upload_id = Arc::new(Mutex::new(run[0].upload_id.clone()));
-        let outcome = match blocking(move || this.guard(&base, mount)).await {
-            Ok(guard) => {
-                let ctx = Ctx {
-                    client: self.0.client.clone(),
-                    store: self.0.store.clone(),
-                    state_id: self.0.state_id.clone(),
-                    part_size: self.0.cfg.part_size,
-                    multipart_from: self.0.cfg.multipart_from,
-                    parts_at_once: self.0.cfg.parts_at_once,
-                    direct_from: self.0.cfg.direct_from,
-                    memory: self.0.memory.clone(),
-                    memory_kib: self.0.memory_kib,
-                    offered: self.0.direct.clone(),
-                    stop: r.stop.clone(),
-                    sent: r.sent.clone(),
-                    may_have_landed,
-                    upload_id: upload_id.clone(),
-                };
-                publish::publish(&ctx, &run, guard).await
-            }
-            Err(e) => Outcome::from(e),
+        let (ack_queue, ack_run) = (self.clone(), run.clone());
+        let ctx = Ctx {
+            client: self.0.client.clone(), store: self.0.store.clone(), state_id: self.0.state_id.clone(),
+            part_size: self.0.cfg.part_size, multipart_from: self.0.cfg.multipart_from, parts_at_once: self.0.cfg.parts_at_once,
+            direct_from: self.0.cfg.direct_from, memory: self.0.memory.clone(), memory_kib: self.0.memory_kib,
+            offered: self.0.direct.clone(), stop: r.stop.clone(), sent: r.sent.clone(), may_have_landed, upload_id: upload_id.clone(),
+            acknowledge: mount.then(|| Arc::new(move |version: &str, key: &str, attrs| ack_queue.acknowledge(&ack_run, version, key, attrs)) as Arc<publish::Acknowledge>),
         };
-        let outcome = match (outcome, r.stop.why()) {
-            // A cancel that came as the publish finished is too late: it was published.
-            (o @ Outcome::Done { .. }, _) => o,
+        let outcome = if let Some(version) = &run[0].published_version {
+            if run[0].published_attrs { publish::resume_attrs(&ctx, &run, version.clone()).await } else { Outcome::Done { version: Some(version.clone()), conflict: None } }
+        } else { match blocking(move || this.guard(&base, mount)).await {
+            Ok(guard) => publish::publish(&ctx, &run, guard).await,
+            Err(e) => Outcome::from(e),
+        }};
+        if mount {
+            let (store, ids) = (self.0.store.clone(), run.iter().map(|e| e.id).collect::<Vec<_>>());
+            if let Ok(recorded) = blocking(move || store.with(|c| ids.into_iter().map(|id| journal::get(c, id)).collect::<rusqlite::Result<Vec<_>>>())).await {
+                for (entry, recorded) in run.iter_mut().zip(recorded) {
+                    if let Some(recorded) = recorded && recorded.published_version.is_some() {
+                        entry.published_version = recorded.published_version; entry.published_key = recorded.published_key; entry.published_attrs = recorded.published_attrs;
+                    }
+                }
+            }
+        }
+        let mut outcome = match (outcome, r.stop.why()) {
+            (o @ (Outcome::Done { .. } | Outcome::Conflict { .. }), _) => o,
+            (_, Some(Why::Cancel)) if run[0].published_version.is_some() => Outcome::Failed { error: "published content awaits reconciliation after cancellation".into(), transient: false },
             (_, Some(w)) => Outcome::Stopped(w),
             (o, None) => o,
         };
+        if mount && run[0].op == Op::Delete && matches!(outcome, Outcome::Done { version: None, .. }) {
+            match self.0.client.head_object(&run[0].drive, &run[0].key, voidfs_sdk::ReadOptions::default()).await {
+                Ok(meta) => outcome = Outcome::Conflict { status: 412, current_version: Some(meta.version_id), error: "the guarded delete left its remote object in place".into() },
+                Err(error) if error.status() == Some(404) => {},
+                Err(error) => {
+                    let error = Error::from(error);
+                    outcome = Outcome::Failed { transient: Self::metadata_retryable(&error), error: format!("confirming the guarded delete: {error}") };
+                }
+            }
+        }
+        let mut completion = None;
+        if mount {
+            match &outcome {
+                Outcome::Done { version, .. } => {
+                    let key = run[0].published_key.clone().or_else(|| run[0].to_key.clone()).unwrap_or_else(|| run[0].key.clone());
+                    let key = if run[0].op == Op::Folder && !key.ends_with('/') { format!("{key}/") } else { key };
+                    if let Some(version) = version.clone() {
+                        for e in &mut run { e.published_version = Some(version.clone()); e.published_key = Some(key.clone()); }
+                        let (this, entries, v, k) = (self.clone(), run.clone(), version.clone(), key.clone());
+                        if let Err(e) = blocking(move || this.acknowledge(&entries, &v, &k, false)).await {
+                            outcome = Outcome::Failed { error: format!("recording the published version: {e}"), transient: true };
+                        } else if run[0].op != Op::Delete {
+                            match self.object(&run[0], &key, Some(version.clone()), true).await {
+                                Ok(object) => completion = Some(crate::mount::publication::Completion::Success { version: Some(version), object: Some(object) }),
+                                Err(e) => {
+                                    let transient = Self::metadata_retryable(&e);
+                                    outcome = Outcome::Failed { error: format!("reconciling the published version: {e}"), transient };
+                                }
+                            }
+                        } else {
+                            completion = Some(crate::mount::publication::Completion::Success { version: Some(version), object: None });
+                        }
+                    } else if run[0].op == Op::Delete {
+                        completion = Some(crate::mount::publication::Completion::Success { version: None, object: None });
+                    } else {
+                        outcome = Outcome::Failed { error: "the mount mutation returned no published version".into(), transient: false };
+                    }
+                }
+                Outcome::Conflict { status, current_version, error } => {
+                    let key = if *status == 409 && run[0].op == Op::Rename { run[0].to_key.as_deref().unwrap_or(&run[0].key) } else { &run[0].key };
+                    let key = if run[0].op == Op::Folder && !key.ends_with('/') { format!("{key}/") } else { key.to_owned() };
+                    let mut detail = error.clone();
+                    let mut remote = None;
+                    let mut normalized = *status;
+                    if *status != 404 {
+                        match self.competing(&run[0], &key, current_version.clone(), *status == 409).await {
+                            Ok(object) => match crate::mount::publication::capture_remote(&self.0.client, &self.0.store, object.clone()).await {
+                                Ok(object) => remote = Some(object),
+                                Err(e) => { remote = Some(object); detail.push_str(&format!("; retaining the remote version: {e}")); },
+                            },
+                            Err(Error::Fetch(e)) if *status == 412 && current_version.is_none() && e.status() == Some(404) => normalized = 404,
+                            Err(e) => detail.push_str(&format!("; reading the remote version: {e}")),
+                        }
+                    }
+                    completion = Some(crate::mount::publication::Completion::Conflict { status: normalized, current_version: current_version.clone(), remote, error: detail, local: HashMap::new() });
+                }
+                _ => {}
+            }
+            if completion.is_none() {
+                completion = match &outcome {
+                    Outcome::Failed { error, .. } | Outcome::Rejected { error, .. } => Some(crate::mount::publication::Completion::Error { error: error.clone() }),
+                    Outcome::Stopped(Why::Cancel) => Some(crate::mount::publication::Completion::Cancelled),
+                    _ => None,
+                };
+            }
+        }
+        let registration = if mount { Some(self.mount_registration(&run[0].drive).await) } else { None };
+        let related = {
+            let st = self.st();
+            let mut entries = Vec::new();
+            let mut ids: HashSet<EntryId> = run.iter().map(|e| e.id).collect();
+            loop {
+                let more = st.pending.values().filter(|e| !ids.contains(&e.id) && (matches!(e.base, StoredBase::Entry(id) if ids.contains(&id)) || entries.iter().chain(run.iter()).any(|prior| prior.id < e.id && depends(prior, e)))).cloned().collect::<Vec<_>>();
+                if more.is_empty() { break; }
+                for e in more { ids.insert(e.id); entries.push(e); }
+            }
+            entries.extend(run.iter().cloned());
+            entries
+        };
+        let prepared = match self.mount_publisher(&run[0].drive) {
+            Some(publisher) if mount => Some(publisher.prepare_publication(&related).await),
+            _ => None,
+        };
+        let connectivity = self.0.cfg.connectivity.clone().unwrap_or_default();
+        if let Some(completion) = &mut completion && let Err(e) = crate::mount::publication::capture_local(&self.0.client, &self.0.store, &run, completion, &connectivity).await
+            && let crate::mount::publication::Completion::Conflict { error, .. } = completion {
+            error.push_str(&format!("; retaining local bytes: {e}"));
+        }
         let this = self.clone();
         let sent = r.sent.load(Ordering::Relaxed);
         let upload_id = upload_id.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let _ = blocking(move || this.finish(run, outcome, sent, upload_id)).await;
+        let backup = run.clone();
+        let fallback_upload = upload_id.clone();
+        let finished = blocking(move || this.finish(run, outcome, completion, sent, upload_id)).await;
+        let finished = match finished {
+            Err(error) if Self::permanent_completion_error(&error) => {
+                let message = format!("reconciling the acknowledged publication: {error}");
+                let (this, run) = (self.clone(), backup.clone());
+                blocking(move || this.finish(run, Outcome::Failed { error: message.clone(), transient: false }, Some(crate::mount::publication::Completion::Error { error: message }), sent, fallback_upload)).await
+            }
+            result => result,
+        };
+        match finished {
+            Ok(reports) => if let Some(prepared) = prepared { prepared.apply(reports); },
+            Err(e) => {
+                eprintln!("voidfs publication reconciliation: {e}");
+                let mut st = self.st();
+                for entry in backup {
+                    st.running.remove(&entry.id);
+                    if let Some(p) = st.pending.get_mut(&entry.id) {
+                        p.state = State::Failed;
+                        p.error = Some(format!("recording publication completion: {e}"));
+                        p.published_version = entry.published_version;
+                        p.published_key = entry.published_key;
+                        p.published_attrs = entry.published_attrs;
+                    }
+                    st.retry_at.insert(entry.id, Instant::now() + Duration::from_secs(1));
+                }
+            }
+        }
+        drop(registration);
+        self.st().runs -= 1;
         self.0.wake.notify_one();
         self.0.changed.notify_waiters();
     }
 
-    /// Records how a run ended.
-    fn finish(&self, run: Vec<Entry>, outcome: Outcome, sent: u64, upload_id: Option<String>) -> Result<()> {
+    /// Journal completion and durable mount state become visible together.
+    fn finish(&self, run: Vec<Entry>, outcome: Outcome, completion: Option<crate::mount::publication::Completion>, sent: u64, upload_id: Option<String>) -> Result<Vec<crate::mount::publication::Report>> {
         let mut st = self.st();
-        st.runs -= 1;
-        for e in &run {
-            st.running.remove(&e.id);
-        }
-        let mut finished = Vec::new();
+        let mut entries = Vec::new();
         let closed = st.closed;
         for (i, e) in run.iter().enumerate() {
-            let cancelled = st.cancelled.remove(&e.id);
-            let Some(p) = st.pending.get_mut(&e.id) else { continue };
-            if i == 0 {
-                p.upload_id = upload_id.clone();
-            }
+            let cancelled = st.cancelled.contains(&e.id);
+            let Some(p) = st.pending.get(&e.id) else { continue };
+            let mut p = p.clone();
+            if i == 0 { p.upload_id = upload_id.clone(); }
+            p.published_version = e.published_version.clone().or(p.published_version);
+            p.published_key = e.published_key.clone().or(p.published_key);
+            if e.published_version.is_some() { p.published_attrs = e.published_attrs; }
             match &outcome {
                 Outcome::Done { version, conflict } => {
-                    p.state = State::Done;
-                    p.version = version.clone();
-                    p.sent = p.size;
-                    p.error = None;
-                    if i == 0 {
-                        p.conflict = conflict.clone();
-                    }
+                    p.state = State::Done; p.version = version.clone(); p.sent = p.size; p.error = None;
+                    if i == 0 { p.conflict = conflict.clone(); }
                 }
-                // The rest of a failed run are tried again when its first is.
-                Outcome::Failed { error, .. } if i == 0 => {
-                    p.state = State::Failed;
-                    p.sent = sent.min(p.size);
-                    p.error = Some(error.clone());
+                Outcome::Conflict { current_version, error, .. } => {
+                    p.state = State::Failed; p.conflict = Some(current_version.clone().unwrap_or_else(|| "?".into())); p.error = Some(error.clone());
+                    if i == 0 { p.sent = sent.min(p.size); }
+                }
+                Outcome::Failed { error, .. } | Outcome::Rejected { error, .. } if i == 0 => {
+                    p.state = State::Failed; p.sent = sent.min(p.size); p.error = Some(error.clone());
                 }
                 Outcome::Stopped(Why::Cancel) if cancelled => p.state = State::Cancelled,
-                // Stopped by a pause, by closing, or by a cancel of another entry of the run: it
-                // goes again. A request dropped part way may have landed; stopped by closing, it
-                // is stored as uploading, so that the next open checks.
                 _ => {
                     p.state = if closed { State::Uploading } else { State::Queued };
                     p.sent = if i == 0 { sent.min(p.size) } else { 0 };
                 }
             }
-            let p = p.clone();
-            self.0.store.with(|c| journal::update(c, &p))?;
-            if p.state == State::Queued && matches!(outcome, Outcome::Stopped(_)) {
-                st.may_have_landed.insert(p.id);
-            }
-            if p.state.finished() {
-                finished.push(p);
-            }
+            entries.push(p);
         }
+        let reports = self.0.store.with(|c| {
+            let tx = c.transaction()?;
+            for e in &entries { journal::update(&tx, e)?; }
+            let reports = if let Some(completion) = &completion {
+                let reconciled: Vec<Entry> = entries.iter().filter(|e| !matches!(completion, crate::mount::publication::Completion::Cancelled) || e.state == State::Cancelled).cloned().collect();
+                crate::mount::publication::reconcile(&tx, &reconciled, completion).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+            } else { Vec::new() };
+            tx.commit()?;
+            Ok(reports)
+        })?;
+        for e in &run { st.running.remove(&e.id); st.cancelled.remove(&e.id); }
         if let Outcome::Failed { transient, .. } = &outcome {
             let id = run[0].id;
             let n = st.attempts.entry(id).or_insert(0);
@@ -1033,28 +1293,21 @@ impl Queue {
             if *transient {
                 let d = Duration::from_secs(1u64 << (*n).min(10)).min(self.0.cfg.retry_max);
                 st.retry_at.insert(id, Instant::now() + d);
-            }
+            } else { st.retry_at.remove(&id); }
+        } else if matches!(outcome, Outcome::Conflict { .. }) {
+            for e in &run { st.retry_at.remove(&e.id); }
         }
-        for e in finished {
-            st.pending.remove(&e.id);
-            st.attempts.remove(&e.id);
-            st.retry_at.remove(&e.id);
-            if e.staged
-                && let Some(p) = &e.source
-            {
-                let _ = std::fs::remove_file(p);
-            }
-            if e.state == State::Cancelled
-                && let Some(id) = &e.upload_id
-            {
-                // Best effort: an upload left open is the garbage collector's.
+        for e in entries {
+            if e.state == State::Queued && matches!(outcome, Outcome::Stopped(_)) { st.may_have_landed.insert(e.id); }
+            if !e.state.finished() { st.pending.insert(e.id, e); continue; }
+            st.pending.remove(&e.id); st.attempts.remove(&e.id); st.retry_at.remove(&e.id);
+            if e.staged && let Some(p) = &e.source { let _ = std::fs::remove_file(p); }
+            if e.state == State::Cancelled && let Some(id) = &e.upload_id {
                 let (client, drive, key, id) = (self.0.client.clone(), e.drive.clone(), e.key.clone(), id.clone());
-                tokio::spawn(async move {
-                    let _ = client.abort_multipart_upload(&drive, &key, &id).await;
-                });
+                tokio::spawn(async move { let _ = client.abort_multipart_upload(&drive, &key, &id).await; });
             }
         }
-        Ok(())
+        Ok(reports)
     }
 
     /// The client the queue publishes with (its bandwidth limit included).
@@ -1132,7 +1385,9 @@ mod tests {
     }
 
     fn local_inode(tx: &rusqlite::Transaction<'_>) -> crate::mount::Result<u64> {
-        tx.execute("INSERT INTO mount_inodes(drive, attrs) VALUES ('d', '{}')", []).map_err(crate::Error::from)?;
+        let attrs = voidfs_sdk::FolderEntry { name: "file".into(), kind: voidfs_sdk::Kind::File, object_id: String::new(), version_id: None,
+            size: Some(0), etag: None, mtime: None, mode: None, has_xattrs: false, target: None };
+        tx.execute("INSERT INTO mount_inodes(drive, attrs) VALUES ('d', ?1)", [serde_json::to_string(&attrs).unwrap()]).map_err(crate::Error::from)?;
         Ok(tx.last_insert_rowid() as u64)
     }
 
@@ -1486,7 +1741,13 @@ mod tests {
         let status = q.status().await.unwrap();
         assert_eq!(status.items.iter().find(|i| i.key == "empty").unwrap().state, State::Done);
         assert_eq!(client.get_object("drv", "empty", Default::default()).await.unwrap().body, Bytes::new());
-        assert!(status.items.iter().filter(|i| i.key != "empty").all(|i| i.state == State::Failed && i.conflict.is_none()), "{:?}", status.items);
+        assert!(status.items.iter().filter(|i| i.key != "empty").all(|i| i.state == State::Failed), "{:?}", status.items);
+        for key in ["occupied", "folder/", "rename", "delete", "attrs"] {
+            assert!(status.items.iter().find(|i| i.key == key).unwrap().conflict.is_some(), "a mount guard rejection is a durable structured conflict");
+        }
+        q.resume(Scope::All).await.unwrap();
+        q.settle().await;
+        assert!(q.status().await.unwrap().items.iter().filter(|i| i.conflict.is_some()).all(|i| i.state == State::Failed), "ordinary resume never resolves mount conflicts");
         for key in ["occupied", "rename", "delete", "attrs"] {
             assert_eq!(client.get_object("drv", key, Default::default()).await.unwrap().body.as_ref(), b"competing");
         }
@@ -1497,4 +1758,388 @@ mod tests {
         assert_eq!(client.list_versions("drv", "folder/", false).await.unwrap().len(), 1, "guarded mkdir does not replace a competing folder");
         q.close().await;
     }
+
+    #[tokio::test]
+    async fn mount_completion_rolls_back_a_partial_run_without_cleaning_sources_or_ram() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = paused(dir.path()).await;
+        let a = q.mount_copy({ let p = dir.path().join("a"); std::fs::write(&p, "aa").unwrap(); p }, 0, 2).await.unwrap();
+        let b = q.mount_copy({ let p = dir.path().join("b"); std::fs::write(&p, "bb").unwrap(); p }, 0, 2).await.unwrap();
+        let sources = [a.clone(), b.clone()];
+        q.mount_transaction(move |_| {
+            let mut first = Entry::new("drive", "file", Op::Write, StoredBase::Version("base".into()));
+            first.source = Some(a); first.staged = true; first.size = 2;
+            let mut second = Entry::new("drive", "file", Op::Write, StoredBase::Any);
+            second.source = Some(b); second.staged = true; second.size = 2; second.offset = 2;
+            Ok(((), vec![first, second]))
+        }).await.unwrap();
+        let run = q.st().pending.values().cloned().collect::<Vec<_>>();
+        q.store().with(|c| c.execute_batch(&format!("CREATE TEMP TRIGGER refuse_completion BEFORE UPDATE OF state ON entries WHEN NEW.id={} AND NEW.state='done' BEGIN SELECT RAISE(ABORT, 'completion failed'); END", run[1].id))).unwrap();
+        assert!(q.finish(run.clone(), Outcome::Done { version: Some("published".into()), conflict: None }, None, 4, None).is_err());
+        assert!(q.store().with(|c| journal::all(c)).unwrap().iter().all(|e| e.state == State::Queued), "the first journal update must roll back with the second");
+        assert!(q.st().pending.values().all(|e| e.state == State::Queued), "RAM cannot advance ahead of the failed transaction");
+        assert!(sources.iter().all(|p| p.exists()), "frozen sources remain available until completion commits");
+        q.store().with(|c| c.execute_batch("DROP TRIGGER refuse_completion")).unwrap();
+        q.finish(run, Outcome::Done { version: Some("published".into()), conflict: None }, None, 4, None).unwrap();
+        assert!(q.store().with(|c| journal::all(c)).unwrap().iter().all(|e| e.state == State::Done));
+        assert!(sources.iter().all(|p| !p.exists()));
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn acknowledged_mount_publication_restarts_without_repeating_it_or_absorbing_later_writes() {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let client = client(&server.endpoint);
+        client.create_drive("drive", Default::default()).await.unwrap();
+        let base = client.put_object("drive", "file", "before", Default::default()).await.unwrap().version_id;
+        let published = client.put_object("drive", "file", "published", Default::default()).await.unwrap().version_id;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.set_meta("paused", "1").unwrap();
+        let q = Queue::open(store.clone(), client.clone(), QueueConfig::default()).await.unwrap();
+        let source = dir.path().join("snapshot"); std::fs::write(&source, "wrong").unwrap();
+        let frozen = q.mount_copy(source, 0, 5).await.unwrap();
+        q.mount_transaction(move |_| {
+            let mut write = Entry::new("drive", "file", Op::Write, StoredBase::Version(base));
+            write.source = Some(frozen); write.staged = true; write.size = 5;
+            let mut truncate = Entry::new("drive", "file", Op::Truncate, StoredBase::Any); truncate.length = 9;
+            Ok(((), vec![write, truncate]))
+        }).await.unwrap();
+        let first = q.st().pending.values().cloned().collect::<Vec<_>>();
+        q.acknowledge(&first, &published, "file", false).unwrap();
+        let source = dir.path().join("later"); std::fs::write(&source, "!").unwrap();
+        let frozen = q.mount_copy(source, 0, 1).await.unwrap();
+        let predecessor = first.last().unwrap().id;
+        q.mount_transaction(move |_| {
+            let mut write = Entry::new("drive", "file", Op::Write, StoredBase::Entry(predecessor));
+            write.source = Some(frozen); write.staged = true; write.size = 1; write.offset = 9;
+            Ok(((), vec![write]))
+        }).await.unwrap();
+        q.close().await; drop(q); drop(store);
+        let q = Queue::open(Arc::new(Store::open(dir.path()).unwrap()), client.clone(), QueueConfig::default()).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+        let status = q.status().await.unwrap();
+        assert!(status.items.iter().all(|e| e.state == State::Done), "{:?}", status.items);
+        assert!(status.items[..2].iter().all(|e| e.version.as_deref() == Some(published.as_str())), "the acknowledged run binds the version it already produced");
+        assert_ne!(status.items[2].version.as_deref(), Some(published.as_str()), "later writes receive their own guarded publication");
+        assert_eq!(client.get_object("drive", "file", Default::default()).await.unwrap().body.as_ref(), b"published!");
+        assert_eq!(client.list_versions("drive", "file", true).await.unwrap().len(), 3, "the acknowledged run is never sent again");
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn mount_guards_reject_cancelled_predecessors_without_falling_back_to_their_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = paused(dir.path()).await;
+        let mut e = Entry::new("drive", "file", Op::Write, StoredBase::Version("old-base".into()));
+        e.mount = true; e.state = State::Cancelled;
+        q.store().with(|c| journal::insert(c, &mut e)).unwrap();
+        assert!(q.guard(&StoredBase::Entry(e.id), true).is_err(), "a skipped local predecessor changes the byte view and cannot retain its old guard");
+        assert_eq!(q.guard(&StoredBase::Entry(e.id), false).unwrap(), Guard::Version("old-base".into()), "CLI cancellation policy is unchanged");
+        q.close().await;
+    }
+
+
+    async fn partial_xattrs(already_applied: bool, foreign_content: bool) -> (tempfile::TempDir, Queue, Client, String, voidfs_server::test_server::TestServer) {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let client = client(&server.endpoint);
+        client.create_drive("drive", Default::default()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap()); store.set_meta("paused", "1").unwrap();
+        let q = Queue::open(store.clone(), client.clone(), QueueConfig::default()).await.unwrap();
+        let source = dir.path().join("source"); std::fs::write(&source, "local").unwrap();
+        let frozen = q.mount_copy(source, 0, 5).await.unwrap();
+        q.mount_transaction(move |_| {
+            let mut e = Entry::new("drive", "file", Op::Put, StoredBase::Absent);
+            e.source = Some(frozen); e.staged = true; e.size = 5; e.attrs.xattrs.insert("user.test".into(), b"wanted".to_vec());
+            Ok(((), vec![e]))
+        }).await.unwrap();
+        let run = q.st().pending.values().cloned().collect::<Vec<_>>();
+        let version = client.put_object("drive", "file", "local", voidfs_sdk::PutOptions {
+            metadata: std::collections::BTreeMap::from([(publish::MARKER.to_owned(), format!("{}.{}", q.0.state_id, run[0].id))]), ..Default::default()
+        }).await.unwrap().version_id;
+        q.acknowledge(&run, &version, "file", true).unwrap();
+        let mut current = version.clone();
+        if already_applied {
+            current = client.set_attributes("drive", "file", voidfs_sdk::AttributesUpdate {
+                set_xattrs: std::collections::BTreeMap::from([("user.test".into(), Bytes::from_static(b"wanted"))]), ..Default::default()
+            }, voidfs_sdk::Preconditions::if_version(current)).await.unwrap().version_id;
+        }
+        if foreign_content {
+            current = client.write_at("drive", "file", 0, "REMOTE", voidfs_sdk::WriteOptions { size: Some(6), if_version: Some(current), ..Default::default() }).await.unwrap().version_id;
+        }
+        q.close().await; drop(q); drop(store);
+        let q = Queue::open(Arc::new(Store::open(dir.path()).unwrap()), client.clone(), QueueConfig::default()).await.unwrap();
+        (dir, q, client, current, server)
+    }
+
+    #[tokio::test]
+    async fn partial_mount_put_restarts_at_xattrs_and_recognizes_an_already_landed_attribute_version() {
+        for already_applied in [false, true] {
+            let (_dir, q, client, _, _server) = partial_xattrs(already_applied, false).await;
+            q.resume(Scope::All).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+            assert_eq!(q.status().await.unwrap().items[0].state, State::Done, "a data put's acknowledged version must resume its attributes independently");
+            let attrs = client.attributes("drive", "file", Default::default()).await.unwrap();
+            assert_eq!(attrs.xattrs.get("user.test").map(String::as_str), Some("d2FudGVk"));
+            assert_eq!(client.get_object("drive", "file", Default::default()).await.unwrap().body.as_ref(), b"local");
+            assert_eq!(client.list_versions("drive", "file", true).await.unwrap().len(), 2, "an already-landed attrs response cannot make a second attrs version");
+            assert!(q.store().with(|c| journal::all(c)).unwrap().iter().all(|e| !e.published_attrs));
+            q.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_mount_put_never_accepts_foreign_content_with_matching_xattrs_as_its_own() {
+        let (_dir, q, client, current, _server) = partial_xattrs(true, true).await;
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+        let status = q.status().await.unwrap();
+        assert_eq!(status.items[0].state, State::Failed);
+        assert_eq!(status.items[0].conflict.as_deref(), Some(current.as_str()), "matching xattrs do not identify a content-changing commit as the put's own attrs request");
+        assert_eq!(client.get_object("drive", "file", Default::default()).await.unwrap().body.as_ref(), b"REMOTE");
+        assert_eq!(client.list_versions("drive", "file", true).await.unwrap().len(), 3);
+        q.close().await;
+    }
+
+
+    #[tokio::test]
+    async fn legacy_done_mount_entries_recover_identity_and_owned_overlays_without_republishing() {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let client = client(&server.endpoint); client.create_drive("drive", Default::default()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap()); store.set_meta("paused", "1").unwrap();
+        let q = Queue::open(store.clone(), client.clone(), QueueConfig::default()).await.unwrap();
+        let cache = crate::Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone())), Default::default()).await.unwrap();
+        let session = crate::mount::Session::new_writable_with_config(store.clone(), client.clone(), cache.clone(), q.clone(), "drive", Default::default(), crate::mount::StagingConfig { min_free_bytes: 0, quiet_period: None, ..Default::default() }).await.unwrap();
+        session.readdir(session.root(), None, 100).await.unwrap();
+        let ino = session.create(session.root(), "file", 0o640).await.unwrap().ino;
+        let fh = session.open(ino, true).await.unwrap();
+        session.write(fh, 0, Bytes::from_static(b"local")).await.unwrap(); session.fsync(fh).await.unwrap();
+        let published = client.put_object("drive", "file", "local", voidfs_sdk::PutOptions { mode: Some(0o640), ..Default::default() }).await.unwrap().version_id;
+        store.with(|c| {
+            for mut e in journal::all(c)? { e.state = State::Done; e.version = Some(published.clone()); journal::update(c, &e)?; }
+            c.execute("DELETE FROM mount_overlay_publications", [])?;
+            Ok(())
+        }).unwrap();
+        session.close(fh).await.unwrap(); drop(session); drop(cache); q.close().await; drop(q); drop(store);
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let q = Queue::open(store.clone(), client.clone(), QueueConfig::default()).await.unwrap();
+        let cache = crate::Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone())), Default::default()).await.unwrap();
+        let session = crate::mount::Session::new_writable_with_config(store.clone(), client.clone(), cache, q.clone(), "drive", Default::default(), crate::mount::StagingConfig { min_free_bytes: 0, quiet_period: None, ..Default::default() }).await.unwrap();
+        q.resume(Scope::All).await.unwrap(); tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+        let attr = session.lookup(session.root(), "file").await.unwrap();
+        assert_eq!(attr.ino, ino, "upgrading cannot replace the local inode");
+        assert_eq!(attr.sync, crate::mount::Sync::Saved, "already-uploaded legacy files need reconciliation rather than another upload");
+        assert_eq!(attr.version_id.as_deref(), Some(published.as_str()));
+        assert!(attr.object_id.is_some());
+        assert_eq!(store.with(|c| c.query_row("SELECT count(*) FROM mount_overlay", [], |r| r.get::<_, i64>(0))).unwrap(), 0);
+        assert_eq!(store.with(|c| c.query_row("SELECT count(*) FROM mount_staged", [], |r| r.get::<_, i64>(0))).unwrap(), 0);
+        assert_eq!(client.list_versions("drive", "file", true).await.unwrap().len(), 1);
+        assert_eq!(q.status().await.unwrap().unpublished, 0);
+        q.close().await;
+    }
+
+
+    #[tokio::test]
+    async fn an_ambiguous_mount_put_marker_never_accepts_a_foreign_edit_as_its_publication() {
+        let (_dir, q, client, _, _server) = partial_xattrs(false, false).await;
+        {
+            let mut st = q.st();
+            for e in st.pending.values_mut() {
+                e.published_version = None; e.published_key = None; e.published_attrs = false;
+                q.store().with(|c| journal::update(c, e)).unwrap();
+            }
+        }
+        let current = client.write_at("drive", "file", 0, "REMOTE", voidfs_sdk::WriteOptions { size: Some(6), ..Default::default() }).await.unwrap().version_id;
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+        let status = q.status().await.unwrap();
+        assert_eq!(status.items[0].state, State::Failed);
+        assert_eq!(status.items[0].conflict.as_deref(), Some(current.as_str()), "an inherited put marker does not identify the current bytes as the lost put");
+        assert_eq!(client.get_object("drive", "file", Default::default()).await.unwrap().body.as_ref(), b"REMOTE");
+        assert_eq!(client.list_versions("drive", "file", true).await.unwrap().len(), 2);
+        assert!(q.store().with(|c| journal::all(c)).unwrap()[0].source.as_ref().unwrap().exists());
+        q.close().await;
+    }
+
+
+    async fn publication_session() -> (tempfile::TempDir, Queue, Client, crate::mount::Session, voidfs_server::test_server::TestServer) {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let client = client(&server.endpoint); client.create_drive("drive", Default::default()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap()); store.set_meta("paused", "1").unwrap();
+        let q = Queue::open(store.clone(), client.clone(), QueueConfig::default()).await.unwrap();
+        let cache = crate::Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone())), Default::default()).await.unwrap();
+        let session = crate::mount::Session::new_writable_with_config(store, client.clone(), cache, q.clone(), "drive", Default::default(), crate::mount::StagingConfig { min_free_bytes: 0, quiet_period: None, ..Default::default() }).await.unwrap();
+        (dir, q, client, session, server)
+    }
+
+    #[tokio::test]
+    async fn a_guarded_folder_delete_that_keeps_new_children_is_a_conflict_and_retains_its_overlay() {
+        let (_dir, q, client, session, _server) = publication_session().await;
+        client.put_object("drive", "folder/", Bytes::new(), Default::default()).await.unwrap();
+        session.readdir(session.root(), None, 100).await.unwrap();
+        let ino = session.lookup(session.root(), "folder").await.unwrap().ino;
+        session.readdir(ino, None, 100).await.unwrap();
+        session.rmdir(session.root(), "folder").await.unwrap();
+        client.put_object("drive", "folder/child", "foreign", Default::default()).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+        let status = q.status().await.unwrap();
+        assert_eq!(status.items[0].state, State::Failed, "a no-op delete response cannot acknowledge removal of an extant folder");
+        assert!(status.items[0].conflict.is_some());
+        assert!(matches!(session.lookup(session.root(), "folder").await, Err(crate::mount::FsError::NotFound)), "the local deletion tombstone remains visible during conflict");
+        assert_eq!(client.get_object("drive", "folder/child", Default::default()).await.unwrap().body.as_ref(), b"foreign");
+        let conflict = session.conflict(ino).await.unwrap().unwrap();
+        assert_eq!(conflict.remote.unwrap().kind, voidfs_sdk::Kind::Folder);
+        assert!(!conflict.remote_missing);
+        assert!(conflict.remote_retained);
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_missing_guarded_base_is_a_retained_absence_conflict_without_a_capture_error() {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let client = client(&server.endpoint); client.create_drive("drive", Default::default()).await.unwrap();
+        client.put_object("drive", "file", "before", Default::default()).await.unwrap();
+        let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback({
+            let rejected = rejected.clone(); let upstream = server.endpoint.clone(); let http = reqwest::Client::new();
+            move |request: axum::extract::Request| {
+                let (rejected, upstream, http) = (rejected.clone(), upstream.clone(), http.clone());
+                async move {
+                    if matches!(request.method().as_str(), "PUT" | "POST") {
+                        rejected.fetch_add(1, Ordering::SeqCst);
+                        return axum::response::Response::builder().status(412).header("content-type", "application/xml")
+                            .body(axum::body::Body::from("<Error><Code>PreconditionFailed</Code><Message>the guarded source was removed</Message><RequestId>missing</RequestId></Error>")).unwrap();
+                    }
+                    let (parts, body) = request.into_parts();
+                    let head = parts.method == axum::http::Method::HEAD;
+                    let mut forwarded = http.request(parts.method, format!("{}{}", upstream, parts.uri.path_and_query().unwrap()));
+                    for (name, value) in &parts.headers { forwarded = forwarded.header(name, value); }
+                    let response = forwarded.body(axum::body::to_bytes(body, usize::MAX).await.unwrap()).send().await.unwrap();
+                    let mut returned = axum::response::Response::builder().status(response.status());
+                    for (name, value) in response.headers() {
+                        if !matches!(name.as_str(), "transfer-encoding" | "connection") && (head || name.as_str() != "content-length") { returned = returned.header(name, value); }
+                    }
+                    returned.body(axum::body::Body::from(response.bytes().await.unwrap())).unwrap()
+                }
+            }
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap()); store.set_meta("paused", "1").unwrap();
+        let q = Queue::open(store.clone(), self::client(&endpoint), QueueConfig::default()).await.unwrap();
+        let cache = crate::Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone())), Default::default()).await.unwrap();
+        let session = crate::mount::Session::new_writable_with_config(store, client.clone(), cache, q.clone(), "drive", Default::default(), crate::mount::StagingConfig { min_free_bytes: 0, quiet_period: None, ..Default::default() }).await.unwrap();
+        session.readdir(session.root(), None, 100).await.unwrap();
+        let ino = session.lookup(session.root(), "file").await.unwrap().ino;
+        let fh = session.open(ino, true).await.unwrap();
+        session.write(fh, 0, Bytes::from_static(b"LOCAL!")).await.unwrap(); session.fsync(fh).await.unwrap();
+        client.delete_object("drive", "file", Default::default()).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+        assert_eq!(rejected.load(Ordering::SeqCst), 1, "the publication received a guarded 412 without a current version");
+        let conflict = session.conflict(ino).await.unwrap().unwrap();
+        assert!(conflict.remote_missing, "412 without a current version followed by HEAD 404 represents explicit remote absence");
+        assert!(conflict.remote_retained && conflict.local_retained);
+        assert!(conflict.remote.is_none());
+        assert!(conflict.error.is_none(), "remote absence requires no downloadable competing bytes: {:?}", conflict.error);
+        assert_eq!(session.read(fh, 0, 6).await.unwrap().as_ref(), b"LOCAL!");
+        assert_eq!(q.status().await.unwrap().items[0].state, State::Failed);
+        session.close(fh).await.unwrap(); q.close().await; task.abort();
+    }
+
+    #[tokio::test]
+    async fn consistent_wrong_kind_metadata_is_rejected_before_publication_reconciliation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async {
+            axum::response::Response::builder().status(200).header("x-amz-version-id", "version").header("x-voidfs-object-id", "object")
+                .header("x-voidfs-kind", "folder").header("etag", "etag").body(axum::body::Body::from(serde_json::to_vec(&serde_json::json!({
+                    "objectId": "object", "kind": "folder", "versionId": "version", "mode": "0644"
+                })).unwrap())).unwrap()
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap()); store.set_meta("paused", "1").unwrap();
+        let q = Queue::open(store.clone(), client(&endpoint), Default::default()).await.unwrap();
+        let ino = store.with(|c| { let tx = c.transaction()?; let ino = local_inode(&tx).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?; tx.commit()?; Ok(ino) }).unwrap();
+        let mut entry = Entry::new("d", "file", Op::Attrs, StoredBase::Version("base".into())); entry.mount = true; entry.mount_ino = Some(ino);
+        assert!(matches!(q.object(&entry, "file", Some("version".into()), true).await, Err(Error::Invalid(message)) if message.contains("kind")), "HEAD and attrs agreeing on the wrong kind still cannot redefine a local file");
+        q.close().await; task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_acknowledged_publication_identity_collision_records_terminal_error_and_keeps_its_source() {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let client = client(&server.endpoint); client.create_drive("drive", Default::default()).await.unwrap();
+        let base = client.put_object("drive", "file", "before", Default::default()).await.unwrap().version_id;
+        let object = client.head_object("drive", "file", Default::default()).await.unwrap().object_id.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap()); store.set_meta("paused", "1").unwrap();
+        let q = Queue::open(store.clone(), client.clone(), Default::default()).await.unwrap();
+        let ino = store.with(|c| {
+            let tx = c.transaction()?;
+            let ino = local_inode(&tx).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            tx.execute("UPDATE mount_inodes SET drive='drive' WHERE ino=?1", [ino])?;
+            let attrs = voidfs_sdk::FolderEntry { name: "other".into(), kind: voidfs_sdk::Kind::File, object_id: object.clone(), version_id: Some(base.clone()),
+                size: Some(6), etag: None, mtime: None, mode: None, has_xattrs: false, target: None };
+            tx.execute("INSERT INTO mount_inodes(drive, object_id, attrs, sync) VALUES ('drive', ?1, ?2, 'pending')", rusqlite::params![object, serde_json::to_string(&attrs).unwrap()])?;
+            tx.commit()?; Ok(ino)
+        }).unwrap();
+        let source = dir.path().join("source"); std::fs::write(&source, "LOCAL!").unwrap();
+        let frozen = q.mount_copy(source, 0, 6).await.unwrap(); let retained = frozen.clone();
+        q.mount_transaction(move |_| {
+            let mut e = Entry::new("drive", "file", Op::Write, StoredBase::Version(base));
+            e.source = Some(frozen); e.staged = true; e.size = 6; e.mount_ino = Some(ino);
+            Ok(((), vec![e]))
+        }).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), q.settle()).await.expect("a permanent identity collision cannot keep retrying reconciliation forever");
+        let status = q.status().await.unwrap();
+        assert_eq!(status.items[0].state, State::Failed);
+        assert!(status.items[0].error.as_deref().unwrap_or_default().contains("pending local inode"));
+        assert_eq!(store.with(|c| c.query_row("SELECT sync FROM mount_inodes WHERE ino=?1", [ino], |r| r.get::<_, String>(0))).unwrap(), "error");
+        assert_eq!(store.with(|c| c.query_row("SELECT object_id FROM mount_inodes WHERE ino=?1", [ino], |r| r.get::<_, Option<String>>(0))).unwrap(), None, "the failed binding rolls back before the error is recorded");
+        let recorded = store.with(|c| journal::all(c)).unwrap();
+        assert_eq!(recorded[0].published_version, Some(client.head_object("drive", "file", Default::default()).await.unwrap().version_id));
+        assert!(retained.exists());
+        assert!(!q.st().retry_at.contains_key(&recorded[0].id));
+        assert_eq!(client.list_versions("drive", "file", true).await.unwrap().len(), 2);
+        q.close().await;
+    }
+
+
+    #[tokio::test]
+    async fn a_conflict_keeps_exact_remote_metadata_when_its_sparse_bytes_cannot_be_reserved() {
+        let (_dir, q, client, session, _server) = publication_session().await;
+        let put = client.put_object("drive", "file", "before", Default::default()).await.unwrap();
+        let attrs = client.set_attributes("drive", "file", voidfs_sdk::AttributesUpdate {
+            set_xattrs: std::collections::BTreeMap::from([("user.tag".into(), Bytes::from_static(b"remote metadata"))]), ..Default::default()
+        }, voidfs_sdk::Preconditions::if_version(put.version_id)).await.unwrap();
+        session.readdir(session.root(), None, 100).await.unwrap();
+        let ino = session.lookup(session.root(), "file").await.unwrap().ino;
+        let fh = session.open(ino, true).await.unwrap();
+        session.write(fh, 0, Bytes::from_static(b"LOCAL!")).await.unwrap(); session.fsync(fh).await.unwrap();
+        let size = 1u64 << 50;
+        let remote = client.truncate("drive", "file", size, voidfs_sdk::Preconditions::if_version(attrs.version_id)).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+        let conflict = session.conflict(ino).await.unwrap().unwrap();
+        let retained = conflict.remote.as_ref().expect("byte admission failure cannot discard the exact remote identity and metadata");
+        assert_eq!(retained.size, size);
+        assert_eq!(retained.version_id.as_deref(), Some(remote.version_id.as_str()));
+        assert_eq!(conflict.remote_attrs.as_ref().unwrap().xattrs.get("user.tag").map(String::as_str), Some("cmVtb3RlIG1ldGFkYXRh"));
+        assert!(!conflict.remote_missing && !conflict.remote_retained);
+        assert!(conflict.local_retained && conflict.error.is_some());
+        assert_eq!(session.read_conflict(ino, crate::mount::ConflictSide::Local, 0, 6).await.unwrap().as_ref(), b"LOCAL!");
+        assert!(matches!(session.read_conflict(ino, crate::mount::ConflictSide::Remote, 0, 1).await, Err(crate::mount::FsError::Io(_))));
+        session.close(fh).await.unwrap(); q.close().await;
+    }
+
 }

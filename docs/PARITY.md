@@ -111,8 +111,8 @@ billing or plans), this page says so.
     the Swift XPC bridge and verified whole shards are accepted; no step 5 item is complete.
     Rust session RPCs share one core/feed per stable drive across mounts and observers. Remembered
     mounts pin stable IDs; local edits notify peers offline, and sessions authenticate Unix peers.
-    Publication reconciliation, full recovery, the Swift bridge and the writable mount remain
-    pending. Steps 6–10 have not started.
+    Guarded publication reconciles exact acknowledgements and retains local/remote conflicts.
+    Full recovery, the Swift bridge and the writable mount remain pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -837,7 +837,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - **Status (2026-10-04):** items 1–6 of 6 done.
 5. **Writable macOS drive** (Phase 2).
    - The ordered deliverables, adapter/bridge decisions and validation gates are in the
-     [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation, staged file-data and Rust daemon-session slices are implemented;
+     [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation,
+     staged file-data, Rust daemon-session and guarded-publication slices are implemented;
      no writable adapter exists yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
@@ -874,9 +875,13 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      never revives discarded bytes. Frozen snapshots enter the existing guarded queue, and files
      that stay open also flush after two seconds without writes. A 256 MiB default local reserve
      refuses further staging with `ENOSPC`; configuration supplies an injectable free-space check.
-     Unlinked handles retain their local bytes without publishing later changes. Queued files
-     retain `saving` until slice 4 reconciles identities, overlays and final states. Mutable staging
-     logs remain retained; safe compaction and orphan cleanup are not implemented yet. Any future
+     Unlinked handles retain their local bytes without publishing later changes. Publication
+     adopts exact acknowledged identity, metadata and owned names atomically with journal completion.
+     Newer edits survive an earlier acknowledgement; clean staging detaches for fresh opens while
+     earlier handles retain their immutable local view. Guard failures retain both local and remote
+     bytes and complete xattrs; successors remain blocked, including after restart or queue
+     cancellation. Mutable staging logs remain retained; safe compaction and orphan cleanup
+     are not implemented yet. Any future
      recursive removal represented by one retained parent needs a separate addressing decision
      for its children. Bounded Rust session RPCs now run over the existing daemon socket, with
      binary data, per-consumer handle ownership/read-only policy and persisted generation
@@ -886,7 +891,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      The read-only transport/adapter may proceed alongside writable core slices after the
      snapshot/restart checks and the user's signed-bundle probe. The accepted direction is FSKit first, SMB evaluation on gate
      failure, the Rust daemon/socket with a thin Swift XPC bridge, and verified whole shards
-     until an authenticated-pieces RFC. New names use NFC; complete conflict reconciliation
+     until an authenticated-pieces RFC. New names use NFC; conflict resolution UI
      remains pending. Writes survive process crashes in staging, with disk flush on
      fsync/F_FULLFSYNC/close and separate cloud status.
 6. **Accounts and web app** (Phase 3).
