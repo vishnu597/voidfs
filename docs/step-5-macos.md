@@ -3,7 +3,8 @@
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
 5 October; local namespace changes and staged file data added 6 October; Rust daemon sessions
 and shared feeds, guarded publication and retained conflicts added 7 October; recovery and
-advertised capabilities and setting mode and mtime added 8 October. **Item 1 is complete**
+advertised capabilities, setting mode and mtime, and recognizing lost replies to edits, renames
+and attribute changes added 8 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. Item 2 has begun with the daemon's sessions. The later
@@ -840,7 +841,9 @@ can only be the put's own, and a guarded put lands right after its guard. A reco
 acknowledged and reconciled without being sent again; anything else stays a conflict, as before.
 Folder creation uses the same check. Patches, renames and deletes carry no marker, so a lost reply
 to one of them still fails closed as a conflict. Recognizing those exactly needs a marker on
-those requests, which is a protocol addition for the user to decide.
+those requests, which is a protocol addition for the user to decide. ([Lost replies](#lost-replies-to-edits-renames-and-attribute-changes-8-october)
+adds it, recognizes renames and attribute changes without one, and finds deletes were already
+accepted.)
 
 **Cleanup.**
 
@@ -1047,3 +1050,84 @@ mode and root checks, the stage view and `handle_attr`, an unguarded publish, a 
 and a write that drops the mode. Spec validation passes 55 cases / 420 steps, and the five
 credential-script tests pass. Local memory, fs and versitygw interoperability passes; boto3 is
 unavailable locally, and CI supplies it and checks MinIO and Docker Compose.
+
+### Lost replies to edits, renames and attribute changes, 8 October
+
+When the reply to a guarded mount publication is lost (a timeout, a dropped connection, a kill),
+the retry finds the guard already moved, by the request's own effect. Since slice 5 a put was
+recognized by its marker; the other mount operations were false conflicts: nothing was lost, but
+the user would have had to resolve a conflict between a save and itself. SpaceFS doesn't
+recognize its own writes either: its documentation says a retried guarded write gets `412` and
+leaves that to the caller, and its mount appears to publish unguarded, so a resent edit can
+overwrite another writer's save (docs.spacefs.com, read 8 October; not observed in the app). The
+mount now keeps its guards and recognizes its own outcome:
+
+| Operation | A retry after it landed gets | Now known by |
+| --- | --- | --- |
+| put, folder | `412` | its marker on the version right after its guard (slice 5) |
+| write, truncate (a patch) | `412` | the same: edits carry the marker now ([RFC 0005](../rfcs/0005-user-metadata-on-edits.md)) |
+| rename | `404`, or `412` if a new object took the old key | the inode's object at the destination, and a `rename` right after the guard in its history |
+| attributes, xattrs, mode, mtime | `412` | an `attrs` version right after the guard whose attributes are the guard's with this change, and the same content |
+| delete | `204` without a version | already accepted once a `HEAD` confirms the key is absent (slice 4); the recovery notes above were wrong to list it |
+
+A rename changes no content, and an attribute change none either, so another writer's identical
+change right after the guard has the same outcome and is taken as this one's. Anything else
+after the guard stays a conflict: a rename to another destination, other attributes, another
+writer's edit, or a version that inherited an earlier marker of this client's.
+
+**Markers on edits (RFC 0005, protocol draft 1, revision 9).** A write, a patch and a splice now
+accept `x-amz-meta-*` (protocol §4.1–§4.3): each header sets that user-metadata entry on the new
+version, and the others keep their values, as all of them did before. The queue sends
+`voidfs-entry: <state id>.<entry id>` on every write and patch, as on puts, and a mount edit
+whose guard fails looks for it on the version right after its guard. An edit's version thus
+carries `voidfs-entry` in its user metadata, as a put's always has, and keeps every other entry. An older server ignores
+the header, so the edit's version keeps the marker of the version before, which names another
+entry: the lost reply stays a conflict, as before, and nothing is misrecognized. The user
+approved the spec change on 8 October; the conformance case is `user-metadata-on-edits`.
+
+**A fix to slice 5: an entry whose reply was lost goes alone.** A retried run could carry more
+entries than the attempt that landed, because writes queued while the reply was outstanding
+coalesced into it, and recognizing the head's marker then took them as published unsent. A new
+file's create whose reply was lost, then a sparse edit before the retry, left the remote file
+empty and dropped the local bytes. Now an entry that may have landed is retried on its own.
+Entries that followed it in the attempt that landed are sent again on top of the recognized
+version, which changes nothing: a run of writes and truncates applied again to its own result
+leaves it as it was, at the cost of one more version in this rare case. A transient failure,
+such as a timeout, now marks the entry as possibly landed, as a stop or a restart did, and the
+mark lasts until an attempt finishes the entry rather than until the next one starts.
+
+The CLI queue shares that mark, so after a timeout its put checks the current version's marker
+before sending the bytes again, a rename that then finds its source gone counts as done (as it
+already did after a restart), and a run that timed out is retried alone. Its `412` policy is
+unchanged.
+
+**Kill points.** `patch.sent`, `rename.sent`, `attrs.sent` and `delete.sent` follow the request,
+as `publish.sent` does in a put. After a kill at each, the restart publishes once and the
+history shows the one version the operation made:
+
+| Point | After a kill there |
+| --- | --- |
+| `patch.sent` | The retried patch is known by its marker: `put`, `put`, `write`, then the mtime's `attrs` |
+| `rename.sent` | `put`, `put`, `rename`, at the new name |
+| `attrs.sent` | `put`, `put`, `attrs`, with the new mode |
+| `delete.sent` | Absent, with nothing left queued |
+
+**Limits.** The rename check reads the inode's object id from the state store, so a rename whose
+inode has no remote identity yet stays a conflict. Attributes compare exactly as the server
+spells them; a server spelling the same time or mode differently would get a conflict. A rename
+that landed and was then moved again elsewhere, before the retry, is a conflict: the object is
+not where this rename put it.
+
+Validation for lost replies: the 11 new tests and the conformance case were each seen to fail
+with their code broken: 16 breaks, 34 isolated failing runs, the lost-reply breaks three times
+each. They cover the run that grew after a lost reply, the possibly-landed mark on a timeout and
+its lasting past an inconclusive attempt, rename, attribute and patch recognition and each kill
+point, accepting any `404`, any attributes or any marker, the SDK leaving the header out, a
+server ignoring it (the conformance case fails against it, and a client facing it gets the
+conflict), the core's merge, and a delete's `404` turned into a conflict. The restored recovery
+and crash tests pass three consecutive runs. 708 workspace tests pass (9 ignored), and workspace
+clippy passes with warnings denied; one existing test now also expects the edit's marker in the
+user metadata it otherwise preserves. Spec validation passes 56 cases / 432 steps, and the five
+credential-script tests pass. Local memory, fs and versitygw interoperability passes, the new
+case included in both addressing styles; boto3 is unavailable locally, and CI supplies it and
+checks MinIO and Docker Compose.

@@ -118,8 +118,12 @@ billing or plans), this page says so.
     [advertises](step-5-macos.md#capabilities-8-october) what it doesn't support (hard links,
     exchange, cloning, cross-machine locks), refused with `ENOTSUP`, through the daemon's session
     reply too. With [mode and mtime changes](step-5-macos.md#setting-mode-and-mtime-8-october),
-    item 1, the mount core, is complete (8 October): step 5's first completed item. The Swift
-    bridge and the writable mount remain pending. Steps 6–10 have not started.
+    item 1, the mount core, is complete (8 October): step 5's first completed item. A mount
+    edit, rename or attribute change whose reply was lost is [known as its own](step-5-macos.md#lost-replies-to-edits-renames-and-attribute-changes-8-october)
+    instead of becoming a false conflict, edits by a marker that
+    [RFC 0005](../rfcs/0005-user-metadata-on-edits.md) lets them carry; SpaceFS's documentation
+    leaves that to the caller. The Swift bridge and the writable mount remain pending. Steps
+    6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -898,7 +902,9 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      A refresh keeps names with unpublished changes, so a removal elsewhere becomes a conflict
      rather than lost edits. The core advertises what it doesn't support (hard links, exchange,
      cloning, cross-machine locks), refused with `ENOTSUP`, and sets mode and mtime, which
-     completes item 1. Any future
+     completes item 1. Lost replies to mount edits, renames and attribute changes are recognized
+     exactly (RFC 0005 lets edits carry the marker), and an entry whose reply was lost is retried
+     alone. Any future
      recursive removal represented by one retained parent needs a separate addressing decision
      for its children. Bounded Rust session RPCs now run over the existing daemon socket, with
      binary data, per-consumer handle ownership/read-only policy and persisted generation

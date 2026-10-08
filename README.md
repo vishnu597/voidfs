@@ -131,8 +131,8 @@ Random session IDs are bound to verified Unix peer credentials. Guarded publicat
 exact acknowledged versions into inode identities, names and xattrs, preserving edits accepted
 during upload and snapshots held by earlier handles. Conflicts retain both versions locally,
 including complete xattrs, and keep later edits guarded. After a process kill, the next writer
-queues what was left unflushed, a put whose reply was lost is known by its marker rather than
-becoming a conflict, and staging files, frozen copies and conflict snapshots that nothing needs
+queues what was left unflushed, a put, edit, rename or attribute change whose reply was lost is
+known as its own rather than becoming a conflict, and staging files, frozen copies and conflict snapshots that nothing needs
 are removed; flushes compact overwritten staging bytes. `Session::capabilities`, also in the
 daemon's session reply, tells an adapter what to advertise: no hard links, exchange or cloning
 (refused with `ENOTSUP`), locks local to the Mac, case-sensitive NFC names and the xattr, name
@@ -141,7 +141,7 @@ item 1). The Swift XPC bridge and the FSKit
 adapter follow in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#setting-mode-and-mtime-8-october) for the current scope
+[step 5 plan](docs/step-5-macos.md#lost-replies-to-edits-renames-and-attribute-changes-8-october) for the current scope
 and decisions.
 
 ### The Rust SDK
