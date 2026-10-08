@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::{Fault, Proxy, client_for};
 use rusqlite::Connection;
-use voidfs_client::mount::{ConflictSide, FsError, Session, StagingConfig, Sync};
+use voidfs_client::mount::{ConflictSide, FsError, RenameMode, Session, StagingConfig, Sync, XattrMode};
 use voidfs_client::{ApiFetcher, Cache, CacheConfig, Connectivity, Queue, QueueConfig, Scope, Store};
-use voidfs_sdk::{Client, Config, PutOptions, ReadOptions};
+use voidfs_sdk::{AttributesUpdate, Client, Config, Preconditions, PutOptions, ReadOptions, RenameOptions};
 use voidfs_server::test_server::TestServer;
 
 fn plenty(_: &Path) -> std::io::Result<u64> { Ok(1 << 50) }
@@ -302,6 +302,141 @@ async fn a_save_whose_reply_was_lost_is_known_as_its_own() {
     assert!(f.proxy.seen().iter().filter(|r| r.starts_with("PUT /drv/new")).count() >= 2, "{:?}", f.proxy.seen());
     assert_eq!(f.remote.list_versions("drv", "new", true).await.unwrap().len(), 2, "the create and the content landed once each");
     assert_eq!(f.remote.get_object("drv", "new", ReadOptions::default()).await.unwrap().body, Bytes::from_static(b"made once"));
+}
+
+/// A fixture whose client gives up on an answer after half a second.
+async fn impatient() -> Fixture { Fixture::with(Config { timeout: Duration::from_millis(500), ..Default::default() }).await }
+
+/// Publishes with the next request's answer lost: it lands, and comes after the client gave up.
+async fn publish_losing_the_reply(f: &Fixture) {
+    f.proxy.fault(Fault::Hang(Duration::from_secs(2)));
+    f.publish().await;
+}
+
+async fn versions(f: &Fixture, key: &str) -> Vec<String> {
+    f.remote.list_versions("drv", key, true).await.unwrap().into_iter().map(|v| v.operation).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rename_whose_reply_was_lost_is_known_as_its_own() {
+    let f = impatient().await;
+    f.remote.put_object("drv", "a", Bytes::from_static(b"bytes"), PutOptions::default()).await.unwrap();
+    f.remote.put_object("drv", "dir/", Bytes::new(), PutOptions::default()).await.unwrap();
+    let ns = f.session(staging(u64::MAX)).await;
+    let root = ns.root();
+    for (from, to) in [("a", "b"), ("dir", "moved")] {
+        let before = ns.lookup(root, from).await.unwrap();
+        ns.rename(root, from, root, to, RenameMode::Exclusive).await.unwrap();
+        f.proxy.clear();
+        publish_losing_the_reply(&f).await;
+        let after = ns.lookup(root, to).await.unwrap();
+        assert_eq!((after.ino, after.sync), (before.ino, Sync::Saved), "{to}: {:?}", f.queue.status().await.unwrap().items);
+        assert!(f.proxy.seen().iter().filter(|r| r.contains("x-voidfs-rename")).count() >= 2, "{:?}", f.proxy.seen());
+        let key = if to == "moved" { "moved/" } else { to };
+        assert_eq!(versions(&f, key).await, ["put", "rename"], "{to} moved once");
+        assert!(ns.conflict(before.ino).await.unwrap().is_none());
+    }
+    assert_eq!(f.remote.get_object("drv", "b", ReadOptions::default()).await.unwrap().body, Bytes::from_static(b"bytes"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attribute_change_whose_reply_was_lost_is_known_as_its_own() {
+    let f = impatient().await;
+    f.remote.put_object("drv", "f", Bytes::from_static(b"bytes"), PutOptions::default()).await.unwrap();
+    let ns = f.session(staging(u64::MAX)).await;
+    let ino = ns.lookup(ns.root(), "f").await.unwrap().ino;
+    let then = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    ns.setattr(ino, Some(0o600), Some(then)).await.unwrap();
+    publish_losing_the_reply(&f).await;
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Saved, "{:?}", f.queue.status().await.unwrap().items);
+    let remote = f.remote.attributes("drv", "f", ReadOptions::default()).await.unwrap();
+    assert_eq!(remote.mode.as_deref(), Some("0600"));
+    assert_eq!(versions(&f, "f").await, ["put", "attrs"]);
+    ns.setxattr(ino, "user.tag", b"value", XattrMode::Create).await.unwrap();
+    publish_losing_the_reply(&f).await;
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Saved, "{:?}", f.queue.status().await.unwrap().items);
+    assert_eq!(f.remote.attributes("drv", "f", ReadOptions::default()).await.unwrap().xattrs.len(), 1);
+    assert_eq!(versions(&f, "f").await, ["put", "attrs", "attrs"]);
+    assert!(ns.conflict(ino).await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_whose_reply_was_lost_is_known_as_its_own() {
+    let f = impatient().await;
+    f.remote.put_object("drv", "f", Bytes::from_static(b"hello world"), PutOptions::default()).await.unwrap();
+    let ns = f.session(staging(u64::MAX)).await;
+    let ino = ns.lookup(ns.root(), "f").await.unwrap().ino;
+    let fh = ns.open(ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"J")).await.unwrap();
+    ns.write(fh, 6, Bytes::from_static(b"W")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    f.proxy.clear();
+    publish_losing_the_reply(&f).await;
+    assert!(f.proxy.seen().iter().filter(|r| r.contains("x-voidfs-patch")).count() >= 2, "{:?}", f.proxy.seen());
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Saved, "{:?}", f.queue.status().await.unwrap().items);
+    assert!(ns.conflict(ino).await.unwrap().is_none());
+    assert_eq!(f.remote.get_object("drv", "f", ReadOptions::default()).await.unwrap().body, Bytes::from_static(b"Jello World"));
+    assert_eq!(versions(&f, "f").await, ["put", "write", "attrs"], "the edit landed once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marker_another_writer_inherited_isnt_taken_as_an_edits_own() {
+    let f = impatient().await;
+    let ns = f.session(staging(u64::MAX)).await;
+    let ino = new_file(&ns, "n", b"made here").await;
+    f.publish().await;
+    let marked = f.remote.head_object("drv", "n", ReadOptions::default()).await.unwrap().metadata;
+    assert!(marked.contains_key("voidfs-entry"), "the put carries its marker");
+    let fh = ns.open(ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"M")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    // Another writer's edit right after the guard carries the put's marker over, not the edit's.
+    let current = f.remote.head_object("drv", "n", ReadOptions::default()).await.unwrap().version_id;
+    f.remote.write_at("drv", "n", 0, Bytes::from_static(b"X"), voidfs_sdk::WriteOptions { if_version: Some(current), ..Default::default() }).await.unwrap();
+    assert_eq!(f.remote.head_object("drv", "n", ReadOptions::default()).await.unwrap().metadata, marked);
+    f.publish().await;
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Conflict);
+    assert_eq!(f.remote.get_object("drv", "n", ReadOptions::default()).await.unwrap().body, Bytes::from_static(b"Xade here"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_whose_reply_was_lost_is_no_conflict() {
+    let f = impatient().await;
+    f.remote.put_object("drv", "gone", Bytes::from_static(b"bytes"), PutOptions::default()).await.unwrap();
+    let ns = f.session(staging(u64::MAX)).await;
+    let ino = ns.lookup(ns.root(), "gone").await.unwrap().ino;
+    ns.unlink(ns.root(), "gone").await.unwrap();
+    publish_losing_the_reply(&f).await;
+    assert!(f.queue.status().await.unwrap().items.iter().all(|i| i.state == voidfs_client::State::Done), "{:?}", f.queue.status().await.unwrap().items);
+    assert!(ns.conflict(ino).await.unwrap().is_none());
+    assert_eq!(ns.lookup(ns.root(), "gone").await.unwrap_err(), FsError::NotFound);
+    assert_eq!(f.remote.head_object("drv", "gone", ReadOptions::default()).await.unwrap_err().status(), Some(404));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_writers_change_after_the_guard_stays_a_conflict() {
+    let f = impatient().await;
+    for key in ["a", "f", "g"] { f.remote.put_object("drv", key, Bytes::from_static(b"bytes"), PutOptions::default()).await.unwrap(); }
+    let ns = f.session(staging(u64::MAX)).await;
+    let root = ns.root();
+    let (a, file, same) = (ns.lookup(root, "a").await.unwrap().ino, ns.lookup(root, "f").await.unwrap().ino, ns.lookup(root, "g").await.unwrap().ino);
+    // Another Mac renames `a` elsewhere, and sets other attributes on `f` and the same on `g`.
+    ns.rename(root, "a", root, "b", RenameMode::Exclusive).await.unwrap();
+    ns.setattr(file, Some(0o600), None).await.unwrap();
+    ns.setattr(same, Some(0o600), None).await.unwrap();
+    f.remote.rename("drv", "a", "c", RenameOptions::default()).await.unwrap();
+    for (key, mode) in [("f", 0o700), ("g", 0o600)] {
+        let current = f.remote.head_object("drv", key, ReadOptions::default()).await.unwrap().version_id;
+        f.remote.set_attributes("drv", key, AttributesUpdate { mode: Some(mode), ..Default::default() }, Preconditions::if_version(current)).await.unwrap();
+    }
+    f.publish().await;
+    assert_eq!(ns.getattr(a).await.unwrap().sync, Sync::Conflict, "a rename to another destination isn't this one");
+    assert_eq!(f.remote.head_object("drv", "b", ReadOptions::default()).await.unwrap_err().status(), Some(404));
+    assert_eq!(ns.getattr(file).await.unwrap().sync, Sync::Conflict, "other attributes are another writer's change");
+    assert_eq!(f.remote.attributes("drv", "f", ReadOptions::default()).await.unwrap().mode.as_deref(), Some("0700"));
+    let same = ns.getattr(same).await.unwrap();
+    assert_eq!((same.sync, same.mode), (Sync::Saved, 0o600), "the same attributes are the same outcome");
+    assert_eq!(versions(&f, "g").await, ["put", "attrs"]);
 }
 
 async fn until(what: &str, mut ok: impl AsyncFnMut() -> bool) {

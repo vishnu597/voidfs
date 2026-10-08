@@ -651,9 +651,10 @@ async fn full_writes_preserve_remote_and_local_extended_attributes() {
     ns.write(local_fh, 0, Bytes::from_static(b"new local bytes")).await.unwrap();
     ns.fsync(local_fh).await.unwrap();
     f.publish().await;
-    let after = f.remote.attributes("drv", "remote", Default::default()).await.unwrap();
+    let mut after = f.remote.attributes("drv", "remote", Default::default()).await.unwrap();
+    assert!(after.meta.remove("voidfs-entry").is_some(), "the edit carries its entry's marker, as a put does");
     assert_eq!((after.xattrs.clone(), after.flags, after.content_type, after.meta),
-        (before.xattrs.clone(), before.flags, before.content_type, before.meta));
+        (before.xattrs.clone(), before.flags, before.content_type, before.meta), "and keeps everything else");
     let published_local = f.remote.attributes("drv", "local", Default::default()).await.unwrap();
     assert_eq!(published_local.xattrs, before.xattrs);
     assert_eq!(f.body("remote").await, Some(Bytes::from_static(b"fully rewritten remote bytes")));
