@@ -732,7 +732,11 @@ async fn quiet_period_publishes_open_files_after_the_last_write() {
         assert!(tokio::time::Instant::now() < deadline, "quiet-period staging was never queued");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(ns.handle_attr(fh).unwrap().sync, Sync::Saving);
+    // The flush commits its entries, then updates the file's attributes in memory.
+    while ns.handle_attr(fh).unwrap().sync != Sync::Saving {
+        assert!(tokio::time::Instant::now() < deadline, "a queued quiet-period flush never reported saving");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     f.publish().await;
     assert_eq!(f.body("file").await, Some(Bytes::from_static(b"final56789ab")));
     assert_eq!(ns.read(fh, 0, u64::MAX).await.unwrap(), Bytes::from_static(b"final56789ab"));
