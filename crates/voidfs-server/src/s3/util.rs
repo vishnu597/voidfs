@@ -109,17 +109,20 @@ impl Ctx {
         Ok(a)
     }
 
+    /// User metadata from the `x-amz-meta-*` headers.
+    pub fn user_meta(&self) -> BTreeMap<String, String> {
+        self.headers.iter().filter_map(|(name, value)| {
+            name.as_str().strip_prefix("x-amz-meta-").map(|m| (m.to_owned(), value.to_str().unwrap_or_default().to_owned()))
+        }).collect()
+    }
+
     /// Attributes for a new object from the request headers.
     pub fn attrs_for_put(&self) -> Result<Attrs, S3Error> {
         let mut a = Attrs::default();
         if let Some(ct) = self.header("content-type") {
             a.content_type = Some(ct.to_owned());
         }
-        for (name, value) in &self.headers {
-            if let Some(m) = name.as_str().strip_prefix("x-amz-meta-") {
-                a.meta.insert(m.to_owned(), value.to_str().unwrap_or_default().to_owned());
-            }
-        }
+        a.meta = self.user_meta();
         let p = self.attrs_patch()?;
         a.mtime = p.mtime;
         a.mode = p.mode;

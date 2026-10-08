@@ -707,7 +707,8 @@ fn edit_range(edit: &Edit, size: u64) -> Vec<(u64, u64)> {
 async fn run_edit(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, edit: Edit, size: Option<u64>) -> Result<Response, S3Error> {
     let key = ctx.key().to_owned();
     let pre = ctx.precondition();
-    let patch = ctx.attrs_patch()?;
+    let mut patch = ctx.attrs_patch()?;
+    patch.meta_set = ctx.user_meta();
     let actor = ctx.actor();
     let create = matches!(edit, Edit::Write { .. });
     for _ in 0..8 {
@@ -885,6 +886,7 @@ async fn post_attrs(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Re
         xattrs_set: x.set,
         xattrs_remove: x.remove,
         flags: b.flags,
+        ..Default::default()
     };
     let key = ctx.key().to_owned();
     let pre = ctx.precondition();
@@ -1695,6 +1697,31 @@ mod tests {
 
     /// An edit whose result is at most 4,096 bytes is held in the descriptor, with no shard
     /// uploaded; one that grows past it gets shards; content of zeros alone stays zeros.
+    #[tokio::test]
+    async fn edits_set_the_user_metadata_they_name_and_keep_the_rest() {
+        let mem = Arc::new(MemStore::new(crate::clock::Clock::System));
+        let (app, _d) = app_with(&mem, &[]).await;
+        let meta = |r: &Response| {
+            let mut m: Vec<(String, String)> = r.headers().iter().filter_map(|(k, v)| k.as_str().strip_prefix("x-amz-meta-").map(|k| (k.to_owned(), v.to_str().unwrap().to_owned()))).collect();
+            m.sort();
+            m
+        };
+        let pairs = |p: &[(&str, &str)]| p.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect::<Vec<_>>();
+        send(&app, Method::PUT, "f", "", &[("x-amz-meta-colour", "blue"), ("x-amz-meta-entry", "one")], b"hello").await;
+        send(&app, Method::PUT, "f", "x-voidfs-write", &[("x-voidfs-offset", "0"), ("x-amz-meta-entry", "two")], b"J").await;
+        assert_eq!(meta(&send(&app, Method::HEAD, "f", "", &[], b"").await), pairs(&[("colour", "blue"), ("entry", "two")]));
+        let patch = voidfs_core::patch::encode(&[voidfs_core::patch::Edit { offset: 1, data: b"E" }]);
+        send(&app, Method::POST, "f", "x-voidfs-patch", &[("x-amz-meta-entry", "three")], &patch).await;
+        assert_eq!(meta(&send(&app, Method::HEAD, "f", "", &[], b"").await), pairs(&[("colour", "blue"), ("entry", "three")]));
+        send(&app, Method::PUT, "f", "x-voidfs-write", &[("x-voidfs-offset", "5")], b"!").await;
+        assert_eq!(meta(&send(&app, Method::HEAD, "f", "", &[], b"").await), pairs(&[("colour", "blue"), ("entry", "three")]), "no headers, no change");
+        send(&app, Method::PUT, "f", "x-voidfs-splice", &[("x-voidfs-offset", "0"), ("x-amz-meta-entry", "four")], b">").await;
+        assert_eq!(meta(&send(&app, Method::HEAD, "f", "", &[], b"").await), pairs(&[("colour", "blue"), ("entry", "four")]));
+        assert_eq!(read_back(&app, "f").await, b">JEllo!");
+        send(&app, Method::PUT, "g", "x-voidfs-write", &[("x-voidfs-offset", "0"), ("x-amz-meta-entry", "new")], b"x").await;
+        assert_eq!(meta(&send(&app, Method::HEAD, "g", "", &[], b"").await), pairs(&[("entry", "new")]), "a write that creates the object");
+    }
+
     #[tokio::test]
     async fn edits_hold_small_results_in_the_descriptor() {
         let mem = Arc::new(MemStore::new(crate::clock::Clock::System));

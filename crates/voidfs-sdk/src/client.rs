@@ -680,13 +680,16 @@ impl Client {
     /// `offset` if it is absent and unguarded (§4.1).
     pub async fn write_at(&self, drive: &str, key: &str, offset: u64, data: impl Into<Bytes>, opts: WriteOptions) -> Result<WriteResult> {
         require("key", key)?;
-        let req = Req::new(Method::PUT, object_path(drive, key))
+        let mut req = Req::new(Method::PUT, object_path(drive, key))
             .query("x-voidfs-write", "")
             .header("x-voidfs-offset", offset.to_string())
             .header_opt("x-voidfs-size", opts.size.map(|s| s.to_string()))
             .guard(opts.if_version.as_ref(), opts.if_match.as_ref())
             .attrs(opts.mtime.as_ref(), opts.mode)
             .body(data);
+        for (k, v) in &opts.metadata {
+            req = req.header(&format!("x-amz-meta-{k}"), v.clone());
+        }
         self.execute(req).await?.write_result()
     }
 
@@ -707,13 +710,16 @@ impl Client {
     /// Sends an encoded `application/vnd.voidfs.patch` body as it is.
     pub async fn raw_patch(&self, drive: &str, key: &str, body: impl Into<Bytes>, opts: WriteOptions) -> Result<WriteResult> {
         require("key", key)?;
-        let req = Req::new(Method::POST, object_path(drive, key))
+        let mut req = Req::new(Method::POST, object_path(drive, key))
             .query("x-voidfs-patch", "")
             .header("content-type", "application/vnd.voidfs.patch")
             .header_opt("x-voidfs-size", opts.size.map(|s| s.to_string()))
             .guard(opts.if_version.as_ref(), opts.if_match.as_ref())
             .attrs(opts.mtime.as_ref(), opts.mode)
             .body(body);
+        for (k, v) in &opts.metadata {
+            req = req.header(&format!("x-amz-meta-{k}"), v.clone());
+        }
         self.execute(req).await?.write_result()
     }
 

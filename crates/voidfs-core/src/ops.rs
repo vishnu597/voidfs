@@ -68,6 +68,9 @@ pub struct AttrsPatch {
     pub xattrs_set: BTreeMap<String, String>,
     pub xattrs_remove: Vec<String>,
     pub flags: Option<Vec<String>>,
+    /// User-metadata entries to set (`x-amz-meta-*` on an edit, protocol §4.1–§4.3); the others
+    /// keep their values.
+    pub meta_set: BTreeMap<String, String>,
 }
 
 impl AttrsPatch {
@@ -108,6 +111,7 @@ impl AttrsPatch {
         if let Some(f) = &self.flags {
             a.flags = f.clone();
         }
+        a.meta.extend(self.meta_set.iter().map(|(name, value)| (name.clone(), value.clone())));
         Ok(a)
     }
 }
@@ -744,5 +748,15 @@ mod tests {
         let mut bad = AttrsPatch::default();
         bad.xattrs_set.insert("user.bad".into(), "not base64!".into());
         assert!(matches!(set_attrs(&d.state, "a.txt", &bad, &pre, &actor()), Err(OpError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn user_metadata_on_an_edit_sets_its_entries_and_keeps_the_others() {
+        let base = Attrs { meta: BTreeMap::from([("colour".into(), "blue".into()), ("entry".into(), "one".into())]), ..Default::default() };
+        let p = AttrsPatch { meta_set: BTreeMap::from([("entry".into(), "two".into())]), ..Default::default() };
+        assert!(!p.is_empty());
+        assert_eq!(p.apply(&base).unwrap().meta, BTreeMap::from([("colour".into(), "blue".into()), ("entry".into(), "two".into())]));
+        assert_eq!(p.apply(&Attrs::default()).unwrap().meta, BTreeMap::from([("entry".into(), "two".into())]), "an object a write creates");
+        assert_eq!(AttrsPatch::default().apply(&base).unwrap().meta, base.meta, "no headers, no change");
     }
 }
