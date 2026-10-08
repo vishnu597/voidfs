@@ -304,6 +304,60 @@ async fn a_save_whose_reply_was_lost_is_known_as_its_own() {
     assert_eq!(f.remote.get_object("drv", "new", ReadOptions::default()).await.unwrap().body, Bytes::from_static(b"made once"));
 }
 
+async fn until(what: &str, mut ok: impl AsyncFnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !ok().await { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }).await.expect(what);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn edits_queued_after_a_lost_reply_are_still_sent() {
+    let f = Fixture::with(Config { timeout: Duration::from_millis(500), ..Default::default() }).await;
+    let ns = f.session(staging(u64::MAX)).await;
+    let ino = ns.create(ns.root(), "new", 0o644).await.unwrap().ino;
+    // The create's put lands, and the client stops before its answer comes.
+    f.proxy.fault(Fault::Hang(Duration::from_secs(3)));
+    f.queue.resume(Scope::All).await.unwrap();
+    until("the create lands", async || f.remote.list_versions("drv", "new", true).await.is_ok_and(|v| v.len() == 1)).await;
+    f.queue.pause(Scope::All).await.unwrap();
+    // A sparse edit before the retry flushes as writes after the create, which a retry could carry.
+    let fh = ns.open(ino, true).await.unwrap();
+    ns.write(fh, 4, Bytes::from_static(b"late")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    f.publish().await;
+    assert_eq!(f.remote.get_object("drv", "new", ReadOptions::default()).await.unwrap().body, Bytes::from_static(b"\0\0\0\0late"),
+        "the edits queued after the lost reply are sent, not taken as published with it");
+    let attr = ns.getattr(ino).await.unwrap();
+    assert_eq!((attr.sync, attr.size), (Sync::Saved, 8));
+    let fh = ns.open(ino, false).await.unwrap();
+    assert_eq!(ns.read(fh, 0, 64).await.unwrap(), Bytes::from_static(b"\0\0\0\0late"));
+    ns.close(fh).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_reply_stays_possibly_landed_until_an_attempt_settles_it() {
+    let mut f = Fixture::with(Config { timeout: Duration::from_millis(500), max_attempts: 1, ..Default::default() }).await;
+    f.queue.close().await;
+    f.queue = Queue::open(f.store.clone(), f.client.clone(), QueueConfig { retry_max: Duration::from_secs(30), ..Default::default() }).await.unwrap();
+    f.queue.pause(Scope::All).await.unwrap();
+    let ns = f.session(staging(u64::MAX)).await;
+    let ino = ns.create(ns.root(), "new", 0o644).await.unwrap().ino;
+    // The create lands and its answer is lost; the SDK's retry gets 412, and reading the history
+    // to find out fails, first for a while, then for good.
+    for fault in [Fault::Hang(Duration::from_secs(3)), Fault::Pass, Fault::Status(503), Fault::Status(400)] { f.proxy.fault(fault); }
+    f.queue.resume(Scope::All).await.unwrap();
+    f.queue.settle().await;
+    assert_eq!(f.remote.list_versions("drv", "new", true).await.unwrap().len(), 1, "the create landed");
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Error, "{:?}", f.proxy.seen());
+    f.queue.pause(Scope::All).await.unwrap();
+    let fh = ns.open(ino, true).await.unwrap();
+    ns.write(fh, 4, Bytes::from_static(b"late")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    f.publish().await;
+    assert_eq!(f.remote.get_object("drv", "new", ReadOptions::default()).await.unwrap().body, Bytes::from_static(b"\0\0\0\0late"));
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Saved);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unlinked_files_stage_goes_with_its_last_handle_or_a_restart() {
     let f = Fixture::new().await;

@@ -160,7 +160,7 @@ struct QState {
     runs: usize,
     retry_at: HashMap<EntryId, Instant>,
     attempts: HashMap<EntryId, u32>,
-    /// Entries that were being sent when the client last stopped.
+    /// Entries that were being sent when the client last stopped, or whose answer was lost.
     may_have_landed: HashSet<EntryId>,
     paused_all: bool,
     paused_drives: BTreeSet<String>,
@@ -914,7 +914,8 @@ impl Queue {
                         st.running.insert(e.id, r.clone());
                     }
                     st.runs += 1;
-                    let may_have_landed = st.may_have_landed.remove(&run[0].id);
+                    // Kept until an attempt finishes the entry: one that fails may not have found out.
+                    let may_have_landed = st.may_have_landed.contains(&run[0].id);
                     let this = self.clone();
                     tasks.spawn(async move { this.run(run, r, may_have_landed).await });
                 }
@@ -968,8 +969,11 @@ impl Queue {
             }
             let mut run = vec![e.clone()];
             taken.insert(*id);
-            // A put takes the writes after it, writes take the writes after them.
-            if matches!(e.op, Op::Put | Op::Write | Op::Truncate) && (e.op != Op::Put || e.size < self.0.cfg.multipart_from) {
+            // A put takes the writes after it, writes take the writes after them. An entry that
+            // may have landed goes alone: its attempt may have carried fewer entries than are
+            // queued now, and recognizing what landed must not take the rest as published.
+            let alone = st.may_have_landed.contains(id);
+            if !alone && matches!(e.op, Op::Put | Op::Write | Op::Truncate) && (e.op != Op::Put || e.size < self.0.cfg.multipart_from) {
                 let patch = e.op != Op::Put;
                 let mut body = e.size.saturating_add(if patch { 12 + if e.op == Op::Write { 16 } else { 0 } } else { 0 });
                 let mut logical = e.size;
@@ -1320,6 +1324,8 @@ impl Queue {
         for e in &run { st.running.remove(&e.id); st.cancelled.remove(&e.id); }
         if let Outcome::Failed { transient, .. } = &outcome {
             let id = run[0].id;
+            // A timeout or a lost connection may have followed a request that landed.
+            if *transient { st.may_have_landed.insert(id); }
             let n = st.attempts.entry(id).or_insert(0);
             *n += 1;
             if *transient {
@@ -1332,7 +1338,7 @@ impl Queue {
         for e in entries {
             if e.state == State::Queued && matches!(outcome, Outcome::Stopped(_)) { st.may_have_landed.insert(e.id); }
             if !e.state.finished() { st.pending.insert(e.id, e); continue; }
-            st.pending.remove(&e.id); st.attempts.remove(&e.id); st.retry_at.remove(&e.id);
+            st.pending.remove(&e.id); st.attempts.remove(&e.id); st.retry_at.remove(&e.id); st.may_have_landed.remove(&e.id);
             if e.staged && let Some(p) = &e.source { let _ = std::fs::remove_file(p); }
             if e.state == State::Cancelled && let Some(id) = &e.upload_id {
                 let (client, drive, key, id) = (self.0.client.clone(), e.drive.clone(), e.key.clone(), id.clone());

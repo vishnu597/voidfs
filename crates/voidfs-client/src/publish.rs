@@ -135,7 +135,7 @@ pub(crate) struct Ctx {
     pub stop: Stop,
     /// Bytes sent, for progress.
     pub sent: Arc<AtomicU64>,
-    /// The put's entry was being sent when the client stopped: it may have landed.
+    /// The entry was being sent when the client stopped, or its answer was lost: it may have landed.
     pub may_have_landed: bool,
     /// The multipart upload the entry has open, which the queue keeps with the entry.
     pub upload_id: Arc<std::sync::Mutex<Option<String>>>,
