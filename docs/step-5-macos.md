@@ -443,7 +443,7 @@ and time budgets, sequence churn, and same-key termination. No step 5 item is co
 
 `Session::new_writable` receives the daemon's existing `Queue` and requires the same `Store`.
 It adds exclusive empty-file `create`, `mkdir`, `unlink`, empty-directory `rmdir`, and `rename`
-with replacement or exclusivity. Exchange returns `EOPNOTSUPP`. This slice covers namespace
+with replacement or exclusivity. Exchange returns `ENOTSUP`. This slice covers namespace
 mutations; staged file data is described below. The existing constructor keeps a read-only namespace.
 Each acknowledged edit changes the overlay, inode metadata and guarded journal entries in one
 SQLite `FULL` transaction. The queue installs that committed work before waking its publisher.
@@ -472,7 +472,7 @@ CLI queue retains its existing policy. Referenced lineage survives clearing fini
 Mount queue dependencies also compare NFC spellings, so removing a decomposed remote name
 finishes before publishing a replacement at its NFC spelling.
 Folder listings that omit a version require an identity-checked attributes lookup to bind one
-before mutation; a folder whose attributes supply no version returns `EOPNOTSUPP` rather than
+before mutation; a folder whose attributes supply no version returns `ENOTSUP` rather than
 publish without a guard.
 
 Rename replacement is atomic locally. The current wire rename guards only its source, so remote

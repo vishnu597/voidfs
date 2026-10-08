@@ -102,12 +102,12 @@ pub enum FsError {
 }
 
 impl FsError {
-    /// Native errno constants, including platforms where ESTALE/EOPNOTSUPP differ.
+    /// Native errno constants, including platforms where ESTALE/ENOTSUP differ.
     pub fn errno(&self) -> i32 {
         match self {
             Self::NotFound => libc::ENOENT, Self::Exists => libc::EEXIST, Self::NotEmpty => libc::ENOTEMPTY,
             Self::IsDir => libc::EISDIR, Self::NotDir => libc::ENOTDIR, Self::NoSpace => libc::ENOSPC,
-            Self::ReadOnly => libc::EROFS, Self::Unsupported => libc::EOPNOTSUPP, Self::Stale => libc::ESTALE,
+            Self::ReadOnly => libc::EROFS, Self::Unsupported => libc::ENOTSUP, Self::Stale => libc::ESTALE,
             Self::Offline => libc::ENETDOWN, Self::Permission => libc::EACCES, Self::InvalidName => libc::EINVAL,
             Self::InvalidArgument => libc::EINVAL, Self::TooLarge => libc::E2BIG,
             Self::NoAttr => {
@@ -1053,7 +1053,7 @@ mod tests {
     fn filesystem_errors_use_native_errno_and_preserve_disk_full() {
         for (e, errno) in [(FsError::NotFound, libc::ENOENT), (FsError::Exists, libc::EEXIST), (FsError::NotEmpty, libc::ENOTEMPTY),
             (FsError::IsDir, libc::EISDIR), (FsError::NotDir, libc::ENOTDIR), (FsError::NoSpace, libc::ENOSPC),
-            (FsError::ReadOnly, libc::EROFS), (FsError::Unsupported, libc::EOPNOTSUPP), (FsError::Stale, libc::ESTALE),
+            (FsError::ReadOnly, libc::EROFS), (FsError::Unsupported, libc::ENOTSUP), (FsError::Stale, libc::ESTALE),
             (FsError::Offline, libc::ENETDOWN), (FsError::Permission, libc::EACCES), (FsError::InvalidName, libc::EINVAL),
             (FsError::Ambiguous, libc::EILSEQ), (FsError::Again, libc::EAGAIN), (FsError::Io("test".into()), libc::EIO)] {
             assert_eq!(e.errno(), errno);
