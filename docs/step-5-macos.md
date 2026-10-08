@@ -3,9 +3,10 @@
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
 5 October; local namespace changes and staged file data added 6 October; Rust daemon sessions
 and shared feeds, guarded publication and retained conflicts added 7 October; recovery and
-advertised capabilities added 8 October. Items 1 and 2 have begun with the Rust mount namespace,
-snapshot handles, durable namespace mutations, staged writes, publication reconciliation and
-recovery; item 1 lacks only setting mode and mtime ([capabilities](#capabilities-8-october)). The later
+advertised capabilities and setting mode and mtime added 8 October. **Item 1 is complete**
+([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
+durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
+capabilities and attribute changes. Item 2 has begun with the daemon's sessions. The later
 deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
@@ -91,6 +92,9 @@ not proof of macOS client behavior or a suitable Rust implementation. That proof
 ## 2. Ordered deliverables
 
 ### Item 1. The mount core and local filesystem contract
+
+**Complete, 8 October:** every bullet and the done-when are met; the evidence is in
+[capabilities](#capabilities-8-october) and [setting mode and mtime](#setting-mode-and-mtime-8-october).
 
 Build the adapter-independent mount session in `voidfs-client`, reused by `voidfs-daemon`.
 
@@ -981,14 +985,15 @@ also returns `ENOTSUP` now.
 - Symbolic-link creation, sparse files and volume sizes aren't advertised yet. The adapter items
   add what FSKit needs as further fields, which older readers ignore.
 
-**Item 1 against its bullets.** Item 1 is still not complete: the core can't set the mode or the
-modification time of an existing file or folder.
+**Item 1 against its bullets.** Item 1 was not yet complete here: the core couldn't set the mode
+or the modification time of an existing file or folder. [Setting mode and mtime](#setting-mode-and-mtime-8-october)
+adds that, and item 1 is complete.
 
 | Item 1 asks for | Where it is |
 | --- | --- |
 | Stable inodes, a persisted overlay, explicit directories, NFC names with equivalent lookups, case-sensitive collisions, byte-exact remote names, ambiguity rejected, handle identity kept through rename and open-unlink | [Namespace](#namespace-slice-5-october), [local namespace changes](#local-namespace-changes-6-october); `tests/mount.rs`, `mount_mutations.rs`, `mount_writes.rs` (`open_unlink_keeps_local_reads_and_writes_without_publishing_after_close`) |
 | Open, close, lookup, enumeration, getattr, read, write, truncate, rename-over, remove, mkdir and xattrs with one error mapping | `Session` and `FsError::errno`; `mount_reads.rs`, `mount_writes.rs`, `mount_mutations.rs`, `mount_xattrs.rs` |
-| Setting attributes (`chmod`, `utimes`, `setattrlist`) | **Not met.** `create` and `mkdir` take a mode and writes set the mtime, but no call changes either afterwards, so `chmod`, `touch -t`, `cp -p` and a Finder copy keeping its date can't be served. The queue's `Op::Attrs` already publishes mode and mtime under a guard, so the missing piece is a `Session::setattr` that records them |
+| Setting attributes (`chmod`, `utimes`, `setattrlist`) | Not met by this slice: `create` and `mkdir` took a mode and writes set the mtime, but no call changed either afterwards. Met by [setting mode and mtime](#setting-mode-and-mtime-8-october): `Session::setattr` and `setattr_*` in `mount_mutations.rs` |
 | Unsupported hard links, exchange, cloning and cross-machine locks advertised and tested | This section; `advertised_capabilities_match_what_the_core_does`, `a_read_only_core_advertises_the_same_and_refuses_links_as_read_only`, `capabilities_reach_the_socket_with_unsupported_operations_marked` |
 | A read-only open binds identity, version, size and attributes and reads that version through the cache; a writable open adds its local generation | [Open handles](#open-handles-and-snapshot-reads-5-october), [staged file data](#staged-file-data-6-october) |
 | Every acknowledged mutation durable with its journal; data kept for open handles; the overlay rebuilt after restart | [Staged file data](#staged-file-data-6-october), [recovery](#recovery-8-october); `local_overlay_and_queue_survive_a_restart_and_remote_refresh` |
@@ -1003,3 +1008,42 @@ failing runs. Spec validation passes 55 cases / 420 steps, and the five credenti
 pass. Local memory, fs and versitygw interoperability passes conformance, stock S3 checks,
 aws-chunked and rclone; boto3 is unavailable locally, and CI supplies it and checks MinIO and
 Docker Compose.
+
+### Setting mode and mtime, 8 October
+
+`Session::setattr(ino, mode, mtime)` sets the permission bits and modification time of a file,
+folder or symbolic link: `chmod`, `utimes` and `setattrlist`, as `touch -t`, `cp -p`, `tar` and a
+Finder copy that keeps its date use them. It was item 1's last missing operation. Size stays with
+`truncate` on a handle. No protocol, format or server behavior changes: the queue's `attrs`
+entries already published mode and mtime under a guard (protocol §4.8).
+
+- The change and its guarded `attrs` entry commit in one transaction, as an xattr change does.
+  It works offline under a complete listing and survives a restart. A version another Mac made
+  after the local base turns it into a conflict that keeps the local values.
+- `None` leaves a value unchanged, and only what changes is sent: a `chmod` leaves the mtime, as
+  POSIX does. A value the inode already has queues nothing, so setting the date a file already
+  shows makes no version.
+- Times keep microseconds, as the server does, so a published time reads back equal. Years 0 to
+  9999 are accepted, those before 1970 included; others have no RFC 3339 form and return
+  `EINVAL`, as do modes above `07777`. Nothing is applied in part.
+- The drive root is refused with `ENOTSUP`, as its xattrs are: it has no object to carry them.
+  A read-only core refuses with `EROFS`, and an unlinked inode with `ESTALE`.
+- A write sets the mtime to now and keeps the mode. A later `setattr` wins until the next write,
+  and the flush publishes the inode's current mode and mtime, so a copy that sets its date before
+  closing publishes that date. Handles sharing the file's live stage see the change through
+  `handle_attr`, which now takes the mode from local state along with the size and mtime; other
+  handles keep their snapshot's attributes, as they do for remote changes. The change is recorded
+  while the stage is locked, so a cancelled caller can't leave the stage's view behind its record.
+- The daemon's socket doesn't carry it yet: namespace, xattr and attribute RPCs are item 2's.
+
+With this, every item 1 bullet in the [table above](#capabilities-8-october) and its done-when are
+met, and **item 1 is complete**: step 5's first completed item.
+
+Validation for setting mode and mtime: 697 workspace tests pass (9 ignored), and workspace clippy
+passes with warnings denied. The four new tests and the read-only test's new assertion were each
+seen to fail with their code broken: 12 breaks, 13 isolated failing runs. They cover a missing
+journal entry, a missing no-op check, unrounded and wrongly converted pre-1970 times, the year,
+mode and root checks, the stage view and `handle_attr`, an unguarded publish, a read-only core,
+and a write that drops the mode. Spec validation passes 55 cases / 420 steps, and the five
+credential-script tests pass. Local memory, fs and versitygw interoperability passes; boto3 is
+unavailable locally, and CI supplies it and checks MinIO and Docker Compose.

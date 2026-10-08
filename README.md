@@ -136,11 +136,12 @@ becoming a conflict, and staging files, frozen copies and conflict snapshots tha
 are removed; flushes compact overwritten staging bytes. `Session::capabilities`, also in the
 daemon's session reply, tells an adapter what to advertise: no hard links, exchange or cloning
 (refused with `ENOTSUP`), locks local to the Mac, case-sensitive NFC names and the xattr, name
-and path limits. The Swift XPC bridge and the FSKit
+and path limits. `Session::setattr` sets mode and mtime, which completes the mount core (step 5,
+item 1). The Swift XPC bridge and the FSKit
 adapter follow in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#capabilities-8-october) for the current scope
+[step 5 plan](docs/step-5-macos.md#setting-mode-and-mtime-8-october) for the current scope
 and decisions.
 
 ### The Rust SDK

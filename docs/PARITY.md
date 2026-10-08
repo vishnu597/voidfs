@@ -109,7 +109,7 @@ billing or plans), this page says so.
     the namespace first and a bounded fallback scan. Durable local namespace/xattr edits and
     staged file writes now share that core. Local edits are visible before upload, including to
     earlier handles; open files queue edits after two seconds without writes. FSKit first,
-    the Swift XPC bridge and verified whole shards are accepted; no step 5 item is complete.
+    the Swift XPC bridge and verified whole shards are accepted; item 1 is complete.
     Rust session RPCs share one core/feed per stable drive across mounts and observers. Remembered
     mounts pin stable IDs; local edits notify peers offline, and sessions authenticate Unix peers.
     Guarded publication reconciles exact acknowledgements and retains local/remote conflicts.
@@ -117,8 +117,9 @@ billing or plans), this page says so.
     lost put reply as its own, compacts staging and removes what nothing needs. The core
     [advertises](step-5-macos.md#capabilities-8-october) what it doesn't support (hard links,
     exchange, cloning, cross-machine locks), refused with `ENOTSUP`, through the daemon's session
-    reply too. Item 1 lacks only setting mode and mtime on existing files, so no step 5 item is
-    complete yet. The Swift bridge and the writable mount remain pending. Steps 6–10 have not started.
+    reply too. With [mode and mtime changes](step-5-macos.md#setting-mode-and-mtime-8-october),
+    item 1, the mount core, is complete (8 October): step 5's first completed item. The Swift
+    bridge and the writable mount remain pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -845,8 +846,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - The ordered deliverables, adapter/bridge decisions and validation gates are in the
      [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation,
      staged file-data, Rust daemon-session, guarded-publication and recovery slices are
-     implemented, and the core advertises its capabilities; no writable adapter exists yet.
-     Item 1 lacks only setting mode and mtime on existing files.
+     implemented, the core advertises its capabilities and sets mode and mtime, and item 1 is
+     complete; no writable adapter exists yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
@@ -863,7 +864,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
-   - **Status (2026-10-08):** items 1 and 2 begun; no completed item yet. The mount session has a
+   - **Status (2026-10-08):** item 1 of 10 done; item 2 begun. The mount session has a
      persistent namespace with stable inodes, indexed equivalent-name lookup, per-directory
      refreshes, generation invalidation and complete offline directory snapshots. Read-only
      handles bind attributes and bytes to a retained version through the shared cache, preserve
@@ -895,8 +896,9 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      points in test builds cover staging, flush, publication, reconciliation, compaction and
      conflict capture, and a seeded model test runs restarts against an in-memory filesystem.
      A refresh keeps names with unpublished changes, so a removal elsewhere becomes a conflict
-     rather than lost edits. Advertising unsupported hard links, cloning and locks to adapters
-     remains in item 1. Any future
+     rather than lost edits. The core advertises what it doesn't support (hard links, exchange,
+     cloning, cross-machine locks), refused with `ENOTSUP`, and sets mode and mtime, which
+     completes item 1. Any future
      recursive removal represented by one retained parent needs a separate addressing decision
      for its children. Bounded Rust session RPCs now run over the existing daemon socket, with
      binary data, per-consumer handle ownership/read-only policy and persisted generation
