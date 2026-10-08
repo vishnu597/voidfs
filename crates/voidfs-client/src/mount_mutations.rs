@@ -162,6 +162,16 @@ impl Session {
         Err(FsError::Again)
     }
 
+    /// Hard links are unsupported (`Capabilities::hard_links`).
+    pub async fn link(&self, _ino: Ino, _parent: Ino, _name: &str) -> Result<Attr> {
+        Err(if self.queue.is_none() { FsError::ReadOnly } else { FsError::Unsupported })
+    }
+
+    /// Cloning is unsupported (`Capabilities::clone`).
+    pub async fn clone_file(&self, _ino: Ino, _parent: Ino, _name: &str) -> Result<Attr> {
+        Err(if self.queue.is_none() { FsError::ReadOnly } else { FsError::Unsupported })
+    }
+
     /// Replaces atomically in the local view. Cloud replacement deletes the destination under
     /// its guard, then renames exclusively because the wire operation guards only the source.
     pub async fn rename(&self, from_parent: Ino, from_name: &str, to_parent: Ino, to_name: &str, how: RenameMode) -> Result<()> {

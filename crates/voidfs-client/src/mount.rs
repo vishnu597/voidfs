@@ -101,6 +101,41 @@ pub enum FsError {
     Io(String),
 }
 
+/// What the mount core supports, for an adapter to advertise (volume capabilities, `pathconf`).
+/// Calls it doesn't support fail with [`FsError::Unsupported`], `ENOTSUP` as macOS documents
+/// for `link`, `clonefile`, `renamex_np` and `exchangedata`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Capabilities {
+    /// [`Session::link`] is refused; every file has one name.
+    pub hard_links: bool,
+    /// Exchanging two names (`RENAME_SWAP`, `exchangedata`): [`RenameMode::Swap`] is refused.
+    pub exchange: bool,
+    /// `RENAME_EXCL`: [`RenameMode::Exclusive`].
+    pub exclusive_rename: bool,
+    /// [`Session::clone_file`] (`clonefile`) is refused.
+    pub clone: bool,
+    pub locks: Locks,
+    pub case_sensitive: bool,
+    /// New names are stored NFC, and a lookup finds a name by any equivalent spelling unless
+    /// two names normalize alike (`EILSEQ`). Existing remote names stay byte-exact.
+    pub nfc_names: bool,
+    /// Inode numbers survive restarts, renames and new versions.
+    pub persistent_ids: bool,
+    pub xattrs: bool,
+    /// An object's xattr names and values together.
+    pub max_xattr_bytes: u64,
+    pub max_name_bytes: u32,
+    /// A file's path from the drive root, or a folder's with its trailing slash.
+    pub max_path_bytes: u32,
+}
+
+/// The core has no lock calls. `Local`: an adapter grants `flock` and `fcntl` locks within this
+/// Mac (FSKit's kernel does), and no other machine sees them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Locks { Local }
+
 impl FsError {
     /// Native errno constants, including platforms where ESTALE/ENOTSUP differ.
     pub fn errno(&self) -> i32 {
@@ -428,6 +463,13 @@ impl Session {
 
     /// Durable session epoch for adapters' reconnect handshakes. Handles use its high 32 bits.
     pub fn generation(&self) -> u32 { self.generation }
+
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities { hard_links: false, exchange: false, exclusive_rename: true, clone: false, locks: Locks::Local,
+            case_sensitive: true, nfc_names: true, persistent_ids: true, xattrs: true,
+            max_xattr_bytes: voidfs_core::model::MAX_XATTR_BYTES as u64, max_name_bytes: voidfs_core::names::MAX_NAME_BYTES as u32,
+            max_path_bytes: voidfs_core::names::MAX_KEY_BYTES as u32 }
+    }
 
     async fn db<T: Send + 'static>(&self, f: impl FnOnce(&mut Connection, &str, Ino) -> rusqlite::Result<T> + Send + 'static) -> Result<T> {
         let s = self.store.clone();

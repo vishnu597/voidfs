@@ -239,7 +239,8 @@ async fn create(State(s): State<Arc<Shared>>, request: Request) -> Result<Respon
     let generation = drive.core.generation();
     let id = session_id()?;
     let info = fs::SessionInfo { version: fs::VERSION, id: id.clone(), drive: drive.drive(), root: drive.core.root(), generation,
-        metadata_generation: drive.metadata_generation(), read_only: new.read_only, max_io: fs::MAX_IO, max_entries: fs::MAX_ENTRIES };
+        metadata_generation: drive.metadata_generation(), read_only: new.read_only, max_io: fs::MAX_IO, max_entries: fs::MAX_ENTRIES,
+        capabilities: drive.core.capabilities() };
     let access = Arc::new(Access { owner, drive, read_only: new.read_only, handles: Mutex::new(HashMap::new()), slots: Arc::new(Semaphore::new(fs::MAX_HANDLES)),
         gate: Arc::new(RwLock::new(())), closed: watch::Sender::new(false), _slot: slot });
     {

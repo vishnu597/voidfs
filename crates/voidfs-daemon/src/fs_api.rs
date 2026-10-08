@@ -2,7 +2,7 @@
 //! Bounded filesystem calls and metadata invalidations on the daemon's Unix socket.
 
 use serde::{Deserialize, Serialize};
-use voidfs_client::mount::Attr;
+use voidfs_client::mount::{Attr, Capabilities};
 
 pub const VERSION: u32 = 1;
 pub const MAX_IO: u64 = 8 * 1024 * 1024;
@@ -31,6 +31,9 @@ pub struct SessionInfo {
     pub read_only: bool,
     pub max_io: u64,
     pub max_entries: usize,
+    /// What the drive's core supports, for the adapter to advertise. Added within version 1:
+    /// earlier readers ignore it, and this crate's client requires it.
+    pub capabilities: Capabilities,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
