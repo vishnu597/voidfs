@@ -59,6 +59,22 @@ fn entry(drive: &str, key: &str, op: Op, n: &Node) -> Result<Entry> {
     Ok(entry)
 }
 
+/// RFC 3339 with microseconds, as the server keeps a time, for years 0 to 9999.
+fn timestamp(t: SystemTime) -> Result<(SystemTime, String)> {
+    use chrono::Datelike;
+    let (secs, nanos) = match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (i64::try_from(d.as_secs()).map_err(|_| FsError::InvalidArgument)?, d.subsec_nanos()),
+        Err(before) => {
+            let d = before.duration();
+            let secs = i64::try_from(d.as_secs()).map_err(|_| FsError::InvalidArgument)?;
+            if d.subsec_nanos() == 0 { (-secs, 0) } else { (-secs - 1, 1_000_000_000 - d.subsec_nanos()) }
+        }
+    };
+    let t = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos / 1000 * 1000)
+        .filter(|t| (0..=9999).contains(&t.year())).ok_or(FsError::InvalidArgument)?;
+    Ok((t.into(), t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)))
+}
+
 fn invalidation(key: String, folder: bool) -> Invalidation {
     if folder { Invalidation::Subtree(key) } else { Invalidation::Object(key) }
 }
@@ -170,6 +186,53 @@ impl Session {
     /// Cloning is unsupported (`Capabilities::clone`).
     pub async fn clone_file(&self, _ino: Ino, _parent: Ino, _name: &str) -> Result<Attr> {
         Err(if self.queue.is_none() { FsError::ReadOnly } else { FsError::Unsupported })
+    }
+
+    /// Sets the mode and modification time of a file, folder or symbolic link; `None` leaves
+    /// either unchanged, and a value it already has queues nothing. The change and its guarded
+    /// attributes entry commit in one transaction, as an xattr change does.
+    pub async fn setattr(&self, ino: Ino, mode: Option<u32>, mtime: Option<SystemTime>) -> Result<Attr> {
+        if self.queue.is_none() { return Err(FsError::ReadOnly); }
+        if ino == self.root { return Err(FsError::Unsupported); }
+        if mode.is_some_and(|mode| mode > 0o7777) { return Err(FsError::InvalidArgument); }
+        let mtime = mtime.map(timestamp).transpose()?;
+        for _ in 0..4 {
+            match self.prepare_mutation(ino).await { Err(FsError::Again) => continue, other => other? }
+            let (queue, local, data) = (self.queue.clone().ok_or(FsError::ReadOnly)?, self.local.clone(), self.data.clone());
+            let (drive, root, offline, mtime) = (self.drive.clone(), self.root, self.connectivity.link() == Link::Offline, mtime.clone());
+            // Owned, so that a cancelled caller can't leave a live stage's view behind its record.
+            let result = tokio::spawn(async move {
+                let _creation = data.opening().await;
+                let file = data.file(ino);
+                let _state = match &file { Some(file) => Some(file.state.clone().lock_owned().await), None => None };
+                let (attr, change) = queue.mount_transaction(move |tx| {
+                    let (mut n, key) = mutation_node(tx, &drive, root, ino, offline)?;
+                    let current = n.attr()?;
+                    let mut entry = Entry::new(&drive, &key, Op::Attrs, mutation_base(&n)?);
+                    if let Some(mode) = mode.filter(|mode| *mode != current.mode) {
+                        n.entry.mode = Some(format!("{mode:04o}"));
+                        entry.attrs.mode = Some(mode);
+                    }
+                    if let Some((_, text)) = mtime.filter(|(at, _)| *at != current.mtime) {
+                        n.entry.mtime = Some(text.clone());
+                        entry.attrs.mtime = Some(text);
+                    }
+                    if entry.attrs.mode.is_none() && entry.attrs.mtime.is_none() {
+                        return Ok(((current, LocalChange { invalidations: Vec::new(), inodes: Vec::new(), namespace: false }), vec![]));
+                    }
+                    n.generation += 1;
+                    n.sync = publication::pending(tx, ino)?;
+                    save_node(tx, &n)?;
+                    entry.mount_ino = Some(ino);
+                    Ok(((n.attr()?, notify::attribute(tx, &drive, root, ino)?), vec![entry]))
+                }).await?;
+                data.attributes_changed(ino, &attr);
+                local.send(change);
+                Ok(attr)
+            }).await.map_err(Error::from)?;
+            match result { Err(FsError::Again) => continue, other => return other }
+        }
+        Err(FsError::Again)
     }
 
     /// Replaces atomically in the local view. Cloud replacement deletes the destination under
