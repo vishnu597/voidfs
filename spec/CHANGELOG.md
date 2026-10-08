@@ -4,6 +4,18 @@ Every change to the [protocol](protocol.md), the [format](format.md) and the
 [conformance suite](conformance/) is recorded here, newest first. Drafts may change
 incompatibly; entries say when they do.
 
+## Draft 1, revision 9: user metadata on edits (2026-10-08)
+
+[RFC 0005](../rfcs/0005-user-metadata-on-edits.md). Additive: a server from before it ignores the
+headers, and a client then sees the user metadata of the version before, as it did.
+
+- **Protocol §4.1–§4.3:** a write at an offset, a batched edit and a splice accept `x-amz-meta-*`
+  headers. Each sets that user-metadata entry on the new version; entries no header names keep
+  their values, and without such headers nothing changes. A write that creates its object has
+  the headers' entries alone. A client can mark an edit as its own and, after a lost reply,
+  recognize that it landed.
+- **Conformance:** `user-metadata-on-edits`.
+
 ## Draft 1, revision 8: storage credentials read the pool's descriptor (2026-10-04)
 
 Step 4, item 6. Additive: a reader with storage credentials can now check the pool before reading
