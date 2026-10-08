@@ -31,11 +31,14 @@ pub struct StagingConfig {
     pub min_free_bytes: u64,
     pub free_space: Option<fn(&Path) -> io::Result<u64>>,
     pub quiet_period: Option<Duration>,
+    /// A flush rewrites a staging file without its overwritten bytes once they exceed both this
+    /// and the bytes still in use.
+    pub compact_garbage: u64,
 }
 
 impl Default for StagingConfig {
     fn default() -> Self {
-        Self { min_free_bytes: 256 * 1024 * 1024, free_space: None, quiet_period: Some(Duration::from_secs(2)) }
+        Self { min_free_bytes: 256 * 1024 * 1024, free_space: None, quiet_period: Some(Duration::from_secs(2)), compact_garbage: 64 * 1024 * 1024 }
     }
 }
 
@@ -55,8 +58,16 @@ pub(crate) struct Record {
     pub flushed: u64,
 }
 
+/// A retired stage's bytes belong to no record any more: its file goes with the last handle
+/// that still reads it.
 #[derive(Debug)]
-pub(crate) struct Stage { pub path: PathBuf, pub record: Record }
+pub(crate) struct Stage { pub path: PathBuf, pub record: Record, pub retired: bool }
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        if self.retired { let _ = std::fs::remove_file(&self.path); }
+    }
+}
 
 fn io_error(error: io::Error) -> FsError { Error::from(error).into() }
 
@@ -109,33 +120,84 @@ pub(crate) fn read_range(path: &Path, physical: u64, len: u64) -> Result<Vec<u8>
     Ok(bytes)
 }
 
-pub(crate) fn load_all(store: &Store, drive: &str) -> Result<HashMap<Ino, Stage>> {
+/// Inodes whose stage can't be used, and why.
+pub(crate) type Damaged = Vec<(Ino, String)>;
+
+/// The drive's stages, and the inodes whose stage can't be used because its record and file
+/// disagree: a power failure can lose bytes a write acknowledged before any fsync, while a later
+/// commit made their record durable. The rest of the drive stays usable.
+pub(crate) fn load(store: &Store, drive: &str) -> Result<(HashMap<Ino, Stage>, Damaged)> {
     let rows = store.with(|c| {
         let mut q = c.prepare("SELECT s.ino, s.path, s.record FROM mount_staged s JOIN mount_inodes n ON n.ino=s.ino WHERE n.drive=?1")?;
         q.query_map([drive], |r| Ok((r.get::<_, Ino>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()
     })?;
-    let mut stages = HashMap::new();
+    let (mut stages, mut damaged) = (HashMap::new(), Vec::new());
     for (ino, path, json) in rows {
-        let record: Record = serde_json::from_str(&json).map_err(|e| FsError::Io(e.to_string()))?;
-        let path = PathBuf::from(path);
-        if record.base.ino != ino || !path.starts_with(store.dir().join("mount-stage")) || record.remote_size > record.base.size || record.remote_size > record.size || record.flushed > record.revision {
-            return Err(FsError::Io("invalid staged file record".into()));
+        match check(store, ino, &path, &json) {
+            Ok(stage) => { stages.insert(ino, stage); }
+            Err(error) => damaged.push((ino, error.to_string())),
         }
-        bounds(record.size, 0)?;
-        let length = std::fs::metadata(&path).map_err(io_error)?.len();
-        let mut previous = 0;
-        for extent in &record.extents {
-            if extent.start < previous || extent.start >= extent.end || extent.end > record.size || bounds(extent.physical, extent.end - extent.start)? > length {
-                return Err(FsError::Io("invalid staged file extent".into()));
-            }
-            previous = extent.end;
-        }
-        for &(start, end) in &record.dirty {
-            if start >= end || end > record.size { return Err(FsError::Io("invalid staged dirty range".into())); }
-        }
-        stages.insert(ino, Stage { path, record });
     }
-    Ok(stages)
+    Ok((stages, damaged))
+}
+
+fn check(store: &Store, ino: Ino, path: &str, json: &str) -> Result<Stage> {
+    let record: Record = serde_json::from_str(json).map_err(|e| FsError::Io(e.to_string()))?;
+    // By name in this state directory, which may be reached by another spelling than recorded.
+    let name = Path::new(path).file_name().ok_or_else(|| FsError::Io("invalid staged file path".into()))?;
+    let path = store.dir().join("mount-stage").join(name);
+    if record.base.ino != ino || record.remote_size > record.base.size || record.remote_size > record.size || record.flushed > record.revision {
+        return Err(FsError::Io("invalid staged file record".into()));
+    }
+    bounds(record.size, 0)?;
+    let length = std::fs::metadata(&path).map_err(io_error)?.len();
+    let mut previous = 0;
+    for extent in &record.extents {
+        if extent.start < previous || extent.start >= extent.end || extent.end > record.size || bounds(extent.physical, extent.end - extent.start)? > length {
+            return Err(FsError::Io("staged bytes are missing from their file".into()));
+        }
+        previous = extent.end;
+    }
+    for &(start, end) in &record.dirty {
+        if start >= end || end > record.size { return Err(FsError::Io("invalid staged dirty range".into())); }
+    }
+    Ok(Stage { path, record, retired: false })
+}
+
+#[cfg(test)]
+pub(crate) fn load_all(store: &Store, drive: &str) -> Result<HashMap<Ino, Stage>> {
+    let (stages, damaged) = load(store, drive)?;
+    match damaged.into_iter().next() { Some((_, error)) => Err(FsError::Io(error)), None => Ok(stages) }
+}
+
+/// Removes the drive's staging files that no record names: bytes a crash left between creating,
+/// compacting or publishing a stage and recording that, and assemblies of an interrupted flush.
+/// Only the drive's writer calls it, before loading its stages, so none of them is open.
+pub(crate) fn collect(store: &Store, drive: &str) -> Result<usize> {
+    let dir = store.dir().join("mount-stage");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(io_error(e)),
+    };
+    let paths = entries.map(|entry| entry.map(|entry| entry.path())).collect::<io::Result<Vec<_>>>().map_err(io_error)?;
+    let removed = store.with(|c| {
+        // By name: the state directory may be reached by another spelling than when recorded.
+        let kept = c.prepare("SELECT path FROM mount_staged")?.query_map([], |r| r.get::<_, String>(0))?
+            .map(|path| path.map(|path| PathBuf::from(path).file_name().map(|name| name.to_owned()))).collect::<rusqlite::Result<HashSet<_>>>()?;
+        let mut ours = c.prepare("SELECT 1 FROM mount_inodes WHERE ino=?1 AND drive=?2")?;
+        let mut removed = 0;
+        for path in paths {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+            let orphan = name.starts_with("snapshot-") || match name.split('-').next().and_then(|ino| ino.parse::<Ino>().ok()) {
+                Some(ino) => !kept.contains(&Some(std::ffi::OsString::from(name))) && ours.exists(params![ino, drive])?,
+                None => false,
+            };
+            if orphan && path.is_file() && std::fs::remove_file(&path).is_ok() { removed += 1; }
+        }
+        Ok(removed)
+    })?;
+    Ok(removed)
 }
 
 impl Stage {
@@ -149,7 +211,7 @@ impl Stage {
         File::options().create_new(true).write(true).open(&path).map_err(io_error)?;
         let size = base.size;
         let record = Record { base, key, size, remote_size: size, extents: Vec::new(), dirty: Vec::new(), reset: None, revision: 0, flushed: 0 };
-        Ok(Self { path, record })
+        Ok(Self { path, record, retired: false })
     }
 
     fn attr(store: &Store, drive: &str, ino: Ino) -> Result<Attr> {
@@ -196,8 +258,9 @@ impl Stage {
             let _ = file.set_len(physical);
             return Err(io_error(e));
         }
+        crate::kill::point("stage.appended");
         match self.persist(store, drive, ino, &next) {
-            Ok(attr) => { self.record = next; Ok(attr) },
+            Ok(attr) => { crate::kill::point("stage.recorded"); self.record = next; Ok(attr) },
             Err(e) => Err(e),
         }
     }
@@ -231,6 +294,62 @@ impl Stage {
         File::open(dir.parent().ok_or_else(|| FsError::Io("staging directory has no parent".into()))?).map_err(io_error)?.sync_all().map_err(io_error)
     }
 
+    /// The staging file's bytes no extent uses any more, and the bytes extents use.
+    pub fn garbage(&self) -> Result<(u64, u64)> {
+        let length = std::fs::metadata(&self.path).map_err(io_error)?.len();
+        let live = self.record.extents.iter().map(|extent| extent.end - extent.start).sum::<u64>();
+        Ok((length.saturating_sub(live), live))
+    }
+
+    /// Copies the bytes extents use to a new file, makes it the stage's durably, then removes the
+    /// old one. A crash leaves one of the two unrecorded, which [`collect`] removes. Returns
+    /// whether it compacted: a stage not yet recorded, or recorded at another file after an
+    /// uncertain commit, is left as it is.
+    pub fn compact(&mut self, store: &Store, ino: Ino, cfg: &StagingConfig) -> Result<bool> {
+        let dir = self.path.parent().ok_or_else(|| FsError::Io("staging path has no parent".into()))?.to_owned();
+        let (_, live) = self.garbage()?;
+        admit(&self.path, live, &self.record, cfg)?;
+        let mut random = [0u8; 12];
+        File::open("/dev/urandom").map_err(io_error)?.read_exact(&mut random).map_err(io_error)?;
+        let path = dir.join(format!("{ino}-{}", hex::encode(random)));
+        let mut record = self.record.clone();
+        let written = (|| {
+            let source = File::open(&self.path).map_err(io_error)?;
+            let dest = File::options().create_new(true).write(true).open(&path).map_err(io_error)?;
+            let mut buffer = vec![0u8; 1024 * 1024];
+            let (mut at, mut extents) = (0u64, Vec::<Extent>::with_capacity(record.extents.len()));
+            for extent in &record.extents {
+                let (physical, mut from, mut left) = (at, extent.physical, extent.end - extent.start);
+                while left > 0 {
+                    let n = left.min(buffer.len() as u64) as usize;
+                    source.read_exact_at(&mut buffer[..n], from).map_err(io_error)?;
+                    dest.write_all_at(&buffer[..n], at).map_err(io_error)?;
+                    (from, at, left) = (from + n as u64, at + n as u64, left - n as u64);
+                }
+                match extents.last_mut() {
+                    Some(last) if last.end == extent.start && last.physical + last.end - last.start == physical => last.end = extent.end,
+                    _ => extents.push(Extent { start: extent.start, end: extent.end, physical }),
+                }
+            }
+            dest.sync_all().map_err(io_error)?;
+            File::open(&dir).map_err(io_error)?.sync_all().map_err(io_error)?;
+            record.extents = extents;
+            serde_json::to_string(&record).map_err(|e| FsError::Io(e.to_string()))
+        })();
+        let json = match written { Ok(json) => json, Err(e) => { let _ = std::fs::remove_file(&path); return Err(e); } };
+        crate::kill::point("compact.written");
+        let (old, new) = (self.path.to_str(), path.to_str());
+        let (Some(old), Some(new)) = (old, new) else { let _ = std::fs::remove_file(&path); return Err(FsError::Io("staging path is not UTF-8".into())); };
+        // An error here may follow a commit: both files stay until the next writer collects one.
+        let updated = store.with(|c| c.execute("UPDATE mount_staged SET path=?3, record=?4 WHERE ino=?1 AND path=?2", params![ino, old, new, json]))?;
+        if updated != 1 { let _ = std::fs::remove_file(&path); return Ok(false); }
+        crate::kill::point("compact.committed");
+        let old = std::mem::replace(&mut self.path, path);
+        self.record = record;
+        let _ = std::fs::remove_file(old);
+        Ok(true)
+    }
+
     /// Reads an immutable byte range referred to by an extent's physical offset.
     #[cfg(test)]
     pub fn read_local(&self, physical: u64, len: u64) -> Result<Vec<u8>> {
@@ -244,7 +363,7 @@ mod tests {
 
     fn plenty(_: &Path) -> io::Result<u64> { Ok(u64::MAX) }
     fn empty(_: &Path) -> io::Result<u64> { Ok(0) }
-    fn config() -> StagingConfig { StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None } }
+    fn config() -> StagingConfig { StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, ..Default::default() } }
 
     fn inode(store: &Store, size: u64) -> Attr {
         store.with(|c| {

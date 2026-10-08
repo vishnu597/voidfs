@@ -18,16 +18,37 @@ pub(crate) struct Staged {
     store: Arc<Store>, drive: String, root: Ino, queue: Option<crate::Queue>, cfg: StagingConfig,
     files: Mutex<HashMap<Ino, Arc<File>>>, creation: Arc<tokio::sync::Mutex<()>>, handles: Mutex<Vec<Weak<Handle>>>,
     normal_commits: AtomicU64, full_commits: AtomicU64,
+    damaged: HashSet<Ino>,
+    recovered: tokio::sync::watch::Sender<bool>,
     _lease: Arc<crate::store::MountLease>,
     local: Arc<notify::Observer>,
 }
 
 impl Staged {
     pub(super) async fn load(store: Arc<Store>, drive: String, root: Ino, queue: Option<crate::Queue>, cfg: StagingConfig, lease: Arc<crate::store::MountLease>, local: Arc<notify::Observer>) -> Result<Arc<Self>> {
-        let (s, d) = (store.clone(), drive.clone());
-        let files = tokio::task::spawn_blocking(move || {
-            let stages = stage::load_all(&s, &d)?;
-            stages.into_iter().map(|(ino, state)| {
+        let (s, d, writer) = (store.clone(), drive.clone(), queue.is_some());
+        let (files, damaged) = tokio::task::spawn_blocking(move || {
+            if writer {
+                // No handle survives a restart: a stage no name reaches can't publish or be read.
+                s.with(|c| {
+                    let tx = c.transaction()?;
+                    let staged = tx.prepare("SELECT s.ino FROM mount_staged s JOIN mount_inodes n ON n.ino=s.ino WHERE n.drive=?1")?
+                        .query_map([&d], |r| r.get::<_, Ino>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    for ino in staged {
+                        if unreachable(&tx, &d, root, ino)? { tx.execute("DELETE FROM mount_staged WHERE ino=?1", [ino])?; }
+                    }
+                    tx.commit()
+                })?;
+                if let Err(e) = stage::collect(&s, &d) { eprintln!("voidfs mount staging cleanup: {e}"); }
+            }
+            let (stages, damaged) = stage::load(&s, &d)?;
+            for (ino, error) in &damaged { eprintln!("voidfs mount staging: inode {ino} is unusable: {error}"); }
+            s.with(|c| {
+                for (ino, _) in &damaged { c.execute("UPDATE mount_inodes SET sync='error', generation=generation+1 WHERE ino=?1 AND sync<>'error'", [ino])?; }
+                Ok(())
+            })?;
+            let damaged = damaged.into_iter().map(|(ino, _)| ino).collect::<HashSet<_>>();
+            let files = stages.into_iter().map(|(ino, state)| {
                 let (n, owned) = s.with(|c| {
                     let n = node(c, &d, ino)?;
                     let owned = match &n {
@@ -40,9 +61,45 @@ impl Staged {
                 let attr = n.attr()?;
                 let guard = if owned { (attr.clone(), n.remote_key.unwrap_or_else(|| state.record.key.clone())) } else { (state.record.base.clone(), state.record.key.clone()) };
                 Ok((ino, Arc::new(File { state: Arc::new(tokio::sync::Mutex::new(state)), attr: Mutex::new(attr), guard: Mutex::new(guard), timer: AtomicBool::new(false), touched: Mutex::new(tokio::time::Instant::now()) })))
-            }).collect::<Result<HashMap<_, _>>>()
+            }).collect::<Result<HashMap<_, _>>>()?;
+            Ok::<_, FsError>((files, damaged))
         }).await.map_err(Error::from)??;
-        Ok(Arc::new(Self { store, drive, root, queue, cfg, files: Mutex::new(files), creation: Arc::new(tokio::sync::Mutex::new(())), handles: Mutex::new(Vec::new()), normal_commits: AtomicU64::new(0), full_commits: AtomicU64::new(0), _lease: lease, local }))
+        Ok(Arc::new(Self { store, drive, root, queue, cfg, files: Mutex::new(files), creation: Arc::new(tokio::sync::Mutex::new(())), handles: Mutex::new(Vec::new()), normal_commits: AtomicU64::new(0), full_commits: AtomicU64::new(0), damaged, recovered: tokio::sync::watch::channel(true).0, _lease: lease, local }))
+    }
+
+    /// Whether this inode's staged bytes were lost: opening it fails rather than read other bytes.
+    pub(super) fn damaged(&self, ino: Ino) -> bool { self.damaged.contains(&ino) }
+
+    /// Drops the stage of an inode no name reaches once no handle has it open: its bytes can't
+    /// publish or be read again. Only a local unlink or replacement leaves a staged inode so:
+    /// a refresh keeps names with unpublished changes. A conflict keeps its stage.
+    pub(super) async fn discard_unlinked(&self, ino: Ino) -> Result<()> {
+        let _creation = self.creation.lock().await;
+        let open = self.handles.lock().unwrap_or_else(|p| p.into_inner()).iter().filter_map(Weak::upgrade)
+            .any(|handle| handle.attr.ino == ino && !handle.closed.load(Ordering::Acquire));
+        if open { return Ok(()); }
+        let file = self.file(ino);
+        let mut state = match &file { Some(file) => Some(file.state.clone().lock_owned().await), None => None };
+        let (store, drive, root) = (self.store.clone(), self.drive.clone(), self.root);
+        let gone = tokio::task::spawn_blocking(move || store.with(|c| {
+            let tx = c.transaction()?;
+            if !unreachable(&tx, &drive, root, ino)? { return Ok(None); }
+            let path = tx.query_row("DELETE FROM mount_staged WHERE ino=?1 RETURNING path", [ino], |r| r.get::<_, String>(0)).optional()?;
+            tx.commit()?;
+            Ok(Some(path))
+        })).await.map_err(Error::from)??;
+        let Some(path) = gone else { return Ok(()); };
+        match (&file, &mut state) {
+            (Some(file), Some(state)) => {
+                state.retired = true;
+                let mut files = self.files.lock().unwrap_or_else(|p| p.into_inner());
+                if files.get(&ino).is_some_and(|active| Arc::ptr_eq(active, file)) { files.remove(&ino); }
+            }
+            _ => if let Some(name) = path.as_deref().and_then(|path| std::path::Path::new(path).file_name()) {
+                let _ = std::fs::remove_file(self.store.dir().join("mount-stage").join(name));
+            },
+        }
+        Ok(())
     }
 
     pub(super) fn file(&self, ino: Ino) -> Option<Arc<File>> { self.files.lock().unwrap_or_else(|p| p.into_inner()).get(&ino).cloned() }
@@ -58,7 +115,8 @@ impl Staged {
     pub(super) async fn retire_saved(&self, ino: Ino, attr: &Attr, persisted: bool) {
         if self.queue.is_some() || attr.sync != Sync::Saved || persisted { return; }
         let Some(file) = self.file(ino) else { return; };
-        let _state = file.state.lock().await;
+        let mut state = file.state.lock().await;
+        state.retired = true;
         let mut retained = file.attr.lock().unwrap_or_else(|p| p.into_inner()).clone();
         retained.sync = Sync::Saved;
         retained.generation = attr.generation;
@@ -108,6 +166,31 @@ impl Staged {
             files.push((ino, file, state));
         }
         Prepared { staged: self.clone(), _creation: creation, files, keys: run.iter().filter_map(|entry| entry.mount_ino.map(|ino| (ino, entry.to_key.clone().unwrap_or_else(|| entry.key.clone())))).collect() }
+    }
+
+    /// Queues, in the background, what a previous session staged without flushing: no handle of
+    /// it is left to close or fsync. A stage that can't be flushed now waits for its quiet period,
+    /// or the next flush. It stops with the session; the next writer starts it again.
+    pub(super) fn recover(self: &Arc<Self>) {
+        let files = self.files.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(ino, file)| (*ino, Arc::downgrade(file))).collect::<Vec<_>>();
+        self.recovered.send_replace(false);
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            futures::stream::iter(files).for_each_concurrent(8, |(ino, file)| {
+                let weak = weak.clone();
+                async move {
+                    let (Some(this), Some(file)) = (weak.upgrade(), file.upgrade()) else { return };
+                    let dirty = { let state = file.state.lock().await; state.record.revision != state.record.flushed };
+                    if dirty && let Err(e) = this.flush(ino, file).await { eprintln!("voidfs mount staged recovery: {e}"); }
+                }
+            }).await;
+            if let Some(this) = weak.upgrade() { this.recovered.send_replace(true); }
+        });
+    }
+
+    pub(super) async fn recovered(&self) {
+        let _ = self.recovered.subscribe().wait_for(|done| *done).await;
     }
 
     pub(super) fn restart_timers(self: &Arc<Self>) {
@@ -173,7 +256,15 @@ impl Staged {
 
     async fn flush_inner(&self, ino: Ino, file: Arc<File>, state: tokio::sync::OwnedMutexGuard<stage::Stage>) -> Result<()> {
         let queue = self.queue.as_ref().ok_or(FsError::ReadOnly)?;
-        let state = tokio::task::spawn_blocking(move || { state.sync()?; Ok::<_, FsError>(state) }).await.map_err(Error::from)??;
+        let (store, cfg) = (self.store.clone(), self.cfg.clone());
+        let state = tokio::task::spawn_blocking(move || {
+            let mut state = state;
+            state.sync()?;
+            // Overwritten bytes stay in the append-only file until a flush rewrites it.
+            let (garbage, live) = state.garbage()?;
+            if garbage > cfg.compact_garbage.max(live) && let Err(e) = state.compact(&store, ino, &cfg) { eprintln!("voidfs mount staging compaction: {e}"); }
+            Ok::<_, FsError>(state)
+        }).await.map_err(Error::from)??;
         if state.record.revision == state.record.flushed {
             let store = self.store.clone();
             tokio::task::spawn_blocking(move || store.with(|c| {
@@ -234,6 +325,7 @@ impl Staged {
             Ok::<_, FsError>(())
         }.await;
         if let Err(error) = frozen { clean(&sources).await; return Err(error); }
+        crate::kill::point("flush.frozen");
         let mut record = state.record.clone();
         record.dirty.clear();
         record.reset = None;
@@ -271,6 +363,7 @@ impl Staged {
             Ok(((n.attr()?, change, !entries.is_empty()), entries))
         }).await;
         let (attr, change, queued) = match result { Ok(result) => result, Err(error) => { clean(&sources).await; return Err(error); } };
+        crate::kill::point("flush.committed");
         if !queued { clean(&sources).await; }
         let mut state = state;
         state.record = record;
@@ -282,6 +375,12 @@ impl Staged {
     }
 }
 
+/// No name reaches the inode and no conflict needs its local bytes.
+fn unreachable(c: &Connection, drive: &str, root: Ino, ino: Ino) -> rusqlite::Result<bool> {
+    Ok(chain(c, drive, root, ino)?.is_none() && !c.query_row("SELECT EXISTS(SELECT 1 FROM mount_conflicts WHERE ino=?1
+        UNION ALL SELECT 1 FROM mount_conflict_blockers WHERE ino=?1)", [ino], |r| r.get::<_, bool>(0))?)
+}
+
 pub(crate) struct Prepared {
     staged: Arc<Staged>,
     _creation: tokio::sync::OwnedMutexGuard<()>,
@@ -290,7 +389,7 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    pub(crate) fn apply(self, reports: Vec<publication::Report>) {
+    pub(crate) fn apply(mut self, reports: Vec<publication::Report>) {
         let mut changes = Vec::new();
         {
             let mut registered = self.staged.handles.lock().unwrap_or_else(|p| p.into_inner());
@@ -321,6 +420,8 @@ impl Prepared {
                 if retire && let Some(file) = file {
                     let mut files = self.staged.files.lock().unwrap_or_else(|p| p.into_inner());
                     if files.get(&report.ino).is_some_and(|active| Arc::ptr_eq(active, file)) { files.remove(&report.ino); }
+                    // Its record is gone: the bytes remain only for handles that still read them.
+                    if let Some((_, _, state)) = self.files.iter_mut().find(|(ino, _, _)| *ino == report.ino) { state.retired = true; }
                 }
                 changes.push(self.staged.store.with(|c| notify::attribute(c, &self.staged.drive, self.staged.root, report.ino)).unwrap_or_else(|_| LocalChange { invalidations: Vec::new(), inodes: vec![report.ino], namespace: false }));
             }
@@ -371,7 +472,7 @@ fn assemble(dir: &std::path::Path, source: &std::path::Path, record: &stage::Rec
     use std::io::{Read, Seek, SeekFrom, Write};
     let mut raw = [0u8; 12];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut raw)?;
-    let path = dir.join(format!("snapshot-{}", hex::encode(raw)));
+    let path = dir.join(format!("{}-assembly-{}", record.base.ino, hex::encode(raw)));
     let result = (|| {
         let mut dest = std::fs::File::options().create_new(true).write(true).open(&path)?;
         dest.set_len(record.size)?;

@@ -113,7 +113,7 @@ async fn proxy(AppState(st): AppState<Arc<ProxyState>>, request: axum::extract::
 }
 
 fn plenty(_: &Path) -> std::io::Result<u64> { Ok(1 << 50) }
-fn staging() -> StagingConfig { StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None } }
+fn staging() -> StagingConfig { StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, ..Default::default() } }
 fn queue_config(connectivity: &Connectivity) -> QueueConfig {
     QueueConfig { retry_max: Duration::from_millis(50), connectivity: Some(connectivity.clone()), ..Default::default() }
 }

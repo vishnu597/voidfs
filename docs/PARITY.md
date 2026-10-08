@@ -7,8 +7,9 @@ S3's bandwidth in the local benchmark, then coalesced shard fetches, and then fo
 step 4 (the scorecard refreshed, SpaceFS 0.2.333 looked at again, the Rust SDK, then the CLI),
 and then for the Mac apps head to head; provider follow-ups and the step 5 plan added on
 2026-10-04, with step 5 decisions, namespace and snapshot-read slices on 2026-10-05, and bounded
-moved-snapshot resolution, local namespace changes and staged file writes on 2026-10-06, and
-Rust daemon sessions/shared feeds on 2026-10-07. The first was taken
+moved-snapshot resolution, local namespace changes and staged file writes on 2026-10-06,
+Rust daemon sessions/shared feeds and guarded publication on 2026-10-07, and mount recovery on
+2026-10-08. The first was taken
 on 2026-09-27.*
 
 Sources:
@@ -112,6 +113,8 @@ billing or plans), this page says so.
     Rust session RPCs share one core/feed per stable drive across mounts and observers. Remembered
     mounts pin stable IDs; local edits notify peers offline, and sessions authenticate Unix peers.
     Guarded publication reconciles exact acknowledgements and retains local/remote conflicts.
+    [Recovery](step-5-macos.md#recovery-8-october) survives process kills at each step, knows a
+    lost put reply as its own, compacts staging and removes what nothing needs.
     Full recovery, the Swift bridge and the writable mount remain pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -838,8 +841,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
 5. **Writable macOS drive** (Phase 2).
    - The ordered deliverables, adapter/bridge decisions and validation gates are in the
      [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation,
-     staged file-data, Rust daemon-session and guarded-publication slices are implemented;
-     no writable adapter exists yet.
+     staged file-data, Rust daemon-session, guarded-publication and recovery slices are
+     implemented; no writable adapter exists yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
@@ -856,7 +859,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
-   - **Status (2026-10-07):** items 1 and 2 begun; no completed item yet. The mount session has a
+   - **Status (2026-10-08):** items 1 and 2 begun; no completed item yet. The mount session has a
      persistent namespace with stable inodes, indexed equivalent-name lookup, per-directory
      refreshes, generation invalidation and complete offline directory snapshots. Read-only
      handles bind attributes and bytes to a retained version through the shared cache, preserve
@@ -880,14 +883,22 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      Newer edits survive an earlier acknowledgement; clean staging detaches for fresh opens while
      earlier handles retain their immutable local view. Guard failures retain both local and remote
      bytes and complete xattrs; successors remain blocked, including after restart or queue
-     cancellation. Mutable staging logs remain retained; safe compaction and orphan cleanup
-     are not implemented yet. Any future
+     cancellation. Recovery queues what a killed session left unflushed when the next writer
+     opens, knows a mount put whose reply was lost by its marker on the version right after its
+     guard, and removes staging files, frozen copies and conflict snapshots that nothing records
+     or reads. Flushes compact staging files whose overwritten bytes outweigh the live ones. A
+     stage that lost its bytes in a power failure marks only its own file `error`. Named kill
+     points in test builds cover staging, flush, publication, reconciliation, compaction and
+     conflict capture, and a seeded model test runs restarts against an in-memory filesystem.
+     A refresh keeps names with unpublished changes, so a removal elsewhere becomes a conflict
+     rather than lost edits. Advertising unsupported hard links, cloning and locks to adapters
+     remains in item 1. Any future
      recursive removal represented by one retained parent needs a separate addressing decision
      for its children. Bounded Rust session RPCs now run over the existing daemon socket, with
      binary data, per-consumer handle ownership/read-only policy and persisted generation
      handshakes. Mounts and RPC clients share one stable-ID core and feed watcher; committed
      metadata invalidations precede observer notifications, and reconnect/gaps trigger full resync.
-     Full recovery, the signed Swift bridge and adapters remain pending.
+     The signed Swift bridge and adapters remain pending.
      The read-only transport/adapter may proceed alongside writable core slices after the
      snapshot/restart checks and the user's signed-bundle probe. The accepted direction is FSKit first, SMB evaluation on gate
      failure, the Rust daemon/socket with a thin Swift XPC bridge, and verified whole shards

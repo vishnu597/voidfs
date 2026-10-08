@@ -130,11 +130,14 @@ without broad resync for attribute changes.
 Random session IDs are bound to verified Unix peer credentials. Guarded publication now reconciles
 exact acknowledged versions into inode identities, names and xattrs, preserving edits accepted
 during upload and snapshots held by earlier handles. Conflicts retain both versions locally,
-including complete xattrs, and keep later edits guarded. Full recovery, the Swift XPC bridge
-and the FSKit adapter follow in later slices. The accepted
+including complete xattrs, and keep later edits guarded. After a process kill, the next writer
+queues what was left unflushed, a put whose reply was lost is known by its marker rather than
+becoming a conflict, and staging files, frozen copies and conflict snapshots that nothing needs
+are removed; flushes compact overwritten staging bytes. The Swift XPC bridge and the FSKit
+adapter follow in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#guarded-publication-and-conflict-reconciliation-7-october) for the current scope
+[step 5 plan](docs/step-5-macos.md#recovery-8-october) for the current scope
 and decisions.
 
 ### The Rust SDK

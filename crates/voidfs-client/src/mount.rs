@@ -26,6 +26,9 @@ pub(crate) mod data;
 mod notify;
 #[path = "mount_publish.rs"]
 pub(crate) mod publication;
+#[cfg(test)]
+#[path = "mount_crash_tests.rs"]
+mod crash_tests;
 pub use mutations::RenameMode;
 pub use xattrs::XattrMode;
 pub use stage::StagingConfig;
@@ -412,9 +415,14 @@ impl Session {
         queue.register_mount_publisher(drive, Arc::downgrade(&session.data));
         drop(registration);
         session.queue = Some(queue);
+        session.data.recover();
         session.data.restart_timers();
         Ok(session)
     }
+
+    /// Waits until the writer has queued what the previous session left unflushed, which it
+    /// starts doing in the background when it opens.
+    pub async fn recovered(&self) { self.data.recovered().await }
 
     pub fn root(&self) -> Ino { self.root }
 
@@ -509,6 +517,7 @@ impl Session {
 
     /// Binds attributes and content from one accepted namespace snapshot. IDs are never reused.
     pub async fn open(&self, ino: Ino, write: bool) -> Result<Fh> {
+        if self.data.damaged(ino) { return Err(FsError::Io("this file's local bytes were lost before an fsync made them durable".into())); }
         if write {
             if self.queue.is_none() { return Err(FsError::ReadOnly); }
             self.prepare_mutation(ino).await?;
@@ -688,6 +697,7 @@ impl Session {
         }
         self.handles.lock().unwrap_or_else(|p| p.into_inner()).entries.remove(&fh).ok_or(FsError::BadHandle)?;
         closing.complete = true;
+        if let Err(e) = self.data.discard_unlinked(handle.attr.ino).await { eprintln!("voidfs mount staging cleanup: {e}"); }
         Ok(())
     }
 

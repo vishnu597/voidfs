@@ -24,7 +24,7 @@ fn plenty(_: &Path) -> std::io::Result<u64> { Ok(1 << 50) }
 fn no_space(_: &Path) -> std::io::Result<u64> { Ok(0) }
 
 fn staging_config() -> StagingConfig {
-    StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None }
+    StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, ..Default::default() }
 }
 
 fn queue_config(connectivity: &Connectivity) -> QueueConfig {
@@ -510,7 +510,7 @@ async fn acknowledged_bytes_and_names_survive_dropping_the_session_without_close
 async fn reserve_admission_returns_enospc_before_bytes_or_metadata_change() {
     let f = Fixture::new(Backend::Api).await;
     f.put("file", b"unchanged").await;
-    let ns = f.session_with(StagingConfig { min_free_bytes: 1024, free_space: Some(no_space), quiet_period: None }).await;
+    let ns = f.session_with(StagingConfig { min_free_bytes: 1024, free_space: Some(no_space), quiet_period: None, ..Default::default() }).await;
     let before = ns.lookup(ns.root(), "file").await.unwrap();
     let fh = ns.open(before.ino, true).await.unwrap();
     let error = ns.write(fh, 2, Bytes::from_static(b"rejected")).await.unwrap_err();
