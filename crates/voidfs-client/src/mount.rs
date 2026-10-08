@@ -26,6 +26,9 @@ pub(crate) mod data;
 mod notify;
 #[path = "mount_publish.rs"]
 pub(crate) mod publication;
+#[cfg(test)]
+#[path = "mount_crash_tests.rs"]
+mod crash_tests;
 pub use mutations::RenameMode;
 pub use xattrs::XattrMode;
 pub use stage::StagingConfig;
@@ -206,6 +209,11 @@ const DESCENDANTS: &str = "WITH RECURSIVE children(ino) AS (
         SELECT ?1 UNION SELECT o.ino FROM mount_overlay o JOIN children p ON o.parent=p.ino WHERE o.ino IS NOT NULL
         UNION SELECT n.ino FROM mount_names n JOIN children p ON n.parent=p.ino WHERE NOT EXISTS
         (SELECT 1 FROM mount_overlay o WHERE o.parent=n.parent AND o.name=n.name)) SELECT ino FROM children";
+
+/// Whether the inode, or anything under it, holds local changes not yet published.
+fn pending_under(c: &Connection, ino: Ino) -> rusqlite::Result<bool> {
+    c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM mount_inodes WHERE sync<>'saved' AND ino IN ({DESCENDANTS}))"), [ino], |r| r.get(0))
+}
 
 fn descendants(c: &Connection, ino: Ino) -> rusqlite::Result<Vec<Ino>> {
     let mut q = c.prepare(DESCENDANTS)?;
@@ -407,9 +415,14 @@ impl Session {
         queue.register_mount_publisher(drive, Arc::downgrade(&session.data));
         drop(registration);
         session.queue = Some(queue);
+        session.data.recover();
         session.data.restart_timers();
         Ok(session)
     }
+
+    /// Waits until the writer has queued what the previous session left unflushed, which it
+    /// starts doing in the background when it opens.
+    pub async fn recovered(&self) { self.data.recovered().await }
 
     pub fn root(&self) -> Ino { self.root }
 
@@ -504,6 +517,7 @@ impl Session {
 
     /// Binds attributes and content from one accepted namespace snapshot. IDs are never reused.
     pub async fn open(&self, ino: Ino, write: bool) -> Result<Fh> {
+        if self.data.damaged(ino) { return Err(FsError::Io("this file's local bytes were lost before an fsync made them durable".into())); }
         if write {
             if self.queue.is_none() { return Err(FsError::ReadOnly); }
             self.prepare_mutation(ino).await?;
@@ -683,6 +697,7 @@ impl Session {
         }
         self.handles.lock().unwrap_or_else(|p| p.into_inner()).entries.remove(&fh).ok_or(FsError::BadHandle)?;
         closing.complete = true;
+        if let Err(e) = self.data.discard_unlinked(handle.attr.ino).await { eprintln!("voidfs mount staging cleanup: {e}"); }
         Ok(())
     }
 
@@ -752,7 +767,13 @@ impl Session {
             let listing = match self.listing(&remote).await {
                 Err(FsError::NotFound) if remote != key => { remote = key.clone(); self.listing(&remote).await },
                 result => result,
-            }?;
+            };
+            // A folder removed elsewhere still holds the names its unpublished changes need.
+            let listing = match listing {
+                Err(FsError::NotFound) if self.db(move |c, _, _| pending_under(c, dir)).await? =>
+                    Some((Vec::new(), self.db(|c, d, _| c.query_row("SELECT seq FROM mount_roots WHERE drive=?1", [d], |r| r.get::<_, u64>(0))).await?)),
+                result => result?,
+            };
             let Some((entries, seq)) = listing else { continue; };
             if let Some(version) = bound_version {
                 match self.client.attributes(&self.drive, &remote, Default::default()).await {
@@ -773,7 +794,7 @@ impl Session {
                         && (ancestors.iter().any(|(a, _)| *a == ino) || node(&tx, d, ino)?.is_none_or(|n| n.entry.kind != e.kind))
                     { return Err(rusqlite::Error::InvalidQuery); }
                 }
-                tx.execute("DELETE FROM mount_names WHERE parent=?1", [dir])?;
+                let mut placed = Vec::with_capacity(entries.len());
                 for e in entries {
                     let json = serde_json::to_string(&e).expect("JSON");
                     let remote_key = format!("{remote}{}", e.name);
@@ -782,10 +803,22 @@ impl Session {
                         WHERE sync='saved'", params![d, e.object_id, json, remote_key])?;
                     let ino: Ino = tx.query_row("SELECT ino FROM mount_inodes WHERE drive=?1 AND object_id=?2", params![d, e.object_id], |r| r.get(0))?;
                     tx.execute("DELETE FROM mount_names WHERE ino=?1", [ino])?;
-                    let name = e.name.trim_end_matches('/');
+                    placed.push((ino, e.name.trim_end_matches('/').to_owned(), e.kind));
+                }
+                // A name the listing no longer has goes, unless it or something in it holds local
+                // changes not yet published: their guarded publication then meets the removal and
+                // keeps both sides as a conflict, rather than losing its path and never publishing.
+                let gone = tx.prepare("SELECT name, ino FROM mount_names WHERE parent=?1")?
+                    .query_map([dir], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Ino>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                for (name, ino) in gone {
+                    if !pending_under(&tx, ino)? { tx.execute("DELETE FROM mount_names WHERE parent=?1 AND name=?2", params![dir, name])?; }
+                }
+                for (ino, name, kind) in placed {
+                    // A kept name shadows another object listed at it until its own change publishes.
+                    if tx.query_row("SELECT 1 FROM mount_names WHERE parent=?1 AND name=?2", params![dir, name], |_| Ok(())).optional()?.is_some() { continue; }
                     let nfc: String = name.nfc().collect();
                     tx.execute("INSERT INTO mount_names(parent, name, ino, nfc) VALUES (?1, ?2, ?3, ?4)", params![dir, name, ino, nfc])?;
-                    if e.kind == Kind::Folder { tx.execute("INSERT OR IGNORE INTO mount_dirs(ino) VALUES (?1)", [ino])?; }
+                    if kind == Kind::Folder { tx.execute("INSERT OR IGNORE INTO mount_dirs(ino) VALUES (?1)", [ino])?; }
                 }
                 tx.execute("UPDATE mount_dirs SET listed=1, seq=?2, generation=generation+1 WHERE ino=?1", params![dir, seq])?;
                 tx.execute("UPDATE mount_inodes SET generation=generation+1 WHERE ino=?1", [dir])?;

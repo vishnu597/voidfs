@@ -17,7 +17,7 @@ pub(crate) enum Completion {
     Cancelled,
 }
 #[derive(Clone)]
-pub(crate) struct Report { pub ino: Ino, pub attr: Attr, pub published: Option<Attr>, pub clean: bool }
+pub(crate) struct Report { pub ino: Ino, pub attr: Attr, pub published: Option<Attr>, pub clean: bool, pub linked: bool }
 
 /// The two retained versions of a guarded save. Snapshot files stay private to the core.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -278,7 +278,9 @@ pub(crate) fn reconcile(tx: &rusqlite::Transaction<'_>, run: &[Entry], completio
         }
         n.generation = n.generation.saturating_add(1);
         save_node(tx, &n)?;
-        reports.push(Report { ino, attr: n.attr()?, published, clean });
+        let root = tx.query_row("SELECT ino FROM mount_roots WHERE drive=?1", [&first.drive], |r| r.get::<_, Ino>(0)).optional()?;
+        let linked = match root { Some(root) => chain(tx, &first.drive, root, ino)?.is_some(), None => false };
+        reports.push(Report { ino, attr: n.attr()?, published, clean, linked });
     }
     Ok(reports)
 }

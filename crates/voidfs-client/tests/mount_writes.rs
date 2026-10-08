@@ -24,7 +24,7 @@ fn plenty(_: &Path) -> std::io::Result<u64> { Ok(1 << 50) }
 fn no_space(_: &Path) -> std::io::Result<u64> { Ok(0) }
 
 fn staging_config() -> StagingConfig {
-    StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None }
+    StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, ..Default::default() }
 }
 
 fn queue_config(connectivity: &Connectivity) -> QueueConfig {
@@ -360,6 +360,33 @@ async fn close_flushes_dirty_bytes_and_does_not_invalidate_other_handles() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_unlinked_file_keeps_its_bytes_after_its_removal_publishes() {
+    for (backend, existing) in [(Backend::Api, true), (Backend::Api, false), (Backend::Bucket, true)] {
+        let f = Fixture::new(backend).await;
+        let ns = f.session().await;
+        let (expected, fh) = if existing {
+            let (_, fh) = file(&f, &ns).await;
+            (&b"first56789aX"[..], fh)
+        } else {
+            let ino = ns.create(ns.root(), "file", 0o644).await.unwrap().ino;
+            (&b"firstX"[..], ns.open(ino, true).await.unwrap())
+        };
+        ns.write(fh, 0, Bytes::from_static(b"first")).await.unwrap();
+        ns.unlink(ns.root(), "file").await.unwrap();
+        ns.fsync(fh).await.unwrap();
+        f.publish().await;
+        assert!(f.body("file").await.is_none());
+        f.queue.pause(Scope::All).await.unwrap();
+        ns.write(fh, expected.len() as u64 - 1, Bytes::from_static(b"X")).await.unwrap();
+        assert_eq!(ns.read(fh, 0, u64::MAX).await.unwrap(), Bytes::from_static(expected), "existing {existing}: the handle keeps the bytes it wrote");
+        ns.close(fh).await.unwrap();
+        f.publish().await;
+        assert!(f.body("file").await.is_none(), "nothing publishes after close");
+        f.queue.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_unlink_keeps_local_reads_and_writes_without_publishing_after_close() {
     for backend in [Backend::Api, Backend::Bucket] {
         let f = Fixture::new(backend).await;
@@ -483,7 +510,7 @@ async fn acknowledged_bytes_and_names_survive_dropping_the_session_without_close
 async fn reserve_admission_returns_enospc_before_bytes_or_metadata_change() {
     let f = Fixture::new(Backend::Api).await;
     f.put("file", b"unchanged").await;
-    let ns = f.session_with(StagingConfig { min_free_bytes: 1024, free_space: Some(no_space), quiet_period: None }).await;
+    let ns = f.session_with(StagingConfig { min_free_bytes: 1024, free_space: Some(no_space), quiet_period: None, ..Default::default() }).await;
     let before = ns.lookup(ns.root(), "file").await.unwrap();
     let fh = ns.open(before.ino, true).await.unwrap();
     let error = ns.write(fh, 2, Bytes::from_static(b"rejected")).await.unwrap_err();
@@ -705,7 +732,11 @@ async fn quiet_period_publishes_open_files_after_the_last_write() {
         assert!(tokio::time::Instant::now() < deadline, "quiet-period staging was never queued");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(ns.handle_attr(fh).unwrap().sync, Sync::Saving);
+    // The flush commits its entries, then updates the file's attributes in memory.
+    while ns.handle_attr(fh).unwrap().sync != Sync::Saving {
+        assert!(tokio::time::Instant::now() < deadline, "a queued quiet-period flush never reported saving");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     f.publish().await;
     assert_eq!(f.body("file").await, Some(Bytes::from_static(b"final56789ab")));
     assert_eq!(ns.read(fh, 0, u64::MAX).await.unwrap(), Bytes::from_static(b"final56789ab"));

@@ -2,9 +2,10 @@
 
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
 5 October; local namespace changes and staged file data added 6 October; Rust daemon sessions
-and shared feeds, guarded publication and retained conflicts added 7 October. Items 1 and 2 have
-begun with the Rust mount namespace, snapshot handles, durable namespace mutations, staged writes
-and publication reconciliation. The later deliverables remain an
+and shared feeds, guarded publication and retained conflicts added 7 October; recovery added
+8 October. Items 1 and 2 have begun with the Rust mount namespace, snapshot handles, durable
+namespace mutations, staged writes, publication reconciliation and recovery. The later
+deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
 
@@ -39,8 +40,9 @@ default. A remembered mount names its adapter explicitly.
 The core now supplies a persistent namespace, snapshot handles, a writable local namespace
 overlay and staged file data. Reads combine shared unpublished edits with each handle's remote
 snapshot. The daemon now supplies bounded Rust session RPCs and one shared per-drive feed.
-Guarded publication reconciles exact acknowledgements and retains conflicting versions locally;
-full kill-point recovery, the Swift bridge and writable FSKit or SMB callbacks remain later work.
+Guarded publication reconciles exact acknowledgements and retains conflicting versions locally,
+and the core recovers from process kills at each step. The Swift bridge and writable FSKit or
+SMB callbacks remain later work.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
@@ -325,8 +327,8 @@ reviewable deliverable.
 Slice 3 is split into local namespace changes and staged file data (both implemented below):
 `write`, `truncate`, `fsync`, durable close, merged reads, disk admission and staged-file leases.
 Item 2's Rust session RPCs and shared per-drive feed are now implemented below. Publication
-reconciliation and retained conflict states are now implemented as slice 4; full kill-point
-recovery remains slice 5. The user selected
+reconciliation and retained conflict states are now implemented as slice 4, and kill-point
+recovery as slice 5. The user selected
 a two-second quiet period for publishing files that stay open, alongside fsync and close.
 
 ### Namespace slice, 5 October
@@ -801,7 +803,133 @@ steps, and the five credential-script tests pass. Local memory, fs and versitygw
 passes conformance, stock S3 checks, aws-chunked and rclone in both addressing styles. Local
 boto3 is unavailable; CI supplies boto3 and checks MinIO and Docker Compose as well.
 
-Next is slice 5: process kill points around staging, publication and reconciliation; a seeded
-filesystem model with restarts; repair of ambiguous interrupted state; and safe staged-file
-compaction and orphan cleanup. Retained snapshots and open-handle leases must survive those
-cleanup rules. The signed-bundle probe still precedes the Swift bridge and FSKit adapter.
+Slice 5, recovery, follows. The signed-bundle probe still precedes the Swift bridge and FSKit
+adapter.
+
+### Recovery, 8 October
+
+Slice 5 completes item 1's core slices. What a process kill, a lost reply or a cleanup leaves
+behind is now recovered or removed, and a seeded model test checks the session against an
+in-memory filesystem across restarts. No protocol, format or server behavior changes.
+
+**Restart.** Opening a drive's writer queues, in the background, every stage the previous
+session left with unflushed bytes: no handle of that session remains to fsync or close them.
+Before, only the quiet-period timer did, so with the timer disabled acknowledged bytes stayed
+local for good. `Session::recovered` waits for the hand-off, which flushes eight files at once
+and stops with its session; the next writer starts it again. The writer opens without waiting:
+
+| Unflushed files after a kill | Writer open | All queued |
+| --- | --- | --- |
+| 1,000 of 4 KiB | 0.09 s | 11.3 s |
+| 100 of 1 MiB | 0.01–0.02 s | 1.3 s |
+
+Each flush still syncs its stage, freezes a copy and commits at `FULL`, so the hand-off of many
+small files is bounded by those syncs; batching them is possible later work.
+
+**A lost publication reply.** A mount put the server committed, but whose reply was lost to a
+timeout or a kill before the client recorded it, is now recognized exactly instead of becoming a
+conflict. The version right after the put's guard in the object's full history
+(`x-voidfs-all`), or the object's first version under an absence guard, must carry the put's
+`<state id>.<entry id>` marker. Later edits can inherit the marker, but the first version with it
+can only be the put's own, and a guarded put lands right after its guard. A recognized put is
+acknowledged and reconciled without being sent again; anything else stays a conflict, as before.
+Folder creation uses the same check. Patches, renames and deletes carry no marker, so a lost reply
+to one of them still fails closed as a conflict. Recognizing those exactly needs a marker on
+those requests, which is a protocol addition for the user to decide.
+
+**Cleanup.**
+
+- A stage whose record is gone is retired: its file goes when the last handle still reading it
+  closes. Before, every saved file left its whole staging file behind, with nothing to remove it.
+- An unlinked file's open handles keep its live stage, even after its removal publishes, and the
+  last close discards it. A refresh no longer drops names with unpublished changes (see the
+  review fixes below), so only a local unlink or replacement leaves a staged inode without a name.
+- Opening a drive's writer removes stages of inodes no name reaches, unless a conflict holds them,
+  then that drive's staging files no record names: a kill between creating, compacting or
+  publishing a stage and recording it. Interrupted flush assemblies are now named
+  `<inode>-assembly-…` so that they are attributed to a drive; legacy `snapshot-…` files go too.
+- Opening the queue removes snapshots in `mount-conflicts` that no conflict records, and a run
+  whose completion fails removes the snapshots it captured. Before, each retry captured both
+  sides again, and an existing conflict row ignored the new copies.
+
+**Compaction.** Staging files are append-only, so overwrites accumulate. A flush rewrites the
+file once its unused bytes exceed both `StagingConfig::compact_garbage` (64 MiB by default) and
+the bytes still in use. Live extents are copied in logical order to a new file, which is synced
+with its directory and recorded at `FULL` before the old file is removed. A kill leaves one of
+the two unrecorded, which the next writer removes. Compaction is skipped when the copy wouldn't
+fit the free-space reserve. Retired layers that earlier handles hold are separate files and are
+never rewritten. After a flush, a staging file is thus at most its live bytes plus the larger of
+those bytes and the threshold; between flushes it grows with the writes. A 64 MiB file rewritten
+three times in 1 MiB writes, fsynced after each pass:
+
+| Compaction | Fsync after each pass | Staging file after the last |
+| --- | --- | --- |
+| Off | 0.06–0.09 s each | 192 MiB |
+| 64 MiB threshold | 0.06–0.08 s, then 0.11–0.13 s for the pass that compacts | 64 MiB |
+
+**Lost staged bytes.** A power failure can lose bytes a write acknowledged before any fsync,
+while a later `FULL` commit makes their record durable. Before, one such stage stopped the whole
+drive from opening. Now that file is marked `error`, opening it fails with `EIO` instead of
+serving other bytes, and the rest of the drive works. Stage paths resolve by name in the current
+state directory, so a state directory reached by another spelling still loads.
+
+**Kill points.** Test builds have named points where a scenario running in a child process (the
+unit-test binary, re-run) sends itself `SIGKILL` at a chosen hit; the test then reopens the state
+directory and checks it. Other builds compile the points to nothing. Each point is covered:
+
+| Point | After a kill there |
+| --- | --- |
+| `stage.appended` | The unrecorded write is absent, earlier writes whole; the restart publishes them. |
+| `stage.recorded` | The recorded write is whole. |
+| `flush.frozen` | Queue open removes the unreferenced copy; the writer queues the stage again. |
+| `flush.committed` | The queued entries publish once. |
+| `publish.sent` | Both the create's absence-guarded put and the content's version-guarded put are recognized; two versions in all. |
+| `publish.acknowledged` | Reconciliation resumes without a second put. |
+| `reconcile.committed` | With a published file still held open: the retired stage and the source are removed on reopen. |
+| `compact.written`, `compact.committed` | Exactly the recorded copy remains, with its bytes. |
+| `conflict.captured` | Unrecorded snapshots go; the conflict is recorded once with one copy per side. |
+
+**Model.** `tests/mount_model.rs` runs seeded `proptest` sequences of create, mkdir, writes
+(including through handles whose file was unlinked or replaced), truncate, rename with
+replacement, unlink, rmdir, fsync, close, restart without closing, upload with handles open and
+publish, over four names two folders deep. After every step the session's listings, inode
+identities, sizes and bytes, and every open handle's bytes, must equal the model's. After each
+publish the drive must equal the model, every name must be saved, and no staging, journal or
+conflict file may remain. The default is 16 cases from a fixed seed, about 6 s;
+`VOIDFS_MODEL_SEED` and `VOIDFS_MODEL_CASES` explore further: 3,600 cases over seeds 12 to 20
+passed on the final code. The wider runs found three bugs in this slice: bytes left unflushed by
+a killed session were never queued without the quiet timer, the stage of a file unlinked while
+open was never removed, and the open-unlinked handle bug below. The default run doesn't reach
+the last one, which needs a narrow sequence of steps; its own regression test guards it.
+
+**Review fixes** (a separate commit). Reviewing PRs 41 to 46 found:
+
+- The daemon refused an oversized socket body without reading it, so a client still sending got a
+  broken pipe instead of the typed 413. That race failed main's CI. It now reads up to twice the
+  limit before refusing.
+- A flush whose journal commit failed left its frozen copies until the queue next opened.
+- A directory refresh dropped every name the listing no longer had. If another Mac deleted a file
+  with unpublished local edits, or its folder, the file vanished locally, and its flush found no
+  path: the edits were neither published nor kept as a conflict. Names whose inode, or something
+  under it, has unpublished changes now stay, a vanished folder holding them lists as empty, and
+  the guarded publication becomes a `404` conflict that keeps the local bytes. A kept name hides
+  another object listed under it until its own change resolves.
+- A handle on a file unlinked while open lost its earlier bytes once the removal published: the
+  stage retired as a clean save, and the handle's next write started from the empty create's
+  version. Such a stage now stays live while a handle has it open.
+- PR 44 included a change to `spec/conformance/cases.json` (ce4c2da, the direct-upload token
+  case's edit), which the handoff rules reserve for the user's approval. It keeps the case's
+  intent, with a test proving it over 4,096 nonces; it is only flagged here.
+
+Item 1 is not marked complete: advertising unsupported hard links, cloning and cross-machine locks
+to adapters remains. Conflict resolution and snapshot cleanup remain UI work.
+
+Recovery validation: 690 workspace tests pass (9 ignored), and workspace clippy passes with
+warnings denied. The 26 new tests, the four review-fix tests among them, were each seen to fail
+with their code broken: 40 isolated failing runs, each alone under a timeout, with the lost-reply
+breaks repeated three times. All restored tests pass. Spec validation passes 55 cases / 420
+steps, and the five credential-script tests pass. Local memory, fs and versitygw interoperability
+passes conformance, stock S3 checks, aws-chunked and rclone in both addressing styles; boto3 is
+unavailable locally, and CI supplies it and checks MinIO and Docker Compose. Reproduce the
+measurements with
+`cargo test -p voidfs-client --locked --test mount_recovery recovery_and_compaction_measurements -- --ignored --nocapture`.

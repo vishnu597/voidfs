@@ -15,6 +15,7 @@ pub mod error;
 pub mod feed;
 pub mod fetch;
 pub mod journal;
+mod kill;
 pub mod mount;
 mod mount_resolve;
 pub mod mounts;

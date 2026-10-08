@@ -220,11 +220,35 @@ fn conflict(e: &voidfs_sdk::Error) -> Option<String> {
     Some(e.current_version_id().unwrap_or("?").to_owned())
 }
 
-/// The version at the key, if its put was this entry's.
-async fn landed(ctx: &Ctx, e: &Entry) -> Step<Option<String>> {
-    if e.mount { return Ok(None); }
+/// The version at the key, if its put was this entry's. A mount entry's must be the version
+/// right after the one it was guarded by: later edits may carry its marker over, but the first
+/// version with the marker can only be the put's own, and a guarded put lands right after its
+/// guard.
+async fn landed(ctx: &Ctx, e: &Entry, guard: &Guard) -> Step<Option<String>> {
+    if e.mount { return own_version(ctx, e, guard).await; }
     match ctx.stop.or(ctx.client.head_object(&e.drive, &e.key, ReadOptions::default())).await? {
         Ok(m) if m.metadata.get(MARKER).is_some_and(|v| *v == marker(ctx, e)) => Ok(Some(m.version_id)),
+        Ok(_) => Ok(None),
+        Err(err) if err.status() == Some(404) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn own_version(ctx: &Ctx, e: &Entry, guard: &Guard) -> Step<Option<String>> {
+    let history = match ctx.stop.or(ctx.client.list_versions(&e.drive, &e.key, true)).await? {
+        Ok(history) => history,
+        Err(err) if err.status() == Some(404) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let next = match guard {
+        Guard::Absent => history.first(),
+        Guard::Version(base) => history.iter().position(|v| v.version_id == *base).and_then(|i| history.get(i + 1)),
+        Guard::None => None,
+    };
+    let Some(next) = next else { return Ok(None) };
+    let opts = ReadOptions { version_id: Some(next.version_id.clone()), ..Default::default() };
+    match ctx.stop.or(ctx.client.head_object(&e.drive, &e.key, opts)).await? {
+        Ok(m) if m.version_id == next.version_id && m.metadata.get(MARKER).is_some_and(|v| *v == marker(ctx, e)) => Ok(Some(m.version_id)),
         Ok(_) => Ok(None),
         Err(err) if err.status() == Some(404) => Ok(None),
         Err(err) => Err(err.into()),
@@ -301,7 +325,7 @@ async fn attrs_landed(ctx: &Ctx, e: &Entry, attrs: &Attrs, base: &str, current: 
 async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
     let e = &run[0];
     if ctx.may_have_landed
-        && let Some(v) = landed(ctx, e).await?
+        && let Some(v) = landed(ctx, e, &guard).await?
     {
         return done(Some(xattrs_after(ctx, e, &e.attrs, v).await?), None);
     }
@@ -335,11 +359,12 @@ async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
     let attrs = &e.attrs;
     let sent = body.len() as u64;
     let r = ctx.stop.or(ctx.client.put_object(&e.drive, &e.key, body.clone(), put_opts(ctx, e, attrs, &guard))).await?;
+    crate::kill::point("publish.sent");
     let (version, clash) = match r {
         Ok(w) => (w.version_id, None),
         Err(err) if is_412(&err) => {
             // Our own put, answered after we stopped waiting, or someone else's.
-            if let Some(v) = landed(ctx, e).await? {
+            if let Some(v) = landed(ctx, e, &guard).await? {
                 (v, None)
             } else if e.mount {
                 return Err(err.into());
@@ -461,13 +486,13 @@ async fn folder(ctx: &Ctx, entry: &Entry, guard: Guard) -> Step<Outcome> {
     if !e.key.ends_with('/') {
         e.key.push('/');
     }
-    if ctx.may_have_landed && let Some(v) = landed(ctx, &e).await? {
+    if ctx.may_have_landed && let Some(v) = landed(ctx, &e, &guard).await? {
         return done(Some(xattrs_after(ctx, &e, &e.attrs, v).await?), None);
     }
     let (version, clash) = match ctx.stop.or(ctx.client.put_object(&e.drive, &e.key, Bytes::new(), put_opts(ctx, &e, &e.attrs, &guard))).await? {
         Ok(w) => (w.version_id, None),
         Err(err) if is_412(&err) => {
-            if let Some(v) = landed(ctx, &e).await? {
+            if let Some(v) = landed(ctx, &e, &guard).await? {
                 (v, None)
             } else if e.mount {
                 return Err(err.into());
@@ -604,7 +629,7 @@ async fn direct(ctx: &Ctx, e: &Entry, size: u64, guard: &Guard) -> Step<Option<O
     let commit = |g: &Guard| ctx.client.commit_upload(&e.drive, &e.key, &plan.token, &shards, &sha, put_opts(ctx, e, &e.attrs, g));
     let (version, clash) = match ctx.stop.or(commit(guard)).await? {
         Ok(w) => (w.version_id, None),
-        Err(err) if is_412(&err) => match landed(ctx, e).await? {
+        Err(err) if is_412(&err) => match landed(ctx, e, guard).await? {
             Some(v) => (v, None),
             None if e.mount => return Err(err.into()),
             None => match ctx.stop.or(commit(&Guard::None)).await? {
@@ -648,7 +673,7 @@ async fn multipart(ctx: &Ctx, e: &Entry, size: u64, guard: Guard) -> Step<Outcom
                 }
             }
             Err(err) if err.code() == Some("NoSuchUpload") => {
-                if let Some(v) = landed(ctx, e).await? {
+                if let Some(v) = landed(ctx, e, &guard).await? {
                     return done(Some(xattrs_after(ctx, e, &e.attrs, v).await?), None);
                 }
                 upload = None;
@@ -712,7 +737,7 @@ async fn multipart(ctx: &Ctx, e: &Entry, size: u64, guard: Guard) -> Step<Outcom
             let w = ctx.stop.or(ctx.client.complete_multipart_upload(&e.drive, &e.key, &id, &parts, pre(&Guard::None))).await??;
             (w.version_id, conflict(&err))
         }
-        Err(err) if err.code() == Some("NoSuchUpload") => match landed(ctx, e).await? {
+        Err(err) if err.code() == Some("NoSuchUpload") => match landed(ctx, e, &guard).await? {
             Some(v) => (v, None),
             None => return Err(err.into()),
         },

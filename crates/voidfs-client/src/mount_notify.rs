@@ -155,7 +155,7 @@ mod tests {
         let fh = core.open(ino, true).await.unwrap();
         core.write(fh, 0, Bytes::from_static(b"before")).await.unwrap();
         let changes = recorder(store.clone(), &core);
-        let file = core.data.file(ino).unwrap();
+        let stage = core.data.file(ino).unwrap().state.lock().await.path.clone();
         let (entered, held) = mpsc::sync_channel(1);
         let (release, resume) = mpsc::sync_channel(1);
         let blocked = tokio::task::spawn_blocking(move || store.with(|_| {
@@ -168,8 +168,10 @@ mod tests {
             let core = core.clone();
             tokio::spawn(async move { core.write(fh, 0, Bytes::from_static(b"after cancellation")).await })
         };
+        // Its bytes are appended before the commit the blocker holds up. Polling the staging lock
+        // instead could take it first and cancel a writer that was handed it but hadn't run.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while file.state.try_lock().is_ok() { tokio::task::yield_now().await; }
+            while std::fs::metadata(&stage).unwrap().len() <= 6 { tokio::task::yield_now().await; }
         }).await.unwrap();
         writer.abort();
         assert!(writer.await.unwrap_err().is_cancelled());

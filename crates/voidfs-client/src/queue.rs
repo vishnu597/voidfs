@@ -271,6 +271,19 @@ impl Queue {
                     let _ = std::fs::remove_file(&f);
                 }
             }
+            // Competing snapshots no conflict recorded were captured by a run that stopped.
+            let conflicts = s2.dir().join("mount-conflicts");
+            if conflicts.is_dir() {
+                let kept: HashSet<std::ffi::OsString> = s2.with(|c| c.prepare("SELECT local_path FROM mount_conflicts WHERE local_path IS NOT NULL
+                    UNION ALL SELECT remote_path FROM mount_conflicts WHERE remote_path IS NOT NULL")?
+                    .query_map([], |r| r.get::<_, String>(0))?.filter_map(|p| p.map(|p| PathBuf::from(p).file_name().map(|n| n.to_owned())).transpose()).collect())?;
+                for f in std::fs::read_dir(&conflicts)? {
+                    let f = f?.path();
+                    if f.is_file() && f.file_name().is_some_and(|n| !kept.contains(n)) {
+                        let _ = std::fs::remove_file(&f);
+                    }
+                }
+            }
             Ok((entries, paused_all, drives, batches, bw, s2.id()?))
         })
         .await?;
@@ -1077,6 +1090,7 @@ impl Queue {
             tx.commit()?;
             Ok(())
         })?;
+        crate::kill::point("publish.acknowledged");
         for e in entries { st.pending.insert(e.id, e); }
         Ok(())
     }
@@ -1204,6 +1218,12 @@ impl Queue {
             && let crate::mount::publication::Completion::Conflict { error, .. } = completion {
             error.push_str(&format!("; retaining local bytes: {e}"));
         }
+        let captured = match &completion {
+            Some(crate::mount::publication::Completion::Conflict { remote, local, .. }) =>
+                remote.iter().filter_map(|o| o.content.clone()).chain(local.values().filter_map(|c| c.path.clone())).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        if !captured.is_empty() { crate::kill::point("conflict.captured"); }
         let this = self.clone();
         let sent = r.sent.load(Ordering::Relaxed);
         let upload_id = upload_id.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -1218,6 +1238,17 @@ impl Queue {
             }
             result => result,
         };
+        if !captured.is_empty() {
+            // Snapshots a conflict didn't record: its completion failed, or an earlier one kept its own.
+            let store = self.0.store.clone();
+            let _ = blocking(move || store.with(|c| {
+                let mut q = c.prepare("SELECT 1 FROM mount_conflicts WHERE local_path=?1 OR remote_path=?1")?;
+                for path in captured {
+                    if !q.exists([path.to_string_lossy()])? { let _ = std::fs::remove_file(&path); }
+                }
+                Ok(())
+            })).await;
+        }
         match finished {
             Ok(reports) => if let Some(prepared) = prepared { prepared.apply(reports); },
             Err(e) => {
@@ -1285,6 +1316,7 @@ impl Queue {
             tx.commit()?;
             Ok(reports)
         })?;
+        crate::kill::point("reconcile.committed");
         for e in &run { st.running.remove(&e.id); st.cancelled.remove(&e.id); }
         if let Outcome::Failed { transient, .. } = &outcome {
             let id = run[0].id;
@@ -1964,6 +1996,58 @@ mod tests {
         q.close().await;
     }
 
+
+    /// A mount put guarded by `base` whose run was uploading when the client stopped, with the
+    /// versions the server holds: its own put's, after someone else's edit if `foreign_first`.
+    async fn lost_mount_put(foreign_first: bool) -> (tempfile::TempDir, Queue, Client, Vec<String>, voidfs_server::test_server::TestServer) {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let client = client(&server.endpoint);
+        client.create_drive("drive", Default::default()).await.unwrap();
+        let mut versions = vec![client.put_object("drive", "file", "base", Default::default()).await.unwrap().version_id];
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap()); store.set_meta("paused", "1").unwrap();
+        let q = Queue::open(store.clone(), client.clone(), QueueConfig::default()).await.unwrap();
+        let source = dir.path().join("source"); std::fs::write(&source, "local").unwrap();
+        let frozen = q.mount_copy(source, 0, 5).await.unwrap();
+        let base = versions[0].clone();
+        q.mount_transaction(move |_| {
+            let mut e = Entry::new("drive", "file", Op::Put, StoredBase::Version(base));
+            e.source = Some(frozen); e.staged = true; e.size = 5;
+            Ok(((), vec![e]))
+        }).await.unwrap();
+        let id = q.st().pending.values().next().unwrap().id;
+        let marker = format!("{}.{id}", q.0.state_id);
+        if foreign_first {
+            let foreign = voidfs_sdk::PutOptions { if_version: versions.last().cloned(), ..Default::default() };
+            versions.push(client.put_object("drive", "file", "foreign", foreign).await.unwrap().version_id);
+        }
+        let own = voidfs_sdk::PutOptions { if_version: versions.last().cloned(), metadata: std::collections::BTreeMap::from([(publish::MARKER.to_owned(), marker)]), ..Default::default() };
+        versions.push(client.put_object("drive", "file", "local", own).await.unwrap().version_id);
+        store.with(|c| c.execute("UPDATE entries SET state='uploading'", [])).unwrap();
+        q.close().await; drop(q); drop(store);
+        let q = Queue::open(Arc::new(Store::open(dir.path()).unwrap()), client.clone(), QueueConfig::default()).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+        (dir, q, client, versions, server)
+    }
+
+    #[tokio::test]
+    async fn a_lost_mount_put_is_known_by_its_marker_on_the_version_right_after_its_guard() {
+        let (_dir, q, client, versions, _server) = lost_mount_put(false).await;
+        let item = q.status().await.unwrap().items.remove(0);
+        assert_eq!((item.state, item.version.as_deref(), item.conflict.as_deref()), (State::Done, Some(versions[1].as_str()), None), "{item:?}");
+        assert_eq!(client.list_versions("drive", "file", true).await.unwrap().len(), 2, "the put that landed is not sent again");
+        q.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_marked_version_after_someone_elses_edit_is_not_the_lost_put() {
+        let (_dir, q, client, versions, _server) = lost_mount_put(true).await;
+        let item = q.status().await.unwrap().items.remove(0);
+        assert_eq!((item.state, item.conflict.as_deref()), (State::Failed, Some(versions[2].as_str())), "{item:?}");
+        assert_eq!(client.list_versions("drive", "file", true).await.unwrap().len(), 3);
+        q.close().await;
+    }
 
     async fn publication_session() -> (tempfile::TempDir, Queue, Client, crate::mount::Session, voidfs_server::test_server::TestServer) {
         let server = voidfs_server::test_server::TestServer::start().await.unwrap();
