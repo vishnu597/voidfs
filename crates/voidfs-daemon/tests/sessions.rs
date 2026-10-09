@@ -4,11 +4,11 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::body::Body;
 use bytes::Bytes;
-use voidfs_client::mount::{FsError, Locks, Sync};
+use voidfs_client::mount::{ConflictSide, FsError, Locks, RenameMode, Sync, XattrMode};
 use voidfs_daemon::api::{Build, Scope, fs};
 use voidfs_daemon::{Daemon, DaemonClient, DaemonConfig, FsClient, FsClientError, InvalidationWatch};
 use voidfs_sdk::Kind;
@@ -171,8 +171,10 @@ async fn capabilities_reach_the_socket_with_unsupported_operations_marked() {
         assert!(!caps.hard_links && !caps.exchange && !caps.clone && caps.locks == Locks::Local);
         assert_eq!(caps, &session.info().capabilities);
         assert_eq!(serde_json::to_value(caps).unwrap(), raw["capabilities"]);
-        let link = post(&http, &session, "link", serde_json::json!({"ino":session.info().root})).send().await.unwrap();
-        raw_refused(link, 404, "NoSuchOperation", FsError::Unsupported).await;
+        let link = post(&http, &session, "link", serde_json::json!({"ino":session.info().root,"parent":session.info().root,"name":"twin"})).send().await.unwrap();
+        if read_only { raw_refused(link, 403, "ReadOnly", FsError::ReadOnly).await } else { raw_refused(link, 501, "Unsupported", FsError::Unsupported).await }
+        let exchange = post(&http, &session, "exchange", serde_json::json!({"ino":session.info().root})).send().await.unwrap();
+        raw_refused(exchange, 404, "NoSuchOperation", FsError::Unsupported).await;
         session.release().await.unwrap();
     }
     f.daemon.stop().await;
@@ -565,5 +567,199 @@ async fn a_failed_release_keeps_its_handles_owned_for_a_later_retry() {
     session.release().await.unwrap();
     assert!(tokio::time::timeout(Duration::from_secs(5), watch.next()).await.unwrap().is_none());
     refused(session.handle_attr(fh).await, 409, "StaleSession", FsError::Stale);
+    f.daemon.stop().await;
+}
+
+fn names(page: &fs::ReadDirReply) -> Vec<&str> { page.entries.iter().map(|(name, _)| name.as_str()).collect() }
+
+async fn remote_names(remote: &voidfs_sdk::Client) -> Vec<String> {
+    remote.list_folder("drive", "").await.unwrap().entries.into_iter().map(|entry| entry.name).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespace_calls_cross_the_socket_into_the_journal_and_notify_other_sessions() {
+    let f = Fixture::new("names", &[("keep", Bytes::from_static(b"kept"))]).await;
+    f.client.pause(&Scope::All).await.unwrap();
+    let writer = f.client.session("drive", false).await.unwrap();
+    let reader = f.client.session("drive", true).await.unwrap();
+    let root = writer.info().root;
+    let mut watch = reader.watch().await.unwrap();
+    let initial = next(&mut watch).await;
+    let before = reader.readdir(root, None, 16).await.unwrap();
+    let dir = writer.mkdir(root, "dir", 0o750).await.unwrap();
+    assert_eq!((dir.kind, dir.mode, dir.sync), (Kind::Folder, 0o750, Sync::Pending));
+    let event = matching(&mut watch, |event| event.generation > initial.generation && event.inodes.contains(&root) && event.inodes.contains(&dir.ino)).await;
+    assert!(!event.resync && event.invalidations.contains(&fs::Invalidation::Subtree("dir/".into())), "{event:?}");
+    let page = reader.readdir(root, None, 16).await.unwrap();
+    assert!(page.generation > before.generation, "a new name moves the page generation");
+    assert_eq!(names(&page), ["dir", "keep"]);
+    let file = writer.create(dir.ino, "cafe\u{301}", 0o600).await.unwrap();
+    assert_eq!((file.kind, file.size, file.mode), (Kind::File, 0, 0o600));
+    assert_eq!(names(&reader.readdir(dir.ino, None, 16).await.unwrap()), ["café"], "new names are stored NFC");
+    assert_eq!(reader.lookup(dir.ino, "café").await.unwrap().ino, file.ino);
+    refused(writer.create(dir.ino, "café", 0o600).await, 409, "Exists", FsError::Exists);
+    refused(writer.mkdir(root, "a/b", 0o755).await, 400, "InvalidName", FsError::InvalidName);
+    refused(writer.create(root, &"n".repeat(256), 0o644).await, 400, "InvalidName", FsError::InvalidName);
+    refused(writer.create(root, "x", 0o10000).await, 400, "InvalidArgument", FsError::InvalidArgument);
+    let fh = writer.open(file.ino, true).await.unwrap().fh;
+    writer.write(fh, 0, Bytes::from_static(b"saved")).await.unwrap();
+    writer.close(fh).await.unwrap();
+    writer.rename(dir.ino, "café", root, "moved", RenameMode::Replace).await.unwrap();
+    refused(reader.lookup(dir.ino, "café").await, 404, "NotFound", FsError::NotFound);
+    assert_eq!(reader.lookup(root, "moved").await.unwrap().ino, file.ino, "a rename keeps the inode");
+    refused(writer.rename(root, "moved", root, "keep", RenameMode::Exclusive).await, 409, "Exists", FsError::Exists);
+    refused(writer.rename(root, "moved", root, "keep", RenameMode::Swap).await, 501, "Unsupported", FsError::Unsupported);
+    let kept = reader.lookup(root, "keep").await.unwrap();
+    assert_eq!((kept.size, reader.lookup(root, "moved").await.unwrap().ino), (4, file.ino), "refused renames leave both names");
+    writer.rename(root, "moved", root, "keep", RenameMode::Replace).await.unwrap();
+    let replaced = reader.lookup(root, "keep").await.unwrap();
+    assert_eq!((replaced.ino, replaced.size), (file.ino, 5), "rename over replaces the destination");
+    let rh = reader.open(replaced.ino, false).await.unwrap().fh;
+    assert_eq!(reader.read(rh, 0, 16).await.unwrap(), Bytes::from_static(b"saved"));
+    reader.close(rh).await.unwrap();
+    refused(writer.rmdir(root, "keep").await, 400, "NotDir", FsError::NotDir);
+    refused(writer.unlink(root, "dir").await, 400, "IsDir", FsError::IsDir);
+    writer.create(dir.ino, "inner", 0o644).await.unwrap();
+    refused(writer.rmdir(root, "dir").await, 409, "NotEmpty", FsError::NotEmpty);
+    writer.unlink(dir.ino, "inner").await.unwrap();
+    refused(writer.unlink(dir.ino, "inner").await, 404, "NotFound", FsError::NotFound);
+    writer.rmdir(root, "dir").await.unwrap();
+    let after = reader.readdir(root, None, 16).await.unwrap();
+    assert_eq!(names(&after), ["keep"]);
+    matching(&mut watch, |event| event.generation > page.generation && event.inodes.contains(&dir.ino) && event.inodes.contains(&root)).await;
+    assert_eq!(remote_names(&f.remote).await, ["keep"], "paused: nothing is published yet");
+    f.client.resume(&Scope::All).await.unwrap();
+    until("the journal publishes the socket's namespace changes", async || {
+        remote_names(&f.remote).await == ["keep"] && f.remote.get_object("drive", "keep", Default::default()).await.is_ok_and(|object| object.body == Bytes::from_static(b"saved"))
+            && reader.getattr(replaced.ino).await.is_ok_and(|attr| attr.sync == Sync::Saved)
+    }).await;
+    writer.release().await.unwrap();
+    reader.release().await.unwrap();
+    drop(watch);
+    f.daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attributes_and_binary_xattrs_cross_the_socket() {
+    let f = Fixture::new("xattrs", &[("data", Bytes::from_static(b"x"))]).await;
+    f.client.pause(&Scope::All).await.unwrap();
+    let s = f.client.session("drive", false).await.unwrap();
+    let root = s.info().root;
+    let ino = s.lookup(root, "data").await.unwrap().ino;
+    let when = UNIX_EPOCH - Duration::from_micros(1_500_001);
+    let attr = s.setattr(ino, Some(0o600), Some(when)).await.unwrap();
+    assert_eq!((attr.mode, attr.mtime, attr.sync), (0o600, when, Sync::Pending), "mode and a pre-1970 time with microseconds");
+    assert_eq!(s.setattr(ino, None, None).await.unwrap(), attr, "nothing given changes nothing");
+    let chmod = s.setattr(ino, Some(0o644), None).await.unwrap();
+    assert_eq!((chmod.mode, chmod.mtime), (0o644, when), "a chmod keeps the time");
+    refused(s.setattr(ino, Some(0o10000), None).await, 400, "InvalidArgument", FsError::InvalidArgument);
+    refused(s.setattr(root, Some(0o755), None).await, 501, "Unsupported", FsError::Unsupported);
+    let http = f.raw();
+    raw_refused(post(&http, &s, "setattr", serde_json::json!({"ino":ino,"mtime":"yesterday"})).send().await.unwrap(), 400, "InvalidArgument", FsError::InvalidArgument).await;
+    let name = "user.a&b=c%d é+/?#";
+    let value = b"\0\xff\x80bin\0";
+    s.setxattr(ino, name, value, XattrMode::Create).await.unwrap();
+    s.setxattr(ino, "empty", b"", XattrMode::Set).await.unwrap();
+    assert_eq!(s.getxattr(ino, name).await.unwrap(), Bytes::from_static(value), "raw bytes and a name needing escapes");
+    assert!(s.getxattr(ino, "empty").await.unwrap().is_empty());
+    assert_eq!(s.listxattr(ino).await.unwrap(), ["empty", name]);
+    assert!(s.getattr(ino).await.unwrap().has_xattrs);
+    refused(s.setxattr(ino, name, b"x", XattrMode::Create).await, 409, "Exists", FsError::Exists);
+    refused(s.setxattr(ino, "absent", b"x", XattrMode::Replace).await, 404, "NoAttr", FsError::NoAttr);
+    s.setxattr(ino, name, b"replaced", XattrMode::Replace).await.unwrap();
+    s.removexattr(ino, "empty").await.unwrap();
+    refused(s.getxattr(ino, "empty").await, 404, "NoAttr", FsError::NoAttr);
+    refused(s.removexattr(ino, "empty").await, 404, "NoAttr", FsError::NoAttr);
+    refused(s.getxattr(ino, &"n".repeat(256)).await, 400, "InvalidName", FsError::InvalidName);
+    assert_eq!(fs::MAX_XATTR as u64, s.capabilities().max_xattr_bytes);
+    let big = s.create(root, "big", 0o644).await.unwrap().ino;
+    let most = Bytes::from(vec![7; fs::MAX_XATTR - 3]);
+    s.setxattr(big, "big", &most, XattrMode::Set).await.unwrap();
+    assert_eq!(s.getxattr(big, "big").await.unwrap(), most, "a name and value at the limit");
+    refused(s.setxattr(big, "more", b"x", XattrMode::Set).await, 413, "TooLarge", FsError::TooLarge);
+    let put = |query: &str| http.put(format!("{}?{query}", route(&s, "setxattr"))).header("x-voidfs-generation", s.info().generation).header("content-type", "application/octet-stream");
+    raw_refused(put(&format!("ino={big}&name=over&how=set")).body(vec![1; fs::MAX_XATTR + 1]).send().await.unwrap(), 413, "TooLarge", FsError::TooLarge).await;
+    raw_refused(put(&format!("ino={big}&name=x")).body("v").send().await.unwrap(), 400, "InvalidArgument", FsError::InvalidArgument).await;
+    raw_refused(put(&format!("ino={big}&name=x&how=set&extra=1")).body("v").send().await.unwrap(), 400, "InvalidArgument", FsError::InvalidArgument).await;
+    raw_refused(put(&format!("ino={big}&name=x&name=y&how=set")).body("v").send().await.unwrap(), 400, "InvalidArgument", FsError::InvalidArgument).await;
+    raw_refused(put(&format!("ino={big}&name=x&how=sideways")).body("v").send().await.unwrap(), 400, "InvalidArgument", FsError::InvalidArgument).await;
+    raw_refused(http.put(format!("{}?ino={big}&name=x&how=set", route(&s, "setxattr"))).header("x-voidfs-generation", s.info().generation).header("content-type", "application/json").body("v").send().await.unwrap(), 400, "InvalidArgument", FsError::InvalidArgument).await;
+    assert_eq!(s.listxattr(big).await.unwrap(), ["big"], "refused values change nothing");
+    f.client.resume(&Scope::All).await.unwrap();
+    until("mode and xattrs are published", async || f.remote.attributes("drive", "data", Default::default()).await.is_ok_and(|attrs| {
+        attrs.mode.as_deref() == Some("0644") && attrs.xattrs.len() == 1 && attrs.xattrs.contains_key(name)
+    })).await;
+    s.release().await.unwrap();
+    f.daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_consumers_are_refused_every_mutation_and_links_are_unsupported() {
+    let f = Fixture::new("rofs", &[("data", Bytes::from_static(b"x")), ("dir/inner", Bytes::from_static(b"y"))]).await;
+    let ro = f.client.session("drive", true).await.unwrap();
+    let rw = f.client.session("drive", false).await.unwrap();
+    let root = ro.info().root;
+    let data = ro.lookup(root, "data").await.unwrap();
+    let dir = ro.lookup(root, "dir").await.unwrap();
+    let before = ro.readdir(root, None, 16).await.unwrap();
+    let erofs = |result: Result<(), FsClientError>, what: &str| match result {
+        Err(FsClientError::Api { status: 403, code, errno, .. }) if code == "ReadOnly" && errno == FsError::ReadOnly.errno() => {},
+        other => panic!("{what}: expected EROFS, got {other:?}"),
+    };
+    erofs(ro.create(root, "new", 0o644).await.map(drop), "create");
+    erofs(ro.mkdir(root, "new", 0o755).await.map(drop), "mkdir");
+    erofs(ro.unlink(root, "data").await, "unlink");
+    erofs(ro.rmdir(dir.ino, "inner").await, "rmdir of a file");
+    erofs(ro.rmdir(root, "dir").await, "rmdir");
+    for how in [RenameMode::Replace, RenameMode::Exclusive, RenameMode::Swap] { erofs(ro.rename(root, "data", root, "other", how).await, "rename"); }
+    erofs(ro.link(data.ino, root, "hard").await.map(drop), "link");
+    erofs(ro.clone_file(data.ino, root, "copy").await.map(drop), "clone_file");
+    erofs(ro.setattr(data.ino, Some(0o600), None).await.map(drop), "setattr");
+    erofs(ro.setxattr(data.ino, "user.x", b"v", XattrMode::Set).await, "setxattr");
+    erofs(ro.removexattr(data.ino, "user.x").await, "removexattr");
+    refused(rw.link(data.ino, root, "hard").await, 501, "Unsupported", FsError::Unsupported);
+    refused(rw.clone_file(data.ino, dir.ino, "copy").await, 501, "Unsupported", FsError::Unsupported);
+    refused(rw.rename(root, "data", root, "dir", RenameMode::Swap).await, 501, "Unsupported", FsError::Unsupported);
+    let after = ro.readdir(root, None, 16).await.unwrap();
+    assert_eq!((after.entries, after.generation), (before.entries, before.generation), "nothing refused changed the namespace");
+    assert_eq!(ro.getattr(data.ino).await.unwrap(), data);
+    assert!(ro.listxattr(data.ino).await.unwrap().is_empty());
+    assert!(f.client.status().await.unwrap().uploads.unpublished == 0, "nothing refused reached the journal");
+    ro.release().await.unwrap();
+    rw.release().await.unwrap();
+    f.daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicts_and_their_retained_versions_cross_the_socket() {
+    let f = Fixture::new("conflict", &[("file", Bytes::from_static(b"base bytes"))]).await;
+    f.client.pause(&Scope::All).await.unwrap();
+    let s = f.client.session("drive", false).await.unwrap();
+    let ino = s.lookup(s.info().root, "file").await.unwrap().ino;
+    assert!(s.conflict(ino).await.unwrap().is_none());
+    refused(s.read_conflict(ino, ConflictSide::Local, 0, 4).await, 404, "NotFound", FsError::NotFound);
+    let fh = s.open(ino, true).await.unwrap().fh;
+    s.write(fh, 0, Bytes::from_static(b"LOCAL")).await.unwrap();
+    s.close(fh).await.unwrap();
+    f.remote.put_object("drive", "file", Bytes::from_static(b"remote \0 bytes"), Default::default()).await.unwrap();
+    f.client.resume(&Scope::All).await.unwrap();
+    until("the guarded publish keeps both versions as a conflict", async || s.getattr(ino).await.is_ok_and(|attr| attr.sync == Sync::Conflict)).await;
+    let ro = f.client.session("drive", true).await.unwrap();
+    let conflict = ro.conflict(ino).await.unwrap().expect("a conflict through the socket");
+    assert_eq!((conflict.ino, conflict.local_size, conflict.remote_missing), (ino, 10, false));
+    assert!(conflict.local_retained && conflict.remote_retained);
+    assert_eq!(ro.read_conflict(ino, ConflictSide::Local, 0, 64).await.unwrap(), Bytes::from_static(b"LOCALbytes"));
+    assert_eq!(ro.read_conflict(ino, ConflictSide::Remote, 0, 64).await.unwrap(), Bytes::from_static(b"remote \0 bytes"));
+    assert_eq!(ro.read_conflict(ino, ConflictSide::Remote, 7, 1).await.unwrap(), Bytes::from_static(b"\0"));
+    assert!(ro.read_conflict(ino, ConflictSide::Remote, 64, 1).await.unwrap().is_empty());
+    let http = f.raw();
+    let get = |query: String| http.get(format!("{}?{query}", route(&ro, "read_conflict"))).header("x-voidfs-generation", ro.info().generation);
+    raw_refused(get(format!("ino={ino}&side=local&offset=0&length={}", fs::MAX_IO + 1)).send().await.unwrap(), 413, "TooLarge", FsError::InvalidArgument).await;
+    raw_refused(get(format!("ino={ino}&side=other&offset=0&length=1")).send().await.unwrap(), 400, "InvalidArgument", FsError::InvalidArgument).await;
+    raw_refused(get(format!("ino={ino}&side=local&offset=0")).send().await.unwrap(), 400, "InvalidArgument", FsError::InvalidArgument).await;
+    raw_refused(get(format!("ino={ino}&side=local&offset={}&length=1", u64::MAX)).send().await.unwrap(), 400, "InvalidArgument", FsError::InvalidArgument).await;
+    assert_eq!(f.remote.get_object("drive", "file", Default::default()).await.unwrap().body, Bytes::from_static(b"remote \0 bytes"), "the conflict stays local");
+    ro.release().await.unwrap();
+    s.release().await.unwrap();
     f.daemon.stop().await;
 }

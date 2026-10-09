@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde::{Serialize, de::DeserializeOwned};
-use voidfs_client::mount::{Attr, Capabilities};
+use voidfs_client::mount::{Attr, Capabilities, Conflict, ConflictSide, RenameMode, XattrMode};
 
 use crate::{ClientError, DaemonClient, api::fs};
 
@@ -73,6 +73,25 @@ async fn answer<T: DeserializeOwned>(client: &DaemonClient, response: reqwest::R
     let body = bounded(client, response, fs::MAX_RESPONSE).await?;
     if !status.is_success() { return Err(refused(status, &body)); }
     serde_json::from_slice(&body).map_err(|e| FsClientError::Failed(format!("the daemon's filesystem answer: {e}")))
+}
+
+/// Percent-encodes a query value: everything but RFC 3986's unreserved characters.
+fn encode(value: &str) -> String {
+    value.bytes().map(|byte| if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) { (byte as char).to_string() } else { format!("%{byte:02X}") }).collect()
+}
+
+fn timestamp(at: std::time::SystemTime) -> Result<String> {
+    let (seconds, nanos) = match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => (i64::try_from(after.as_secs()).ok(), after.subsec_nanos()),
+        Err(before) => {
+            let before = before.duration();
+            let carry = u64::from(before.subsec_nanos() > 0);
+            (i64::try_from(before.as_secs().saturating_add(carry)).ok().map(|s| -s), if carry == 1 { 1_000_000_000 - before.subsec_nanos() } else { 0 })
+        }
+    };
+    seconds.and_then(|seconds| chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos))
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+        .ok_or_else(|| FsClientError::Failed("modification time out of range".into()))
 }
 
 /// A logical session owned by the process that created it. Clones and new socket connections
@@ -171,6 +190,93 @@ impl FsClient {
     pub async fn readlink(&self, ino: u64) -> Result<String> {
         let link: fs::Link = self.post("readlink", &fs::Inode { ino }).await?;
         Ok(link.target)
+    }
+
+    /// Creates an empty file exclusively.
+    pub async fn create(&self, parent: u64, name: &str, mode: u32) -> Result<Attr> {
+        self.post("create", &fs::Create { parent, name: name.to_owned(), mode }).await
+    }
+
+    pub async fn mkdir(&self, parent: u64, name: &str, mode: u32) -> Result<Attr> {
+        self.post("mkdir", &fs::Create { parent, name: name.to_owned(), mode }).await
+    }
+
+    pub async fn unlink(&self, parent: u64, name: &str) -> Result<()> {
+        let _: fs::Empty = self.post("unlink", &fs::Lookup { parent, name: name.to_owned() }).await?;
+        Ok(())
+    }
+
+    pub async fn rmdir(&self, parent: u64, name: &str) -> Result<()> {
+        let _: fs::Empty = self.post("rmdir", &fs::Lookup { parent, name: name.to_owned() }).await?;
+        Ok(())
+    }
+
+    pub async fn rename(&self, from_parent: u64, from_name: &str, to_parent: u64, to_name: &str, how: RenameMode) -> Result<()> {
+        let request = fs::Rename { from_parent, from_name: from_name.to_owned(), to_parent, to_name: to_name.to_owned(), how: how.into() };
+        let _: fs::Empty = self.post("rename", &request).await?;
+        Ok(())
+    }
+
+    /// Refused: the core has no hard links (`Capabilities::hard_links`).
+    pub async fn link(&self, ino: u64, parent: u64, name: &str) -> Result<Attr> {
+        self.post("link", &fs::LinkTo { ino, parent, name: name.to_owned() }).await
+    }
+
+    /// Refused: the core doesn't clone (`Capabilities::clone`).
+    pub async fn clone_file(&self, ino: u64, parent: u64, name: &str) -> Result<Attr> {
+        self.post("clone_file", &fs::LinkTo { ino, parent, name: name.to_owned() }).await
+    }
+
+    /// `None` leaves the mode or the modification time as it is.
+    pub async fn setattr(&self, ino: u64, mode: Option<u32>, mtime: Option<std::time::SystemTime>) -> Result<Attr> {
+        self.post("setattr", &fs::SetAttr { ino, mode, mtime: mtime.map(timestamp).transpose()? }).await
+    }
+
+    /// The raw value, empty included.
+    pub async fn getxattr(&self, ino: u64, name: &str) -> Result<Bytes> {
+        let path = format!("{}?ino={ino}&name={}", self.path("getxattr"), encode(name));
+        let response = self.request(reqwest::Method::GET, &path).timeout(TIMEOUT).send().await.map_err(|e| self.client.sent(e))?;
+        let status = response.status();
+        if !status.is_success() { return Err(refused(status, &bounded(&self.client, response, fs::MAX_RESPONSE).await?)); }
+        bounded(&self.client, response, fs::MAX_XATTR).await
+    }
+
+    pub async fn listxattr(&self, ino: u64) -> Result<Vec<String>> {
+        let reply: fs::XattrNames = self.post("listxattr", &fs::Inode { ino }).await?;
+        Ok(reply.names)
+    }
+
+    pub async fn setxattr(&self, ino: u64, name: &str, value: &[u8], how: XattrMode) -> Result<()> {
+        if value.len() > fs::MAX_XATTR { return Err(FsClientError::Failed("extended attribute exceeds the size limit".into())); }
+        let how = match fs::XattrHow::from(how) { fs::XattrHow::Set => "set", fs::XattrHow::Create => "create", fs::XattrHow::Replace => "replace" };
+        let path = format!("{}?ino={ino}&name={}&how={how}", self.path("setxattr"), encode(name));
+        let response = self.request(reqwest::Method::PUT, &path).timeout(TIMEOUT)
+            .header("content-type", "application/octet-stream").body(value.to_vec()).send().await.map_err(|e| self.client.sent(e))?;
+        let _: fs::Empty = answer(&self.client, response).await?;
+        Ok(())
+    }
+
+    pub async fn removexattr(&self, ino: u64, name: &str) -> Result<()> {
+        let _: fs::Empty = self.post("removexattr", &fs::Xattr { ino, name: name.to_owned() }).await?;
+        Ok(())
+    }
+
+    /// The retained versions of a conflicted save the inode belongs to, if any.
+    pub async fn conflict(&self, ino: u64) -> Result<Option<Conflict>> {
+        let reply: fs::ConflictReply = self.post("conflict", &fs::Inode { ino }).await?;
+        Ok(reply.conflict)
+    }
+
+    pub async fn read_conflict(&self, ino: u64, side: ConflictSide, offset: u64, length: u64) -> Result<Bytes> {
+        if length > self.info.max_io || offset.checked_add(length).is_none() {
+            return Err(FsClientError::Failed("conflict read exceeds the range or I/O limit".into()));
+        }
+        let side = match fs::Side::from(side) { fs::Side::Local => "local", fs::Side::Remote => "remote" };
+        let path = format!("{}?ino={ino}&side={side}&offset={offset}&length={length}", self.path("read_conflict"));
+        let response = self.request(reqwest::Method::GET, &path).timeout(TIMEOUT).send().await.map_err(|e| self.client.sent(e))?;
+        let status = response.status();
+        if !status.is_success() { return Err(refused(status, &bounded(&self.client, response, fs::MAX_RESPONSE).await?)); }
+        bounded(&self.client, response, length as usize).await
     }
 
     pub async fn release(&self) -> Result<()> {
