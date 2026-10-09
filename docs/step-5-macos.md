@@ -4,13 +4,15 @@
 5 October; local namespace changes and staged file data added 6 October; Rust daemon sessions
 and shared feeds, guarded publication and retained conflicts added 7 October; recovery and
 advertised capabilities, setting mode and mtime, and recognizing lost replies to edits, renames
-and attribute changes added 8 October; the signed-bundle probe and the rest of the session calls
-and the Swift bridge added 9 October. **Item 1 is complete**
+and attribute changes added 8 October; the signed-bundle probe, the rest of the session calls,
+the Swift bridge and one daemon for the CLI and the app added 9 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
-capabilities and attribute changes. Item 2 has begun: the daemon's sessions carry every
-mount-core call, and the app's agent bridges the sandboxed extension to them. The later
-deliverables remain an
+capabilities and attribute changes. **Item 2 is complete**
+([9 October](#one-daemon-for-the-cli-and-the-app-9-october)): the daemon's sessions carry every
+mount-core call, the app's agent bridges the sandboxed extension to them, and the app shares the
+CLI's daemon and store, which the user accepted in place of a move into the App Group container.
+The later deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
 
@@ -130,6 +132,12 @@ published entry still held open.
 
 ### Item 2. Daemon sessions and the Swift transport bridge
 
+**Complete, 9 October:** every bullet and the done-when are met, the migration bullet as the user
+accepted it: the app shares the CLI's daemon and store rather than moving them into the App Group
+container, which macOS closes to the CLI's daemon. The evidence is in
+[the Swift bridge](#the-swift-bridge-9-october) and
+[one daemon for the CLI and the app](#one-daemon-for-the-cli-and-the-app-9-october).
+
 Extend the daemon with bounded, versioned local filesystem RPCs. The existing `/v1/` status,
 uploads and mounts remain the app and CLI's control plane; the adapter must not create a second
 upload queue or remembered-mount store.
@@ -151,6 +159,8 @@ upload queue or remembered-mount store.
   eviction/replacement while an extension reads. Never expose arbitrary daemon file paths.
 - Define a migration for existing CLI daemon state to the app's shared container, without
   losing queued bytes or remembered mounts and without two daemons owning separate stores.
+  (Replaced on 9 October, with the user's acceptance, by sharing the CLI's location: nothing
+  moves. See [one daemon](#one-daemon-for-the-cli-and-the-app-9-october).)
 
 **Done when:** a signed sandboxed extension can create a session, read/write bounded payloads
 and receive a generation update through XPC → socket → daemon. Restarting the bridge and daemon
@@ -1258,9 +1268,10 @@ The spike's volume still reads through its own HTTP client; moving it onto the b
   answers bounded (1 MiB of JSON, `maxIo` of bytes), 30 s timeouts as in the Rust client, and the
   watch's chunked NDJSON on a connection of its own. Each call blocks a GCD thread, one hop fewer
   than going through Swift concurrency's pool as well; the timings below didn't separate the two.
-- **Where the daemon is:** `~/Library/Group Containers/HAUTK68F56.dev.voidfs/daemon/daemon.sock`,
-  the state directory the next section makes the CLI's default. Until then, run the daemon with
-  `VOIDFS_STATE_DIR` set to that folder.
+- **Where the daemon is:** first `~/Library/Group Containers/HAUTK68F56.dev.voidfs/daemon`, where
+  the plan meant to move the CLI's state. macOS keeps the CLI's daemon out of that container, so
+  the agent now connects where the CLI keeps it
+  ([one daemon](#one-daemon-for-the-cli-and-the-app-9-october)).
 - **The XPC interface is typed** (`Shared/Bridge.swift`): one method per daemon call, plus `ping`
   and `watch`. Bytes travel as `Data`; attributes, session limits, directory pages and events as
   small `NSSecureCoding` classes. An attribute's time is seconds and nanoseconds, so nothing is
@@ -1373,7 +1384,79 @@ says, a daemon whose `VOIDFS_STATE_DIR` is the container's `daemon` folder, and
 | A shared per-drive feed, monotonic generations, a resync after a gap | The daemon's feed. The agent subscribes per session, adds no watcher, and checks the resync and generations |
 | A Swift launchd agent with the App Group prefix that forwards to the user-only socket, relays invalidations and owns no journal; peers authenticated, calls and paths validated | This section |
 | A generation-tagged metadata memo in the extension, reads over the bridge first, no daemon file paths | `BridgeSession`'s memo; reads are `Data` over XPC; no path crosses |
-| A migration of the CLI's state into the shared container | Not met by this section: the next pull request |
+| A migration of the CLI's state into the shared container | Replaced, as the user accepted on 9 October, by one shared location that needs no move: [one daemon](#one-daemon-for-the-cli-and-the-app-9-october) |
 | Done when: a signed sandboxed extension creates a session, reads and writes bounded payloads and receives a generation update through XPC → socket → daemon | Evidence above |
 | Done when: restarting the bridge and the daemon has known outcomes and leaves the journal recoverable | The restart table |
 | Done when: warm metadata and cache-hit hop costs recorded against the spike | The hop-cost table |
+
+### One daemon for the CLI and the app, 9 October
+
+The plan was to move the CLI daemon's state from `~/Library/Application Support/voidfs` into the
+app's App Group container, `~/Library/Group Containers/HAUTK68F56.dev.voidfs`, so that the CLI and
+the app share one daemon and one store, and the extension could later read cache files there.
+**macOS doesn't let the CLI's daemon use that container.** On macOS 27.0.1, with a daemon state
+directory in the container:
+
+| Run by launchd, as `void daemon install` runs it | Result |
+| --- | --- |
+| `void daemon run`, built by cargo (ad hoc signature) | `daemon.json: Operation not permitted`: it doesn't start |
+| `void daemon status`, the same binary, with a daemon running there | Works: connecting to the socket is allowed |
+| `void daemon run`, signed with the team's Apple Development identity and the App Group entitlement | `Operation not permitted` |
+| The same signed binary inside a copy of the app's bundle (`Contents/MacOS/void`, the bundle re-signed) | `Operation not permitted` |
+
+TCC refused each with `kTCCServiceSystemPolicyAppDataDetailed`, macOS's protection of other apps'
+data, and identified the binary by its path rather than as a member of the group. Run from this
+session's shell, the same daemon worked, as the bridge's evidence did: that process's permissions,
+not the daemon's, let it in. A daemon in the container would thus work from some terminals and
+fail under launchd, which is where `void daemon install` and login run it.
+
+**Decision: one daemon and one store, where the CLI already keeps them.** The app's agent connects
+to `~/Library/Application Support/voidfs/daemon.sock`, the socket of `voidfs_client::default_dir()`.
+The agent runs unsandboxed and the extension only speaks XPC, so neither needs the files.
+
+- **Nothing moves**, so nothing can be lost in a move. Queued bytes, staged files, conflicts and
+  remembered mounts stay in the store the CLI already uses, and the `dev.voidfs.daemon` launchd job
+  keeps its paths.
+- **A second daemon is refused** by the store's lock, as before: `void daemon run` beside a running
+  daemon answers "a daemon is already running on … (pid …)". `VOIDFS_STATE_DIR` still names another
+  store, for the CLI only: the agent knows just the default.
+- **Direct cache reads**, when the lease API comes, can hand the extension open file descriptors
+  over XPC (`FileHandle` crosses it) instead of paths in the container.
+- **If the container is wanted later** (item 7), its owner must be something the App Data
+  protection admits, which none of the four above was. A provisioned helper with the App Group
+  might be; that is untested. The move would then take the old directory's lock, rename it in one
+  step on the same volume, and leave a link. That needs the next point.
+- **A fix found on the way:** queue startup compared the recorded absolute paths of the journal's
+  own copies with its folder as opened, so a state directory reached through a link, or moved, lost
+  the copies of unpublished bytes. Seen happening, then fixed in a separate commit: the recorded
+  paths of the journal's copies, conflict snapshots and staging files are found again by name
+  (`journal_copies_survive_a_state_directory_reached_by_another_path`).
+
+**Evidence.** With the release daemon at the default location and the agent connecting there:
+- the extension's 43 checks pass, and so does its daemon-restart run;
+- the unsigned daemon started by a launchd job (the case the container refused) starts, and the
+  extension reaches it through the agent;
+- a second `void daemon run` is refused.
+
+The same three runs in the container are above. Three breaks were each seen to fail: no
+re-rooting, conflicts not re-rooted, and the agent looking in the container.
+
+**Item 2 is complete.** Its last bullet asked for a migration of the CLI's state into the app's
+shared container. That move isn't possible for the CLI's daemon on this macOS, and this section
+replaces it with a shared location that needs no move: no queued bytes or remembered mounts can be
+lost, and the store's lock keeps a second daemon from opening the store. The user accepted that in
+place of the container on 9 October. Every other bullet and the done-when are met
+([the bridge](#the-swift-bridge-9-october)), so item 2 is complete: step 5's second completed item.
+
+The installed app followed. The user's Developer ID build of this branch (notarized, stapled) is
+in `/Applications`, and its extension is the copy FSKit uses, switched on. Its agent is registered
+from it and runs from `/Applications/voidfs.app`, connecting to
+`~/Library/Application Support/voidfs/daemon.sock`, and it refuses the app itself
+(`voidfs bridge-check`). The 43 end-to-end checks ran on the development build. The Developer ID
+build passed the same peer requirement (`codesign --verify -R`), and they weren't repeated through
+it, so that no test state went into the shared location the user now runs.
+
+Validation for these sections: 714 workspace tests pass (9 ignored), and workspace clippy passes
+with warnings denied. Spec validation passes 56 cases / 432 steps, and the five credential-script
+tests pass. Local memory, fs and versitygw interoperability passes; boto3 is unavailable locally,
+and CI supplies it and checks MinIO and Docker Compose.
