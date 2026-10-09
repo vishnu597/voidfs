@@ -187,6 +187,9 @@ pub(crate) fn routes(shared: Arc<Shared>) -> Router<Arc<Shared>> {
         .route("/{id}/{op}", post(call))
         .route("/{id}/read", get(read))
         .route("/{id}/write", put(write))
+        .route("/{id}/getxattr", get(getxattr))
+        .route("/{id}/setxattr", put(setxattr))
+        .route("/{id}/read_conflict", get(read_conflict))
         .route("/{id}/watch", get(watch_events))
         .fallback(|| async { Failure::new(StatusCode::NOT_FOUND, "NoSuchOperation", FsError::Unsupported) })
         .method_not_allowed_fallback(|| async { Failure::new(StatusCode::METHOD_NOT_ALLOWED, "Unsupported", FsError::Unsupported) })
@@ -309,6 +312,43 @@ async fn call(State(s): State<Arc<Shared>>, Path((id, op)): Path<(String, String
             answer(fs::Empty::default())
         },
         "fsync" => { let q: fs::Handle = decode(&bytes)?; access.handle(q.fh)?; core.fsync(q.fh).await?; answer(fs::Empty::default()) },
+        "create" | "mkdir" => {
+            let q: fs::Create = decode(&bytes)?;
+            access.writable()?;
+            answer(if op == "create" { core.create(q.parent, &q.name, q.mode).await? } else { core.mkdir(q.parent, &q.name, q.mode).await? })
+        },
+        "unlink" | "rmdir" => {
+            let q: fs::Lookup = decode(&bytes)?;
+            access.writable()?;
+            if op == "unlink" { core.unlink(q.parent, &q.name).await? } else { core.rmdir(q.parent, &q.name).await? }
+            answer(fs::Empty::default())
+        },
+        "rename" => {
+            let q: fs::Rename = decode(&bytes)?;
+            access.writable()?;
+            core.rename(q.from_parent, &q.from_name, q.to_parent, &q.to_name, q.how.into()).await?;
+            answer(fs::Empty::default())
+        },
+        // The shared core is writable, so a read-only consumer's refusal is this boundary's.
+        "link" | "clone_file" => {
+            let q: fs::LinkTo = decode(&bytes)?;
+            access.writable()?;
+            answer(if op == "link" { core.link(q.ino, q.parent, &q.name).await? } else { core.clone_file(q.ino, q.parent, &q.name).await? })
+        },
+        "setattr" => {
+            let q: fs::SetAttr = decode(&bytes)?;
+            access.writable()?;
+            let mtime = q.mtime.map(|text| chrono::DateTime::parse_from_rfc3339(&text).map(std::time::SystemTime::from).map_err(|_| Failure::from(FsError::InvalidArgument))).transpose()?;
+            answer(core.setattr(q.ino, q.mode, mtime).await?)
+        },
+        "listxattr" => { let q: fs::Inode = decode(&bytes)?; answer(fs::XattrNames { names: core.listxattr(q.ino).await? }) },
+        "removexattr" => {
+            let q: fs::Xattr = decode(&bytes)?;
+            access.writable()?;
+            core.removexattr(q.ino, &q.name).await?;
+            answer(fs::Empty::default())
+        },
+        "conflict" => { let q: fs::Inode = decode(&bytes)?; answer(fs::ConflictReply { conflict: core.conflict(q.ino).await? }) },
         _ => Err(Failure::new(StatusCode::NOT_FOUND, "NoSuchOperation", FsError::Unsupported)),
     }
     }).await.map_err(|e| Failure::from(FsError::Io(e.to_string())))?
@@ -353,6 +393,59 @@ async fn write(State(s): State<Arc<Shared>>, Path(id): Path<String>, request: Re
     let (_gate, _permit) = (gate, permit);
     let written = access.drive.core.write(q[0], q[1], bytes).await?;
     answer(fs::Written { written })
+    }).await.map_err(|e| Failure::from(FsError::Io(e.to_string())))?
+}
+
+/// A binary route's query, percent-decoded, with no unknown or repeated field.
+fn params<T: DeserializeOwned>(request: &Request) -> Result<T, Failure> {
+    axum::extract::Query::<T>::try_from_uri(request.uri()).map(|query| query.0).map_err(|_| Failure::invalid())
+}
+
+fn octets(bytes: Bytes) -> Response {
+    Response::builder().header(header::CONTENT_TYPE, "application/octet-stream").body(Body::from(bytes)).expect("a response")
+}
+
+async fn getxattr(State(s): State<Arc<Shared>>, Path(id): Path<String>, request: Request) -> Result<Response, Failure> {
+    let access = s.rpc.access(&id, &request)?;
+    let permit = permit(&request);
+    let q: fs::Xattr = params(&request)?;
+    let gate = access.gate.clone().read_owned().await;
+    if *access.closed.borrow() { return Err(Failure::new(StatusCode::CONFLICT, "StaleSession", FsError::Stale)); }
+    tokio::spawn(async move {
+    let (_gate, _permit) = (gate, permit);
+    Ok(octets(Bytes::from(access.drive.core.getxattr(q.ino, &q.name).await?)))
+    }).await.map_err(|e| Failure::from(FsError::Io(e.to_string())))?
+}
+
+/// The value is the raw body. One over the limit is `E2BIG`, as the core answers a name and
+/// value that together exceed it.
+async fn setxattr(State(s): State<Arc<Shared>>, Path(id): Path<String>, request: Request) -> Result<Response, Failure> {
+    let access = s.rpc.access(&id, &request)?;
+    let permit = permit(&request);
+    access.writable()?;
+    let q: fs::SetXattr = params(&request)?;
+    if request.headers().get(header::CONTENT_TYPE).is_none_or(|h| h != "application/octet-stream") { return Err(Failure::invalid()); }
+    let value = body(request, fs::MAX_XATTR).await.map_err(|failure| if failure.status == StatusCode::PAYLOAD_TOO_LARGE { FsError::TooLarge.into() } else { failure })?;
+    let gate = access.gate.clone().read_owned().await;
+    if *access.closed.borrow() { return Err(Failure::new(StatusCode::CONFLICT, "StaleSession", FsError::Stale)); }
+    tokio::spawn(async move {
+    let (_gate, _permit) = (gate, permit);
+    access.drive.core.setxattr(q.ino, &q.name, &value, q.how.into()).await?;
+    answer(fs::Empty::default())
+    }).await.map_err(|e| Failure::from(FsError::Io(e.to_string())))?
+}
+
+async fn read_conflict(State(s): State<Arc<Shared>>, Path(id): Path<String>, request: Request) -> Result<Response, Failure> {
+    let access = s.rpc.access(&id, &request)?;
+    let permit = permit(&request);
+    let q: fs::ReadConflict = params(&request)?;
+    if q.length > fs::MAX_IO { return Err(Failure::large()); }
+    if q.offset.checked_add(q.length).is_none_or(|end| end > i64::MAX as u64) { return Err(Failure::invalid()); }
+    let gate = access.gate.clone().read_owned().await;
+    if *access.closed.borrow() { return Err(Failure::new(StatusCode::CONFLICT, "StaleSession", FsError::Stale)); }
+    tokio::spawn(async move {
+    let (_gate, _permit) = (gate, permit);
+    Ok(octets(access.drive.core.read_conflict(q.ino, q.side.into(), q.offset, q.length).await?))
     }).await.map_err(|e| Failure::from(FsError::Io(e.to_string())))?
 }
 

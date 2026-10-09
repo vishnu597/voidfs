@@ -151,3 +151,26 @@ async fn invalidation_frames_require_full_resync_and_increasing_generations() {
         assert!(watch.next().await.is_none(), "{case}: a rejected watch is terminal");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_xattr_conflict_and_time_answers_are_bounded() {
+    for streamed in [false, true] {
+        let big = vec![b'x'; fs::MAX_XATTR + 1];
+        let reply = if streamed { Reply::stream(vec![Bytes::from(big)]) } else { Reply::bytes(big) };
+        let f = fake(Reply::json(&info()), reply).await;
+        let session = f.client.session("drive", true).await.unwrap();
+        failed(session.getxattr(1, "user.x").await, "size limit", "oversized extended attribute");
+        let reply = if streamed { Reply::stream(vec![Bytes::from_static(b"12345")]) } else { Reply::bytes("12345") };
+        let f = fake(Reply::json(&info()), reply).await;
+        let session = f.client.session("drive", true).await.unwrap();
+        failed(session.read_conflict(1, voidfs_client::mount::ConflictSide::Local, 0, 4).await, "size limit", "oversized conflict read");
+    }
+    let f = fake(Reply::json(&info()), Reply::json(&json!({"conflict":{"ino":"one"}}))).await;
+    let session = f.client.session("drive", true).await.unwrap();
+    failed(session.conflict(1).await, "filesystem answer", "malformed conflict");
+    failed(session.setxattr(1, "user.x", &vec![0; fs::MAX_XATTR + 1], voidfs_client::mount::XattrMode::Set).await, "size limit", "oversized value sent");
+    failed(session.read_conflict(1, voidfs_client::mount::ConflictSide::Remote, 0, fs::MAX_IO + 1).await, "I/O limit", "oversized conflict request");
+    if let Some(far) = std::time::UNIX_EPOCH.checked_add(Duration::from_secs(1 << 62)) {
+        failed(session.setattr(1, None, Some(far)).await, "out of range", "unrepresentable time");
+    }
+}

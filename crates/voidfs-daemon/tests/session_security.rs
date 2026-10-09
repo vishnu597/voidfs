@@ -40,6 +40,12 @@ fn child(socket: &Path) {
         ("GET", format!("read?fh={fh}&offset=0&length=4"), String::new()),
         ("PUT", format!("write?fh={fh}&offset=0"), "evil".to_owned()),
         ("GET", "watch".to_owned(), String::new()),
+        ("POST", "create".to_owned(), format!("{{\"parent\":{root},\"name\":\"evil\",\"mode\":420}}")),
+        ("POST", "rename".to_owned(), format!("{{\"fromParent\":{root},\"fromName\":\"data\",\"toParent\":{root},\"toName\":\"evil\",\"how\":\"replace\"}}")),
+        ("POST", "setattr".to_owned(), format!("{{\"ino\":{root},\"mode\":511}}")),
+        ("PUT", format!("setxattr?ino={root}&name=evil&how=set"), "evil".to_owned()),
+        ("GET", format!("getxattr?ino={root}&name=evil"), String::new()),
+        ("POST", "conflict".to_owned(), format!("{{\"ino\":{root}}}")),
         ("POST", "release".to_owned(), "{}".to_owned()),
     ] {
         let (status, body) = request(socket, method, &format!("/v1/fs/{id}/{operation}"), generation, &body);
@@ -88,6 +94,8 @@ async fn sessions_have_random_ids_and_are_owned_by_the_connecting_process() {
     let info = session.info().clone();
     let (status, body) = tokio::task::spawn_blocking(move || request(&socket, "GET", &format!("/v1/fs/{}/read?fh={fh}&offset=0&length=4", info.id), info.generation, "")).await.unwrap();
     assert_eq!((status, body.as_slice()), (200, b"safe".as_slice()), "a fresh connection from the session owner is valid, and foreign writes did not land");
+    let root = session.info().root;
+    assert_eq!(session.readdir(root, None, 16).await.unwrap().entries.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["data"], "foreign namespace calls did not land");
     session.close(fh).await.unwrap();
     session.release().await.unwrap();
     other.release().await.unwrap();

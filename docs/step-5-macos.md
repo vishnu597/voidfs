@@ -4,10 +4,12 @@
 5 October; local namespace changes and staged file data added 6 October; Rust daemon sessions
 and shared feeds, guarded publication and retained conflicts added 7 October; recovery and
 advertised capabilities, setting mode and mtime, and recognizing lost replies to edits, renames
-and attribute changes added 8 October. **Item 1 is complete**
+and attribute changes added 8 October; the signed-bundle probe and the rest of the session calls
+added 9 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
-capabilities and attribute changes. Item 2 has begun with the daemon's sessions. The later
+capabilities and attribute changes. Item 2 has begun: the daemon's sessions carry every
+mount-core call. The later
 deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
@@ -661,6 +663,16 @@ the object protocol and format.
 | `POST …/truncate`, `…/fsync`, `…/close` | `{fh, size}` for truncate, otherwise `{fh}` → `{}` |
 | `POST …/release` | `{}` → `{}`; closes all of that consumer's handles |
 | `GET …/watch` | NDJSON `{generation, seq, resync, invalidations, inodes}` |
+| `POST …/create`, `…/mkdir` | `{parent, name, mode}` → `Attr` ([9 October](#the-rest-of-the-session-calls-9-october), as are the rows below) |
+| `POST …/unlink`, `…/rmdir` | `{parent, name}` → `{}` |
+| `POST …/rename` | `{fromParent, fromName, toParent, toName, how}`, `how` one of `replace`, `exclusive`, `swap` → `{}` |
+| `POST …/link`, `…/clone_file` | `{ino, parent, name}` → always refused: `ENOTSUP`, or `EROFS` for a read-only consumer |
+| `POST …/setattr` | `{ino, mode?, mtime?}`, `mtime` RFC 3339 → `Attr` |
+| `GET …/getxattr?ino=&name=` | raw `application/octet-stream` value |
+| `PUT …/setxattr?ino=&name=&how=` | raw value (at most 64 KiB), `how` one of `set`, `create`, `replace` → `{}` |
+| `POST …/listxattr`, `…/removexattr` | `{ino}` → `{names}`; `{ino, name}` → `{}` |
+| `POST …/conflict` | `{ino}` → `{conflict}`: the core's `Conflict`, or `null` |
+| `GET …/read_conflict?ino=&side=&offset=&length=` | raw bytes of the `local` or `remote` retained version |
 
 Every session route requires `x-voidfs-generation` from creation. `SessionInfo.generation` is
 the persisted core epoch; `metadataGeneration` and watch generations order all drive-wide
@@ -668,7 +680,7 @@ notifications within that core. Page generations count namespace changes and rem
 invalidation independently, so a data/attribute edit does not force `readdir` to retry. `Attr.generation` is the inode-local metadata
 generation. Session IDs are opaque; handle IDs retain the core's persisted epoch/counter. Old sessions/generations/handles return `ESTALE`
 after restart. A different logical consumer's handle returns `EBADF`, and a read-only consumer's
-write/truncate/open-for-write returns `EROFS`. Errors are `{error: {code, message, errno}}` with
+write/truncate/open-for-write, and since 9 October every other mutation, returns `EROFS`. Errors are `{error: {code, message, errno}}` with
 a non-success status. Backend error codes/messages are clipped at UTF-8 boundaries to 256/4,096
 bytes, keeping error frames within the response limit. JSON wrappers use camelCase; nested `Attr` keeps its existing Rust serde
 shape (`object_id`, `version_id`, `has_xattrs`, RFC3339 `mtime`, and `Saved`/`Pending`/`Saving`/
@@ -1164,3 +1176,62 @@ bridge will forward. Contributors still need their own team.
 Reproduce with a Developer ID provisioning profile of that name and a notarytool keychain
 profile from `xcrun notarytool store-credentials`:
 `apps/macos/scripts/release.sh voidfs-notary`, then the steps in `apps/macos/README.md`.
+
+### The rest of the session calls, 9 October
+
+The daemon's `/v1/fs` socket now carries every mount-core call an adapter needs: `create`,
+`mkdir`, `unlink`, `rmdir`, `rename` with its mode, the `link` and `clone_file` refusals,
+`setattr`, the four xattr calls, and the conflict reads. `FsClient` has a typed method for each,
+and the [wire table](#rust-daemon-sessions-7-october) lists them. No protocol, format or server
+behavior changes: this is the local API.
+
+**Decisions.**
+
+- **Binary values travel raw.** Xattr values and conflict reads use `GET` or `PUT` with a query
+  and a raw `application/octet-stream` body, as `read` and `write` do; JSON stays on `POST`.
+  Base64 in JSON would have put a 64 KiB value (87 KiB encoded) over the 64 KiB JSON bound.
+  Names are percent-encoded in the query (any UTF-8 but NUL) and decoded strictly: an unknown,
+  repeated or missing field is `EINVAL`.
+- **Limits.** A `setxattr` body over 64 KiB is refused before the core with `E2BIG` (413
+  `TooLarge`), the answer the core gives when an object's names and values together exceed
+  64 KiB; the client won't send one. A conflict read is at most `maxIo` (8 MiB), as a `read` is.
+  Names keep the core's checks (`EINVAL` for `/`, NUL, or more than 255 bytes).
+- **Read-only consumers get `EROFS` for every mutation**, at the socket and before the core: the
+  drive's core is shared and writable, so the refusal is the boundary's. That includes `link` and
+  `clone_file`, which a writable consumer gets `ENOTSUP` for, as it does a `swap` rename; both
+  names stay as they were. Reading xattrs and conflicts is allowed.
+- **A conflict keeps its Rust shape.** `conflict` returns the core's `Conflict` as serde writes
+  it (snake_case; `local_xattrs` as byte arrays), as nested `Attr`s do, and `read_conflict` reads
+  the retained bytes. The Swift bridge won't forward either: resolving a conflict is the app's
+  (item 8), not the extension's.
+- **The wire version stays 1.** The calls are additive. A daemon from before answers them
+  `404 NoSuchOperation` with `ENOTSUP`, as it still answers any unknown call; nothing outside
+  this workspace speaks version 1 yet, and the app will carry its own daemon (item 7).
+- **Times.** `setattr`'s `mtime` is RFC 3339, as `Attr` spells it, so times before 1970 and
+  microseconds round trip. One beyond what RFC 3339 can say is refused by the client before
+  sending, and one the daemon can't parse is `EINVAL`.
+
+**Tests** (`crates/voidfs-daemon/tests`), through the real socket unless said otherwise:
+
+| Test | Shows |
+| --- | --- |
+| `namespace_calls_cross_the_socket_into_the_journal_and_notify_other_sessions` | `mkdir`, `create` (NFD stored NFC), `rename` (inode kept, rename-over, `EEXIST` for exclusive, `ENOTSUP` for swap with both names kept), `unlink`, `rmdir` (`ENOTEMPTY`, `ENOTDIR`, `EISDIR`, `ENOENT`, `EINVAL`), another session's watch and page generation, and the journal publishing it all once resumed |
+| `attributes_and_binary_xattrs_cross_the_socket` | `setattr` (a pre-1970 time with microseconds, a `chmod` keeping the time, `EINVAL`, `ENOTSUP` at the root), binary and empty xattr values under a name needing escapes, `EEXIST`/`ENOATTR` for create/replace, 64 KiB at the limit and `E2BIG` over it, a strict query, and publication |
+| `read_only_consumers_are_refused_every_mutation_and_links_are_unsupported` | `EROFS` for each of the eleven mutations from a read-only consumer, `ENOTSUP` for link, clone and swap from a writable one, and nothing reaching the namespace or the journal |
+| `conflicts_and_their_retained_versions_cross_the_socket` | A guarded save refused by another writer's version: `conflict` and both retained versions read from a read-only consumer, ranges, and refusals |
+| `sessions_have_random_ids_and_are_owned_by_the_connecting_process` (`session_security.rs`) | Another process can't use a known session for `create`, `rename`, `setattr`, `setxattr`, `getxattr` or `conflict` |
+| `hostile_xattr_conflict_and_time_answers_are_bounded` (`fs_client.rs`) | The client's bounds against a fake daemon: an xattr over 64 KiB, a conflict read longer than asked, a malformed conflict, values and times it won't send |
+| `capabilities_reach_the_socket_with_unsupported_operations_marked` (changed) | `link` through the socket: `ENOTSUP`, or `EROFS` when read-only; an unknown call is still `NoSuchOperation` |
+
+Validation: 713 workspace tests pass (9 ignored), and workspace clippy passes with warnings
+denied. The five new tests and the two changed ones were each seen to fail with their code
+broken: 20 breaks, each run alone under a timeout. They cover `create` dispatched as `mkdir`, a
+rename ignoring its mode, `unlink` and `rmdir` swapped, the read-only check dropped from
+`create`, `link`, `setxattr` and `removexattr`, `setattr` dropping the time, names sent
+unescaped, an oversized value answered with `EINVAL`, times before 1970 losing a second,
+conflicts answered as none, conflict reads unbounded at the socket, a client accepting an
+oversized xattr or a longer conflict read, sending any value or clamping an unrepresentable
+time, and the owner check skipped for the xattr routes or `create`. Spec validation passes 56
+cases / 432 steps, and the five credential-script tests pass. Local memory, fs and versitygw
+interoperability passes; boto3 is unavailable locally, and CI supplies it and checks MinIO and
+Docker Compose.
