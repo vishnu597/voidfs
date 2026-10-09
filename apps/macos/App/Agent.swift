@@ -24,14 +24,16 @@ enum Agent {
         }
     }
 
-    /// The daemon's state directory in the App Group container, shared by the CLI and the app.
+    /// The daemon's state directory: the CLI's default, `voidfs_client::default_dir()`, which the
+    /// app shares, so that one daemon owns one store. Not the App Group container: macOS keeps the
+    /// CLI's daemon out of it (step 5, "One daemon for the CLI and the app").
     static var stateDirectory: URL? {
-        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: MountStore.appGroup)?.appending(path: "daemon")
+        FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Application Support/voidfs")
     }
 
     static func serve() -> Never {
         guard let socket = stateDirectory?.appending(path: "daemon.sock").path else {
-            log.error("no App Group container for \(MountStore.appGroup, privacy: .public)")
+            log.error("no home directory for the daemon's state")
             exit(1)
         }
         let delegate = BridgeListener(socket: DaemonSocket(path: socket))
