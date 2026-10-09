@@ -81,10 +81,12 @@ The app's launch agent is the extension's bridge to the Rust daemon (step 5, ite
 sandboxed extension calls it over XPC on `HAUTK68F56.dev.voidfs.agent`, and it forwards a typed,
 bounded set of filesystem calls to the daemon's socket and relays its invalidations
 ([the Swift bridge](../../docs/step-5-macos.md#the-swift-bridge-9-october)). It accepts only the
-extension's code signature. The daemon must run with its state in the App Group container:
+extension's code signature. It connects to the daemon the CLI runs, at its default state
+directory, `~/Library/Application Support/voidfs`
+([one daemon](../../docs/step-5-macos.md#one-daemon-for-the-cli-and-the-app-9-october)):
 
 ```bash
-VOIDFS_STATE_DIR="$HOME/Library/Group Containers/HAUTK68F56.dev.voidfs/daemon" target/release/void daemon start
+void daemon start
 ```
 
 Register the agent from the copy of the app you built (registering from another copy changes which

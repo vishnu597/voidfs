@@ -127,8 +127,10 @@ billing or plans), this page says so.
     namespace changes, attributes, xattrs and conflict reads. The app's launch agent is now
     [the Swift bridge](step-5-macos.md#the-swift-bridge-9-october): the signed, sandboxed
     extension reaches the daemon through it, with a metadata memo, restart outcomes and hop costs
-    recorded. Moving the CLI's state into the app's container, and the writable mount, remain
-    pending. Steps 6–10 have not started.
+    recorded. macOS keeps the CLI's daemon out of the app's App Group container, so the app
+    shares [the CLI's daemon and store](step-5-macos.md#one-daemon-for-the-cli-and-the-app-9-october)
+    where they already are; item 2 is complete once the user accepts that in place of the planned
+    move. The writable mount remains pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
