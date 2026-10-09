@@ -122,8 +122,10 @@ billing or plans), this page says so.
     edit, rename or attribute change whose reply was lost is [known as its own](step-5-macos.md#lost-replies-to-edits-renames-and-attribute-changes-8-october)
     instead of becoming a false conflict, edits by a marker that
     [RFC 0005](../rfcs/0005-user-metadata-on-edits.md) lets them carry; SpaceFS's documentation
-    leaves that to the caller. The Swift bridge and the writable mount remain pending. Steps
-    6–10 have not started.
+    leaves that to the caller. The daemon's socket now carries
+    [every mount-core call](step-5-macos.md#the-rest-of-the-session-calls-9-october) (9 October):
+    namespace changes, attributes, xattrs and conflict reads. The Swift bridge and the writable
+    mount remain pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -851,7 +853,7 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation,
      staged file-data, Rust daemon-session, guarded-publication and recovery slices are
      implemented, the core advertises its capabilities and sets mode and mtime, and item 1 is
-     complete; no writable adapter exists yet.
+     complete; the daemon's socket carries every mount-core call; no writable adapter exists yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
