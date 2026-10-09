@@ -8,10 +8,11 @@ and attribute changes added 8 October; the signed-bundle probe, the rest of the 
 the Swift bridge and one daemon for the CLI and the app added 9 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
-capabilities and attribute changes. Item 2 has begun: the daemon's sessions carry every
+capabilities and attribute changes. **Item 2 is complete**
+([9 October](#one-daemon-for-the-cli-and-the-app-9-october)): the daemon's sessions carry every
 mount-core call, the app's agent bridges the sandboxed extension to them, and the app shares the
-CLI's daemon; only the planned move into the App Group container is unmet. The later
-deliverables remain an
+CLI's daemon and store, which the user accepted in place of a move into the App Group container.
+The later deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
 
@@ -131,6 +132,12 @@ published entry still held open.
 
 ### Item 2. Daemon sessions and the Swift transport bridge
 
+**Complete, 9 October:** every bullet and the done-when are met, the migration bullet as the user
+accepted it: the app shares the CLI's daemon and store rather than moving them into the App Group
+container, which macOS closes to the CLI's daemon. The evidence is in
+[the Swift bridge](#the-swift-bridge-9-october) and
+[one daemon for the CLI and the app](#one-daemon-for-the-cli-and-the-app-9-october).
+
 Extend the daemon with bounded, versioned local filesystem RPCs. The existing `/v1/` status,
 uploads and mounts remain the app and CLI's control plane; the adapter must not create a second
 upload queue or remembered-mount store.
@@ -152,6 +159,8 @@ upload queue or remembered-mount store.
   eviction/replacement while an extension reads. Never expose arbitrary daemon file paths.
 - Define a migration for existing CLI daemon state to the app's shared container, without
   losing queued bytes or remembered mounts and without two daemons owning separate stores.
+  (Replaced on 9 October, with the user's acceptance, by sharing the CLI's location: nothing
+  moves. See [one daemon](#one-daemon-for-the-cli-and-the-app-9-october).)
 
 **Done when:** a signed sandboxed extension can create a session, read/write bounded payloads
 and receive a generation update through XPC → socket → daemon. Restarting the bridge and daemon
@@ -1375,7 +1384,7 @@ says, a daemon whose `VOIDFS_STATE_DIR` is the container's `daemon` folder, and
 | A shared per-drive feed, monotonic generations, a resync after a gap | The daemon's feed. The agent subscribes per session, adds no watcher, and checks the resync and generations |
 | A Swift launchd agent with the App Group prefix that forwards to the user-only socket, relays invalidations and owns no journal; peers authenticated, calls and paths validated | This section |
 | A generation-tagged metadata memo in the extension, reads over the bridge first, no daemon file paths | `BridgeSession`'s memo; reads are `Data` over XPC; no path crosses |
-| A migration of the CLI's state into the shared container | Not met: see [one daemon](#one-daemon-for-the-cli-and-the-app-9-october) |
+| A migration of the CLI's state into the shared container | Replaced, as the user accepted on 9 October, by one shared location that needs no move: [one daemon](#one-daemon-for-the-cli-and-the-app-9-october) |
 | Done when: a signed sandboxed extension creates a session, reads and writes bounded payloads and receives a generation update through XPC → socket → daemon | Evidence above |
 | Done when: restarting the bridge and the daemon has known outcomes and leaves the journal recoverable | The restart table |
 | Done when: warm metadata and cache-hit hop costs recorded against the spike | The hop-cost table |
@@ -1432,11 +1441,20 @@ The agent runs unsandboxed and the extension only speaks XPC, so neither needs t
 The same three runs in the container are above. Three breaks were each seen to fail: no
 re-rooting, conflicts not re-rooted, and the agent looking in the container.
 
-**Item 2 is not complete.** Its last bullet asks for a migration of the CLI's state into the app's
+**Item 2 is complete.** Its last bullet asked for a migration of the CLI's state into the app's
 shared container. That move isn't possible for the CLI's daemon on this macOS, and this section
-replaces it with a shared location that needs no move. Every other bullet and the done-when are met
-([the bridge](#the-swift-bridge-9-october)). If the user accepts the shared location in place of
-the container, item 2 is complete.
+replaces it with a shared location that needs no move: no queued bytes or remembered mounts can be
+lost, and the store's lock keeps a second daemon from opening the store. The user accepted that in
+place of the container on 9 October. Every other bullet and the done-when are met
+([the bridge](#the-swift-bridge-9-october)), so item 2 is complete: step 5's second completed item.
+
+The installed app followed. The user's Developer ID build of this branch (notarized, stapled) is
+in `/Applications`, and its extension is the copy FSKit uses, switched on. Its agent is registered
+from it and runs from `/Applications/voidfs.app`, connecting to
+`~/Library/Application Support/voidfs/daemon.sock`, and it refuses the app itself
+(`voidfs bridge-check`). The 43 end-to-end checks ran on the development build. The Developer ID
+build passed the same peer requirement (`codesign --verify -R`), and they weren't repeated through
+it, so that no test state went into the shared location the user now runs.
 
 Validation for these sections: 714 workspace tests pass (9 ignored), and workspace clippy passes
 with warnings denied. Spec validation passes 56 cases / 432 steps, and the five credential-script

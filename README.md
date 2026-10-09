@@ -139,8 +139,8 @@ daemon's session reply, tells an adapter what to advertise: no hard links, excha
 (refused with `ENOTSUP`), locks local to the Mac, case-sensitive NFC names and the xattr, name
 and path limits. `Session::setattr` sets mode and mtime, which completes the mount core (step 5,
 item 1). The app's launch agent bridges the sandboxed FSKit extension to the daemon over XPC,
-with a metadata memo in the extension, and the app shares the CLI's daemon and store; the FSKit
-adapter follows in later slices. The accepted
+with a metadata memo in the extension, and the app shares the CLI's daemon and store, which
+completes step 5, item 2; the FSKit adapter follows in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
 [step 5 plan](docs/step-5-macos.md#lost-replies-to-edits-renames-and-attribute-changes-8-october) for the current scope
