@@ -113,6 +113,22 @@ async fn scenario(name: &str, dir: &Path, endpoint: &str) {
             ns.close(fh).await.unwrap();
             env.publish().await;
         }
+        "rename" | "attrs" | "delete" | "patch" => {
+            ns.write(fh, 0, Bytes::from_static(b"data")).await.unwrap();
+            ns.close(fh).await.unwrap();
+            env.publish().await;
+            match name {
+                "rename" => ns.rename(ns.root(), "file", ns.root(), "renamed", RenameMode::Exclusive).await.unwrap(),
+                "attrs" => { ns.setattr(ino, Some(0o600), None).await.unwrap(); }
+                "delete" => ns.unlink(ns.root(), "file").await.unwrap(),
+                _ => {
+                    let fh = ns.open(ino, true).await.unwrap();
+                    ns.write(fh, 0, Bytes::from_static(b"D")).await.unwrap();
+                    ns.close(fh).await.unwrap();
+                }
+            }
+            env.publish().await;
+        }
         other => panic!("no scenario {other}"),
     }
 }
@@ -204,6 +220,30 @@ async fn killed_after_a_put_lands_the_restart_knows_it_as_its_own() {
         let ino = env.file().await;
         assert_eq!(env.session.getattr(ino).await.unwrap().sync, Sync::Saved, "put {after}");
         assert_eq!(env.remote().await, (Bytes::from_static(b"data"), 2), "put {after} landed once and was not sent again");
+        env.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killed_after_an_edit_rename_attrs_or_delete_lands_the_restart_knows_it_as_its_own() {
+    for (scenario, point, key, expected) in [("patch", "patch.sent", "file", &["put", "put", "write", "attrs"][..]),
+        ("rename", "rename.sent", "renamed", &["put", "put", "rename"][..]),
+        ("attrs", "attrs.sent", "file", &["put", "put", "attrs"][..]), ("delete", "delete.sent", "file", &[][..])] {
+        let (dir, server) = crashed(scenario, point, 1).await;
+        let env = Env::open(dir.path(), &server.endpoint).await;
+        env.publish().await;
+        assert!(env.unfinished().await.is_empty(), "{scenario}: {:?}", env.unfinished().await);
+        let history = env.client.list_versions(DRIVE, key, true).await.map(|v| v.into_iter().map(|v| v.operation).collect::<Vec<_>>()).unwrap_or_default();
+        assert_eq!(history, expected.iter().map(|o| (*o).to_owned()).collect::<Vec<_>>(), "{scenario} landed once and was not sent again");
+        match env.session.lookup(env.session.root(), key).await {
+            Ok(attr) => {
+                assert_eq!(attr.sync, Sync::Saved, "{scenario}");
+                assert!(env.session.conflict(attr.ino).await.unwrap().is_none(), "{scenario}");
+                if scenario == "attrs" { assert_eq!(attr.mode, 0o600); }
+                assert_eq!(env.read(attr.ino).await, Bytes::from_static(if scenario == "patch" { b"Data" } else { b"data" }), "{scenario}");
+            }
+            Err(error) => assert_eq!((scenario, error), ("delete", FsError::NotFound)),
+        }
         env.close().await;
     }
 }

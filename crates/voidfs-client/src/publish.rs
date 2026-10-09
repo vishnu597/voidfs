@@ -5,9 +5,10 @@
 //! **The `412` rule** (item 3's design): when the object changed since the change was based on
 //! it, the local version is published anyway, since every version stays in the history, and the
 //! conflict is recorded. Mount edits instead keep their guard and fail for reconciliation,
-//! preserving both the competing remote version and the local overlay. A put first checks
-//! whether the version it collided with is its own,
-//! written by an attempt whose answer was lost: each put carries a marker naming its entry.
+//! preserving both the competing remote version and the local overlay. A put or an edit first
+//! checks whether the version it collided with is its own, written by an attempt whose answer
+//! was lost: each carries a marker naming its entry (edits since protocol revision 9, RFC 0005).
+//! A mount rename or attribute change is known by the history after its guard instead.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::FileExt;
@@ -23,7 +24,7 @@ use crate::error::{Error, Result};
 use crate::journal::{self, Attrs, Entry, Op};
 use crate::store::Store;
 
-/// The user metadata a put carries: `<state id>.<entry id>`.
+/// The user metadata a put or an edit carries: `<state id>.<entry id>`.
 pub(crate) const MARKER: &str = "voidfs-entry";
 
 /// What a publish is guarded by.
@@ -135,7 +136,7 @@ pub(crate) struct Ctx {
     pub stop: Stop,
     /// Bytes sent, for progress.
     pub sent: Arc<AtomicU64>,
-    /// The put's entry was being sent when the client stopped: it may have landed.
+    /// The entry was being sent when the client stopped, or its answer was lost: it may have landed.
     pub may_have_landed: bool,
     /// The multipart upload the entry has open, which the queue keeps with the entry.
     pub upload_id: Arc<std::sync::Mutex<Option<String>>>,
@@ -288,7 +289,7 @@ async fn xattrs_after(ctx: &Ctx, e: &Entry, attrs: &Attrs, version: String) -> S
         Ok(w) => w.version_id,
         Err(error) if e.mount && is_412(&error) => {
             let Some(current) = error.current_version_id().map(str::to_owned) else { return Err(error.into()); };
-            if attrs_landed(ctx, e, attrs, &version, &current).await? { current } else { return Err(error.into()); }
+            if attrs_landed(ctx, e, attrs, &version, &current, true).await? { current } else { return Err(error.into()); }
         }
         Err(error) => return Err(error.into()),
     };
@@ -304,7 +305,9 @@ async fn acknowledge(ctx: &Ctx, e: &Entry, version: &str, attrs: bool) -> Step<(
     Ok(())
 }
 
-async fn attrs_landed(ctx: &Ctx, e: &Entry, attrs: &Attrs, base: &str, current: &str) -> Step<bool> {
+/// Whether `current` is `base` with `attrs` applied and its content unchanged. A put's xattrs
+/// are `marked`: `base` must then be the put's own version.
+async fn attrs_landed(ctx: &Ctx, e: &Entry, attrs: &Attrs, base: &str, current: &str, marked: bool) -> Step<bool> {
     use base64::Engine;
     let opts = |version: &str| ReadOptions { version_id: Some(version.to_owned()), ..Default::default() };
     let before = ctx.stop.or(ctx.client.head_object(&e.drive, &e.key, opts(base))).await??;
@@ -314,12 +317,61 @@ async fn attrs_landed(ctx: &Ctx, e: &Entry, attrs: &Attrs, base: &str, current: 
     }
     let mut expected = ctx.stop.or(ctx.client.attributes(&e.drive, &e.key, opts(base))).await??;
     let actual = ctx.stop.or(ctx.client.attributes(&e.drive, &e.key, opts(current))).await??;
-    if expected.version_id.as_deref() != Some(base) || actual.version_id.as_deref() != Some(current) || expected.meta.get(MARKER) != Some(&marker(ctx, e)) { return Ok(false); }
+    if expected.version_id.as_deref() != Some(base) || actual.version_id.as_deref() != Some(current) || marked && expected.meta.get(MARKER) != Some(&marker(ctx, e)) { return Ok(false); }
     for name in &attrs.remove_xattrs { expected.xattrs.remove(name); }
     for (name, bytes) in &attrs.xattrs { expected.xattrs.insert(name.clone(), base64::engine::general_purpose::STANDARD.encode(bytes)); }
-    if attrs.mtime.is_none() { expected.mtime = actual.mtime.clone(); }
+    match &attrs.mtime { Some(mtime) => expected.mtime = Some(mtime.clone()), None => expected.mtime = actual.mtime.clone() }
+    if let Some(mode) = attrs.mode { expected.mode = Some(format!("{mode:04o}")); }
+    if attrs.content_type.is_some() { expected.content_type = attrs.content_type.clone(); }
     expected.version_id = Some(current.to_owned());
     Ok(expected == actual)
+}
+
+/// The version right after `base` in the full history at `key` (protocol §4.4), with its
+/// operation.
+async fn next_version(ctx: &Ctx, drive: &str, key: &str, base: &str) -> Step<Option<voidfs_sdk::VersionEntry>> {
+    let history = match ctx.stop.or(ctx.client.list_versions(drive, key, true)).await? {
+        Ok(history) => history,
+        Err(err) if err.status() == Some(404) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(history.iter().position(|v| v.version_id == base).and_then(|i| history.get(i + 1)).cloned())
+}
+
+/// The object id the mount knows the entry's inode by.
+async fn inode_object(ctx: &Ctx, e: &Entry) -> Step<Option<String>> {
+    let Some(ino) = e.mount_ino else { return Ok(None) };
+    let store = ctx.store.clone();
+    let attrs = blocking(move || store.with(|c| {
+        use rusqlite::OptionalExtension;
+        c.query_row("SELECT attrs FROM mount_inodes WHERE ino=?1", [ino], |r| r.get::<_, String>(0)).optional()
+    })).await?;
+    Ok(attrs.and_then(|json| serde_json::from_str::<voidfs_sdk::FolderEntry>(&json).ok()).map(|n| n.object_id).filter(|id| !id.is_empty()))
+}
+
+/// A mount rename whose answer was lost: the inode's object is at the destination, and the
+/// version right after the guard in its history, which follows the object (protocol §4.4), is
+/// a rename. A rename changes no content, so a matching rename by someone else has the same
+/// outcome.
+async fn rename_landed(ctx: &Ctx, e: &Entry, guard: &Guard) -> Step<Option<String>> {
+    let (Guard::Version(base), Some(to)) = (guard, e.to_key.as_deref()) else { return Ok(None) };
+    let Some(object) = inode_object(ctx, e).await? else { return Ok(None) };
+    match ctx.stop.or(ctx.client.head_object(&e.drive, to, ReadOptions::default())).await? {
+        Ok(m) if m.object_id.as_deref() == Some(object.as_str()) => {}
+        Ok(_) => return Ok(None),
+        Err(err) if err.status() == Some(404) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    Ok(next_version(ctx, &e.drive, to, base).await?.filter(|v| v.operation == "rename").map(|v| v.version_id))
+}
+
+/// A mount attribute change whose answer was lost: the version right after the guard is an
+/// `attrs` version with the guard's attributes, this change applied, and the same content. A
+/// matching change by someone else has the same outcome.
+async fn attrs_after_guard(ctx: &Ctx, e: &Entry, guard: &Guard) -> Step<Option<String>> {
+    let Guard::Version(base) = guard else { return Ok(None) };
+    let Some(next) = next_version(ctx, &e.drive, &e.key, base).await?.filter(|v| v.operation == "attrs") else { return Ok(None) };
+    Ok(attrs_landed(ctx, e, &e.attrs, base, &next.version_id, false).await?.then_some(next.version_id))
 }
 
 async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
@@ -410,6 +462,9 @@ async fn apply(body: &mut Vec<u8>, w: &Entry) -> Step<()> {
 
 async fn patch(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
     let e = &run[0];
+    if e.mount && ctx.may_have_landed && let Some(v) = own_version(ctx, e, &guard).await? {
+        return done(Some(v), None);
+    }
     let mut edits = Vec::new();
     let mut size = None;
     for w in run {
@@ -421,18 +476,25 @@ async fn patch(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
     }
     let total: u64 = edits.iter().map(|e| e.data.len() as u64).sum();
     let _mem = ctx.hold(total).await?;
-    let opts = WriteOptions { size, if_version: guard.version(), ..Default::default() };
+    let metadata = BTreeMap::from([(MARKER.to_owned(), marker(ctx, e))]);
+    let opts = WriteOptions { size, if_version: guard.version(), metadata, ..Default::default() };
     let r = if edits.is_empty() {
         // A truncate alone: an empty write at 0 with the size.
         ctx.stop.or(ctx.client.write_at(&e.drive, &e.key, 0, Bytes::new(), opts)).await?
     } else {
         ctx.stop.or(ctx.client.patch(&e.drive, &e.key, &edits, opts)).await?
     };
+    crate::kill::point("patch.sent");
     match r {
         Ok(w) => {
             ctx.sent.store(total, Ordering::Relaxed);
             done(Some(w.version_id), None)
         }
+        // Our own edit, answered after we stopped waiting, or someone else's.
+        Err(err) if is_412(&err) && e.mount => match own_version(ctx, e, &guard).await? {
+            Some(version) => done(Some(version), None),
+            None => Err(err.into()),
+        },
         Err(err) if is_412(&err) && !e.mount => {
             // The local version is the base with these edits: build it, and put it.
             let base = guard.version().unwrap_or_default();
@@ -451,12 +513,19 @@ async fn patch(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
 async fn rename(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
     let to = e.to_key.clone().unwrap_or_default();
     let opts = |g: &Guard| RenameOptions { replace: e.replace, if_version: g.version(), if_match: None };
-    match ctx.stop.or(ctx.client.rename(&e.drive, &e.key, &to, opts(&guard))).await? {
+    let r = ctx.stop.or(ctx.client.rename(&e.drive, &e.key, &to, opts(&guard))).await?;
+    crate::kill::point("rename.sent");
+    match r {
         Ok(w) => done(Some(w.version_id), None),
         Err(err) if is_412(&err) && !e.mount => {
             let w = ctx.stop.or(ctx.client.rename(&e.drive, &e.key, &to, opts(&Guard::None))).await??;
             done(Some(w.version_id), conflict(&err))
         }
+        // Moved already, by an attempt whose answer was lost, or a conflict.
+        Err(err) if e.mount && matches!(err.status(), Some(404 | 412)) => match rename_landed(ctx, e, &guard).await? {
+            Some(version) => done(Some(version), None),
+            None => Err(err.into()),
+        },
         // Moved already, by an attempt whose answer was lost.
         Err(err) if err.status() == Some(404) && ctx.may_have_landed && !e.mount => done(None, None),
         Err(err) => Err(err.into()),
@@ -465,7 +534,9 @@ async fn rename(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
 
 async fn delete(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
     let pre = |g: &Guard| Preconditions { if_version: g.version(), if_match: None };
-    match ctx.stop.or(ctx.client.delete_object(&e.drive, &e.key, pre(&guard))).await? {
+    let r = ctx.stop.or(ctx.client.delete_object(&e.drive, &e.key, pre(&guard))).await?;
+    crate::kill::point("delete.sent");
+    match r {
         Ok(v) => done(v, None),
         Err(err) if is_412(&err) && !e.mount => {
             let v = ctx.stop.or(ctx.client.delete_object(&e.drive, &e.key, pre(&Guard::None))).await??;
@@ -517,12 +588,18 @@ async fn attrs(ctx: &Ctx, e: &Entry, guard: Guard) -> Step<Outcome> {
         content_type: a.content_type.clone(),
     };
     let pre = |g: &Guard| Preconditions { if_version: g.version(), if_match: None };
-    match ctx.stop.or(ctx.client.set_attributes(&e.drive, &e.key, update(), pre(&guard))).await? {
+    let r = ctx.stop.or(ctx.client.set_attributes(&e.drive, &e.key, update(), pre(&guard))).await?;
+    crate::kill::point("attrs.sent");
+    match r {
         Ok(w) => done(Some(w.version_id), None),
         Err(err) if is_412(&err) && !e.mount => {
             let w = ctx.stop.or(ctx.client.set_attributes(&e.drive, &e.key, update(), pre(&Guard::None))).await??;
             done(Some(w.version_id), conflict(&err))
         }
+        Err(err) if e.mount && is_412(&err) => match attrs_after_guard(ctx, e, &guard).await? {
+            Some(version) => done(Some(version), None),
+            None => Err(err.into()),
+        },
         Err(err) => Err(err.into()),
     }
 }

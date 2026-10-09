@@ -27,3 +27,4 @@ RFCs are never deleted. A later RFC that replaces one says so, and the old one i
 | [0002](0002-gc-safe-against-writers.md) | Garbage collection that is safe against writers | Implemented |
 | [0003](0003-small-content-in-descriptors.md) | Small content inside the content descriptor | Implemented |
 | [0004](0004-a-version-for-every-object-it-changes.md) | A version for every object a transaction changes | Implemented |
+| [0005](0005-user-metadata-on-edits.md) | User metadata on edits | Implemented |

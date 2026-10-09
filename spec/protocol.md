@@ -172,6 +172,11 @@ before `offset`, unless a precondition is present, in which case the answer is `
 
 **Truncate or extend:** an empty body, `x-voidfs-offset: 0` and `x-voidfs-size`.
 
+`x-amz-meta-*` headers set user-metadata entries on the new version: each names an entry, which
+takes the header's value. Entries no header names keep their values from the version before.
+Without such headers the user metadata is unchanged. When a write creates the object, its user
+metadata is the headers' entries.
+
 Errors: `400 InvalidArgument`, `409 PathConflict`, `412 PreconditionFailed`,
 `413 EntityTooLarge`.
 
@@ -195,6 +200,7 @@ repeat count times:
 - The whole body is at most 64 MiB.
 - A body that is truncated, has trailing bytes, has a wrong magic or version, or non-zero
   reserved bytes fails with `400 InvalidPatch` and changes nothing.
+- `x-amz-meta-*` headers work as in §4.1.
 
 ### 4.3 Splice (insert or remove bytes): `PUT /{drive}/{key}?x-voidfs-splice`
 
@@ -207,6 +213,7 @@ repeat count times:
 The object becomes `object[..offset] ++ body ++ object[offset + remove..]`, as one version. The
 object MUST exist (`404 NoSuchKey`), and `offset + remove` MUST NOT be past its end
 (`400 InvalidArgument`). A splice that neither inserts nor removes is `400 InvalidArgument`.
+`x-amz-meta-*` headers work as in §4.1.
 
 A client MUST NOT retry an unguarded splice after an ambiguous failure, such as a timeout. The
 first attempt may have succeeded, and a second would insert or remove twice. Clients SHOULD send

@@ -84,6 +84,9 @@ pub struct WriteOptions {
     pub if_match: Option<String>,
     pub mtime: Option<String>,
     pub mode: Option<u32>,
+    /// User metadata entries the new version sets, sent as `x-amz-meta-<name>`; the others keep
+    /// their values. A server from before protocol revision 9 ignores them.
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Which version a read serves: the current one by default, or `version_id`, or the one current
