@@ -233,6 +233,27 @@ pub(crate) fn depends(a: &Entry, b: &Entry) -> bool {
     }))
 }
 
+/// Paths the state recorded for its own files (the journal's copies, retained conflict snapshots,
+/// staging files) name them under the directory as it was opened then. Reached by another path
+/// since (moved, or through a link), they are found again by name, as staging files always were:
+/// otherwise startup would take the journal's copies of unpublished bytes for strays.
+fn reroot(tx: &rusqlite::Transaction<'_>, dir: &Path) -> rusqlite::Result<()> {
+    let here = |sub: &str, recorded: &str| Path::new(recorded).file_name().map(|name| dir.join(sub).join(name).to_string_lossy().into_owned());
+    let sources = tx.prepare("SELECT id, source FROM entries WHERE staged=1 AND source IS NOT NULL AND state NOT IN ('done', 'cancelled')")?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, source) in sources {
+        if let Some(path) = here("journal", &source).filter(|path| *path != source) { tx.execute("UPDATE entries SET source=?2 WHERE id=?1", rusqlite::params![id, path])?; }
+    }
+    for (table, column, sub) in [("mount_conflicts", "local_path", "mount-conflicts"), ("mount_conflicts", "remote_path", "mount-conflicts"), ("mount_staged", "path", "mount-stage")] {
+        let rows = tx.prepare(&format!("SELECT ino, {column} FROM {table} WHERE {column} IS NOT NULL"))?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (ino, recorded) in rows {
+            if let Some(path) = here(sub, &recorded).filter(|path| *path != recorded) { tx.execute(&format!("UPDATE {table} SET {column}=?2 WHERE ino=?1"), rusqlite::params![ino, path])?; }
+        }
+    }
+    Ok(())
+}
+
 impl Queue {
     /// Opens the journal in `store`, and starts publishing what it holds. `client` should not
     /// have an upload bandwidth limit of its own: the queue sets its.
@@ -243,6 +264,7 @@ impl Queue {
             std::fs::create_dir_all(&d2)?;
             s2.with(|c| {
                 let tx = c.transaction()?;
+                reroot(&tx, s2.dir())?;
                 crate::mount::publication::recover_overlays(&tx)?;
                 let ids = tx.prepare("SELECT e.id FROM entries e JOIN mount_inodes n ON n.entry_id=e.id AND n.ino=e.mount_ino
                     WHERE e.mount=1 AND e.state='done' AND e.version IS NOT NULL AND e.published_version IS NULL AND n.sync<>'saved'")?
@@ -1427,6 +1449,47 @@ mod tests {
             size: Some(0), etag: None, mtime: None, mode: None, has_xattrs: false, target: None };
         tx.execute("INSERT INTO mount_inodes(drive, attrs) VALUES ('d', ?1)", [serde_json::to_string(&attrs).unwrap()]).map_err(crate::Error::from)?;
         Ok(tx.last_insert_rowid() as u64)
+    }
+
+    #[tokio::test]
+    async fn journal_copies_survive_a_state_directory_reached_by_another_path() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("state");
+        let staging = tempfile::tempdir().unwrap();
+        let source = staging.path().join("file");
+        std::fs::write(&source, b"snapshot").unwrap();
+        let q = paused(&real).await;
+        let frozen = q.mount_copy(source, 0, 8).await.unwrap();
+        let name = frozen.file_name().unwrap().to_owned();
+        let snapshots = real.join("mount-conflicts");
+        let (local, remote) = (snapshots.join("local-1"), snapshots.join("remote-1"));
+        q.mount_transaction(move |tx| {
+            let mut e = Entry::new("d", "file", Op::Put, StoredBase::Absent);
+            let ino = local_inode(tx)?;
+            e.mount_ino = Some(ino);
+            (e.source, e.staged, e.size) = (Some(frozen), true, 8);
+            tx.execute("INSERT INTO mount_conflicts(ino, entry_id, local_path, remote_path) VALUES (?1, 1, ?2, ?3)",
+                rusqlite::params![ino, local.to_str(), remote.to_str()]).map_err(crate::Error::from)?;
+            Ok(((), vec![e]))
+        }).await.unwrap();
+        q.close().await;
+        drop(q);
+        // Through a link, then moved: the same state, recorded under another path.
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let moved = parent.path().join("moved");
+        for (open, rename) in [(link.clone(), None), (moved.clone(), Some((&real, &moved)))] {
+            if let Some((from, to)) = rename { std::fs::rename(from, to).unwrap(); }
+            let q = paused(&open).await;
+            let entry = q.store().with(|c| journal::unfinished(c)).unwrap().pop().expect("the entry is still queued");
+            assert_eq!(entry.source.as_deref(), Some(open.join("journal").join(&name).as_path()), "recorded where this state now is");
+            assert_eq!(std::fs::read(entry.source.unwrap()).unwrap(), b"snapshot", "queue startup keeps the journal's copy");
+            let paths: (String, String) = q.store().with(|c| c.query_row("SELECT local_path, remote_path FROM mount_conflicts", [], |r| Ok((r.get(0)?, r.get(1)?)))).unwrap();
+            let snapshots = open.join("mount-conflicts");
+            assert_eq!(paths, (snapshots.join("local-1").to_string_lossy().into_owned(), snapshots.join("remote-1").to_string_lossy().into_owned()),
+                "retained snapshots are found where this state now is");
+            q.close().await;
+        }
     }
 
     #[tokio::test]
