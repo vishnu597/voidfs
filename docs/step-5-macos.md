@@ -325,7 +325,8 @@ namespace and snapshot handles come first, followed by staged writes, guarded pu
 recovery in separate slices. Once snapshot/coherence and restart behavior are demonstrated,
 item 2's read-only transport and item 3's read-only adapter may proceed alongside those writable
 core slices, at a user-owned mountpoint. Establish the signed-bundle probe on voidfs's own Apple
-team before the sandboxed bridge and adapter, and the compatibility rig in parallel.
+team before the sandboxed bridge and adapter, and the compatibility rig in parallel. (The probe
+passed on 9 October: [signed-bundle probe](#signed-bundle-probe-9-october).)
 Only after snapshot/coherence and restart behavior are demonstrated should writable callbacks
 land. Pieces, `/Volumes`, UI and distribution follow the same core; each remains a separate
 reviewable deliverable.
@@ -1131,3 +1132,35 @@ user metadata it otherwise preserves. Spec validation passes 56 cases / 432 step
 credential-script tests pass. Local memory, fs and versitygw interoperability passes, the new
 case included in both addressing styles; boto3 is unavailable locally, and CI supplies it and
 checks MinIO and Docker Compose.
+
+### Signed-bundle probe, 9 October
+
+The FSKit spike ran with development signing only. This probe shows voidfs's own team, HAUTK68F56,
+can ship the module the way SpaceFS does, and that the sandboxed extension, signed for
+distribution, reaches a helper the app registers: the path item 2's bridge needs. It used the
+spike's app, a local memory-store server and one test drive, on macOS 27.0.1 with Xcode 27 beta
+(27A5194q). No bucket, account or SpaceFS session was involved.
+
+| Step | Result |
+| --- | --- |
+| Profile | A Developer ID provisioning profile, "voidfs FSKit Developer ID", for `dev.voidfs.app.fskit` with FSKit Module, made in the developer portal by the user: all devices, expires 2044. The app needs none: its App Group carries the team prefix |
+| Build | `apps/macos/scripts/release.sh` archives, then exports with `scripts/ExportOptions-DeveloperID.plist`: both bundles signed "Developer ID Application: … (HAUTK68F56)" with the hardened runtime; the extension embeds the profile and has `com.apple.developer.fskit.fsmodule` |
+| Notarization | Accepted with no issues (submission `48919b2d-00a1-4ebe-a642-cf5d4f3795bf`), so the beta toolchain is no obstacle. Stapled; `stapler validate` passes |
+| Gatekeeper | `spctl --assess`: accepted, "Notarized Developer ID"; `syspolicy_check distribution`: ready for distribution. Installed in `/Applications` with a quarantine flag, the first launch showed the downloaded-app prompt, checked the notarization online, and ran once the user chose Open |
+| The module | FSKit found it at `/Applications/voidfs.app/Contents/Extensions/VoidfsFS.appex`, off until the user switched it on once. `mount -F -t voidfs` mounted the drive and read its file; AMFI logged nothing about it. The running extension verifies as the Developer ID build with the profile |
+| The helper | The app's own binary, as a launch agent in `Contents/Library/LaunchAgents/dev.voidfs.agent.plist`, registered with `SMAppService` (`voidfs agent-register`): enabled at once, without an approval step; launchd holds it with the Mach service `HAUTK68F56.dev.voidfs.agent` and a team launch constraint, and starts it on demand from `/Applications` |
+| Extension to helper | 500 XPC round trips of 4 KiB from the sandboxed extension: p50 59 µs, p90 80 µs, p99 150 µs (the spike, development-signed: 62 µs). The unprefixed `dev.voidfs.agent` fails from the sandbox, as in the spike |
+
+**Translocation.** Copied into `/Applications` by a script rather than moved in Finder, the
+quarantined app ran from a randomized `AppTranslocation` path, and so did its extension; the
+helper, started by launchd, ran from `/Applications`. A downloaded disk image that the user drags
+into Applications is moved in Finder and avoids this. Item 7's installer must keep it that way.
+
+**Not covered.** Mounting in `/Volumes` still needs `com.apple.developer.fskit.mount`, which
+neither profile grants; item 7's privileged helper stays the plan, as SpaceFS does it. The probe
+used the spike's read-only module and its echo, not the daemon's session RPCs, which item 2's
+bridge will forward. Contributors still need their own team.
+
+Reproduce with a Developer ID provisioning profile of that name and a notarytool keychain
+profile from `xcrun notarytool store-credentials`:
+`apps/macos/scripts/release.sh voidfs-notary`, then the steps in `apps/macos/README.md`.
