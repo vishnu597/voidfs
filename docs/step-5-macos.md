@@ -5,11 +5,11 @@
 and shared feeds, guarded publication and retained conflicts added 7 October; recovery and
 advertised capabilities, setting mode and mtime, and recognizing lost replies to edits, renames
 and attribute changes added 8 October; the signed-bundle probe and the rest of the session calls
-added 9 October. **Item 1 is complete**
+and the Swift bridge added 9 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. Item 2 has begun: the daemon's sessions carry every
-mount-core call. The later
+mount-core call, and the app's agent bridges the sandboxed extension to them. The later
 deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
@@ -46,7 +46,8 @@ The core now supplies a persistent namespace, snapshot handles, a writable local
 overlay and staged file data. Reads combine shared unpublished edits with each handle's remote
 snapshot. The daemon now supplies bounded Rust session RPCs and one shared per-drive feed.
 Guarded publication reconciles exact acknowledgements and retains conflicting versions locally,
-and the core recovers from process kills at each step. The Swift bridge and writable FSKit or
+and the core recovers from process kills at each step. The app's launch agent bridges the
+sandboxed extension to the daemon ([9 October](#the-swift-bridge-9-october)); writable FSKit or
 SMB callbacks remain later work.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
@@ -1235,3 +1236,144 @@ time, and the owner check skipped for the xattr routes or `create`. Spec validat
 cases / 432 steps, and the five credential-script tests pass. Local memory, fs and versitygw
 interoperability passes; boto3 is unavailable locally, and CI supplies it and checks MinIO and
 Docker Compose.
+
+### The Swift bridge, 9 October
+
+The app's launch agent, the signed-bundle probe's XPC echo until now, is the bridge item 2 asks
+for. The sandboxed extension calls it over XPC; it forwards a typed, bounded set of calls to the
+daemon's `/v1/fs` socket and relays the daemon's invalidations back. It owns no journal,
+publisher or cache. No Rust changed for it: the previous section's calls are what it forwards.
+The spike's volume still reads through its own HTTP client; moving it onto the bridge is item 3.
+
+**Decisions.**
+
+- **The app's own binary stays the agent**, grown from the probe's rather than a new target:
+  `voidfs agent`, from `Contents/Library/LaunchAgents/dev.voidfs.agent.plist`, registered with
+  `SMAppService` and answering `HAUTK68F56.dev.voidfs.agent`. The probe proved exactly this path
+  (signing, launch constraint, a Mach service the sandbox reaches). A separate helper would need
+  its own identity and constraint, and holding no state, gains nothing. The echo is now the
+  bridge's `ping`.
+- **The agent speaks HTTP/1.1 to the daemon's Unix socket itself** (`App/DaemonSocket.swift`,
+  POSIX sockets, no package): up to eight keep-alive connections, one request on each at a time,
+  answers bounded (1 MiB of JSON, `maxIo` of bytes), 30 s timeouts as in the Rust client, and the
+  watch's chunked NDJSON on a connection of its own. Each call blocks a GCD thread, one hop fewer
+  than going through Swift concurrency's pool as well; the timings below didn't separate the two.
+- **Where the daemon is:** `~/Library/Group Containers/HAUTK68F56.dev.voidfs/daemon/daemon.sock`,
+  the state directory the next section makes the CLI's default. Until then, run the daemon with
+  `VOIDFS_STATE_DIR` set to that folder.
+- **The XPC interface is typed** (`Shared/Bridge.swift`): one method per daemon call, plus `ping`
+  and `watch`. Bytes travel as `Data`; attributes, session limits, directory pages and events as
+  small `NSSecureCoding` classes. An attribute's time is seconds and nanoseconds, so nothing is
+  lost to `Date`'s double. Conflict calls aren't forwarded: resolving a conflict is the app's.
+- **Only the extension gets in.** The listener sets
+  `setCodeSigningRequirement("anchor apple generic and certificate leaf[subject.OU] = \"HAUTK68F56\" and identifier \"dev.voidfs.app.fskit\"")`
+  and checks the peer's user ID. Both the development and the Developer ID extension satisfy it
+  (`codesign --verify -R`); the app itself, the probe tool and anything else are refused when they
+  send a message.
+- **An allowlist, not a proxy.** The agent builds every daemon request from typed arguments: names
+  of 1 to 255 bytes without `/` or NUL, drive names up to 1,024 bytes, reads and writes up to
+  `maxIo`, xattr values up to 64 KiB, pages of 1 to 256 entries. A connection may have 16 sessions
+  and 32 calls in flight (`EAGAIN` beyond). No path, socket request or daemon session ID crosses
+  XPC: the agent numbers a connection's sessions itself.
+- **Sessions belong to a connection.** The daemon ties a session to the agent's process, so the
+  agent keeps each connection's sessions and releases them in the daemon when the connection is
+  invalidated (the extension exits, or its volume unmounts), and all of them on SIGTERM.
+- **Invalidations.** `watch` opens one daemon watch for the session (a subscription to the drive's
+  shared feed, not another feed watcher), requires the initial full resync and increasing
+  generations, and calls the extension's exported `VoidfsBridgeEvents`. The extension's client
+  gives up on a relay that sends no initial resync within 10 s.
+- **`EAGAIN` is tried again by the client**, eight times over about 200 ms, because it always
+  means nothing was applied: a directory page or a mutation's check raced a namespace change, or
+  admission (the agent's 32, the daemon's 32) was full. See the finding below.
+- **The metadata memo lands now, in the extension's bridge client** (`BridgeSession` in
+  `Shared/BridgeClient.swift`), rather than with item 3's adapter, which will call through it.
+  `getattr` and `lookup` are answered from it only while the session's relay is live. An event
+  drops the inodes it names (with the names under them), a resync or `all` drops everything, and
+  so does the end of the relay or of the connection. A reply is kept only if no event arrived while
+  it was in flight. The client's own changes drop what they touch before and after the call. A
+  remote change thus stays visible in the memo only until its event arrives, as in the kernel's
+  own caches the feed revokes. Negative lookups aren't kept.
+- **`ProcessType` is `Adaptive`**, launchd's type for a service that works while its XPC clients
+  do, instead of the default's light resource limits. It made no measurable difference here.
+
+**Restarts** (each seen from the extension, and in the self-test):
+
+| What restarts | What the extension sees | The daemon's side | The journal |
+| --- | --- | --- | --- |
+| The daemon, orderly (`void daemon restart`) | Its session and handles answer `ESTALE`, and its relay ends, which empties the memo. A new session has a higher generation and the same inode numbers; an old handle on it is `ESTALE` too | Recovers the store as at any start | Bytes acknowledged before are read back, and published |
+| The daemon, killed (`kill -9`) | `ECONNREFUSED` while it's down, then the same as above | Same | Same |
+| The agent, stopped (SIGTERM: `launchctl kickstart -k`, unregistering, logging out) | The connection is interrupted: calls in flight fail with `EIO` and the session with `ESTALE`. The next call starts the agent at once, and a new session works | The agent released its sessions first, so the drive's core closed with its last consumer and reopened with a new generation | Unaffected |
+| The agent, killed | The same, but launchd's crash throttle starts it again only after about 10 s (9–10 s measured); calls wait for it | The dead agent's sessions stay until the daemon restarts, within its 256 | Unaffected |
+
+**Evidence.** On 9 October, from the development-signed, sandboxed extension (the build folder's
+copy, which FSKit used once LaunchServices forgot `/Applications/voidfs.app`), through the agent
+that copy registered, to a release daemon in the App Group container and a local memory-store
+server. A mount's `.voidfs-bridge` lookup ran 43 checks three times, all passing:
+
+- a session, with its capabilities and the relay's initial resync;
+- bounded binary writes of 4 KiB, 1 MiB and 8 MiB, read back byte for byte;
+- `EINVAL` from the agent itself for one byte over `maxIo`, either way;
+- a generation update after the writes;
+- 256 concurrent calls;
+- every namespace, attribute and xattr call with its refusals, and the memo following both this
+  client's changes and another connection's;
+- a read-only session's `EROFS`;
+- release.
+
+`.voidfs-bridge-remote:data` saw an upload from the CLI arrive as a new generation 0.1 s after the
+upload began, before the CLI had returned. The restart rows above are the
+`.voidfs-bridge-daemon-restart` and `.voidfs-bridge-agent-restart` runs. The app itself is
+refused by the installed agent (`voidfs bridge-check`). The Developer ID build wasn't rebuilt
+with the bridge: the probe showed that signing path, and the agent's requirement accepts both
+(`codesign --verify -R`).
+
+**Hop costs** (µs, 1,000 calls after one warm-up; the 4 KiB file is in the daemon's cache):
+
+| Path | Warm `getattr` p50 / p99 | Cache-hit 4 KiB read p50 / p99 |
+| --- | --- | --- |
+| Spike: XPC echo, 4 KiB, from the extension, development-signed (27 September) | hop only: 62 / 153 | |
+| Signed-bundle probe: the same, Developer ID (9 October) | hop only: 59 / 150 | |
+| The bridge's `ping`, 4 KiB, from the extension | hop only: 57–67 / 122–185 | |
+| Daemon socket only, Rust client, debug daemon (as on 7 October) | 289 / 371 | 110 / 159 |
+| Daemon socket only, Rust client, release daemon | 94 / 139 | 26 / 45 |
+| Self-test: in-process XPC, agent code, socket, release daemon | 122–135 / 183–235 | 67–69 / 93–94 |
+| **Extension → XPC → agent → socket → daemon (release)** | **200–205 / 311–369** | **107–119 / 171–185** |
+| The extension's memo | under 0.1 | |
+
+An FSKit upcall costs about 17 µs (spike §4.1). So a warm `getattr` is served from the memo
+without leaving the extension, and a cache-hit read costs about 110 µs more than the kernel
+needs: about 60 µs of XPC, 26 µs of daemon and the rest in the agent's thread hops and coding.
+FSKit's own data cache keeps repeated reads in the kernel, and direct cache-file reads wait for a
+lease API, as planned. Nothing here is a gate. Reproduce with the app built as `apps/macos/README.md`
+says, a daemon whose `VOIDFS_STATE_DIR` is the container's `daemon` folder, and
+`voidfs bridge-selftest <drive>` or `stat <mount>/.voidfs-bridge~1` (log:
+`log stream --predicate 'subsystem == "dev.voidfs"'`); the socket rows with
+`cargo test [--release] -p voidfs-daemon --locked --test sessions measure_warm_metadata_and_cached_read_socket_hops -- --ignored --exact --nocapture`.
+
+**Findings.**
+
+- **An agent registered from a differently signed copy keeps the old launch constraint once.**
+  Registered from the development-signed build after the Developer ID copy, launchd refused to
+  start it ("Launch Constraint Violation … Constraint not matched … vc: 3") until it was
+  unregistered and registered again. Rebuilds of the same copy started without it. Item 7's
+  installer, and anyone switching builds, should expect it.
+- **The core answers `EAGAIN` while the daemon publishes nearby.** The feed reports each of the
+  daemon's own publications, and each report marks the parent's listing for refresh. A
+  mutation's check or a directory page then races the refresh, and after its own four tries the
+  core returns `EAGAIN`, having applied nothing. With the client's retries, runs here needed 0 to
+  17. Items 3 and 4 should keep the retry; the core could also recognize its own publications in
+  the feed instead of re-listing. That isn't done here.
+
+**Item 2 against its bullets**, after this section:
+
+| Item 2 asks for | Where it is |
+| --- | --- |
+| Sessions mapped to a drive, read-only policy and lifetime; opaque IDs, generation handshakes, structured errors, stale handles after a reconnect | [Rust daemon sessions](#rust-daemon-sessions-7-october); the bridge carries them through: per-connection sessions, `ESTALE` and new generations (restart rows above) |
+| Bounded sizes, calls and read-ahead; binary data without JSON; responsive controls; safe cancellation | The socket's bounds, and the agent's own (above). Bytes are `Data` over XPC and raw over the socket. A call whose connection ends finishes in the daemon and its reply is dropped; its sessions are released |
+| A shared per-drive feed, monotonic generations, a resync after a gap | The daemon's feed. The agent subscribes per session, adds no watcher, and checks the resync and generations |
+| A Swift launchd agent with the App Group prefix that forwards to the user-only socket, relays invalidations and owns no journal; peers authenticated, calls and paths validated | This section |
+| A generation-tagged metadata memo in the extension, reads over the bridge first, no daemon file paths | `BridgeSession`'s memo; reads are `Data` over XPC; no path crosses |
+| A migration of the CLI's state into the shared container | Not met by this section: the next pull request |
+| Done when: a signed sandboxed extension creates a session, reads and writes bounded payloads and receives a generation update through XPC → socket → daemon | Evidence above |
+| Done when: restarting the bridge and the daemon has known outcomes and leaves the journal recoverable | The restart table |
+| Done when: warm metadata and cache-hit hop costs recorded against the spike | The hop-cost table |

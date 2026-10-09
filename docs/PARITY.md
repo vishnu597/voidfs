@@ -124,8 +124,11 @@ billing or plans), this page says so.
     [RFC 0005](../rfcs/0005-user-metadata-on-edits.md) lets them carry; SpaceFS's documentation
     leaves that to the caller. The daemon's socket now carries
     [every mount-core call](step-5-macos.md#the-rest-of-the-session-calls-9-october) (9 October):
-    namespace changes, attributes, xattrs and conflict reads. The Swift bridge and the writable
-    mount remain pending. Steps 6–10 have not started.
+    namespace changes, attributes, xattrs and conflict reads. The app's launch agent is now
+    [the Swift bridge](step-5-macos.md#the-swift-bridge-9-october): the signed, sandboxed
+    extension reaches the daemon through it, with a metadata memo, restart outcomes and hop costs
+    recorded. Moving the CLI's state into the app's container, and the writable mount, remain
+    pending. Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
 
@@ -853,7 +856,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      [step 5 plan](step-5-macos.md). Its namespace, snapshot-read, local namespace-mutation,
      staged file-data, Rust daemon-session, guarded-publication and recovery slices are
      implemented, the core advertises its capabilities and sets mode and mtime, and item 1 is
-     complete; the daemon's socket carries every mount-core call; no writable adapter exists yet.
+     complete; the daemon's socket carries every mount-core call, and the app's agent bridges the
+     sandboxed extension to it; no writable adapter exists yet.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
