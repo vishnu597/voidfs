@@ -912,7 +912,9 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      metadata invalidations precede observer notifications, and reconnect/gaps trigger full resync.
      The signed Swift bridge and adapters remain pending.
      The read-only transport/adapter may proceed alongside writable core slices after the
-     snapshot/restart checks and the user's signed-bundle probe. The accepted direction is FSKit first, SMB evaluation on gate
+     snapshot/restart checks and the user's signed-bundle probe, which passed on 9 October: a
+     Developer ID, notarized build whose sandboxed module mounts and reaches an `SMAppService`
+     helper ([step 5](step-5-macos.md#signed-bundle-probe-9-october)). The accepted direction is FSKit first, SMB evaluation on gate
      failure, the Rust daemon/socket with a thin Swift XPC bridge, and verified whole shards
      until an authenticated-pieces RFC. New names use NFC; conflict resolution UI
      remains pending. Writes survive process crashes in staging, with disk flush on

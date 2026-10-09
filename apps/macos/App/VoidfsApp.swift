@@ -9,8 +9,12 @@
 //     voidfs.app/Contents/MacOS/voidfs save voidfs://127.0.0.1:9000/spike <access-key-id>   (secret on stdin)
 //     voidfs.app/Contents/MacOS/voidfs mount voidfs://127.0.0.1:9000/spike [mount-point]
 //     voidfs.app/Contents/MacOS/voidfs settings
+//     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status
+//
+// `agent` is how launchd runs it as the signed-bundle probe's helper (LaunchAgents/).
 
 import FSKit
+import ServiceManagement
 import SwiftUI
 
 let extensionBundleID = "dev.voidfs.app.fskit"
@@ -19,7 +23,8 @@ let extensionBundleID = "dev.voidfs.app.fskit"
 enum Launcher {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
-        if let command = args.first, ["status", "save", "mount", "settings"].contains(command) {
+        if args.first == "agent" { Agent.serve() }
+        if let command = args.first, ["status", "save", "mount", "settings", "agent-register", "agent-unregister", "agent-status"].contains(command) {
             Task {
                 let code = await HostCommands.run(args)
                 exit(code)
@@ -61,6 +66,15 @@ enum HostCommands {
                 print("mounted at \(path.path) in \(ContinuousClock.now - start)")
             case "settings":
                 print(FSClient.shared.openFileSystemExtensionsSettings() ? "opened System Settings" : "could not open System Settings")
+            case "agent-register":
+                do { try Agent.service.register() } catch { print("register: \(error.localizedDescription)") }
+                print("agent: \(Agent.status)")
+                return Agent.service.status == .enabled ? 0 : 1
+            case "agent-unregister":
+                try await Agent.service.unregister()
+                print("agent: \(Agent.status)")
+            case "agent-status":
+                print("agent: \(Agent.status)")
             default:
                 return 2
             }
@@ -70,6 +84,46 @@ enum HostCommands {
             print("error: \(e.domain) \(e.code): \(e.localizedDescription) \(e.userInfo)")
             return 1
         }
+    }
+}
+
+/// The signed-bundle probe's helper: the app itself, which launchd runs from the bundle's
+/// `Contents/Library/LaunchAgents` plist once it is registered and the user allows it. It answers
+/// the extension's XPC echo on the App-Group-prefixed name, the only kind the sandbox lets the
+/// extension reach.
+enum Agent {
+    static let service = SMAppService.agent(plistName: "dev.voidfs.agent.plist")
+
+    static var status: String {
+        switch service.status {
+        case .notRegistered: "not registered"
+        case .enabled: "enabled"
+        case .requiresApproval: "requires approval in System Settings → General → Login Items & Extensions"
+        case .notFound: "not found in the bundle"
+        @unknown default: "unknown (\(service.status.rawValue))"
+        }
+    }
+
+    static func serve() -> Never {
+        let delegate = EchoDelegate()
+        let listener = NSXPCListener(machServiceName: "\(MountStore.appGroup).agent")
+        listener.delegate = delegate
+        listener.resume()
+        withExtendedLifetime((listener, delegate)) { RunLoop.main.run() }
+        exit(0)
+    }
+}
+
+final class Echo: NSObject, XPCEcho {
+    func echo(_ data: Data, reply: @escaping (Data) -> Void) { reply(data) }
+}
+
+final class EchoDelegate: NSObject, NSXPCListenerDelegate {
+    func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
+        connection.exportedInterface = NSXPCInterface(with: XPCEcho.self)
+        connection.exportedObject = Echo()
+        connection.resume()
+        return true
     }
 }
 

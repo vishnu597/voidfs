@@ -260,7 +260,9 @@ Shape for Phase 2:
 - **Discovery.** FSKit found the module wherever the app was registered with LaunchServices
   (even in a build folder); no copy to `/Applications` was needed.
 - **Distribution:** Developer ID signing needs a Developer ID provisioning profile that carries
-  the FSKit Module capability, plus notarization. Not tried with voidfs's team yet, but SpaceFS
+  the FSKit Module capability, plus notarization. (Tried with voidfs's team on 9 October: it
+  works, notarized, with a sandboxed extension reaching an `SMAppService` agent; see
+  [step 5's signed-bundle probe](../step-5-macos.md#signed-bundle-probe-9-october).) SpaceFS
   ships exactly that, notarized ([PARITY.md §5](../PARITY.md#5-what-spacefss-mac-app-is-made-of)).
   SpaceFS also shows that `/Volumes` needs no `fskit.mount` entitlement: a privileged
   LaunchDaemon helper mounts there.

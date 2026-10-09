@@ -44,3 +44,41 @@ mkdir -p /tmp/voidfs-mnt && mount -F -t voidfs voidfs://127.0.0.1:9000/spike /tm
 ```
 
 Unmount with `umount /tmp/voidfs-mnt`. Logs: `log stream --predicate 'subsystem == "dev.voidfs"'`.
+
+## Release build: Developer ID, notarized
+
+`scripts/release.sh` builds the app as it ships: archived, signed with Developer ID, notarized and
+stapled, then checked with `codesign`, `spctl` and `stapler` (the
+[signed-bundle probe](../../docs/step-5-macos.md#signed-bundle-probe-9-october) ran it on
+9 October). It needs, for team `HAUTK68F56` or your own:
+
+- a Developer ID Application certificate in the login keychain;
+- a Developer ID provisioning profile for `dev.voidfs.app.fskit` with the FSKit Module capability,
+  named `voidfs FSKit Developer ID` (or change `scripts/ExportOptions-DeveloperID.plist`), installed
+  in `~/Library/Developer/Xcode/UserData/Provisioning Profiles/<UUID>.provisionprofile`;
+- notarization credentials in the keychain, saved once with an app-specific password:
+
+```bash
+xcrun notarytool store-credentials voidfs-notary --apple-id <Apple ID> --team-id HAUTK68F56
+```
+
+```bash
+apps/macos/scripts/release.sh voidfs-notary
+```
+
+The result is `apps/macos/build/release/voidfs.app`. Install it by moving it into Applications in
+Finder; copied there by a script, a quarantined app runs from a translocated copy. Building
+registers the build folders' copies with LaunchServices, and FSKit can use any registered copy of
+the module: `voidfs status` shows which one it uses, and
+`/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u <path to voidfs.app>`
+forgets a copy without deleting it.
+
+The app also carries the probe's helper, a launch agent that answers the extension's XPC echo on
+`HAUTK68F56.dev.voidfs.agent`. Register it, then look up `.voidfs-xpc` in a mount to have the
+extension call it (the result is in the log):
+
+```bash
+/Applications/voidfs.app/Contents/MacOS/voidfs agent-register
+```
+
+`agent-status` reports it and `agent-unregister` removes it.
