@@ -2,9 +2,10 @@
 
 *Proposed 4 October 2026, after step 4; architecture, integrity and local-save decisions accepted
 5 October; local namespace changes and staged file data added 6 October; Rust daemon sessions
-and shared feeds, guarded publication and retained conflicts added 7 October; recovery added
-8 October. Items 1 and 2 have begun with the Rust mount namespace, snapshot handles, durable
-namespace mutations, staged writes, publication reconciliation and recovery. The later
+and shared feeds, guarded publication and retained conflicts added 7 October; recovery and
+advertised capabilities added 8 October. Items 1 and 2 have begun with the Rust mount namespace,
+snapshot handles, durable namespace mutations, staged writes, publication reconciliation and
+recovery; item 1 lacks only setting mode and mtime ([capabilities](#capabilities-8-october)). The later
 deliverables remain an
 implementation plan; no writable adapter, platform service installation, new protocol field or
 format feature is delivered by this slice.*
@@ -443,7 +444,7 @@ and time budgets, sequence churn, and same-key termination. No step 5 item is co
 
 `Session::new_writable` receives the daemon's existing `Queue` and requires the same `Store`.
 It adds exclusive empty-file `create`, `mkdir`, `unlink`, empty-directory `rmdir`, and `rename`
-with replacement or exclusivity. Exchange returns `EOPNOTSUPP`. This slice covers namespace
+with replacement or exclusivity. Exchange returns `ENOTSUP`. This slice covers namespace
 mutations; staged file data is described below. The existing constructor keeps a read-only namespace.
 Each acknowledged edit changes the overlay, inode metadata and guarded journal entries in one
 SQLite `FULL` transaction. The queue installs that committed work before waking its publisher.
@@ -472,7 +473,7 @@ CLI queue retains its existing policy. Referenced lineage survives clearing fini
 Mount queue dependencies also compare NFC spellings, so removing a decomposed remote name
 finishes before publishing a replacement at its NFC spelling.
 Folder listings that omit a version require an identity-checked attributes lookup to bind one
-before mutation; a folder whose attributes supply no version returns `EOPNOTSUPP` rather than
+before mutation; a folder whose attributes supply no version returns `ENOTSUP` rather than
 publish without a guard.
 
 Rename replacement is atomic locally. The current wire rename guards only its source, so remote
@@ -643,7 +644,7 @@ the object protocol and format.
 
 | Method and path | Request / response |
 | --- | --- |
-| `POST /v1/fs/sessions` | `{version, drive, readOnly}` → `{version, id, drive, root, generation, metadataGeneration, readOnly, maxIo, maxEntries}` |
+| `POST /v1/fs/sessions` | `{version, drive, readOnly}` → `{version, id, drive, root, generation, metadataGeneration, readOnly, maxIo, maxEntries, capabilities}` ([capabilities](#capabilities-8-october), added 8 October within version 1) |
 | `POST /v1/fs/{id}/lookup` | `{parent, name}` → `Attr` |
 | `POST …/getattr`, `…/readlink` | `{ino}` → `Attr` or `{target}` |
 | `POST …/readdir` | `{ino, after, limit}` → `{entries: [[name, Attr], …], generation}` |
@@ -922,7 +923,8 @@ the last one, which needs a narrow sequence of steps; its own regression test gu
   intent, with a test proving it over 4,096 nonces; it is only flagged here.
 
 Item 1 is not marked complete: advertising unsupported hard links, cloning and cross-machine locks
-to adapters remains. Conflict resolution and snapshot cleanup remain UI work.
+to adapters remains (done in [capabilities](#capabilities-8-october), which found one more gap).
+Conflict resolution and snapshot cleanup remain UI work.
 
 Recovery validation: 690 workspace tests pass (9 ignored), and workspace clippy passes with
 warnings denied. The 26 new tests, the four review-fix tests among them, were each seen to fail
@@ -933,3 +935,71 @@ passes conformance, stock S3 checks, aws-chunked and rclone in both addressing s
 unavailable locally, and CI supplies it and checks MinIO and Docker Compose. Reproduce the
 measurements with
 `cargo test -p voidfs-client --locked --test mount_recovery recovery_and_compaction_measurements -- --ignored --nocapture`.
+
+### Capabilities, 8 October
+
+Item 1 asks that unsupported hard links, exchange, cloning and cross-machine locks be advertised
+and tested explicitly. `Session::capabilities()` now returns what an adapter advertises, for
+FSKit's volume capabilities and `pathconf` answers, and the daemon's session reply carries it.
+No protocol, format or server behavior changes.
+
+| Capability | Value | What the core does |
+| --- | --- | --- |
+| `hardLinks` | no | `Session::link` is refused; every file has one name |
+| `exchange` | no | `RenameMode::Swap` (`RENAME_SWAP`, `exchangedata`) is refused, both files untouched |
+| `exclusiveRename` | yes | `RenameMode::Exclusive` (`RENAME_EXCL`) fails with `EEXIST` |
+| `clone` | no | `Session::clone_file` (`clonefile`) is refused |
+| `locks` | `local` | The core has no lock calls. FSKit's kernel grants `flock` and `fcntl` locks without reaching the module ([spike §4.5](spikes/fskit.md#45-what-must-a-writable-mount-additionally-handle)), so they hold on this Mac only; no other machine sees them. Cross-machine locking (D7) needs its own design |
+| `caseSensitive` | yes | `OTHER` doesn't find `other`, and both can exist |
+| `nfcNames` | yes | New names are stored NFC; any equivalent spelling finds a name unless two normalize alike (`EILSEQ`); remote names stay byte-exact |
+| `persistentIds` | yes | Inode numbers survive restarts, renames and new versions |
+| `xattrs`, `maxXattrBytes` | yes, 65,536 | An object's xattr names and values together |
+| `maxNameBytes` | 255 | |
+| `maxPathBytes` | 1,024 | A file's path from the drive root, or a folder's with its trailing slash |
+
+**Refusals use `ENOTSUP`.** `FsError::Unsupported` mapped to `EOPNOTSUPP`, which on macOS is 102,
+"operation not supported on socket". macOS documents `ENOTSUP` (45) for a filesystem that doesn't
+support `link`, `clonefile`, a `renamex_np` flag or `exchangedata`, and SpaceFS's mount returns it
+for all four ([head-to-head](../bench/results/mac-head-to-head/README.md#semanticsc-observed)).
+Apps fall back on that value, so `Unsupported` now maps to `ENOTSUP` (a separate commit). Linux
+has one value for both, so nothing changes there. A folder whose attributes supply no version
+also returns `ENOTSUP` now.
+
+**Decisions.**
+
+- The capabilities describe the drive's core, not one consumer: a read-only RPC session gets the
+  same set, and `SessionInfo.readOnly` already says it can't write. A read-only core refuses
+  `link` and `clone_file` with `EROFS`, as it does `rename`.
+- `link` and `clone_file` exist only to refuse, so an adapter forwards every callback through one
+  error mapping, and supporting either later changes no adapter.
+- The local wire version stays 1. `capabilities` is an added response field: earlier readers
+  ignore it, since `SessionInfo` doesn't deny unknown fields. `FsClient` requires it rather than
+  guess, so a daemon built before it is refused at session creation. Version 1 has no consumer
+  outside this workspace yet, so nothing in use breaks; the Swift bridge should require it too.
+- The RPC doesn't carry rename, namespace or xattr calls yet, so `Swap` isn't reachable through
+  it; an unknown call such as `link` returns `404 NoSuchOperation` with `ENOTSUP`.
+- Symbolic-link creation, sparse files and volume sizes aren't advertised yet. The adapter items
+  add what FSKit needs as further fields, which older readers ignore.
+
+**Item 1 against its bullets.** Item 1 is still not complete: the core can't set the mode or the
+modification time of an existing file or folder.
+
+| Item 1 asks for | Where it is |
+| --- | --- |
+| Stable inodes, a persisted overlay, explicit directories, NFC names with equivalent lookups, case-sensitive collisions, byte-exact remote names, ambiguity rejected, handle identity kept through rename and open-unlink | [Namespace](#namespace-slice-5-october), [local namespace changes](#local-namespace-changes-6-october); `tests/mount.rs`, `mount_mutations.rs`, `mount_writes.rs` (`open_unlink_keeps_local_reads_and_writes_without_publishing_after_close`) |
+| Open, close, lookup, enumeration, getattr, read, write, truncate, rename-over, remove, mkdir and xattrs with one error mapping | `Session` and `FsError::errno`; `mount_reads.rs`, `mount_writes.rs`, `mount_mutations.rs`, `mount_xattrs.rs` |
+| Setting attributes (`chmod`, `utimes`, `setattrlist`) | **Not met.** `create` and `mkdir` take a mode and writes set the mtime, but no call changes either afterwards, so `chmod`, `touch -t`, `cp -p` and a Finder copy keeping its date can't be served. The queue's `Op::Attrs` already publishes mode and mtime under a guard, so the missing piece is a `Session::setattr` that records them |
+| Unsupported hard links, exchange, cloning and cross-machine locks advertised and tested | This section; `advertised_capabilities_match_what_the_core_does`, `a_read_only_core_advertises_the_same_and_refuses_links_as_read_only`, `capabilities_reach_the_socket_with_unsupported_operations_marked` |
+| A read-only open binds identity, version, size and attributes and reads that version through the cache; a writable open adds its local generation | [Open handles](#open-handles-and-snapshot-reads-5-october), [staged file data](#staged-file-data-6-october) |
+| Every acknowledged mutation durable with its journal; data kept for open handles; the overlay rebuilt after restart | [Staged file data](#staged-file-data-6-october), [recovery](#recovery-8-october); `local_overlay_and_queue_survive_a_restart_and_remote_refresh` |
+| Writes admitted within the disk reserve, `ENOSPC` without acknowledging, pending/saving/conflict/error states | `reserve_admission_returns_enospc_before_bytes_or_metadata_change`; `Sync` |
+| Queue guards and the `412` policy; both versions kept on a conflict; no later unguarded overwrite | [Guarded publication](#guarded-publication-and-conflict-reconciliation-7-october); `mount_publication.rs` |
+| Done when: save, rename, open-unlink and crash recovery against a temporary store; reads agree with the overlay while paused; kill points over staged bytes, metadata, publish and cleanup, with a published entry held open | [Recovery](#recovery-8-october)'s kill-point table and model test; `killed_after_reconciling_a_publication_held_open_leaves_no_orphans` |
+
+Capabilities validation: 693 workspace tests pass (9 ignored), and workspace clippy passes with
+warnings denied. The three new tests and the two changed ones (the errno mapping and the typed
+client's refusals) were each seen to fail with their code broken: eight breaks, 12 isolated
+failing runs. Spec validation passes 55 cases / 420 steps, and the five credential-script tests
+pass. Local memory, fs and versitygw interoperability passes conformance, stock S3 checks,
+aws-chunked and rclone; boto3 is unavailable locally, and CI supplies it and checks MinIO and
+Docker Compose.

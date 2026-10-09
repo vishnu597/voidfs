@@ -55,7 +55,9 @@ async fn fake(session: Reply, call: Reply) -> Fake {
 
 fn info() -> Value {
     json!({"version":fs::VERSION,"id":"1-a","drive":"drive","root":1,"generation":1,
-        "metadataGeneration":7,"readOnly":true,"maxIo":fs::MAX_IO,"maxEntries":fs::MAX_ENTRIES})
+        "metadataGeneration":7,"readOnly":true,"maxIo":fs::MAX_IO,"maxEntries":fs::MAX_ENTRIES,
+        "capabilities":{"hardLinks":false,"exchange":false,"exclusiveRename":true,"clone":false,"locks":"local",
+        "caseSensitive":true,"nfcNames":true,"persistentIds":true,"xattrs":true,"maxXattrBytes":65536,"maxNameBytes":255,"maxPathBytes":1024}})
 }
 
 fn attr() -> Value {
@@ -82,6 +84,10 @@ async fn hostile_session_identities_and_finite_response_limits_are_refused() {
         let f = fake(Reply::json(&session), Reply::bytes("{}")).await;
         failed(f.client.session("drive", true).await, "invalid filesystem session", field);
     }
+    let mut bare = info();
+    bare.as_object_mut().unwrap().remove("capabilities");
+    let f = fake(Reply::json(&bare), Reply::bytes("{}")).await;
+    failed(f.client.session("drive", true).await, "capabilities", "a session without capabilities");
     let good = info();
     let mut huge = vec![b' '; fs::MAX_RESPONSE + 1];
     huge.extend_from_slice(&serde_json::to_vec(&good).unwrap());

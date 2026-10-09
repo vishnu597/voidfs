@@ -133,11 +133,14 @@ during upload and snapshots held by earlier handles. Conflicts retain both versi
 including complete xattrs, and keep later edits guarded. After a process kill, the next writer
 queues what was left unflushed, a put whose reply was lost is known by its marker rather than
 becoming a conflict, and staging files, frozen copies and conflict snapshots that nothing needs
-are removed; flushes compact overwritten staging bytes. The Swift XPC bridge and the FSKit
+are removed; flushes compact overwritten staging bytes. `Session::capabilities`, also in the
+daemon's session reply, tells an adapter what to advertise: no hard links, exchange or cloning
+(refused with `ENOTSUP`), locks local to the Mac, case-sensitive NFC names and the xattr, name
+and path limits. The Swift XPC bridge and the FSKit
 adapter follow in later slices. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#recovery-8-october) for the current scope
+[step 5 plan](docs/step-5-macos.md#capabilities-8-october) for the current scope
 and decisions.
 
 ### The Rust SDK
@@ -403,7 +406,7 @@ nothing on either port does. The drives' state, which the server serves from, st
 | [`crates/voidfs-server`](crates/voidfs-server/) | The S3 server: storage backends, commit log, checkpoints, forks, SigV4, change feed |
 | [`crates/voidfs-sdk`](crates/voidfs-sdk/) | The Rust SDK: the AWS SDK for S3 plus typed calls for the extensions |
 | [`crates/voidfs-cli`](crates/voidfs-cli/) | `void`, the command line, on the SDK |
-| [`crates/voidfs-client`](crates/voidfs-client/) | The client core: block cache with read-ahead through the server or bucket, write journal and upload queue, change feed and connectivity, and the mount core with persistent inodes, snapshot reads, durable namespace/xattr mutations and staged file writes |
+| [`crates/voidfs-client`](crates/voidfs-client/) | The client core: block cache with read-ahead through the server or bucket, write journal and upload queue, change feed and connectivity, and the mount core with persistent inodes, snapshot reads, durable namespace/xattr mutations, staged file writes, guarded publication, recovery and advertised capabilities |
 | [`crates/voidfs-daemon`](crates/voidfs-daemon/) | The per-user daemon: one core/feed per drive, control and bounded filesystem RPCs over a Unix socket, with a typed Rust session client |
 | [`crates/voidfs-conformance`](crates/voidfs-conformance/) | Runs the conformance suite against any endpoint |
 | [`crates/voidfs-bench`](crates/voidfs-bench/), [`bench/`](bench/) | SpaceFS's 49 benchmark scenarios, run through voidfs and against the bare bucket; scripts and results |

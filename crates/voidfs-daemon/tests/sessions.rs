@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use bytes::Bytes;
-use voidfs_client::mount::{FsError, Sync};
+use voidfs_client::mount::{FsError, Locks, Sync};
 use voidfs_daemon::api::{Build, Scope, fs};
 use voidfs_daemon::{Daemon, DaemonClient, DaemonConfig, FsClient, FsClientError, InvalidationWatch};
 use voidfs_sdk::Kind;
@@ -151,6 +151,30 @@ async fn native_namespace_errors_keep_their_errno_on_the_wire() {
     refused(session.getattr(0).await, 409, "Stale", FsError::Stale);
     refused(session.readlink(attr.ino).await, 400, "InvalidName", FsError::InvalidName);
     session.release().await.unwrap();
+    f.daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capabilities_reach_the_socket_with_unsupported_operations_marked() {
+    let f = Fixture::new("caps", &[("data", Bytes::from_static(b"x"))]).await;
+    let http = f.raw();
+    let response = http.post("http://localhost/v1/fs/sessions").header("content-type", "application/json")
+        .body(r#"{"version":1,"drive":"drive","readOnly":false}"#).send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let raw: serde_json::Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(raw["capabilities"], serde_json::json!({"hardLinks":false,"exchange":false,"exclusiveRename":true,"clone":false,
+        "locks":"local","caseSensitive":true,"nfcNames":true,"persistentIds":true,"xattrs":true,"maxXattrBytes":65536,
+        "maxNameBytes":255,"maxPathBytes":1024}), "the wire names what an adapter advertises");
+    for read_only in [false, true] {
+        let session = f.client.session("drive", read_only).await.unwrap();
+        let caps = session.capabilities();
+        assert!(!caps.hard_links && !caps.exchange && !caps.clone && caps.locks == Locks::Local);
+        assert_eq!(caps, &session.info().capabilities);
+        assert_eq!(serde_json::to_value(caps).unwrap(), raw["capabilities"]);
+        let link = post(&http, &session, "link", serde_json::json!({"ino":session.info().root})).send().await.unwrap();
+        raw_refused(link, 404, "NoSuchOperation", FsError::Unsupported).await;
+        session.release().await.unwrap();
+    }
     f.daemon.stop().await;
 }
 

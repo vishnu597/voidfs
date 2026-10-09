@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::{Proxy, client_for};
 use rusqlite::{Connection, params};
-use voidfs_client::mount::{FsError, RenameMode, Session, Sync};
+use voidfs_client::mount::{Capabilities, FsError, Locks, RenameMode, Session, Sync, XattrMode};
 use voidfs_client::{ApiFetcher, BucketConfig, BucketFetcher, Cache, CacheConfig, Connectivity, Fetch,
     Invalidation, Link, Op, Queue, QueueConfig, Scope, State, Store};
 use voidfs_sdk::{Client, Config, Kind, ReadOptions};
@@ -316,6 +316,69 @@ async fn rename_exclusive_swap_cycles_and_same_names_leave_the_queue_unchanged()
     assert_eq!(ns.lookup(ns.root(), "file").await.unwrap(), file);
     assert_eq!(ns.lookup(ns.root(), "other").await.unwrap(), other);
     assert_eq!(ns.lookup(ns.root(), "a").await.unwrap(), a);
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn advertised_capabilities_match_what_the_core_does() {
+    let f = Fixture::new().await;
+    f.put("file", "one").await;
+    f.put("other", "two").await;
+    let ns = f.session().await;
+    let caps = ns.capabilities();
+    assert_eq!(caps, Capabilities { hard_links: false, exchange: false, exclusive_rename: true, clone: false, locks: Locks::Local,
+        case_sensitive: true, nfc_names: true, persistent_ids: true, xattrs: true, max_xattr_bytes: 64 * 1024,
+        max_name_bytes: 255, max_path_bytes: 1024 });
+    let root = ns.root();
+    let file = ns.lookup(root, "file").await.unwrap();
+    let other = ns.lookup(root, "other").await.unwrap();
+    let queued = f.queue.status().await.unwrap();
+    assert_eq!(ns.link(file.ino, root, "hard").await.unwrap_err(), FsError::Unsupported);
+    assert_eq!(ns.clone_file(file.ino, root, "copy").await.unwrap_err(), FsError::Unsupported);
+    assert_eq!(ns.rename(root, "file", root, "other", RenameMode::Swap).await.unwrap_err(), FsError::Unsupported);
+    assert_eq!(FsError::Unsupported.errno(), libc::ENOTSUP, "macOS documents ENOTSUP for link, clonefile, RENAME_SWAP and exchangedata");
+    for name in ["hard", "copy"] { assert_eq!(ns.lookup(root, name).await.unwrap_err(), FsError::NotFound); }
+    assert_eq!((ns.lookup(root, "file").await.unwrap(), ns.lookup(root, "other").await.unwrap()), (file.clone(), other));
+    assert_eq!(f.queue.status().await.unwrap(), queued, "a refused operation queues nothing");
+
+    assert_eq!(ns.rename(root, "file", root, "other", RenameMode::Exclusive).await.unwrap_err(), FsError::Exists);
+    ns.rename(root, "file", root, "moved", RenameMode::Exclusive).await.unwrap();
+    assert_eq!(ns.lookup(root, "moved").await.unwrap().ino, file.ino);
+    assert_eq!(ns.lookup(root, "OTHER").await.unwrap_err(), FsError::NotFound);
+    assert_ne!(ns.create(root, "Other", 0o644).await.unwrap().ino, ns.lookup(root, "other").await.unwrap().ino);
+    let cafe = ns.create(root, "cafe\u{301}", 0o644).await.unwrap();
+    assert_eq!(ns.lookup(root, "caf\u{e9}").await.unwrap().ino, cafe.ino);
+    assert!(ns.readdir(root, None, 100).await.unwrap().iter().any(|(name, attr)| name == "caf\u{e9}" && attr.ino == cafe.ino));
+
+    let longest = "n".repeat(caps.max_name_bytes as usize);
+    ns.create(root, &longest, 0o644).await.unwrap();
+    assert_eq!(ns.create(root, &format!("{longest}n"), 0o644).await.unwrap_err(), FsError::InvalidName);
+    let mut dir = root;
+    for letter in ["a", "b", "c"] { dir = ns.mkdir(dir, &letter.repeat(255), 0o755).await.unwrap().ino; }
+    ns.mkdir(dir, &"e".repeat(255), 0o755).await.unwrap();
+    let deepest = ns.mkdir(dir, &"d".repeat(254), 0o755).await.unwrap().ino;
+    ns.create(deepest, "z", 0o644).await.unwrap();
+    assert_eq!(ns.create(deepest, "zz", 0o644).await.unwrap_err(), FsError::InvalidName, "a path past {} bytes", caps.max_path_bytes);
+
+    let limit = caps.max_xattr_bytes as usize;
+    ns.setxattr(file.ino, "x", &vec![1; limit - 1], XattrMode::Create).await.unwrap();
+    assert_eq!(ns.setxattr(file.ino, "y", b"", XattrMode::Create).await.unwrap_err(), FsError::TooLarge);
+    assert_eq!(ns.listxattr(file.ino).await.unwrap(), ["x"]);
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_only_core_advertises_the_same_and_refuses_links_as_read_only() {
+    let f = Fixture::new().await;
+    f.put("file", "one").await;
+    let ns = Session::new(f.store.clone(), f.client.clone(), f.cache.clone(), "drv", f.connectivity.clone()).await.unwrap();
+    let file = ns.lookup(ns.root(), "file").await.unwrap();
+    assert_eq!(ns.capabilities(), Capabilities { hard_links: false, exchange: false, exclusive_rename: true, clone: false,
+        locks: Locks::Local, case_sensitive: true, nfc_names: true, persistent_ids: true, xattrs: true, max_xattr_bytes: 64 * 1024,
+        max_name_bytes: 255, max_path_bytes: 1024 });
+    assert_eq!(ns.link(file.ino, ns.root(), "hard").await.unwrap_err(), FsError::ReadOnly);
+    assert_eq!(ns.clone_file(file.ino, ns.root(), "copy").await.unwrap_err(), FsError::ReadOnly);
+    assert_eq!(ns.rename(ns.root(), "file", ns.root(), "other", RenameMode::Swap).await.unwrap_err(), FsError::ReadOnly);
     f.queue.close().await;
 }
 

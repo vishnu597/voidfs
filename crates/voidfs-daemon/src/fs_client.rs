@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde::{Serialize, de::DeserializeOwned};
-use voidfs_client::mount::Attr;
+use voidfs_client::mount::{Attr, Capabilities};
 
 use crate::{ClientError, DaemonClient, api::fs};
 
@@ -97,6 +97,8 @@ impl DaemonClient {
 
 impl FsClient {
     pub fn info(&self) -> &fs::SessionInfo { &self.info }
+
+    pub fn capabilities(&self) -> &Capabilities { &self.info.capabilities }
 
     fn path(&self, operation: &str) -> String { format!("/v1/fs/{}/{operation}", self.info.id) }
 
