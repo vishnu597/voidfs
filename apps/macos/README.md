@@ -6,9 +6,9 @@ findings, numbers and Phase 2 plan are in [`docs/spikes/fskit.md`](../../docs/sp
 
 | Folder | What |
 |---|---|
-| `App/` | The host app. Run from a terminal it also takes `status`, `save`, `mount` and `settings` |
+| `App/` | The host app, and the launch agent that bridges the extension to the daemon. Run from a terminal it also takes `status`, `save`, `mount`, `settings` and the agent and bridge commands |
 | `FSModule/` | The FSKit module: a `FSUnaryFileSystem` that serves `voidfs://host[:port]/drive` URLs |
-| `Shared/` | SigV4 signing, the HTTP client, where access keys are stored |
+| `Shared/` | SigV4 signing, the HTTP client, where access keys are stored, and the bridge's XPC interface, client and checks |
 | `Probe/` | `voidfs-probe`, the module's HTTP calls without FSKit, for baselines |
 | `Config/` | The extension's `Info.plist` and the entitlements |
 | `scripts/` | Seeding, benchmarks and the semantics probes the spike used |
@@ -20,7 +20,9 @@ findings, numbers and Phase 2 plan are in [`docs/spikes/fskit.md`](../../docs/sp
   without a provisioning profile that grants it, macOS kills the extension at launch. With Xcode
   signed in to your team, automatic signing creates the profile. The project uses team
   `HAUTK68F56`; set `DEVELOPMENT_TEAM` to your own, and change the App Group
-  (`HAUTK68F56.dev.voidfs` in `Config/*.entitlements` and `Shared/MountStore.swift`) to match.
+  (`HAUTK68F56.dev.voidfs` in `Config/*.entitlements`, `Shared/MountStore.swift` and
+  `LaunchAgents/dev.voidfs.agent.plist`) and the team in the bridge's code-signing requirements
+  (`Shared/Bridge.swift`, `App/SelfTest.swift`) to match.
 
 ## Build, enable, mount
 
@@ -73,12 +75,37 @@ the module: `voidfs status` shows which one it uses, and
 `/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u <path to voidfs.app>`
 forgets a copy without deleting it.
 
-The app also carries the probe's helper, a launch agent that answers the extension's XPC echo on
-`HAUTK68F56.dev.voidfs.agent`. Register it, then look up `.voidfs-xpc` in a mount to have the
-extension call it (the result is in the log):
+## The bridge to the daemon
+
+The app's launch agent is the extension's bridge to the Rust daemon (step 5, item 2): the
+sandboxed extension calls it over XPC on `HAUTK68F56.dev.voidfs.agent`, and it forwards a typed,
+bounded set of filesystem calls to the daemon's socket and relays its invalidations
+([the Swift bridge](../../docs/step-5-macos.md#the-swift-bridge-9-october)). It accepts only the
+extension's code signature. The daemon must run with its state in the App Group container:
 
 ```bash
-/Applications/voidfs.app/Contents/MacOS/voidfs agent-register
+VOIDFS_STATE_DIR="$HOME/Library/Group Containers/HAUTK68F56.dev.voidfs/daemon" target/release/void daemon start
 ```
 
-`agent-status` reports it and `agent-unregister` removes it.
+Register the agent from the copy of the app you built (registering from another copy changes which
+binary launchd runs; after switching between a Developer ID and a development copy, launchd may
+refuse the first start, and unregistering and registering again fixes it):
+
+```bash
+apps/macos/build/Build/Products/Release/voidfs.app/Contents/MacOS/voidfs agent-register
+```
+
+`agent-status` reports it, `agent-unregister` removes it, and `bridge-check` shows that it turns
+the app itself away. `bridge-selftest <drive>` runs the bridge's checks in process, without
+launchd or FSKit; its modes `daemon-restart`, `agent-restart`, `remote <key>`, `refused` and
+`wire` cover restarts, an outside change, peer refusal and the agent's codecs. In a mount, the
+extension runs the same checks through the real agent when you look up these names. The results go
+to the log, and a `~<anything>` suffix runs one again, since the kernel caches a missing name:
+
+| Name | Runs |
+|---|---|
+| `.voidfs-xpc` | 500 XPC round trips of 4 KiB to the agent |
+| `.voidfs-bridge` | The checks and timings, end to end |
+| `.voidfs-bridge-daemon-restart` | Waits while you restart or kill the daemon, then checks what survived |
+| `.voidfs-bridge-agent-restart` | The same for the agent (`launchctl kickstart -k gui/$(id -u)/dev.voidfs.agent`, or `kill -9`) |
+| `.voidfs-bridge-remote:<name>` | Waits for an outside change to `<name>`, such as a `void upload` |

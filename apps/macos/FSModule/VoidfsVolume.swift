@@ -105,6 +105,9 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     private var nextVerifier: UInt64 = 1
     private var seq: UInt64
     private var feed: Task<Void, Never>?
+    /// The bridge to the daemon through the app's agent: spike-only hooks use it until item 3
+    /// moves the volume onto it.
+    private let bridge = BridgeClient()
 
     init(client: VoidfsClient, drive: DriveInfo, volumeID: FSVolume.Identifier) {
         self.client = client
@@ -309,11 +312,28 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
             await selfBenchmark()
             throw posix(ENOENT)
         }
-        if n == ".voidfs-xpc" {
-            // Spike instrumentation: can the sandboxed extension reach a launchd agent, and how fast?
-            for service in ["\(MountStore.appGroup).agent", "dev.voidfs.agent"] {
-                let result = await XPCEchoProbe.run(name: service)
-                log.notice("xpc \(result, privacy: .public)")
+        // The kernel caches a name's ENOENT, so a hook takes a `~<anything>` suffix to run again.
+        let hook = n.split(separator: "~", maxSplits: 1).first.map(String.init) ?? n
+        if hook == ".voidfs-xpc" {
+            // Spike instrumentation: the bare hop to the app's agent, 500 x 4 KiB.
+            let scenario = BridgeScenario(client: bridge, drive: client.target.drive, another: { BridgeClient() }) { [log] line in log.notice("xpc \(line, privacy: .public)") }
+            do { scenario.distribution("XPC ping 4 KiB to \(Bridge.service)", try await scenario.timed(500) { _ = try await bridge.ping(Data(count: 4096)) }) }
+            catch { log.notice("xpc \(Bridge.service, privacy: .public): \(error.localizedDescription, privacy: .public)") }
+            throw posix(ENOENT)
+        }
+        if hook == ".voidfs-bridge" || hook.hasPrefix(".voidfs-bridge-") {
+            // Spike instrumentation: the bridge to the daemon, end to end from this sandbox
+            // (Shared/BridgeScenario.swift). It runs detached; its lines go to the log.
+            let scenario = BridgeScenario(client: bridge, drive: client.target.drive, another: { BridgeClient() }) { [log] line in log.notice("bridge \(line, privacy: .public)") }
+            let mode = String(hook.dropFirst(".voidfs-bridge".count))
+            Task.detached {
+                switch mode {
+                case "": await scenario.main()
+                case "-daemon-restart": await scenario.restart("daemon")
+                case "-agent-restart": await scenario.restart("agent")
+                case let m where m.hasPrefix("-remote:"): await scenario.remote(key: String(m.dropFirst("-remote:".count)))
+                default: scenario.say("unknown bridge hook \(mode)")
+                }
             }
             throw posix(ENOENT)
         }

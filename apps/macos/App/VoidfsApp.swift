@@ -10,8 +10,10 @@
 //     voidfs.app/Contents/MacOS/voidfs mount voidfs://127.0.0.1:9000/spike [mount-point]
 //     voidfs.app/Contents/MacOS/voidfs settings
 //     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status
+//     voidfs.app/Contents/MacOS/voidfs bridge-check
+//     voidfs.app/Contents/MacOS/voidfs bridge-selftest <drive> [main|daemon-restart|agent-restart|remote <key>|refused|wire] [--socket <path>]
 //
-// `agent` is how launchd runs it as the signed-bundle probe's helper (LaunchAgents/).
+// `agent` is how launchd runs it as the extension's bridge to the daemon (Agent.swift).
 
 import FSKit
 import ServiceManagement
@@ -24,7 +26,7 @@ enum Launcher {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
         if args.first == "agent" { Agent.serve() }
-        if let command = args.first, ["status", "save", "mount", "settings", "agent-register", "agent-unregister", "agent-status"].contains(command) {
+        if let command = args.first, ["status", "save", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "bridge-check", "bridge-selftest"].contains(command) {
             Task {
                 let code = await HostCommands.run(args)
                 exit(code)
@@ -75,6 +77,19 @@ enum HostCommands {
                 print("agent: \(Agent.status)")
             case "agent-status":
                 print("agent: \(Agent.status)")
+            case "bridge-check":
+                // The installed agent must refuse anything but the extension, this app included.
+                let client = BridgeClient()
+                do {
+                    _ = try await client.open(drive: "check", readOnly: true, watch: false)
+                    print("bridge-check: the agent accepted the app: FAIL")
+                    return 1
+                } catch {
+                    let e = error as NSError
+                    print("bridge-check: refused (\(e.domain) \(e.code)): ok")
+                }
+            case "bridge-selftest":
+                return await SelfTest.run(Array(args.dropFirst()))
             default:
                 return 2
             }
@@ -84,46 +99,6 @@ enum HostCommands {
             print("error: \(e.domain) \(e.code): \(e.localizedDescription) \(e.userInfo)")
             return 1
         }
-    }
-}
-
-/// The signed-bundle probe's helper: the app itself, which launchd runs from the bundle's
-/// `Contents/Library/LaunchAgents` plist once it is registered and the user allows it. It answers
-/// the extension's XPC echo on the App-Group-prefixed name, the only kind the sandbox lets the
-/// extension reach.
-enum Agent {
-    static let service = SMAppService.agent(plistName: "dev.voidfs.agent.plist")
-
-    static var status: String {
-        switch service.status {
-        case .notRegistered: "not registered"
-        case .enabled: "enabled"
-        case .requiresApproval: "requires approval in System Settings → General → Login Items & Extensions"
-        case .notFound: "not found in the bundle"
-        @unknown default: "unknown (\(service.status.rawValue))"
-        }
-    }
-
-    static func serve() -> Never {
-        let delegate = EchoDelegate()
-        let listener = NSXPCListener(machServiceName: "\(MountStore.appGroup).agent")
-        listener.delegate = delegate
-        listener.resume()
-        withExtendedLifetime((listener, delegate)) { RunLoop.main.run() }
-        exit(0)
-    }
-}
-
-final class Echo: NSObject, XPCEcho {
-    func echo(_ data: Data, reply: @escaping (Data) -> Void) { reply(data) }
-}
-
-final class EchoDelegate: NSObject, NSXPCListenerDelegate {
-    func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
-        connection.exportedInterface = NSXPCInterface(with: XPCEcho.self)
-        connection.exportedObject = Echo()
-        connection.resume()
-        return true
     }
 }
 
