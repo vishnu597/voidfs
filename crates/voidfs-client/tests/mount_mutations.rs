@@ -4,7 +4,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use common::{Proxy, client_for};
@@ -382,6 +382,150 @@ async fn a_read_only_core_advertises_the_same_and_refuses_links_as_read_only() {
     f.queue.close().await;
 }
 
+fn remote_mtime(attributes: &voidfs_sdk::Attributes) -> SystemTime {
+    chrono::DateTime::parse_from_rfc3339(attributes.mtime.as_deref().unwrap()).unwrap().into()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setattr_records_mode_and_mtime_and_publishes_one_attributes_version_each() {
+    let f = Fixture::new().await;
+    f.put("file", "bytes").await;
+    f.put("dir/", "").await;
+    let ns = f.session().await;
+    let root = ns.root();
+    let file = ns.lookup(root, "file").await.unwrap();
+    let dir = ns.lookup(root, "dir").await.unwrap();
+    let then = UNIX_EPOCH + Duration::new(1_000_000_000, 123_456_789);
+    let kept = UNIX_EPOCH + Duration::new(1_000_000_000, 123_456_000);
+    let set = ns.setattr(file.ino, Some(0o600), Some(then)).await.unwrap();
+    assert_eq!((set.ino, set.mode, set.mtime, set.size, set.sync), (file.ino, 0o600, kept, 5, Sync::Pending), "kept to the microsecond, as the server keeps it");
+    assert!(set.generation > file.generation);
+    assert_eq!(ns.getattr(file.ino).await.unwrap(), set);
+    assert_eq!(ns.lookup(root, "file").await.unwrap(), set);
+    let before_1970 = UNIX_EPOCH - Duration::new(86_400, 500_000_000);
+    let folder = ns.setattr(dir.ino, Some(0o700), Some(before_1970)).await.unwrap();
+    assert_eq!((folder.kind, folder.mode, folder.mtime), (Kind::Folder, 0o700, before_1970));
+    let chmod = ns.setattr(file.ino, Some(0o640), None).await.unwrap();
+    assert_eq!((chmod.mode, chmod.mtime), (0o640, kept), "a chmod leaves the mtime");
+    let queued = f.queue.status().await.unwrap();
+    assert_eq!(queued.items.iter().filter(|item| item.op == Op::Attrs).count(), 3);
+    for unchanged in [ns.setattr(file.ino, Some(0o640), Some(then)).await.unwrap(), ns.setattr(file.ino, None, None).await.unwrap()] {
+        assert_eq!(unchanged, chmod, "a value it already has changes nothing");
+    }
+    assert_eq!(f.queue.status().await.unwrap(), queued, "and queues nothing");
+    let versions = f.remote.list_versions("drv", "file", true).await.unwrap().len();
+    f.publish().await;
+    let remote = f.remote.attributes("drv", "file", Default::default()).await.unwrap();
+    assert_eq!((remote.mode.as_deref(), remote_mtime(&remote)), (Some("0640"), kept));
+    assert_eq!(f.remote.list_versions("drv", "file", true).await.unwrap().len(), versions + 2);
+    assert_eq!(remote_body(&f.remote, "file").await, Some(Bytes::from_static(b"bytes")));
+    let remote = f.remote.attributes("drv", "dir/", Default::default()).await.unwrap();
+    assert_eq!((remote.mode.as_deref(), remote_mtime(&remote)), (Some("0700"), before_1970));
+    let saved = ns.getattr(file.ino).await.unwrap();
+    assert_eq!((saved.sync, saved.mode, saved.mtime), (Sync::Saved, 0o640, kept));
+    assert_eq!(ns.getattr(dir.ino).await.unwrap().sync, Sync::Saved);
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setattr_refuses_what_it_cannot_record_and_queues_nothing() {
+    let f = Fixture::new().await;
+    f.put("file", "bytes").await;
+    let ns = f.session().await;
+    let file = ns.lookup(ns.root(), "file").await.unwrap();
+    assert_eq!(ns.setattr(ns.root(), Some(0o700), None).await.unwrap_err(), FsError::Unsupported);
+    assert_eq!(ns.setattr(file.ino, Some(0o10000), None).await.unwrap_err(), FsError::InvalidArgument);
+    let far = UNIX_EPOCH + Duration::from_secs(8_100 * 365 * 86_400);
+    assert_eq!(ns.setattr(file.ino, None, Some(far)).await.unwrap_err(), FsError::InvalidArgument, "years past 9999 have no RFC 3339 form");
+    assert_eq!(ns.setattr(file.ino, Some(0o600), Some(far)).await.unwrap_err(), FsError::InvalidArgument, "nothing is applied in part");
+    assert_eq!(ns.getattr(file.ino).await.unwrap(), file);
+    ns.unlink(ns.root(), "file").await.unwrap();
+    let queued = f.queue.status().await.unwrap();
+    assert_eq!(ns.setattr(file.ino, Some(0o600), None).await.unwrap_err(), FsError::Stale);
+    assert_eq!(f.queue.status().await.unwrap(), queued);
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_keep_a_set_mode_and_a_later_mtime_is_the_one_published() {
+    let f = Fixture::new().await;
+    let ns = f.session().await;
+    let root = ns.root();
+    let file = ns.create(root, "copy", 0o644).await.unwrap();
+    let fh = ns.open(file.ino, true).await.unwrap();
+    let reader = ns.open(file.ino, false).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"hello")).await.unwrap();
+    let then = UNIX_EPOCH + Duration::from_secs(1_200_000_000);
+    ns.setattr(file.ino, Some(0o640), Some(then)).await.unwrap();
+    for handle in [fh, reader] {
+        let attr = ns.handle_attr(handle).unwrap();
+        assert_eq!((attr.mode, attr.mtime, attr.size), (0o640, then, 5), "handles sharing the local bytes see the change");
+    }
+    ns.write(fh, 5, Bytes::from_static(b" world")).await.unwrap();
+    let written = ns.getattr(file.ino).await.unwrap();
+    assert_eq!(written.mode, 0o640, "a write keeps the mode");
+    assert!(written.mtime > then, "a write sets the mtime to now");
+    // A copy that keeps its source's date sets it after writing, before closing.
+    ns.setattr(file.ino, None, Some(then)).await.unwrap();
+    assert_eq!(ns.handle_attr(fh).unwrap().mtime, then);
+    ns.close(fh).await.unwrap();
+    ns.close(reader).await.unwrap();
+    f.publish().await;
+    assert_eq!(remote_body(&f.remote, "copy").await, Some(Bytes::from_static(b"hello world")));
+    let remote = f.remote.attributes("drv", "copy", Default::default()).await.unwrap();
+    assert_eq!((remote.mode.as_deref(), remote_mtime(&remote)), (Some("0640"), then));
+    let saved = ns.getattr(file.ino).await.unwrap();
+    assert_eq!((saved.sync, saved.mode, saved.mtime, saved.size), (Sync::Saved, 0o640, then, 11));
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setattr_works_offline_survives_a_restart_and_stays_guarded() {
+    let f = Fixture::new().await;
+    f.put("file", "one").await;
+    f.put("other", "two").await;
+    let ns = f.session().await;
+    let root = ns.root();
+    let file = ns.lookup(root, "file").await.unwrap();
+    let other = ns.lookup(root, "other").await.unwrap();
+    f.offline();
+    f.proxy.clear();
+    let then = UNIX_EPOCH + Duration::from_secs(1_300_000_000);
+    let set = ns.setattr(file.ino, Some(0o600), Some(then)).await.unwrap();
+    ns.setattr(other.ino, Some(0o600), None).await.unwrap();
+    assert!(f.proxy.seen().is_empty(), "a complete listing admits it offline");
+    let queued = f.queue.status().await.unwrap();
+    f.queue.close().await;
+    f.cache.settle().await;
+    let Fixture { _server, proxy, remote, client, state, store, cache, queue, connectivity } = f;
+    drop(ns);
+    drop(cache);
+    drop(queue);
+    drop(store);
+    let reopened = Arc::new(Store::open(state.path()).unwrap());
+    let queue = Queue::open(reopened.clone(), client.clone(), queue_config()).await.unwrap();
+    assert_eq!(queue.status().await.unwrap(), queued);
+    let cache = Cache::open(reopened.clone(), Arc::new(ApiFetcher::new(client.clone()).with_connectivity(connectivity.clone())),
+        CacheConfig { min_free_bytes: 0, ..Default::default() }).await.unwrap();
+    let ns = Session::new_writable(reopened, client, cache, queue.clone(), "drv", connectivity.clone()).await.unwrap();
+    let reopened = ns.getattr(file.ino).await.unwrap();
+    assert_eq!((reopened.mode, reopened.mtime, reopened.sync), (set.mode, set.mtime, Sync::Pending));
+    // Another Mac changes `other` after the local base: its guarded change must not land over it.
+    remote.put_object("drv", "other", "elsewhere", Default::default()).await.unwrap();
+    connectivity.answered(false);
+    queue.resume(Scope::All).await.unwrap();
+    queue.settle().await;
+    let published = remote.attributes("drv", "file", Default::default()).await.unwrap();
+    assert_eq!((published.mode.as_deref(), remote_mtime(&published)), (Some("0600"), then));
+    assert_eq!(ns.getattr(file.ino).await.unwrap().sync, Sync::Saved);
+    assert_eq!(remote.attributes("drv", "other", Default::default()).await.unwrap().mode.as_deref(), Some("0644"));
+    assert_eq!(remote_body(&remote, "other").await, Some(Bytes::from_static(b"elsewhere")));
+    let conflicted = ns.getattr(other.ino).await.unwrap();
+    assert_eq!((conflicted.sync, conflicted.mode), (Sync::Conflict, 0o600), "the local change is kept as a conflict");
+    queue.close().await;
+    drop(proxy);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn equivalent_unicode_rename_to_the_same_inode_is_a_noop() {
     let f = Fixture::new().await;
@@ -707,6 +851,7 @@ async fn read_only_sessions_reject_each_mutation_and_write_open() {
     assert_eq!(ns.rmdir(ns.root(), "new").await.unwrap_err(), FsError::ReadOnly);
     assert_eq!(ns.rename(ns.root(), "file", ns.root(), "new", RenameMode::Replace).await.unwrap_err(), FsError::ReadOnly);
     assert_eq!(ns.open(file.ino, true).await.unwrap_err(), FsError::ReadOnly);
+    assert_eq!(ns.setattr(file.ino, Some(0o600), Some(UNIX_EPOCH)).await.unwrap_err(), FsError::ReadOnly);
     assert!(f.queue.status().await.unwrap().items.is_empty());
     f.queue.close().await;
 }

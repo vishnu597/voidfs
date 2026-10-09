@@ -625,6 +625,7 @@ impl Session {
         };
         if let Some(local) = local {
             attr.size = local.size;
+            attr.mode = local.mode;
             attr.mtime = local.mtime;
             attr.generation = local.generation;
             attr.sync = local.sync;

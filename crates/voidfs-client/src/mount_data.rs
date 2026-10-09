@@ -102,6 +102,18 @@ impl Staged {
         Ok(())
     }
 
+    /// A committed mode or mtime change reaches the live stage's view, and the local state
+    /// that handles of its inode already show.
+    pub(super) fn attributes_changed(&self, ino: Ino, attr: &Attr) {
+        if let Some(file) = self.file(ino) { *file.attr.lock().unwrap_or_else(|p| p.into_inner()) = attr.clone(); }
+        let handles = self.handles.lock().unwrap_or_else(|p| p.into_inner());
+        for handle in handles.iter().filter_map(Weak::upgrade).filter(|handle| handle.attr.ino == ino) {
+            if let Some(local) = handle.local_attr.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                (local.mode, local.mtime, local.generation, local.sync) = (attr.mode, attr.mtime, attr.generation, attr.sync);
+            }
+        }
+    }
+
     pub(super) fn file(&self, ino: Ino) -> Option<Arc<File>> { self.files.lock().unwrap_or_else(|p| p.into_inner()).get(&ino).cloned() }
 
     pub(super) async fn opening(&self) -> tokio::sync::OwnedMutexGuard<()> { self.creation.clone().lock_owned().await }
