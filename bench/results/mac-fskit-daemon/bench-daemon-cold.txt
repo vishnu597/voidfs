@@ -1,0 +1,90 @@
+### daemon cold (state emptied before each cold step), run 1
+== Mount
+  mount                                           116.4 ms
+== Listing (fresh mount before each cold run)
+  many: cold ls -f (readdir only)                  58.1 ms
+  many: warm ls -f                                  5.9 ms
+  many: cold ls -l (readdir + lstat each)         231.0 ms
+  many: warm ls -l                                 68.5 ms
+  many: cold getattrlistbulk (Finder's call)      163.9 ms
+  many: warm getattrlistbulk                        5.4 ms
+  many10k: cold ls -f (readdir only)              404.1 ms
+  many10k: warm ls -f                              17.8 ms
+  many10k: cold ls -l (readdir + lstat each)     1915.4 ms
+  many10k: warm ls -l                             624.5 ms
+  many10k: cold getattrlistbulk (Finder's call)    388.7 ms
+  many10k: warm getattrlistbulk                    13.3 ms
+== Sequential read of media/big.bin (1 GiB)
+  cold, dd bs=1m:
+    1073741824 bytes transferred in 0.598139 secs (1795137625 bytes/sec)
+  cold, dd bs=8m:
+    1073741824 bytes transferred in 0.596103 secs (1801268948 bytes/sec)
+  warm (kernel cache), dd bs=1m:
+    1073741824 bytes transferred in 0.058025 secs (18504813856 bytes/sec)
+== Random 4 KiB reads of media/big.bin
+  cold: 300 random 4096-byte reads (F_NOCACHE): mean 2.55 ms, p50 2.89 ms, p90 4.26 ms, p99 6.15 ms, max 6.33 ms
+  again: 300 random 4096-byte reads (F_NOCACHE): mean 0.48 ms, p50 0.31 ms, p90 0.48 ms, p99 4.92 ms, max 6.92 ms
+  cold: 300 random 4096-byte reads (cached): mean 2.68 ms, p50 3.07 ms, p90 4.35 ms, p99 5.58 ms, max 6.78 ms
+== First byte of a small file in a folder not yet listed
+  cat docs/nested/deep/readme.md (cold)            29.8 ms
+  cat docs/nested/deep/readme.md (warm)             4.6 ms
+### daemon cold (state emptied before each cold step), run 2
+== Mount
+  mount                                            87.3 ms
+== Listing (fresh mount before each cold run)
+  many: cold ls -f (readdir only)                  55.5 ms
+  many: warm ls -f                                  5.6 ms
+  many: cold ls -l (readdir + lstat each)         217.3 ms
+  many: warm ls -l                                 65.5 ms
+  many: cold getattrlistbulk (Finder's call)      146.2 ms
+  many: warm getattrlistbulk                        5.1 ms
+  many10k: cold ls -f (readdir only)              366.0 ms
+  many10k: warm ls -f                              21.7 ms
+  many10k: cold ls -l (readdir + lstat each)     1965.6 ms
+  many10k: warm ls -l                             613.2 ms
+  many10k: cold getattrlistbulk (Finder's call)    365.1 ms
+  many10k: warm getattrlistbulk                    16.6 ms
+== Sequential read of media/big.bin (1 GiB)
+  cold, dd bs=1m:
+    1073741824 bytes transferred in 0.586645 secs (1830309342 bytes/sec)
+  cold, dd bs=8m:
+    1073741824 bytes transferred in 0.593287 secs (1809818560 bytes/sec)
+  warm (kernel cache), dd bs=1m:
+    1073741824 bytes transferred in 0.061177 secs (17551397159 bytes/sec)
+== Random 4 KiB reads of media/big.bin
+  cold: 300 random 4096-byte reads (F_NOCACHE): mean 2.48 ms, p50 2.88 ms, p90 4.33 ms, p99 6.24 ms, max 7.52 ms
+  again: 300 random 4096-byte reads (F_NOCACHE): mean 0.44 ms, p50 0.29 ms, p90 0.45 ms, p99 4.22 ms, max 5.24 ms
+  cold: 300 random 4096-byte reads (cached): mean 2.80 ms, p50 3.05 ms, p90 4.47 ms, p99 6.32 ms, max 11.52 ms
+== First byte of a small file in a folder not yet listed
+  cat docs/nested/deep/readme.md (cold)            25.8 ms
+  cat docs/nested/deep/readme.md (warm)             3.9 ms
+### daemon cold (state emptied before each cold step), run 3
+== Mount
+  mount                                            90.2 ms
+== Listing (fresh mount before each cold run)
+  many: cold ls -f (readdir only)                  59.9 ms
+  many: warm ls -f                                  6.0 ms
+  many: cold ls -l (readdir + lstat each)         226.1 ms
+  many: warm ls -l                                 67.7 ms
+  many: cold getattrlistbulk (Finder's call)      133.1 ms
+  many: warm getattrlistbulk                        6.0 ms
+  many10k: cold ls -f (readdir only)              389.4 ms
+  many10k: warm ls -f                              18.1 ms
+  many10k: cold ls -l (readdir + lstat each)     1902.3 ms
+  many10k: warm ls -l                             618.6 ms
+  many10k: cold getattrlistbulk (Finder's call)    381.7 ms
+  many10k: warm getattrlistbulk                    13.4 ms
+== Sequential read of media/big.bin (1 GiB)
+  cold, dd bs=1m:
+    1073741824 bytes transferred in 0.594947 secs (1804768868 bytes/sec)
+  cold, dd bs=8m:
+    1073741824 bytes transferred in 0.592387 secs (1812568176 bytes/sec)
+  warm (kernel cache), dd bs=1m:
+    1073741824 bytes transferred in 0.068301 secs (15720733576 bytes/sec)
+== Random 4 KiB reads of media/big.bin
+  cold: 300 random 4096-byte reads (F_NOCACHE): mean 2.29 ms, p50 2.78 ms, p90 4.29 ms, p99 5.18 ms, max 5.89 ms
+  again: 300 random 4096-byte reads (F_NOCACHE): mean 0.53 ms, p50 0.32 ms, p90 0.51 ms, p99 4.85 ms, max 8.27 ms
+  cold: 300 random 4096-byte reads (cached): mean 2.60 ms, p50 2.96 ms, p90 4.30 ms, p99 6.88 ms, max 9.20 ms
+== First byte of a small file in a folder not yet listed
+  cat docs/nested/deep/readme.md (cold)            29.3 ms
+  cat docs/nested/deep/readme.md (warm)             4.8 ms

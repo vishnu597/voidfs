@@ -1,0 +1,59 @@
+== S1-no-snapshot (coherence.py)
+** BUILD SUCCEEDED **
+FAIL grows.bin: open while overwritten 12 → 32 bytes, it keeps the version it opened, whole (12 bytes, fstat 12): read b'FFFFFFFFFFFF'… (12 bytes), fstat 12
+FAIL shrinks.bin: open while overwritten 3145728 → 8 bytes, it keeps the version it opened, whole (33 bytes, fstat 3145728): read '[Errno 5] Input/output error at 0'… (33 bytes), fstat 3145728
+2 failed
+### exit 1
+== S2-no-file-revoke (coherence.py)
+** BUILD SUCCEEDED **
+FAIL grows.bin: an overwrite 12 → 32 bytes, a sibling held open, shows by path within 5 s (never): 
+FAIL shrinks.bin: an overwrite 3145728 → 8 bytes, a sibling held open, shows by path within 5 s (never): 
+FAIL renamed.txt → renamed-to.txt: a rename, a sibling held open, shows within 5 s: old name gone (never), new name listed (14 ms) and opens: 
+FAIL renamed-open.txt: once closed, the old name is gone (never): 
+FAIL deleted.txt: a delete, a sibling held open, shows within 5 s: by path (never), listing (16 ms): 
+FAIL deleted-open.txt: once closed, it is gone (never): 
+6 failed
+### exit 1
+== S3-children-only (coherence.py)
+** BUILD SUCCEEDED **
+FAIL coherence-1791683194-6129/missed-while-held.txt: found by path once the sibling closes (never): 
+FAIL coherence-1791683194-6129/missed-nothing-held.txt: looked up and missed, then created, nothing held: found by path within 5 s (never): 
+FAIL coherence-1791683194-6129/later/inside.txt: a folder looked up and missed, then created with a file in it, nothing held: found by path within 5 s (never): 
+3 failed
+### exit 1
+== S4-folders-cached (coherence.py)
+** BUILD SUCCEEDED **
+FAIL coherence-1791683229-6211/missed-while-held.txt: looked up and missed, then created, a sibling held open: listed within 5 s (never): 
+FAIL coherence-1791683229-6211-top.txt: looked up and missed, then created, in the drive's top folder: listed within 5 s (never): 
+2 failed
+### exit 1
+== S5-listings-kept (coherence.py)
+** BUILD SUCCEEDED **
+FAIL grows.bin: an overwrite 12 → 32 bytes, a sibling held open, shows by path within 5 s (never): 
+FAIL shrinks.bin: an overwrite 3145728 → 8 bytes, a sibling held open, shows by path within 5 s (never): 
+FAIL grows.bin: once closed, its path shows the new version (never): 
+FAIL shrinks.bin: once closed, its path shows the new version (never): 
+FAIL renamed.txt → renamed-to.txt: a rename, a sibling held open, shows within 5 s: old name gone (never), new name listed (never) and opens: 
+FAIL renamed-open.txt → renamed-open-to.txt: open while renamed, it still reads it; the new name is listed (never) and opens: 
+FAIL renamed-open.txt: once closed, the old name is gone (never): 
+FAIL deleted.txt: a delete, a sibling held open, shows within 5 s: by path (never), listing (never): 
+FAIL deleted-open.txt: open while deleted, it still reads it; the listing drops it (never): 
+FAIL deleted-open.txt: once closed, it is gone (never): 
+FAIL created.txt: a new file, a sibling held open, is listed within 5 s (never) and opens: 
+FAIL coherence-1791683250-6647/missed-while-held.txt: looked up and missed, then created, a sibling held open: listed within 5 s (never): 
+### exit 1
+== S6-last-component (coherence.py)
+** BUILD SUCCEEDED **
+0 failed
+### exit 0
+== S9-no-retry-on-close (coherence.py)
+** BUILD SUCCEEDED **
+FAIL coherence-1791684389-7021/missed-while-held.txt: found by path once the sibling closes (never): 
+1 failed
+### exit 1
+== S8-no-rebind (restarts.py agent-restarted)
+** BUILD SUCCEEDED **
+FAIL agent-restarted: the open file reads the same bytes, and a stat and a listing work, not within 60053 ms (meanwhile: [Errno 70] Stale NFS file handle)
+### exit 1
+** BUILD SUCCEEDED **
+== batch done

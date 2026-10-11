@@ -143,10 +143,14 @@ and path limits. `Session::setattr` sets mode and mtime, which completes the mou
 item 1). The app's launch agent bridges the sandboxed FSKit extension to the daemon over XPC,
 with a metadata memo in the extension, and the app shares the CLI's daemon and store, which
 completes step 5, item 2. The daemon's `fskit` adapter mounts a drive with that extension, and a
-mount call whose server has gone silent fails after 5 s instead of waiting out timeouts. The accepted
+mount call whose server has gone silent fails after 5 s instead of waiting out timeouts. The
+extension now reads through the daemon and follows other machines' changes, which completes step 5,
+item 3 with a release blocker: FSKit keeps a name this Mac looked up and missed while anything
+below its folder is in use (and in the drive's top folder until remount), so the SMB decision is
+reopened before the writable mount ([step 5](docs/step-5-macos.md#the-blocker-a-name-missed-while-its-folder-is-in-use)). The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#lost-replies-to-edits-renames-and-attribute-changes-8-october) for the current scope
+[step 5 plan](docs/step-5-macos.md#read-only-fskit-on-the-daemon-10-october) for the current scope
 and decisions.
 
 ### The Rust SDK

@@ -26,9 +26,12 @@ enum Agent {
 
     /// The daemon's state directory: the CLI's default, `voidfs_client::default_dir()`, which the
     /// app shares, so that one daemon owns one store. Not the App Group container: macOS keeps the
-    /// CLI's daemon out of it (step 5, "One daemon for the CLI and the app").
+    /// CLI's daemon out of it (step 5, "One daemon for the CLI and the app"). A developer can
+    /// point the agent at a daemon elsewhere, as `VOIDFS_STATE_DIR` points the CLI, with
+    /// `defaults write dev.voidfs.app VoidfsStateDirectory <dir>` and a restart of the agent.
     static var stateDirectory: URL? {
-        FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Application Support/voidfs")
+        if let dir = UserDefaults.standard.string(forKey: "VoidfsStateDirectory"), dir.hasPrefix("/") { return URL(filePath: dir) }
+        return FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Application Support/voidfs")
     }
 
     static func serve() -> Never {

@@ -5,16 +5,20 @@
 and shared feeds, guarded publication and retained conflicts added 7 October; recovery and
 advertised capabilities, setting mode and mtime, and recognizing lost replies to edits, renames
 and attribute changes added 8 October; the signed-bundle probe, the rest of the session calls,
-the Swift bridge and one daemon for the CLI and the app added 9 October. **Item 1 is complete**
+the Swift bridge and one daemon for the CLI and the app added 9 October; read-only FSKit on the
+daemon added 10 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
 ([9 October](#one-daemon-for-the-cli-and-the-app-9-october)): the daemon's sessions carry every
 mount-core call, the app's agent bridges the sandboxed extension to them, and the app shares the
 CLI's daemon and store, which the user accepted in place of a move into the App Group container.
-The later deliverables remain an
-implementation plan; no writable adapter, platform service installation, new protocol field or
-format feature is delivered by this slice.*
+**Item 3 is complete with a release blocker** ([10 October](#read-only-fskit-on-the-daemon-10-october)):
+the extension reads through the daemon, `void mount` mounts with the `fskit` adapter, and the mount
+follows other machines' changes, except that FSKit keeps a name this Mac missed while its folder
+is in use (and in the top folder until remount), which reopens the SMB decision before item 4.
+The later deliverables remain an implementation plan; no writable adapter, platform service
+installation, new protocol field or format feature is delivered by this slice.*
 
 Step 5 is **done when** the daemon mounts a writable drive from the same durable client core the
 CLI uses, Finder and the target applications can save through it, and a signed, notarized app can
@@ -54,7 +58,7 @@ SMB callbacks remain later work.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
-| FSKit, SMB or both | **Accepted 5 October: FSKit first, keep the adapter boundary, evaluate SMB only if the compatibility gate fails.** Preserve the native-module decision and the existing spike. | SMB first could avoid FSKit-specific cache and entitlement constraints, but needs a reusable SMB server, a license review and proof of Mac semantics. Shipping both now doubles adapter and coherence validation. SpaceFS's default SMB is evidence to evaluate, not evidence that voidfs's SMB adapter already exists. |
+| FSKit, SMB or both | **Accepted 5 October: FSKit first, keep the adapter boundary, evaluate SMB only if the compatibility gate fails.** Preserve the native-module decision and the existing spike. **Reopened 10 October** by item 3's release blocker ([a name missed while its folder is in use](#the-blocker-a-name-missed-while-its-folder-is-in-use)): item 6's SMB feasibility spike runs next, before item 4. | SMB first could avoid FSKit-specific cache and entitlement constraints, but needs a reusable SMB server, a license review and proof of Mac semantics. Shipping both now doubles adapter and coherence validation. SpaceFS's default SMB is evidence to evaluate, not evidence that voidfs's SMB adapter already exists. |
 | Minimum OS | **Keep macOS 27 for FSKit.** Recheck the final SDK/runtime before release. | Any lower minimum requires a separate coherence strategy and an explicit change to the recorded platform decision. An SMB adapter would need its own measured minimum; it does not automatically lower the app's minimum. |
 | Rust/Swift boundary | **Accepted 5 October: keep the Rust daemon and socket; add a thin Swift XPC bridge for the sandboxed extension.** | A Swift agent embedding Rust through UniFFI follows the original spike, but replaces the now-built daemon host and adds bindings/build work. A direct extension-to-socket path is smaller only if a signed sandbox test proves access and notifications. |
 | Cache and journal ownership | **One daemon owns mutable state; shared cache files are read through leases.** | An extension-owned core repeats state per drive and loses its process on eject. Neither a bridge nor an extension may independently open the writable state database. |
@@ -168,6 +172,12 @@ has known outcomes and leaves the journal recoverable. Record warm metadata and 
 costs against the spike before optimizing direct file access.
 
 ### Item 3. Read-only FSKit on the daemon, then coherence
+
+**Complete, 10 October, with a release blocker:** every bullet and the done-when are met, and the
+done-when's last clause applies. A name this Mac looked up and missed stays missing to path
+lookups while anything below its folder is in use, and in the drive's top folder until remount,
+so the SMB decision is reopened before more app surface. The evidence is in
+[read-only FSKit on the daemon](#read-only-fskit-on-the-daemon-10-october).
 
 Replace the spike's Swift HTTP/cache/feed ownership with the session from items 1–2. Keep
 `FSGenericURLResource` and the secret-free resource URL for mounting in a user-owned folder.
@@ -1460,3 +1470,255 @@ Validation for these sections: 714 workspace tests pass (9 ignored), and workspa
 with warnings denied. Spec validation passes 56 cases / 432 steps, and the five credential-script
 tests pass. Local memory, fs and versitygw interoperability passes; boto3 is unavailable locally,
 and CI supplies it and checks MinIO and Docker Compose.
+
+### Read-only FSKit on the daemon, 10 October
+
+The extension no longer has an HTTP client, a cache or a change feed of its own. Every callback
+goes to the daemon's session through the app's agent (`Shared/BridgeClient.swift`), and the
+session's invalidation relay says what changed, here or on other machines; the volume turns that
+into kernel revokes. `void mount` mounts with it: the daemon's first adapter on macOS is now
+`fskit`. The volume is still read-only (item 4 makes it writable). One coherence case can't meet
+the 5-second requirement on this FSKit, which the plan treats as a release blocker: see
+[the blocker](#the-blocker-a-name-missed-while-its-folder-is-in-use) below. The user chose on
+10 October to finish item 3 with the blocker recorded, to start no writable surface (item 4) yet,
+and to test the case with SMB next (item 6's feasibility spike).
+
+**Decisions.**
+
+- **The resource names only the drive: `voidfs://<drive>`.** The daemon holds the server and the
+  key, so the extension needs neither, and `mount`'s output shows `voidfs://footage on …`. Drive
+  aliases follow bucket naming and ids are `d-<uuid>`, so the drive is the URL's host. The spike's
+  `voidfs://host:port/drive` named a server the daemon now chooses: `loadResource` refuses it
+  (`EINVAL`, with a log line saying why) rather than mount whatever the daemon's server is.
+  `loadResource` opens a read-only bridge session on the drive and waits for its relay's initial
+  resync, so a mount fails at once when the daemon isn't running, doesn't know the drive, or the
+  agent can't be reached; it gives up after 15 s, because launchd can hold a message for an agent
+  it refuses to start (a launch constraint) without failing it.
+- **`MountStore` is gone, with the spike's `save` command.** Nothing reads the App Group
+  container's `mounts.json` any more (the file the spike wrote stays where it is). The app's
+  `mount` command and menu ask the daemon (`POST /v1/mounts`), as `void mount` does. The HTTP
+  client and its signer moved into `Probe/`, the baseline tool that still uses them, so the
+  extension doesn't carry them. Credentials stay in `daemon.json` until item 7.
+- **The `fskit` adapter** (`crates/voidfs-daemon/src/fskit.rs`) runs `/sbin/mount -F -t voidfs -r
+  voidfs://<drive> <mountpoint>` as the user and `/sbin/umount`. The extension receives `-r` as
+  `-o ro`. `Adapter::writable` (new, true by default) lets it say it can't write, so the mount
+  shows as read-only while the remembered record keeps what was asked, ready for item 4.
+  `Mounted::invalidate` does nothing: the extension has its own relay. The mountpoint is compared
+  by its real path (`/private/tmp`, as `mount` prints it). A mount of the same resource already
+  there (a daemon that was killed leaves it mounted) is adopted, not mounted over; anything else
+  at the mountpoint is refused. Unmounting a drive already ejected in Finder succeeds without
+  `umount`. A refused unmount (busy) now leaves the mount in the table and remembered, instead of
+  dropping a drive that is still mounted. A module that is switched off fails with a hint naming
+  the System Settings pane. `void mounts` shows `fskit`, `read-only`, the state and the feed.
+- **A drive mounts in one place at a time** on a Mac: FSKit's unary file system gives a resource one
+  volume, and a second `mount` of `voidfs://<drive>` answers `Resource busy` (the adapter reports it
+  as `MountFailed`).
+- **Remembered mounts come back** as before: the daemon mounts them again when it starts, or adopts
+  them. An orderly `void daemon restart` unmounts and mounts again, unless a file is open (then
+  the unmount is refused and the next daemon adopts the mount).
+- **Items are the daemon's inodes.** The core's inode numbers are persistent, so they are the file
+  IDs (shifted by 2 past FSKit's reserved ones; the root is FSKit's root).
+- **Incarnations make snapshot-at-open work.** FSKit reads name an item, not an open file, so the
+  volume keeps one `FSItem` per inode as the kernel holds it, and opens a daemon handle when the
+  kernel first opens it. That handle binds the version current then, with its attributes, and
+  every read and `getattr` of that item uses them until the kernel closes it. When an event names
+  the inode, the item is retired and revoked: a descriptor opened before keeps the retired item
+  and its version, whole, while the next lookup makes a new item that opens the new version. A
+  handle belongs to its session: after the daemon or the agent restarts, a read reopens the file
+  and goes on only if the same version is still current (`ESTALE` otherwise).
+- **Listings.** Enumeration fetches all of a folder's pages at one namespace generation (a page
+  that raced a change answers `EAGAIN`, which the session retries; pages of different generations
+  start again), and the volume keeps the listing until an event names the folder. Every event
+  names the folders on a changed key's path, so the listing also answers lookups, misses
+  included: `ls -l` and Finder look up an AppleDouble `._name` for every file, and those no
+  longer cross the bridge. Names match by their NFC form, as the daemon matches them; two names
+  alike go to the daemon (`EILSEQ`). The cookie is a position; the verifier, the generation.
+- **Folders are opened without kernel caching.** The kernel's own listing of a folder outlives a
+  revoke while anything below it is in use, and every revoke of the top folder, so the volume
+  grants folders `noCache` and serves repeated enumerations from its listing instead.
+- **Invalidations become revokes**, run in order on one queue and never under the volume's lock:
+  changed files first, then (when a name the kernel was told is missing in a folder is among the
+  changed key's names) everything known below that folder, deepest first, then the folders the
+  event names. A vnode pins its parent, so a visited subfolder would block the purge. When files
+  below a purged folder are open, the purge is tried again as each closes or goes (`close`,
+  `reclaimItem`): the kernel finishes the deferred revoke by itself when nothing below is in use,
+  but not when something was looked up again meanwhile. A resync (the feed reconnected or missed
+  a generation) drops every listing and revokes everything the kernel holds. A revoke of an item
+  the kernel has let go answers `kIOReturnBadArgument`; those are counted apart from any other
+  failure, which is logged as a possibly stale cache. No listing holds an `FSItem`, and a reclaim
+  clears its inode's current item, so the spike's stale-twin bug can't recur.
+- **Offline.** Cached metadata and bytes are served by the daemon; uncached ones fail with
+  `ENETDOWN`. The daemon's link took minutes to notice a server that stopped answering (a 120 s
+  read timeout, three attempts), so the mount core now has a patience (`ConnectivityConfig::patience`,
+  5 s): a filesystem call waiting on the server fails once nothing at all has been answered, to
+  any request, for that long, and the link goes offline at once. A listed folder is then served as
+  it was. An answer arriving, or any other answer meanwhile, keeps the wait going, so a slow link
+  isn't cut off. The extension logs going offline on the first `ENETDOWN`, and declares the mount
+  current again when the relay brings a resync (the feed reconnected) or an event that advances
+  the feed's sequence.
+- **Test runs used a developer override for the agent**, not the shared location: with
+  `defaults write dev.voidfs.app VoidfsStateDirectory <dir>` the agent connects to that daemon, as
+  `VOIDFS_STATE_DIR` points the CLI. Nothing was put in `~/Library/Application Support/voidfs`.
+- **Kept and removed.** The spike's lookup names (`.voidfs-bench`, `.voidfs-xpc`, `.voidfs-bridge*`,
+  `.voidfs-cache:`, `.voidfs-stats`), its request counters, the XPC echo and the probe's `xpc`
+  mode are gone. `voidfs bridge-selftest` stays: it checks the bridge in process, and the checks
+  moved into the app (`App/BridgeScenario.swift`).
+- **The platform, rechecked** on macOS 27.0.1 (26A434) with Xcode 27 beta (27A5194q). Lookups,
+  `getattr` and reads still want `0x4000000000003fff`; the volume fills every attribute FSKit's
+  `FSItem.Attributes` can carry (the 14 asked for, and the added, backup, limited-xattr and
+  offload ones; bit 62 has no property). The OS still sends `activateVolumeWithOptions:`: built
+  without the volume's answer to it, the first mount crashes on an unrecognized selector, so that
+  seed workaround stays.
+
+#### The blocker: a name missed while its folder is in use
+
+The kernel caches a name it was told is missing. FSKit lets a module drop that only by revoking
+the folder, and a folder's revoke takes effect only when the kernel can reclaim the folder's vnode,
+which it can't while anything below is in use. On macOS 27.0.1, with another machine creating a
+name this Mac had looked up and missed:
+
+| Held while the name is created | Found by path |
+|---|---|
+| nothing, or a file open in another folder | 25–37 ms |
+| a file open in the folder or any subfolder; a shell's working directory in it; the folder open (`O_EVTONLY` too, as change watchers open it) | not while held (still missing after 90 s); 3–18 ms after it lets go |
+| anything, in the drive's top folder | not until the drive is mounted again |
+
+The listing shows the name at once in every case, so Finder windows and `ls` see it; opening it
+by path doesn't. Tried, all without effect: every `setCacheState` action and mode on the folder
+(the spike's hook), on its held child and on the root; revoking the whole subtree first; a new
+`FSItem` for the folder after the revoke (the kernel never looks the folder up again); a newer
+modification time on the folder (the kernel reads it, and keeps the miss); `getattrlistbulk`;
+`noCache` opens; waiting. The kernel refuses every cache action on the volume's root item
+(`kIOReturnBadArgument`), so in the top folder a miss lasts until remount even with nothing held.
+The same holds for an item in use: while a file is open on this Mac, its path keeps finding the
+version it opened (consistent, never torn); a rename or delete elsewhere shows once it closes.
+
+So "changes appear within 5 seconds" fails whenever this Mac looked a name up before another
+machine created it and something in that folder is in use. An app polling for a file another
+machine is about to create can catch the miss in the feed's latency (about 30 ms) by itself. It
+matters for the item 6 matrix: render outputs, lock files, a code repo's `.git` probes. As the plan
+says, this reopens the SMB decision before more app surface: item 6's SMB feasibility spike runs
+the same cases. A Feedback to Apple asking for a way to purge a folder's cached misses (and to
+revoke the root item) would help either way. The experiments are in
+[`bench/results/mac-fskit-daemon`](../bench/results/mac-fskit-daemon/README.md).
+
+**Evidence.** All on this Mac against a local memory-store server, the drive filled with the spike's
+tree by the SDK's new `mount_seed` example, and the SDK's `mount_peer` example as the other
+machine. Raw output: [`bench/results/mac-fskit-daemon`](../bench/results/mac-fskit-daemon/README.md).
+
+- **Listings and bytes match the spike.** `apps/macos/scripts/manifest.sh` over both volumes:
+  11,011 entries (six folders, 11,005 files) with identical paths, types, sizes, modes, mtimes and
+  SHA-256 of every file, the 1 GiB file included; the xattrs of `tagged.txt` match.
+- **Cold and warm** (`apps/macos/scripts/bench.sh`, which no longer needs the spike's hooks; three
+  runs each, a fresh mount before every cold step). "Daemon, empty" empties the daemon's state
+  before every cold step too; "daemon, warm" keeps its cache:
+
+| Measurement (ms unless said) | The spike's volume | Daemon, empty | Daemon, warm |
+| --- | --- | --- | --- |
+| Mount | 68–81 | 87–116 | 84–88 |
+| 1,000 files: `ls -f` cold / warm | 18–22 / 5–6 | 56–60 / 6 | 59–64 / 5–6 |
+| 1,000 files: `ls -l` cold / warm | 185–193 / 65–69 | 217–231 / 66–68 | 227–234 / 68 |
+| 1,000 files: `getattrlistbulk` cold / warm | 87–121 / 4–6 | 133–164 / 5–6 | 128–184 / 5–7 |
+| 10,000 files: `ls -f` cold / warm | 137–150 / 23–25 | 366–404 / 18–22 | 379–395 / 17–20 |
+| 10,000 files: `ls -l` cold / warm | 1,597–1,659 / 615–623 | 1,902–1,966 / 613–624 | 1,954–1,993 / 612–619 |
+| 10,000 files: `getattrlistbulk` cold / warm | 98–100 / 19 | 365–389 / 13–17 | 362–376 / 13–18 |
+| 1 GiB, `dd bs=1m` cold, GB/s | 2.56–2.60 | 1.80–1.83 | 2.01–2.19 |
+| 1 GiB, `dd bs=8m` cold, GB/s | 2.60–2.69 | 1.80–1.81 | 2.05–2.20 |
+| 1 GiB again, kernel cache, GB/s | 21.6–22.0 | 15.7–18.5 | 23.2–23.9 |
+| 300 random 4 KiB reads, `F_NOCACHE`, p50 / p99 | 1.40–1.74 / 4.25–5.66 | 2.78–2.89 / 5.18–6.24 | 0.26–0.33 / 0.56–0.61 |
+| The same 300 again | 1.43–1.74 / 5.09–5.22 | 0.29–0.32 / 4.22–4.92 | 0.24 / 0.37–0.39 |
+| 300 random 4 KiB reads, page cache, p50 / p99 | 1.34–1.59 / 4.28–4.78 | 2.96–3.07 / 5.58–6.88 | 0.27–0.28 / 0.43–0.48 |
+| A file three folders deep, first byte cold / warm | 10 / 3 | 26–30 / 4–5 | 21–26 / 4 |
+
+  Warm listings and cached reads match or beat the spike: a random 4 KiB read the daemon has
+  cached takes 0.24–0.33 ms against the spike's 1.4–1.7 ms per ranged GET. A cold random read waits
+  for its whole verified shard (2.8–3.1 ms; pieces are item 5). A cold 10,000-entry listing costs
+  2.5–4× the spike's: per page of 256, about 1.2 ms in the daemon, 2.5 ms in the agent's JSON
+  decoding and conversion and 0.7 ms of XPC, and the first page about 90 ms (the server's listing,
+  about 40 ms, and storing the rows). Two core fixes on the way brought it down from about 500 ms
+  (a page read from its cursor, and a relist that prepares its statements once), and answering
+  misses from the extension's listing brought `ls -l` of 10,000 files down from 4.7 s. A cheaper
+  decoding in the agent is left for item 9's listing measurements. Sequential reads run at
+  1.8–2.2 GB/s against 2.6.
+- **A second client** (`apps/macos/scripts/coherence.py`, three runs, no failures), in a fresh
+  folder with a sibling held open: an overwrite growing 12 → 32 bytes shows by path in 16–20 ms
+  and one shrinking 3 MiB → 8 bytes in 29–33 ms; a rename in 25–28 ms (new name listed in 14–15); a
+  delete in 28–30 ms; a new file is listed in 15–27 ms and opens. With the changed file itself open,
+  read with `F_NOCACHE` so every read reaches the module: it keeps the version it opened, whole
+  (12 bytes, `fstat` 12; 3 MiB, `fstat` 3 MiB), and its path shows the new version 17–27 ms after
+  it closes. A renamed or deleted file open here still reads; its old name goes 1–2 ms after it
+  closes. Names looked up and missed, then created: with nothing held, found by path in 28–31 ms,
+  a new folder's file too; with the sibling held, listed in 16–32 ms, not found by path while held,
+  found 14–16 ms after it closes, even when other files were looked up meanwhile; in the top
+  folder, listed in 11–30 ms and not found by path (the blocker's rows).
+- **Offline** (`apps/macos/scripts/offline.py`, the daemon behind a relay that is killed or
+  stopped). Refused: a listed folder lists in 6 ms, a file read before reads in 30 ms, a file
+  looked up before stats; bytes never read fail with `ENETDOWN` in 317 ms, then 41 ms; a folder
+  never listed fails in 8 ms. Hung: the same cached answers in 6–37 ms; bytes never read fail after
+  the 5 s patience, then in 52 ms; a folder never listed fails in 8 ms (the link is offline by
+  then). Back: the change another machine made meanwhile shows in 451 ms (refused; the feed
+  reconnects and resyncs) and 234 ms (hung; the held long poll delivers it), and what failed now
+  reads. Before the patience, a stopped server held an uncached read for the agent's whole 30 s.
+- **Restarts** (`apps/macos/scripts/restarts.py`) with a file held open, three rounds each: the
+  daemon killed and started again, 73–85 ms until the open file reads the same bytes and a stat
+  and a listing work; `void daemon restart`, 276–304 ms (on a `void mount`ed drive the busy mount
+  is kept, then adopted); the agent restarted, 125–145 ms; the agent killed, 10.1 s (launchd's
+  crash throttle, as item 2 found).
+- **`void mount spike /tmp/voidfs-vm`** mounted in 0.17 s through the real adapter, `void mounts`
+  showed it with the feed, `void unmount` unmounted and forgot it, and it came back after daemon
+  restarts.
+
+**Tests.** Rust, in CI:
+
+| Test | Shows |
+| --- | --- |
+| `fskit_mounts_with_the_system_mount_read_only_and_comes_back_or_is_adopted_when_the_daemon_starts` (`voidfs-daemon/tests/fskit.rs`) | With stand-ins for `mount` and `umount` that keep a mount table: the resource and `-r` at the real path, read-only shown and the request remembered, unmount on stop and mount on start, adoption with no second mount, a busy unmount kept mounted and remembered, an ejected drive unmounted without `umount` |
+| `an_fskit_mount_that_fails_or_finds_something_else_mounted_is_not_remembered` | A disabled module's message with the System Settings hint, `mount`'s own message, another type or another drive at the mountpoint refused, nothing remembered |
+| `fskit::tests::the_table_names_what_is_mounted_where` | `mount`'s table parsed, mountpoints with ` on ` and parentheses included |
+| `a_silent_server_fails_uncached_calls_after_the_links_patience_and_serves_what_is_cached` (`voidfs-client/tests/mount.rs`) | A slow server answering others is waited for; a silent one fails an uncached read after the patience and takes the link offline, then everything offline fails at once while cached listings and bytes are served; a listed folder whose refresh meets the silence is served as it was; once answering, everything reads |
+| `connectivity::tests::silence_takes_the_link_offline_and_any_answer_counts_as_heard` | The link's last answer, silence, and recovery |
+| `namespace_queries_search_the_name_and_parent_indexes` (changed) | A page of a directory starts at its cursor on the name index |
+
+Swift: the scripts are the tests. `coherence.py`, `offline.py` and `restarts.py` run against a
+mounted drive; `manifest.sh` and `bench.sh` against both volumes.
+
+Each new test was seen to fail with its code broken, each break alone under a timeout. Rust: 14
+breaks (the timing ones three times): no `-r`, no adoption, a busy unmount dropped, the adapter
+claiming to write, `umount` run on an ejected drive, no hint, mounting over something else, any
+type taken for voidfs, an inclusive cursor (an existing paging test), a page scanning the
+directory, a relist dropping names with unpublished changes (an existing conflict test), no
+patience, a patience deaf to other answers, silence leaving the link up. Swift, each built, mounted
+and run: reads not bound to the handle opened (the torn read: new bytes at the old length), no
+revoke of changed files, a purge of the folder's own files only, folders cached by the kernel,
+listings kept across events, no retry as files close, and handles not rebound after the agent
+restarts (`ESTALE` for 60 s); each failed its checks. Matching only a changed key's last name
+didn't fail anything: the feed names a new folder as its own key, so matching every name along the
+key is a precaution. Logs: `breaks-rust.log`, `breaks-swift.log`.
+
+**Item 3 against its bullets.**
+
+| Item 3 asks for | Where it is |
+| --- | --- |
+| The spike's HTTP, cache and feed replaced by the session; `FSGenericURLResource` and a secret-free URL, mounted in a user-owned folder; an `Adapter` named `fskit`; spike-only lookup names and echo instrumentation removed | Decisions above; `FSModule/`, `crates/voidfs-daemon/src/fskit.rs` |
+| Every required attribute; runtime selectors and protocols rechecked on this Xcode and macOS; seed workarounds removed only after a mount proves them unnecessary | The platform, rechecked: all attributes; the activate workaround still needed (`activate-selector.txt`) |
+| Snapshot-at-open reads with metadata and data; memos expired, changed items then parents revoked on feed changes; parent revokes retried as open children close; parent listings invalidated when items are reclaimed | Incarnations; invalidations; the coherence checks and their breaks. No listing holds an item, so a reclaim leaves none stale |
+| `setCacheState` outside module locks; benign unknown-item failures apart from coherence failures; a missed generation triggers a relist/resync | The revoke queue and its counts; a resync drops listings and revokes everything |
+| An external overwrite that grows and shrinks, a create after a negative lookup, a rename and a delete, with siblings held open; open files never an old length with new bytes; any negative-name limit documented | `coherence.py`; [the blocker](#the-blocker-a-name-missed-while-its-folder-is-in-use) |
+| Cached metadata and bytes served offline, uncached reads failing promptly; reconnection resumes the feed and refreshes state before the mount is current | `offline.py`; the patience; the extension's state lines |
+| Done when: the daemon-backed mount matches the spike's listings and byte hashes | Identical manifests |
+| Done when: a recorded cold/warm read table | The table above |
+| Done when: a second client exercises the coherence cases | `mount_peer` and `coherence.py` |
+| If the open-sibling case prevents the 5-second requirement: a release blocker, and the SMB decision reopened before more app surface | It does, and the top folder is worse: recorded above; the user chose SMB's feasibility spike next and no item 4 before it |
+
+**Item 3 is complete, with a release blocker.** Every bullet and the done-when are met; the
+done-when's last clause applies, so the SMB decision is reopened and item 6's SMB spike comes before
+any writable surface.
+
+Validation: 719 workspace tests pass (9 ignored), and workspace clippy passes with warnings
+denied. One full run failed `stop_cancels_stalled_bootstrap_and_creators_waiting_for_the_registry`
+when it reopened the state directory after the stop; it passed 13 times alone and in the full
+rerun, and nothing here touches its path, so it looks like a flake under load. Spec validation
+passes 56 cases / 432 steps, and the five credential-script tests pass. Local memory, fs and
+versitygw interoperability passes; boto3 is unavailable locally, and CI supplies it and checks
+MinIO and Docker Compose. `xcodebuild` builds the app, the extension and the probe with no
+warnings in the Swift sources.

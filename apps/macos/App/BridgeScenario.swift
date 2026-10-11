@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Checks of the bridge, end to end through the daemon, with timings. The app's `bridge-selftest`
-// runs them over an in-process XPC listener; the extension runs them through the launch agent
-// when a mount looks up `.voidfs-bridge` (spike-only instrumentation, removed with item 3).
-// Each line is logged as it happens; a failed check says FAIL.
+// runs them over an in-process XPC listener. (Until step 5's item 3 the extension also ran them
+// through the launch agent when a mount looked up `.voidfs-bridge`; the mount itself now
+// exercises that path.) Each line is printed as it happens; a failed check says FAIL.
 
 import Foundation
 

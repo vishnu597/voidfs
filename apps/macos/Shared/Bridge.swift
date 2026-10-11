@@ -8,8 +8,10 @@
 import Foundation
 
 enum Bridge {
+    /// The App Group the app and the extension share; it prefixes the agent's Mach service.
+    static let appGroup = "HAUTK68F56.dev.voidfs"
     /// The agent's Mach service: App-Group-prefixed, the only kind the extension's sandbox reaches.
-    static let service = "\(MountStore.appGroup).agent"
+    static let service = "\(appGroup).agent"
     /// Who the agent accepts: the extension, signed by voidfs's team.
     static let peerRequirement = "anchor apple generic and certificate leaf[subject.OU] = \"HAUTK68F56\" and identifier \"dev.voidfs.app.fskit\""
     /// The daemon's own bounds (`crates/voidfs-daemon/src/fs_api.rs`), checked here before a call

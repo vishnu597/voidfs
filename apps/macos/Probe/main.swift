@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// voidfs-probe: runs the mount's HTTP calls directly, without FSKit, to check signing and to give
-// a baseline for the mount's numbers.
+// voidfs-probe: the protocol calls the FSKit spike's module made over HTTP, without FSKit or the
+// daemon, as a baseline for the mount's numbers. Its HTTP client (VoidfsClient.swift, SigV4.swift)
+// is the spike's, kept for this tool only: the extension reads through the daemon.
 //
 //     VOIDFS_ACCESS_KEY_ID=... VOIDFS_SECRET_ACCESS_KEY=... voidfs-probe voidfs://127.0.0.1:9000/spike list many/
 //     voidfs-probe <url> read <key> [block-bytes] [parallel]      sequential read, prints MB/s and SHA-256
@@ -91,10 +92,6 @@ case "changes":
     let c = try await client.changes(since: since, wait: wait)
     print("seq \(c.seq), \(c.changes.count) changes, more \(c.more ?? false)")
     for ch in c.changes.prefix(20) { print("  \(ch.seq) \(ch.op) \(ch.key)") }
-
-case "xpc":
-    // Spike instrumentation: round trips to scripts/xpc-echo-agent from an unsandboxed process.
-    print(await XPCEchoProbe.run(name: args.count > 3 ? args[3] : "\(MountStore.appGroup).agent"))
 
 default:
     fail("unknown command \(args[2])")
