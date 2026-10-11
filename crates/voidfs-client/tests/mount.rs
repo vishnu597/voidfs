@@ -359,6 +359,7 @@ async fn a_silent_server_fails_uncached_calls_after_the_links_patience_and_serve
     f.put("cached/file", "bytes").await;
     f.put("uncached/file", "remote").await;
     f.put("unread", "never read").await;
+    f.put("slow", "slow but answered").await;
     // The client's answers count on the link, as the daemon's do.
     let conn = Connectivity::new(voidfs_client::ConnectivityConfig { patience: std::time::Duration::from_millis(300), probe_every: std::time::Duration::from_secs(3600), ..Default::default() });
     let client = client_for(&f.proxy.endpoint, Config { observer: Some(Arc::new(conn.clone())), ..Config::default() });
@@ -370,7 +371,18 @@ async fn a_silent_server_fails_uncached_calls_after_the_links_patience_and_serve
     let fh = ns.open(file.ino, false).await.unwrap();
     assert_eq!(&ns.read(fh, 0, 5).await.unwrap()[..], b"bytes");
     let unread = ns.open(ns.lookup(root, "unread").await.unwrap().ino, false).await.unwrap();
+    let slow = ns.open(ns.lookup(root, "slow").await.unwrap().ino, false).await.unwrap();
     ns.invalidate(&objects(&["cached/file", "uncached/file"])).await.unwrap();
+
+    // A slow server that answers other requests meanwhile is waited for past the patience.
+    f.proxy.slow(std::time::Duration::from_millis(1200));
+    let answering = tokio::spawn({
+        let conn = conn.clone();
+        async move { loop { conn.answered(false); tokio::time::sleep(std::time::Duration::from_millis(100)).await; } }
+    });
+    assert_eq!(&ns.read(slow, 0, 17).await.unwrap()[..], b"slow but answered", "answers meanwhile keep the wait going");
+    answering.abort();
+    assert_eq!(conn.link(), Link::Online);
 
     // The server stops answering, each request held 1.5 s: five times the patience (a test
     // client's own timeout would allow 120 s).
