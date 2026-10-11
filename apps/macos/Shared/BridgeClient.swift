@@ -154,6 +154,8 @@ final class BridgeSession: @unchecked Sendable {
     private var nextWaiter = 0
     private var started: CheckedContinuation<Void, Error>?
     private(set) var memoHits = 0
+    /// The volume's: each event once the memo has applied it, and `nil` when the relay ends.
+    private var listener: ((BridgeEvent?) -> Void)?
     /// Calls tried again after `EAGAIN`.
     private(set) var retries = 0
     private(set) var events = 0
@@ -162,6 +164,9 @@ final class BridgeSession: @unchecked Sendable {
     init(client: BridgeClient, info: BridgeSessionInfo, epoch: Int) { (self.client, self.info, self.epoch) = (client, info, epoch) }
 
     var isWatching: Bool { lock.withLock { watching } }
+
+    /// Hears the session's invalidations after the memo, in order, and the relay's end as `nil`.
+    func listen(_ listener: @escaping (BridgeEvent?) -> Void) { lock.withLock { self.listener = listener } }
 
     // MARK: Memo
 
@@ -240,6 +245,7 @@ final class BridgeSession: @unchecked Sendable {
         }
         start?.resume()
         for c in ready { c.resume(returning: event.generation) }
+        lock.withLock { listener }?(event)
     }
 
     func unwatched() {
@@ -253,6 +259,7 @@ final class BridgeSession: @unchecked Sendable {
         let ended = Bridge.error(ESTALE, "WatchEnded", "the invalidation relay ended")
         start?.resume(throwing: ended)
         for c in pending { c.resume(throwing: ended) }
+        lock.withLock { listener }?(nil)
     }
 
     func lost() {
@@ -352,8 +359,21 @@ final class BridgeSession: @unchecked Sendable {
         try await send { p, done in p.readlink(token, ino: ino) { done(BridgeClient.result($0, $1)) } }
     }
 
+    /// A page of `ino`; what it lists is remembered, so that lookups of its names that follow
+    /// (`ls -l`, Finder) stay in the extension.
     func readdir(_ ino: UInt64, after: String?, limit: Int) async throws -> BridgeDirPage {
-        try await send { p, done in p.readdir(token, ino: ino, after: after, limit: limit) { done(BridgeClient.result($0, $1)) } }
+        let since = mark
+        let page: BridgeDirPage = try await send { p, done in p.readdir(token, ino: ino, after: after, limit: limit) { done(BridgeClient.result($0, $1)) } }
+        lock.withLock {
+            guard watching, changes == since else { return }
+            if attrs.count + page.names.count > Self.memoLimit { clearLocked() }
+            for (name, a) in zip(page.names, page.attrs) {
+                attrs[a.ino] = a
+                names[Name(parent: ino, name: name)] = a.ino
+                children[ino, default: []].insert(name)
+            }
+        }
+        return page
     }
 
     func open(_ ino: UInt64, write: Bool) async throws -> (UInt64, BridgeAttr) {
