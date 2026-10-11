@@ -117,6 +117,10 @@ pub async fn run(conn: &Connection, opts: &DaemonOptions) -> Result<()> {
     let config = connection(conn, &place.dir)?;
     let endpoint = config.endpoint.clone();
     let mut cfg = DaemonConfig::new(&place.dir, config, build());
+    // Mounting: FSKit, through voidfs.app's module (step 5, item 3).
+    if cfg!(target_os = "macos") {
+        cfg.adapters.push(std::sync::Arc::new(voidfs_daemon::FsKit::default()));
+    }
     if let Some(t) = opts.multipart_threshold {
         cfg.queue.multipart_from = t << 20;
     }

@@ -222,6 +222,18 @@ fn names(c: &Connection, parent: Ino) -> rusqlite::Result<Vec<(String, Ino)>> {
     q.query_map([parent], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
 }
 
+/// A page of a directory's names after an exclusive cursor, in UTF-8 byte order (SQLite's
+/// `BINARY` collation), from the name indexes rather than the whole directory. No name is
+/// empty, so the first page's cursor is "".
+const NAMES_PAGE: &str = "SELECT name, ino FROM mount_overlay WHERE parent=?1 AND name>?2 AND ino IS NOT NULL
+        UNION ALL SELECT name, ino FROM mount_names n WHERE parent=?1 AND name>?2 AND NOT EXISTS
+        (SELECT 1 FROM mount_overlay o WHERE o.parent=n.parent AND o.name=n.name) ORDER BY name LIMIT ?3";
+
+fn names_page(c: &Connection, parent: Ino, after: Option<&str>, limit: usize) -> rusqlite::Result<Vec<(String, Ino)>> {
+    let mut q = c.prepare(NAMES_PAGE)?;
+    q.query_map(params![parent, after.unwrap_or(""), i64::try_from(limit).unwrap_or(i64::MAX)], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+}
+
 const EQUIVALENT_NAMES: &str = "SELECT ino FROM mount_overlay INDEXED BY mount_overlay_nfc WHERE parent=?1 AND nfc=?2 AND ino IS NOT NULL
         UNION ALL SELECT ino FROM mount_names n INDEXED BY mount_names_nfc WHERE parent=?1 AND nfc=?2 AND NOT EXISTS
         (SELECT 1 FROM mount_overlay o WHERE o.parent=n.parent AND o.name=n.name) LIMIT 2";
@@ -478,6 +490,25 @@ impl Session {
         Ok(tokio::task::spawn_blocking(move || s.with(|c| f(c, &d, root))).await.map_err(Error::from)??)
     }
 
+    /// `work`, unless the server answers nothing at all, to anyone, for the link's patience: a
+    /// stopped server, or a connection gone quiet. The link is then offline and the call fails as
+    /// it would offline, instead of waiting out the client's timeouts; a slow answer that is
+    /// arriving, or anything else answered meanwhile, keeps the wait going.
+    pub(crate) async fn patient<T>(&self, work: impl std::future::Future<Output = T>) -> Result<T> {
+        let patience = self.connectivity.patience();
+        let mut work = std::pin::pin!(work);
+        loop {
+            match tokio::time::timeout(patience, &mut work).await {
+                Ok(done) => return Ok(done),
+                Err(_) if self.connectivity.answered_within(patience) => {},
+                Err(_) => {
+                    self.connectivity.silent();
+                    return Err(FsError::Offline);
+                }
+            }
+        }
+    }
+
     async fn ancestors(&self, ino: Ino) -> Result<()> {
         if ino == 0 || ino > i64::MAX as u64 { return Err(FsError::Stale); }
         let path = self.db(move |c, d, root| chain(c, d, root, ino)).await?.ok_or(FsError::Stale)?;
@@ -529,10 +560,10 @@ impl Session {
             if ino == self.root || n.entry_id.is_some() || n.entry.version_id.as_ref().is_some_and(|v| !v.is_empty()) { return Ok(()); }
             if offline { return Err(FsError::Offline); }
             let base_key = n.remote_key.as_deref().unwrap_or(&key);
-            let attrs = match self.client.attributes(&self.drive, base_key, Default::default()).await {
+            let attrs = self.patient(async { match self.client.attributes(&self.drive, base_key, Default::default()).await {
                 Err(e) if e.status() == Some(404) && base_key != key => self.client.attributes(&self.drive, &key, Default::default()).await,
                 result => result,
-            }.map_err(|e| sdk_error(&e))?;
+            }}).await?.map_err(|e| sdk_error(&e))?;
             if attrs.object_id != n.entry.object_id || attrs.kind != n.entry.kind { return Err(FsError::Again); }
             let Some(version) = attrs.version_id.filter(|s| !s.is_empty()) else { return Err(FsError::Unsupported); };
             let accepted = self.db(move |c, d, root| {
@@ -707,7 +738,7 @@ impl Session {
         if offset >= handle.attr.size || len == 0 { return Ok(Bytes::new()); }
         let len = len.min(handle.attr.size - offset);
         for _ in 0..4 {
-            match reader.read(offset, len).await {
+            match self.patient(reader.read(offset, len)).await? {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => {
                     let missing = matches!(&e, Error::Fetch(e) if e.status() == Some(404));
@@ -757,7 +788,7 @@ impl Session {
         self.refresh_dir(dir).await?;
         let after = after.map(str::to_owned);
         let rows = self.db(move |c, d, _| {
-            names(c, dir)?.into_iter().filter(|(n, _)| after.as_ref().is_none_or(|a| n > a)).take(limit)
+            names_page(c, dir, after.as_deref(), limit)?.into_iter()
                 .map(|(name, ino)| Ok((name, node(c, d, ino)?.ok_or(rusqlite::Error::InvalidQuery)?))).collect::<rusqlite::Result<Vec<_>>>()
         }).await?;
         rows.into_iter().map(|(name, n)| Ok((name, n.attr()?))).collect()
@@ -792,12 +823,16 @@ impl Session {
             if self.connectivity.link() == Link::Offline {
                 return if seq.is_some() { Ok(()) } else { Err(FsError::Offline) };
             }
+            // A server that has gone silent leaves a listed folder as it was, as offline does.
+            let silent = |e: FsError| if e == FsError::Offline && seq.is_some() { Ok(()) } else { Err(e) };
             let bound_version = if sync != Sync::Saved && dir != self.root {
                 let matches = |attrs: &voidfs_sdk::Attributes| attrs.kind == Kind::Folder && attrs.object_id == object_id;
-                let attrs = match self.client.attributes(&self.drive, &remote, Default::default()).await {
+                let found = match self.patient(self.client.attributes(&self.drive, &remote, Default::default())).await { Ok(found) => found, Err(e) => return silent(e) };
+                let attrs = match found {
                     Ok(attrs) if matches(&attrs) => attrs,
                     result if remote != key && (result.as_ref().is_ok_and(|attrs| !matches(attrs)) || result.as_ref().is_err_and(|e| e.status() == Some(404))) => {
-                        let attrs = self.client.attributes(&self.drive, &key, Default::default()).await.map_err(|e| sdk_error(&e))?;
+                        let found = match self.patient(self.client.attributes(&self.drive, &key, Default::default())).await { Ok(found) => found, Err(e) => return silent(e) };
+                        let attrs = found.map_err(|e| sdk_error(&e))?;
                         if !matches(&attrs) { return Err(FsError::Again); }
                         remote = key.clone();
                         attrs
@@ -807,10 +842,11 @@ impl Session {
                 };
                 Some(attrs.version_id)
             } else { None };
-            let listing = match self.listing(&remote).await {
-                Err(FsError::NotFound) if remote != key => { remote = key.clone(); self.listing(&remote).await },
+            let listing = match self.patient(self.listing(&remote)).await {
+                Ok(Err(FsError::NotFound)) if remote != key => { remote = key.clone(); self.patient(self.listing(&remote)).await },
                 result => result,
             };
+            let listing = match listing { Ok(listing) => listing, Err(e) => return silent(e) };
             // A folder removed elsewhere still holds the names its unpublished changes need.
             let listing = match listing {
                 Err(FsError::NotFound) if self.db(move |c, _, _| pending_under(c, dir)).await? =>
@@ -819,7 +855,8 @@ impl Session {
             };
             let Some((entries, seq)) = listing else { continue; };
             if let Some(version) = bound_version {
-                match self.client.attributes(&self.drive, &remote, Default::default()).await {
+                let found = match self.patient(self.client.attributes(&self.drive, &remote, Default::default())).await { Ok(found) => found, Err(e) => return silent(e) };
+                match found {
                     Ok(attrs) if attrs.kind == Kind::Folder && attrs.object_id == object_id && attrs.version_id == version => {},
                     Ok(_) => continue,
                     Err(e) if e.status() == Some(404) => continue,
@@ -832,8 +869,9 @@ impl Session {
                 let latest: u64 = tx.query_row("SELECT seq FROM mount_roots WHERE drive=?1", [d], |r| r.get(0))?;
                 if current != generation || seq < latest { return Ok(false); }
                 let ancestors = chain(&tx, d, root, dir)?.ok_or(rusqlite::Error::InvalidQuery)?;
+                // Statements run once per entry are prepared once (a folder may list 10,000).
                 for e in &entries {
-                    if let Some(ino) = tx.query_row("SELECT ino FROM mount_inodes WHERE drive=?1 AND object_id=?2", params![d, e.object_id], |r| r.get::<_, Ino>(0)).optional()?
+                    if let Some(ino) = tx.prepare_cached("SELECT ino FROM mount_inodes WHERE drive=?1 AND object_id=?2")?.query_row(params![d, e.object_id], |r| r.get::<_, Ino>(0)).optional()?
                         && (ancestors.iter().any(|(a, _)| *a == ino) || node(&tx, d, ino)?.is_none_or(|n| n.entry.kind != e.kind))
                     { return Err(rusqlite::Error::InvalidQuery); }
                 }
@@ -841,27 +879,32 @@ impl Session {
                 for e in entries {
                     let json = serde_json::to_string(&e).expect("JSON");
                     let remote_key = format!("{remote}{}", e.name);
-                    tx.execute("INSERT INTO mount_inodes(drive, object_id, attrs, remote_key) VALUES (?1, ?2, ?3, ?4)
+                    tx.prepare_cached("INSERT INTO mount_inodes(drive, object_id, attrs, remote_key) VALUES (?1, ?2, ?3, ?4)
                         ON CONFLICT(drive, object_id) DO UPDATE SET generation=generation+(attrs<>excluded.attrs OR remote_key IS NOT excluded.remote_key), attrs=excluded.attrs, remote_key=excluded.remote_key
-                        WHERE sync='saved'", params![d, e.object_id, json, remote_key])?;
-                    let ino: Ino = tx.query_row("SELECT ino FROM mount_inodes WHERE drive=?1 AND object_id=?2", params![d, e.object_id], |r| r.get(0))?;
-                    tx.execute("DELETE FROM mount_names WHERE ino=?1", [ino])?;
+                        WHERE sync='saved'")?.execute(params![d, e.object_id, json, remote_key])?;
+                    let ino: Ino = tx.prepare_cached("SELECT ino FROM mount_inodes WHERE drive=?1 AND object_id=?2")?.query_row(params![d, e.object_id], |r| r.get(0))?;
+                    tx.prepare_cached("DELETE FROM mount_names WHERE ino=?1")?.execute([ino])?;
                     placed.push((ino, e.name.trim_end_matches('/').to_owned(), e.kind));
                 }
                 // A name the listing no longer has goes, unless it or something in it holds local
                 // changes not yet published: their guarded publication then meets the removal and
                 // keeps both sides as a conflict, rather than losing its path and never publishing.
-                let gone = tx.prepare("SELECT name, ino FROM mount_names WHERE parent=?1")?
-                    .query_map([dir], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Ino>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                for (name, ino) in gone {
-                    if !pending_under(&tx, ino)? { tx.execute("DELETE FROM mount_names WHERE parent=?1 AND name=?2", params![dir, name])?; }
+                // Usually nothing in the folder is unpublished, and one statement does.
+                if pending_under(&tx, dir)? {
+                    let gone = tx.prepare("SELECT name, ino FROM mount_names WHERE parent=?1")?
+                        .query_map([dir], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Ino>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    for (name, ino) in gone {
+                        if !pending_under(&tx, ino)? { tx.execute("DELETE FROM mount_names WHERE parent=?1 AND name=?2", params![dir, name])?; }
+                    }
+                } else {
+                    tx.execute("DELETE FROM mount_names WHERE parent=?1", [dir])?;
                 }
                 for (ino, name, kind) in placed {
                     // A kept name shadows another object listed at it until its own change publishes.
-                    if tx.query_row("SELECT 1 FROM mount_names WHERE parent=?1 AND name=?2", params![dir, name], |_| Ok(())).optional()?.is_some() { continue; }
+                    if tx.prepare_cached("SELECT 1 FROM mount_names WHERE parent=?1 AND name=?2")?.query_row(params![dir, name], |_| Ok(())).optional()?.is_some() { continue; }
                     let nfc: String = name.nfc().collect();
-                    tx.execute("INSERT INTO mount_names(parent, name, ino, nfc) VALUES (?1, ?2, ?3, ?4)", params![dir, name, ino, nfc])?;
-                    if kind == Kind::Folder { tx.execute("INSERT OR IGNORE INTO mount_dirs(ino) VALUES (?1)", [ino])?; }
+                    tx.prepare_cached("INSERT INTO mount_names(parent, name, ino, nfc) VALUES (?1, ?2, ?3, ?4)")?.execute(params![dir, name, ino, nfc])?;
+                    if kind == Kind::Folder { tx.prepare_cached("INSERT OR IGNORE INTO mount_dirs(ino) VALUES (?1)")?.execute([ino])?; }
                 }
                 tx.execute("UPDATE mount_dirs SET listed=1, seq=?2, generation=generation+1 WHERE ino=?1", params![dir, seq])?;
                 tx.execute("UPDATE mount_inodes SET generation=generation+1 WHERE ino=?1", [dir])?;
@@ -946,6 +989,9 @@ mod tests {
             let mut q = c.prepare(&format!("EXPLAIN QUERY PLAN {DESCENDANTS}"))?;
             let plan = q.query_map([1u64], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?.join("\n");
             assert!(plan.contains("SEARCH n USING PRIMARY KEY (parent=?)"), "{plan}");
+            let mut q = c.prepare(&format!("EXPLAIN QUERY PLAN {NAMES_PAGE}"))?;
+            let plan = q.query_map(params![1u64, "file", 256], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?.join("\n");
+            assert!(plan.contains("SEARCH n USING PRIMARY KEY (parent=? AND name>?)") && plan.contains("SEARCH mount_overlay USING PRIMARY KEY (parent=? AND name>?)"), "a page reads from its cursor, not the whole directory: {plan}");
             Ok(())
         }).unwrap();
     }

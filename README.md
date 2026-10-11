@@ -104,8 +104,10 @@ void daemon info                      # its build, what its journal holds unpubl
   Ctrl-C leaves it uploading. With no daemon running it uploads in the foreground, and
   `--detach` starts one.
 - `void mount <drive> [mountpoint]`, `void unmount` and `void mounts` keep the daemon's mount
-  table and the mounts it brings back when it starts; mounting itself comes with the Mac drive
-  ([step 5's plan](docs/step-5-macos.md)), so for now `void mount` answers `NoAdapter`.
+  table and the mounts it brings back when it starts. On macOS the daemon mounts with the FSKit
+  module in voidfs.app (the `fskit` adapter, read-only for now: `mount -F -t voidfs
+  voidfs://<drive> <mountpoint>`), which reads through the daemon ([step 5](docs/step-5-macos.md#read-only-fskit-on-the-daemon-10-october));
+  elsewhere `void mount` answers `NoAdapter`.
 - `void daemon install` (macOS) writes a launchd agent, so that the daemon and its remembered
   mounts come back at login; `void daemon uninstall` removes it.
 
@@ -140,7 +142,8 @@ daemon's session reply, tells an adapter what to advertise: no hard links, excha
 and path limits. `Session::setattr` sets mode and mtime, which completes the mount core (step 5,
 item 1). The app's launch agent bridges the sandboxed FSKit extension to the daemon over XPC,
 with a metadata memo in the extension, and the app shares the CLI's daemon and store, which
-completes step 5, item 2; the FSKit adapter follows in later slices. The accepted
+completes step 5, item 2. The daemon's `fskit` adapter mounts a drive with that extension, and a
+mount call whose server has gone silent fails after 5 s instead of waiting out timeouts. The accepted
 direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
 whole-shard reads remain the path until a later authenticated-pieces RFC. See the
 [step 5 plan](docs/step-5-macos.md#lost-replies-to-edits-renames-and-attribute-changes-8-october) for the current scope

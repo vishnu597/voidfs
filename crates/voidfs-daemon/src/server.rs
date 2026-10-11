@@ -61,7 +61,7 @@ pub struct DaemonConfig {
     pub queue: QueueConfig,
     pub cache: CacheConfig,
     pub connectivity: ConnectivityConfig,
-    /// What mounts drives; the first is the default. None yet in `void` (step 5).
+    /// What mounts drives; the first is the default. `void` has [`crate::FsKit`] on macOS.
     pub adapters: Vec<Arc<dyn Adapter>>,
     /// Where a drive mounts when no mountpoint is named, as `<root>/<drive>`: `~/voidfs`.
     pub mount_root: Option<PathBuf>,

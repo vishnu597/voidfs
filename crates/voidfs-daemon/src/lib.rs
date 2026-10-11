@@ -8,7 +8,8 @@
 //! - [`api`]: what the socket speaks, which the Mac app speaks too.
 //! - [`DaemonClient`]: a client for the socket, which `void` uses.
 //! - [`Settings`]: the connection `void daemon start` leaves for the daemon in `daemon.json`.
-//! - [`Adapter`]: what mounts a drive (step 5); the daemon keeps the mount table.
+//! - [`Adapter`]: what mounts a drive (step 5); the daemon keeps the mount table. [`FsKit`] mounts
+//!   with macOS's FSKit module in voidfs.app.
 
 pub mod api;
 mod client;
@@ -19,11 +20,13 @@ mod uploads;
 mod fs_client;
 mod sessions;
 mod rpc;
+mod fskit;
 
 use std::path::{Path, PathBuf};
 
 pub use client::{ClientError, DaemonClient, UploadWatch};
 pub use fs_client::{FsClient, FsClientError, InvalidationWatch};
+pub use fskit::FsKit;
 pub use mounts::{Adapter, Core, MountSpec, Mounted};
 pub use server::{Daemon, DaemonConfig, Error};
 pub use settings::Settings;

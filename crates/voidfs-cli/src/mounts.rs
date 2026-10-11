@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `mount`, `unmount` and `mounts`: the daemon's mount table, and the mounts it remembers.
-//! Mounting is an adapter's (step 5); a daemon without one answers `NoAdapter`.
+//! Mounting is an adapter's (step 5): `fskit` on macOS; a daemon without one answers `NoAdapter`.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +21,7 @@ pub struct MountArgs {
     /// Mount it read-only
     #[arg(long)]
     pub read_only: bool,
-    /// The adapter that mounts it (with step 5: fskit, smb or fuse) [default: the daemon's first]
+    /// The adapter that mounts it (fskit on macOS) [default: the daemon's first]
     #[arg(long, value_name = "NAME")]
     pub adapter: Option<String>,
 }

@@ -36,6 +36,9 @@ pub struct ConnectivityConfig {
     /// The first wait between probes while offline; it doubles up to `probe_max`.
     pub probe_every: Duration,
     pub probe_max: Duration,
+    /// How long a filesystem call waits on the server while the server answers nothing at all,
+    /// to anyone: then the link is offline, and the call fails rather than wait out timeouts.
+    pub patience: Duration,
 }
 
 impl Default for ConnectivityConfig {
@@ -47,6 +50,7 @@ impl Default for ConnectivityConfig {
             slow: Duration::from_secs(10),
             probe_every: Duration::from_secs(2),
             probe_max: Duration::from_secs(30),
+            patience: Duration::from_secs(5),
         }
     }
 }
@@ -56,6 +60,8 @@ struct Counts {
     unanswered: u32,
     /// When recent server errors and slow answers were.
     troubles: VecDeque<Instant>,
+    /// When the server last answered anything.
+    answer: Option<Instant>,
 }
 
 struct Inner {
@@ -84,7 +90,7 @@ impl Default for Connectivity {
 impl Connectivity {
     pub fn new(cfg: ConnectivityConfig) -> Connectivity {
         let (tx, _) = watch::channel(Link::Online);
-        Connectivity(Arc::new(Inner { cfg, tx, counts: Mutex::new(Counts { unanswered: 0, troubles: VecDeque::new() }) }))
+        Connectivity(Arc::new(Inner { cfg, tx, counts: Mutex::new(Counts { unanswered: 0, troubles: VecDeque::new(), answer: None }) }))
     }
 
     pub fn link(&self) -> Link {
@@ -114,6 +120,7 @@ impl Connectivity {
         let now = Instant::now();
         let mut c = self.0.counts.lock().unwrap_or_else(|p| p.into_inner());
         c.unanswered = 0;
+        c.answer = Some(now);
         if trouble {
             c.troubles.push_back(now);
         }
@@ -134,6 +141,23 @@ impl Connectivity {
         if offline {
             self.set(Link::Offline);
         }
+    }
+
+    /// [`ConnectivityConfig::patience`].
+    pub fn patience(&self) -> Duration {
+        self.0.cfg.patience
+    }
+
+    /// Whether the server answered anything, to any request, within the last `d`.
+    pub fn answered_within(&self, d: Duration) -> bool {
+        self.0.counts.lock().unwrap_or_else(|p| p.into_inner()).answer.is_some_and(|t| t.elapsed() <= d)
+    }
+
+    /// A wait heard nothing from the server for [`ConnectivityConfig::patience`], nor did anything
+    /// else: the server is as good as unreachable (stopped, or a connection that went quiet), so
+    /// the link is offline now rather than after its requests time out. The probe brings it back.
+    pub fn silent(&self) {
+        self.set(Link::Offline);
     }
 
     /// While offline, asks the server something small (`ListBuckets`), `probe_every` apart and
@@ -180,6 +204,23 @@ mod tests {
 
     fn obs(status: Option<u16>) -> Observation {
         Observation { status, sent: true, elapsed: Duration::from_millis(5) }
+    }
+
+    #[test]
+    fn silence_takes_the_link_offline_and_any_answer_counts_as_heard() {
+        let c = Connectivity::new(ConnectivityConfig { patience: Duration::from_millis(50), ..Default::default() });
+        assert_eq!(c.patience(), Duration::from_millis(50));
+        assert!(!c.answered_within(Duration::from_secs(60)), "nothing heard yet");
+        c.observe(&obs(Some(404)));
+        assert!(c.answered_within(Duration::from_millis(50)));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!c.answered_within(Duration::from_millis(50)));
+        c.observe(&obs(None));
+        assert!(!c.answered_within(Duration::from_millis(50)), "no answer is not an answer");
+        c.silent();
+        assert_eq!(c.link(), Link::Offline, "silence is offline at once, not after timeouts");
+        c.answered(false);
+        assert_eq!(c.link(), Link::Online);
     }
 
     #[test]

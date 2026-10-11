@@ -89,10 +89,10 @@ impl Session {
                 },
             };
             let opts = ReadOptions { version_id: Some(version), ..Default::default() };
-            let remote = match self.client.attributes(&self.drive, &remote_key, opts.clone()).await {
+            let remote = self.patient(async { match self.client.attributes(&self.drive, &remote_key, opts.clone()).await {
                 Err(e) if e.status() == Some(404) && remote_key != key => self.client.attributes(&self.drive, &key, opts).await,
                 other => other,
-            }.map_err(|e| sdk_error(&e))?;
+            }}).await?.map_err(|e| sdk_error(&e))?;
             if remote.object_id != n.entry.object_id || remote.version_id != n.entry.version_id || remote.kind != n.entry.kind {
                 return Err(FsError::Io("extended attributes returned the wrong object or version".into()));
             }

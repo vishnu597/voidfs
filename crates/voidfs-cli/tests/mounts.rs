@@ -106,14 +106,22 @@ fn mounts_through_the_daemon_are_remembered_until_unmounted() {
 }
 
 #[test]
-fn void_has_no_adapter_until_step_5() {
+fn void_mounts_with_fskit_on_macos_and_has_no_adapter_elsewhere() {
     let f = Fixture::new("noadapter");
     f.drive("footage");
     let s = State::new(&f, "a");
-    // `mount` starts the daemon, as Space's does, which has nothing to mount with.
-    let e = s.void(&["mount", "footage", path(&s.dir.join("m")), "--json"]).fails(1).error();
+    // `mount` starts the daemon, as Space's does. An adapter it lacks is refused, naming what it
+    // has: FSKit on macOS (not run here: it would mount for real), nothing elsewhere.
+    let e = s.void(&["mount", "footage", path(&s.dir.join("m")), "--adapter", "smb", "--json"]).fails(1).error();
     assert_eq!((e["code"].as_str(), e["status"].as_u64()), (Some("NoAdapter"), Some(501)), "{e}");
-    assert!(e["message"].as_str().unwrap().contains("step 5"));
+    let message = e["message"].as_str().unwrap();
+    if cfg!(target_os = "macos") {
+        assert_eq!(message, "the adapters here are fskit");
+    } else {
+        assert!(message.contains("step 5"), "{message}");
+        let e = s.void(&["mount", "footage", path(&s.dir.join("m")), "--json"]).fails(1).error();
+        assert_eq!((e["code"].as_str(), e["status"].as_u64()), (Some("NoAdapter"), Some(501)), "{e}");
+    }
     assert_eq!(s.void(&["daemon", "status", "--json"]).ok().json()["running"], true);
     assert!(s.void(&["mounts", "--json"]).ok().json()["remembered"].as_array().unwrap().is_empty());
     assert!(lines(&s.void(&["status"]).ok().out()).contains(&"mounts none".to_owned()));
