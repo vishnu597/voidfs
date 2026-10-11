@@ -222,6 +222,18 @@ fn names(c: &Connection, parent: Ino) -> rusqlite::Result<Vec<(String, Ino)>> {
     q.query_map([parent], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
 }
 
+/// A page of a directory's names after an exclusive cursor, in UTF-8 byte order (SQLite's
+/// `BINARY` collation), from the name indexes rather than the whole directory. No name is
+/// empty, so the first page's cursor is "".
+const NAMES_PAGE: &str = "SELECT name, ino FROM mount_overlay WHERE parent=?1 AND name>?2 AND ino IS NOT NULL
+        UNION ALL SELECT name, ino FROM mount_names n WHERE parent=?1 AND name>?2 AND NOT EXISTS
+        (SELECT 1 FROM mount_overlay o WHERE o.parent=n.parent AND o.name=n.name) ORDER BY name LIMIT ?3";
+
+fn names_page(c: &Connection, parent: Ino, after: Option<&str>, limit: usize) -> rusqlite::Result<Vec<(String, Ino)>> {
+    let mut q = c.prepare(NAMES_PAGE)?;
+    q.query_map(params![parent, after.unwrap_or(""), i64::try_from(limit).unwrap_or(i64::MAX)], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+}
+
 const EQUIVALENT_NAMES: &str = "SELECT ino FROM mount_overlay INDEXED BY mount_overlay_nfc WHERE parent=?1 AND nfc=?2 AND ino IS NOT NULL
         UNION ALL SELECT ino FROM mount_names n INDEXED BY mount_names_nfc WHERE parent=?1 AND nfc=?2 AND NOT EXISTS
         (SELECT 1 FROM mount_overlay o WHERE o.parent=n.parent AND o.name=n.name) LIMIT 2";
@@ -757,7 +769,7 @@ impl Session {
         self.refresh_dir(dir).await?;
         let after = after.map(str::to_owned);
         let rows = self.db(move |c, d, _| {
-            names(c, dir)?.into_iter().filter(|(n, _)| after.as_ref().is_none_or(|a| n > a)).take(limit)
+            names_page(c, dir, after.as_deref(), limit)?.into_iter()
                 .map(|(name, ino)| Ok((name, node(c, d, ino)?.ok_or(rusqlite::Error::InvalidQuery)?))).collect::<rusqlite::Result<Vec<_>>>()
         }).await?;
         rows.into_iter().map(|(name, n)| Ok((name, n.attr()?))).collect()
@@ -946,6 +958,9 @@ mod tests {
             let mut q = c.prepare(&format!("EXPLAIN QUERY PLAN {DESCENDANTS}"))?;
             let plan = q.query_map([1u64], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?.join("\n");
             assert!(plan.contains("SEARCH n USING PRIMARY KEY (parent=?)"), "{plan}");
+            let mut q = c.prepare(&format!("EXPLAIN QUERY PLAN {NAMES_PAGE}"))?;
+            let plan = q.query_map(params![1u64, "file", 256], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?.join("\n");
+            assert!(plan.contains("SEARCH n USING PRIMARY KEY (parent=? AND name>?)") && plan.contains("SEARCH mount_overlay USING PRIMARY KEY (parent=? AND name>?)"), "a page reads from its cursor, not the whole directory: {plan}");
             Ok(())
         }).unwrap();
     }
