@@ -1,17 +1,19 @@
 # voidfs for macOS
 
 The macOS drive: `voidfs.app`, a SwiftUI menu-bar app that contains an FSKit module
-(`VoidfsFS.appex`). Today it is the **FSKit spike**: a read-only mount of one drive. The
-findings, numbers and Phase 2 plan are in [`docs/spikes/fskit.md`](../../docs/spikes/fskit.md).
+(`VoidfsFS.appex`) and runs as the launch agent that bridges the module to the `void` daemon. A
+mount is read-only for now ([step 5, item 3](../../docs/step-5-macos.md#read-only-fskit-on-the-daemon-10-october));
+the module reads every byte and name through the daemon, which holds the server and key. The
+FSKit spike that started it is in [`docs/spikes/fskit.md`](../../docs/spikes/fskit.md).
 
 | Folder | What |
 |---|---|
-| `App/` | The host app, and the launch agent that bridges the extension to the daemon. Run from a terminal it also takes `status`, `save`, `mount`, `settings` and the agent and bridge commands |
-| `FSModule/` | The FSKit module: a `FSUnaryFileSystem` that serves `voidfs://host[:port]/drive` URLs |
-| `Shared/` | SigV4 signing, the HTTP client, where access keys are stored, and the bridge's XPC interface, client and checks |
-| `Probe/` | `voidfs-probe`, the module's HTTP calls without FSKit, for baselines |
+| `App/` | The host app, the launch agent that bridges the extension to the daemon, and the bridge's in-process checks. Run from a terminal it also takes `status`, `mount`, `settings` and the agent and bridge commands |
+| `FSModule/` | The FSKit module: a `FSUnaryFileSystem` that serves `voidfs://<drive>` resources from daemon sessions |
+| `Shared/` | The bridge's XPC interface and the extension's client of it, with its metadata memo |
+| `Probe/` | `voidfs-probe`, the spike's HTTP calls without FSKit or the daemon, for baselines |
 | `Config/` | The extension's `Info.plist` and the entitlements |
-| `scripts/` | Seeding, benchmarks and the semantics probes the spike used |
+| `scripts/` | Measurements and checks of a mounted drive, the semantics probes, and the release script |
 
 ## Requirements
 
@@ -20,7 +22,7 @@ findings, numbers and Phase 2 plan are in [`docs/spikes/fskit.md`](../../docs/sp
   without a provisioning profile that grants it, macOS kills the extension at launch. With Xcode
   signed in to your team, automatic signing creates the profile. The project uses team
   `HAUTK68F56`; set `DEVELOPMENT_TEAM` to your own, and change the App Group
-  (`HAUTK68F56.dev.voidfs` in `Config/*.entitlements`, `Shared/MountStore.swift` and
+  (`HAUTK68F56.dev.voidfs` in `Config/*.entitlements`, `Shared/Bridge.swift` and
   `LaunchAgents/dev.voidfs.agent.plist`) and the team in the bridge's code-signing requirements
   (`Shared/Bridge.swift`, `App/SelfTest.swift`) to match.
 
@@ -35,17 +37,57 @@ apps/macos/build/Build/Products/Release/voidfs.app/Contents/MacOS/voidfs setting
 ```
 
 Switch on **voidfs** in the pane that opens (General → Login Items & Extensions → File System
-Extensions). Then store an access key for the drive (the secret is read from stdin) and mount it:
+Extensions). The module reaches the daemon through the app's launch agent: start the daemon (it
+keeps the server and key, from `VOIDFS_ENDPOINT`, `VOIDFS_ACCESS_KEY_ID` and
+`VOIDFS_SECRET_ACCESS_KEY` the first time) and register the agent from the copy you built (see
+[the bridge](#the-bridge-to-the-daemon) below):
 
 ```bash
-apps/macos/build/Build/Products/Release/voidfs.app/Contents/MacOS/voidfs save voidfs://127.0.0.1:9000/spike VFSPIKEKEY0000000000
+void daemon start
 ```
 
 ```bash
-mkdir -p /tmp/voidfs-mnt && mount -F -t voidfs voidfs://127.0.0.1:9000/spike /tmp/voidfs-mnt
+apps/macos/build/Build/Products/Release/voidfs.app/Contents/MacOS/voidfs agent-register
 ```
 
-Unmount with `umount /tmp/voidfs-mnt`. Logs: `log stream --predicate 'subsystem == "dev.voidfs"'`.
+Then mount a drive by its alias or id. `void mount` asks the daemon, which mounts it with the
+module (the `fskit` adapter) and mounts it again when it starts:
+
+```bash
+void mount footage ~/voidfs/footage
+```
+
+`mount` works too, into any empty folder you own; the resource names only the drive, never a
+server or a key:
+
+```bash
+mkdir -p /tmp/voidfs-mnt && mount -F -t voidfs voidfs://footage /tmp/voidfs-mnt
+```
+
+Unmount with `void unmount footage` or `umount /tmp/voidfs-mnt`. The app's `mount <drive>
+[mountpoint]` command and its menu ask the daemon as `void mount` does. Logs:
+`log stream --predicate 'subsystem == "dev.voidfs"'` (the module logs as category `fs`, the agent
+as `agent`).
+
+Another machine's changes reach the mount through the daemon's change feed, in tens of
+milliseconds, with one limit FSKit leaves: a name this Mac looked up and missed stays missing to
+path lookups while anything below its folder is in use, and in the drive's top folder until the
+drive is mounted again; listings show it at once
+([the blocker](../../docs/step-5-macos.md#the-blocker-a-name-missed-while-its-folder-is-in-use)).
+
+## Checking a mount
+
+The scripts take a drive filled by `cargo run --release -p voidfs-sdk --example mount_seed`
+(the spike's tree, as `scripts/seed.py` makes it with boto3), and `mount_peer` from the same
+examples plays another machine:
+
+| Script | What |
+|---|---|
+| `bench.sh <resource> [mountpoint]` | Cold and warm listings, sequential and random reads; `VOIDFS_BENCH_COLD` runs before each remount (to empty the daemon's cache, say) |
+| `manifest.sh <mountpoint>` | Every path, type, size, mode, mtime and SHA-256, to compare two mounts with `diff` |
+| `coherence.py <mountpoint> <peer…>` | Overwrites, renames, deletes and new files from another client, with a sibling and the file itself held open |
+| `offline.py <mountpoint> <relay pid> "<relay command>" <peer…>` | The server refusing and hanging behind a relay, and coming back |
+| `restarts.py <mountpoint> <label> <command…>` | A file held open across a restart of the daemon or the agent |
 
 ## Release build: Developer ID, notarized
 
@@ -100,14 +142,18 @@ apps/macos/build/Build/Products/Release/voidfs.app/Contents/MacOS/voidfs agent-r
 `agent-status` reports it, `agent-unregister` removes it, and `bridge-check` shows that it turns
 the app itself away. `bridge-selftest <drive>` runs the bridge's checks in process, without
 launchd or FSKit; its modes `daemon-restart`, `agent-restart`, `remote <key>`, `refused` and
-`wire` cover restarts, an outside change, peer refusal and the agent's codecs. In a mount, the
-extension runs the same checks through the real agent when you look up these names. The results go
-to the log, and a `~<anything>` suffix runs one again, since the kernel caches a missing name:
+`wire` cover restarts, an outside change, peer refusal and the agent's codecs. (Until item 3 the
+extension also ran them when a mount looked up names such as `.voidfs-bridge`; the mount itself now
+goes through the agent, and those names are gone.)
 
-| Name | Runs |
-|---|---|
-| `.voidfs-xpc` | 500 XPC round trips of 4 KiB to the agent |
-| `.voidfs-bridge` | The checks and timings, end to end |
-| `.voidfs-bridge-daemon-restart` | Waits while you restart or kill the daemon, then checks what survived |
-| `.voidfs-bridge-agent-restart` | The same for the agent (`launchctl kickstart -k gui/$(id -u)/dev.voidfs.agent`, or `kill -9`) |
-| `.voidfs-bridge-remote:<name>` | Waits for an outside change to `<name>`, such as a `void upload` |
+To point the agent at a daemon elsewhere, as `VOIDFS_STATE_DIR` points the CLI (a test daemon, say,
+so that nothing touches the shared location), set a default and restart the agent; delete the
+default afterwards:
+
+```bash
+defaults write dev.voidfs.app VoidfsStateDirectory /tmp/vfsd.test
+```
+
+```bash
+launchctl kickstart -k gui/$(id -u)/dev.voidfs.agent
+```

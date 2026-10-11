@@ -70,6 +70,11 @@ apps/macos/
 
 ### How to run it
 
+*This records the spike as it ran. Since step 5's item 3 (10 October) the module reads through the
+daemon and mounts `voidfs://<drive>`, `save` is gone, `bench.sh` needs none of the hooks below, and
+the spike-only names are removed: see
+[step 5](../step-5-macos.md#read-only-fskit-on-the-daemon-10-october) and `apps/macos/README.md`.*
+
 Prerequisites: Xcode 27 signed in to a team whose profile can carry the FSKit Module capability,
 and a running server:
 
