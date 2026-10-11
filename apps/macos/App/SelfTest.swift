@@ -4,8 +4,8 @@
 // [--socket <path>]`: the bridge end to end (the client and its memo, XPC coding, the agent's
 // checks and forwarding, the daemon) over an in-process XPC listener, without launchd or FSKit.
 // The listener accepts this app's own signature; `refused` shows the extension's requirement
-// turning this app away. The signed, sandboxed extension runs the same checks through the real
-// agent (`.voidfs-bridge` in a mount).
+// turning this app away. The signed, sandboxed extension reaches the same agent code through
+// launchd whenever a drive is mounted.
 
 import Foundation
 

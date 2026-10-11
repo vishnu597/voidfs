@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The calls a read-only mount makes: folder listings with attributes (§4.9), ranged reads (§3),
+// The calls the FSKit spike's module made, now voidfs-probe's: folder listings with attributes (§4.9), ranged reads (§3),
 // extended attributes (§4.8), drive description (§5.4) and the change feed (§5.6).
 
 import Foundation

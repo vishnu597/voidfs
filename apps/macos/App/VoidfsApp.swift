@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// voidfs.app: the menu-bar host FSKit requires. For the spike it stores an access key where the
-// extension can read it, shows whether the extension is enabled, and mounts drives.
+// voidfs.app: the menu-bar host FSKit requires. It shows whether the extension is enabled and asks
+// the daemon to mount drives, which it does with the extension (the `fskit` adapter) and remembers.
+// The daemon holds the server and key (`void daemon start`); the extension and the app hold none.
 //
 // It also runs headless, for scripts:
 //
 //     voidfs.app/Contents/MacOS/voidfs status
-//     voidfs.app/Contents/MacOS/voidfs save voidfs://127.0.0.1:9000/spike <access-key-id>   (secret on stdin)
-//     voidfs.app/Contents/MacOS/voidfs mount voidfs://127.0.0.1:9000/spike [mount-point]
+//     voidfs.app/Contents/MacOS/voidfs mount <drive> [mount-point]
 //     voidfs.app/Contents/MacOS/voidfs settings
 //     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status
 //     voidfs.app/Contents/MacOS/voidfs bridge-check
@@ -26,7 +26,7 @@ enum Launcher {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
         if args.first == "agent" { Agent.serve() }
-        if let command = args.first, ["status", "save", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "bridge-check", "bridge-selftest"].contains(command) {
+        if let command = args.first, ["status", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "bridge-check", "bridge-selftest"].contains(command) {
             Task {
                 let code = await HostCommands.run(args)
                 exit(code)
@@ -50,22 +50,14 @@ enum HostCommands {
                     print("\(extensionBundleID) is not installed")
                     return 1
                 }
-            case "save":
-                guard args.count == 3, let url = URL(string: args[1]), let target = MountTarget(url: url) else {
-                    print("usage: save voidfs://host:port/drive <access-key-id>  (secret on stdin)")
-                    return 2
-                }
-                guard let secret = readLine(strippingNewline: true), !secret.isEmpty else { print("no secret on stdin"); return 2 }
-                try MountStore.save(target, .init(accessKeyId: args[2], secretAccessKey: secret))
-                print("saved credentials for \(target.url.absoluteString) in \(MountStore.fileURL!.path)")
             case "mount":
-                guard args.count >= 2, let url = URL(string: args[1]), let target = MountTarget(url: url) else {
-                    print("usage: mount voidfs://host:port/drive [mount-point]")
+                guard args.count == 2 || args.count == 3 else {
+                    print("usage: mount <drive> [mount-point]")
                     return 2
                 }
                 let start = ContinuousClock.now
-                let path = try await Mounter.mount(target, at: args.count > 2 ? URL(filePath: args[2]) : nil)
-                print("mounted at \(path.path) in \(ContinuousClock.now - start)")
+                let path = try await Mounter.mount(args[1], at: args.count > 2 ? URL(filePath: args[2]).standardizedFileURL.path : nil)
+                print("mounted at \(path) in \(ContinuousClock.now - start)")
             case "settings":
                 print(FSClient.shared.openFileSystemExtensionsSettings() ? "opened System Settings" : "could not open System Settings")
             case "agent-register":
@@ -103,29 +95,26 @@ enum HostCommands {
 }
 
 enum Mounter {
-    /// Mounts a drive. `FSClient.mountSingleVolume` (macOS 27) mounts in /Volumes but needs the
-    /// `com.apple.developer.fskit.mount` entitlement, which the team's profile does not grant
-    /// (fskitd answers EPERM). mount(8) needs no entitlement and works for the logged-in user, so
-    /// it is the fallback, into `~/voidfs/<drive>` unless told otherwise.
-    static func mount(_ target: MountTarget, at mountPoint: URL? = nil) async throws -> URL {
+    /// Asks the daemon to mount `drive`, as `void mount` does: it mounts with the extension (the
+    /// `fskit` adapter) into `~/voidfs/<drive>` unless told otherwise, and mounts it again when it
+    /// starts. Returns the mountpoint.
+    static func mount(_ drive: String, at mountPoint: String? = nil) async throws -> String {
+        guard let dir = Agent.stateDirectory else { throw NSError(domain: "dev.voidfs", code: 1, userInfo: [NSLocalizedDescriptionKey: "no home directory"]) }
+        var request: [String: Any] = ["drive": drive]
+        if let mountPoint { request["mountpoint"] = mountPoint }
+        let socket = DaemonSocket(path: dir.appending(path: "daemon.sock").path)
+        let response: DaemonResponse
         do {
-            return try await FSClient.shared.mountSingleVolume(resource: FSGenericURLResource(url: target.url), bundleID: extensionBundleID, options: [])
-        } catch let e as NSError where e.domain == NSPOSIXErrorDomain && e.code == Int(EPERM) {
-            let dir = mountPoint ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: "voidfs/\(target.drive)")
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let p = Process()
-            p.executableURL = URL(filePath: "/sbin/mount")
-            p.arguments = ["-F", "-t", "voidfs", target.url.absoluteString, dir.path]
-            let err = Pipe()
-            p.standardError = err
-            try p.run()
-            p.waitUntilExit()
-            guard p.terminationStatus == 0 else {
-                let message = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                throw NSError(domain: "dev.voidfs", code: Int(p.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.trimmingCharacters(in: .whitespacesAndNewlines)])
-            }
-            return dir
+            response = try await socket.request("POST", "/v1/mounts", generation: nil, contentType: "application/json", body: try JSONSerialization.data(withJSONObject: request), limit: 1 << 20)
+        } catch DaemonSocketError.notRunning {
+            throw NSError(domain: "dev.voidfs", code: 1, userInfo: [NSLocalizedDescriptionKey: "the voidfs daemon isn't running: start it with `void daemon start`"])
         }
+        let o = (try? JSONSerialization.jsonObject(with: response.body)) as? [String: Any]
+        guard (200..<300).contains(response.status), let path = o?["mountpoint"] as? String else {
+            let message = (o?["error"] as? [String: Any])?["message"] as? String ?? "the daemon answered \(response.status)"
+            throw NSError(domain: "dev.voidfs", code: response.status, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        return path
     }
 }
 
@@ -143,9 +132,7 @@ struct VoidfsApp: App {
 @Observable
 @MainActor
 final class HostModel {
-    var url = "voidfs://127.0.0.1:9000/spike"
-    var accessKeyId = ""
-    var secret = ""
+    var drive = ""
     var status = ""
     var enabled: Bool?
 
@@ -159,17 +146,14 @@ final class HostModel {
         }
     }
 
-    func saveAndMount() async {
-        guard let u = URL(string: url), let target = MountTarget(url: u) else { status = "Not a voidfs:// URL"; return }
+    func mount() async {
+        let drive = drive.trimmingCharacters(in: .whitespaces)
+        guard !drive.isEmpty else { status = "Name a drive"; return }
         do {
-            if !accessKeyId.isEmpty, !secret.isEmpty {
-                try MountStore.save(target, .init(accessKeyId: accessKeyId, secretAccessKey: secret))
-                secret = ""
-            }
             status = "Mounting…"
-            let path = try await Mounter.mount(target)
-            status = "Mounted at \(path.path)"
-            NSWorkspace.shared.open(path)
+            let path = try await Mounter.mount(drive)
+            status = "Mounted at \(path)"
+            NSWorkspace.shared.open(URL(filePath: path))
         } catch {
             status = "Mount failed: \(error.localizedDescription)"
         }
@@ -189,11 +173,9 @@ struct HostView: View {
                 Button("Open File System Extensions settings") { _ = FSClient.shared.openFileSystemExtensionsSettings() }
             case nil: EmptyView()
             }
-            TextField("voidfs://host:port/drive", text: $model.url)
-            TextField("Access key id", text: $model.accessKeyId)
-            SecureField("Secret access key", text: $model.secret)
+            TextField("Drive", text: $model.drive)
             HStack {
-                Button("Mount") { Task { await model.saveAndMount() } }
+                Button("Mount") { Task { await model.mount() } }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
