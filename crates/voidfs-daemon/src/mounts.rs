@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The mount table: what is mounted where, by which adapter, with its drive's change feed; and the
 //! remembered mounts, which the daemon mounts again when it starts. Mounting is an [`Adapter`]'s
-//! (step 5: FSKit, SMB or FUSE); the `void` binary has none yet.
+//! (step 5: FSKit, SMB or FUSE); the `void` binary has [`crate::FsKit`] on macOS.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -41,6 +41,8 @@ pub struct Core {
 pub trait Adapter: Send + Sync + 'static {
     /// Its name, as `void mount --adapter` takes it.
     fn name(&self) -> &str;
+    /// Whether it can mount a drive writable; one that can't mounts every drive read-only.
+    fn writable(&self) -> bool { true }
     /// Mounts `spec`, serving it from `core`. The mountpoint exists.
     fn mount<'a>(&'a self, spec: &'a MountSpec, core: &'a Core) -> BoxFuture<'a, Result<Arc<dyn Mounted>, String>>;
 }
@@ -139,7 +141,7 @@ impl Mounts {
     /// is updated as it goes.
     async fn attach(s: &Shared, spec: &MountSpec, adapter: &Arc<dyn Adapter>, drive: Option<Arc<DriveSession>>) -> Result<(), Failure> {
         let drive = match drive { Some(drive) => drive, None => s.sessions.drive(s, &spec.drive).await? };
-        let effective = MountSpec { drive: drive.drive(), read_only: spec.read_only || !drive.pinned, ..spec.clone() };
+        let effective = MountSpec { drive: drive.drive(), read_only: spec.read_only || !drive.pinned || !adapter.writable(), ..spec.clone() };
         let handle = adapter.mount(&effective, &s.core(drive.core.clone())).await.map_err(|m| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "MountFailed", m))?;
         drive.observe(handle.clone());
         let unwanted = {
@@ -272,11 +274,15 @@ pub(crate) async fn unmount(State(s): State<Arc<Shared>>, Json(u): Json<api::Unm
         gone
     };
     let mut unmounted: Vec<String> = Vec::new();
-    for l in gone {
-        if let Is::Mounted(h) = l.is
-            && let Err(e) = h.unmount().await
+    let mut gone = gone.into_iter();
+    while let Some(l) = gone.next() {
+        if let Is::Mounted(h) = &l.is
+            && let Err(e) = h.clone().unmount().await
         {
-            return Err(Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "UnmountFailed", format!("{}: {e}", l.spec.mountpoint.display())));
+            // Still mounted (busy, say): it stays in the table and remembered, as do the rest.
+            let message = format!("{}: {e}", l.spec.mountpoint.display());
+            s.mounts.live().extend(std::iter::once(l).chain(gone));
+            return Err(Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "UnmountFailed", message));
         }
         unmounted.push(l.spec.mountpoint.display().to_string());
     }
