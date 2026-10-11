@@ -352,3 +352,54 @@ async fn offline_reopening_serves_complete_snapshots_and_fails_uncached_lookups_
     assert_eq!(ns.lookup(uncached, "file").await.unwrap().size, 6);
     assert_eq!(f.proxy.seen().len(), 2, "reconnecting refreshes the root and the uncached directory");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_server_fails_uncached_calls_after_the_links_patience_and_serves_what_is_cached() {
+    let f = Fixture::new().await;
+    f.put("cached/file", "bytes").await;
+    f.put("uncached/file", "remote").await;
+    f.put("unread", "never read").await;
+    // The client's answers count on the link, as the daemon's do.
+    let conn = Connectivity::new(voidfs_client::ConnectivityConfig { patience: std::time::Duration::from_millis(300), probe_every: std::time::Duration::from_secs(3600), ..Default::default() });
+    let client = client_for(&f.proxy.endpoint, Config { observer: Some(Arc::new(conn.clone())), ..Config::default() });
+    let ns = session(f.store.clone(), client, "drv", conn.clone()).await;
+    let root = ns.root();
+    let cached = ns.lookup(root, "cached").await.unwrap().ino;
+    let uncached = ns.lookup(root, "uncached").await.unwrap().ino;
+    let file = ns.lookup(cached, "file").await.unwrap();
+    let fh = ns.open(file.ino, false).await.unwrap();
+    assert_eq!(&ns.read(fh, 0, 5).await.unwrap()[..], b"bytes");
+    let unread = ns.open(ns.lookup(root, "unread").await.unwrap().ino, false).await.unwrap();
+    ns.invalidate(&objects(&["cached/file", "uncached/file"])).await.unwrap();
+
+    // The server stops answering, each request held 1.5 s: five times the patience (a test
+    // client's own timeout would allow 120 s).
+    f.proxy.slow(std::time::Duration::from_millis(1500));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let start = std::time::Instant::now();
+    assert_eq!(ns.read(unread, 0, 10).await.unwrap_err(), FsError::Offline);
+    assert!(start.elapsed() < std::time::Duration::from_secs(3), "an uncached read fails after the patience, not the timeouts: {:?}", start.elapsed());
+    assert_eq!(conn.link(), Link::Offline, "and the link is offline");
+    let start = std::time::Instant::now();
+    assert_eq!(ns.lookup(uncached, "file").await.unwrap_err(), FsError::Offline);
+    assert_eq!(ns.read(unread, 0, 10).await.unwrap_err(), FsError::Offline);
+    assert!(start.elapsed() < std::time::Duration::from_millis(250), "offline, at once: {:?}", start.elapsed());
+    assert_eq!(ns.lookup(cached, "file").await.unwrap().ino, file.ino, "a listed folder is served");
+    assert_eq!(&ns.read(fh, 0, 5).await.unwrap()[..], b"bytes", "cached bytes are served");
+
+    // A listed folder whose refresh meets the silence is served as it was, once the link is back
+    // up but the server still says nothing.
+    conn.answered(false);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let start = std::time::Instant::now();
+    assert_eq!(ns.lookup(cached, "file").await.unwrap().ino, file.ino);
+    assert!(start.elapsed() < std::time::Duration::from_secs(3), "{:?}", start.elapsed());
+    assert_eq!(conn.link(), Link::Offline);
+
+    // Answers again (once what it held drains): everything reads.
+    f.proxy.slow(std::time::Duration::ZERO);
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    conn.answered(false);
+    assert_eq!(&ns.read(unread, 0, 10).await.unwrap()[..], b"never read");
+    assert_eq!(ns.lookup(uncached, "file").await.unwrap().size, 6);
+}

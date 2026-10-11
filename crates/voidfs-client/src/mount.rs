@@ -490,6 +490,25 @@ impl Session {
         Ok(tokio::task::spawn_blocking(move || s.with(|c| f(c, &d, root))).await.map_err(Error::from)??)
     }
 
+    /// `work`, unless the server answers nothing at all, to anyone, for the link's patience: a
+    /// stopped server, or a connection gone quiet. The link is then offline and the call fails as
+    /// it would offline, instead of waiting out the client's timeouts; a slow answer that is
+    /// arriving, or anything else answered meanwhile, keeps the wait going.
+    pub(crate) async fn patient<T>(&self, work: impl std::future::Future<Output = T>) -> Result<T> {
+        let patience = self.connectivity.patience();
+        let mut work = std::pin::pin!(work);
+        loop {
+            match tokio::time::timeout(patience, &mut work).await {
+                Ok(done) => return Ok(done),
+                Err(_) if self.connectivity.answered_within(patience) => {},
+                Err(_) => {
+                    self.connectivity.silent();
+                    return Err(FsError::Offline);
+                }
+            }
+        }
+    }
+
     async fn ancestors(&self, ino: Ino) -> Result<()> {
         if ino == 0 || ino > i64::MAX as u64 { return Err(FsError::Stale); }
         let path = self.db(move |c, d, root| chain(c, d, root, ino)).await?.ok_or(FsError::Stale)?;
@@ -541,10 +560,10 @@ impl Session {
             if ino == self.root || n.entry_id.is_some() || n.entry.version_id.as_ref().is_some_and(|v| !v.is_empty()) { return Ok(()); }
             if offline { return Err(FsError::Offline); }
             let base_key = n.remote_key.as_deref().unwrap_or(&key);
-            let attrs = match self.client.attributes(&self.drive, base_key, Default::default()).await {
+            let attrs = self.patient(async { match self.client.attributes(&self.drive, base_key, Default::default()).await {
                 Err(e) if e.status() == Some(404) && base_key != key => self.client.attributes(&self.drive, &key, Default::default()).await,
                 result => result,
-            }.map_err(|e| sdk_error(&e))?;
+            }}).await?.map_err(|e| sdk_error(&e))?;
             if attrs.object_id != n.entry.object_id || attrs.kind != n.entry.kind { return Err(FsError::Again); }
             let Some(version) = attrs.version_id.filter(|s| !s.is_empty()) else { return Err(FsError::Unsupported); };
             let accepted = self.db(move |c, d, root| {
@@ -719,7 +738,7 @@ impl Session {
         if offset >= handle.attr.size || len == 0 { return Ok(Bytes::new()); }
         let len = len.min(handle.attr.size - offset);
         for _ in 0..4 {
-            match reader.read(offset, len).await {
+            match self.patient(reader.read(offset, len)).await? {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) => {
                     let missing = matches!(&e, Error::Fetch(e) if e.status() == Some(404));
@@ -804,12 +823,16 @@ impl Session {
             if self.connectivity.link() == Link::Offline {
                 return if seq.is_some() { Ok(()) } else { Err(FsError::Offline) };
             }
+            // A server that has gone silent leaves a listed folder as it was, as offline does.
+            let silent = |e: FsError| if e == FsError::Offline && seq.is_some() { Ok(()) } else { Err(e) };
             let bound_version = if sync != Sync::Saved && dir != self.root {
                 let matches = |attrs: &voidfs_sdk::Attributes| attrs.kind == Kind::Folder && attrs.object_id == object_id;
-                let attrs = match self.client.attributes(&self.drive, &remote, Default::default()).await {
+                let found = match self.patient(self.client.attributes(&self.drive, &remote, Default::default())).await { Ok(found) => found, Err(e) => return silent(e) };
+                let attrs = match found {
                     Ok(attrs) if matches(&attrs) => attrs,
                     result if remote != key && (result.as_ref().is_ok_and(|attrs| !matches(attrs)) || result.as_ref().is_err_and(|e| e.status() == Some(404))) => {
-                        let attrs = self.client.attributes(&self.drive, &key, Default::default()).await.map_err(|e| sdk_error(&e))?;
+                        let found = match self.patient(self.client.attributes(&self.drive, &key, Default::default())).await { Ok(found) => found, Err(e) => return silent(e) };
+                        let attrs = found.map_err(|e| sdk_error(&e))?;
                         if !matches(&attrs) { return Err(FsError::Again); }
                         remote = key.clone();
                         attrs
@@ -819,10 +842,11 @@ impl Session {
                 };
                 Some(attrs.version_id)
             } else { None };
-            let listing = match self.listing(&remote).await {
-                Err(FsError::NotFound) if remote != key => { remote = key.clone(); self.listing(&remote).await },
+            let listing = match self.patient(self.listing(&remote)).await {
+                Ok(Err(FsError::NotFound)) if remote != key => { remote = key.clone(); self.patient(self.listing(&remote)).await },
                 result => result,
             };
+            let listing = match listing { Ok(listing) => listing, Err(e) => return silent(e) };
             // A folder removed elsewhere still holds the names its unpublished changes need.
             let listing = match listing {
                 Err(FsError::NotFound) if self.db(move |c, _, _| pending_under(c, dir)).await? =>
@@ -831,7 +855,8 @@ impl Session {
             };
             let Some((entries, seq)) = listing else { continue; };
             if let Some(version) = bound_version {
-                match self.client.attributes(&self.drive, &remote, Default::default()).await {
+                let found = match self.patient(self.client.attributes(&self.drive, &remote, Default::default())).await { Ok(found) => found, Err(e) => return silent(e) };
+                match found {
                     Ok(attrs) if attrs.kind == Kind::Folder && attrs.object_id == object_id && attrs.version_id == version => {},
                     Ok(_) => continue,
                     Err(e) if e.status() == Some(404) => continue,
