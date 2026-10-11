@@ -1,78 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import CryptoKit
 import FSKit
 import Foundation
 
-enum Kind: String {
-    case file, folder, symlink
-}
-
-/// What the mount knows about an object, from its parent's listing.
-struct ItemInfo {
-    var key: String         // full key; folders end in "/", the root is ""
-    var kind: Kind
-    var size: UInt64
-    var mtime: timespec
-    var mode: UInt32
-    var etag: String?
-    var versionId: String?
-    var hasXattrs: Bool
-    var target: String?
-
-    init(key: String, entry e: ListEntry) {
-        self.key = key
-        self.kind = Kind(rawValue: e.kind) ?? .file
-        self.size = e.size ?? 0
-        self.mtime = parseTimestamp(e.mtime)
-        self.mode = parseMode(e.mode)
-        self.etag = e.etag
-        self.versionId = e.versionId
-        self.hasXattrs = e.hasXattrs ?? false
-        self.target = e.target
-    }
-
-    init(root mtime: timespec) {
-        key = ""
-        kind = .folder
-        size = 0
-        self.mtime = mtime
-        mode = 0o755
-        hasXattrs = false
-    }
-
-    /// The name inside the parent folder, without the folder's trailing "/".
-    var name: String {
-        var k = Substring(key)
-        if k.hasSuffix("/") { k = k.dropLast() }
-        return String(k[(k.lastIndex(of: "/").map { k.index(after: $0) } ?? k.startIndex)...])
-    }
-}
-
-/// One object of the drive. FSKit keeps one per kernel vnode; the volume keeps one per object id
-/// so repeated lookups return the same instance.
+/// One incarnation of a daemon inode, as the kernel holds it. The volume answers lookups of an
+/// inode with its current incarnation, so repeated lookups return the same instance; when another
+/// machine changes the inode, the volume revokes it in the kernel and retires it, and the next
+/// lookup makes a new one. A descriptor opened before the change keeps the retired instance, and
+/// with it the daemon handle opened then: its reads, and the attributes they carry, come from the
+/// version that was current at open (snapshot-at-open), never an old length with new bytes.
 final class VoidfsItem: FSItem {
-    let objectId: String
+    let ino: UInt64
     let id: FSItem.Identifier
     /// Guarded by the volume's lock.
-    var info: ItemInfo
-    var parentID: FSItem.Identifier
+    var parent: UInt64
+    var kind: BridgeAttr.Kind
+    /// The daemon handle opened when the kernel first opened this incarnation, until the kernel
+    /// closes it.
+    var handle: OpenFile?
+    /// The open in flight, which other opens and reads of this incarnation wait for.
+    var opening: Task<OpenFile, Error>?
+    /// A later incarnation answers lookups now.
+    var retired = false
 
-    init(objectId: String, id: FSItem.Identifier, info: ItemInfo, parentID: FSItem.Identifier) {
-        self.objectId = objectId
-        self.id = id
-        self.info = info
-        self.parentID = parentID
+    init(ino: UInt64, id: FSItem.Identifier, parent: UInt64, kind: BridgeAttr.Kind) {
+        (self.ino, self.id, self.parent, self.kind) = (ino, id, parent, kind)
     }
 
-    /// A stable 63-bit file id derived from the object id, so inode numbers survive remounts
-    /// (Finder aliases and bookmarks record them). 0–2 are reserved by FSKit.
-    static func fileID(for objectId: String) -> FSItem.Identifier {
-        let digest = SHA256.hash(data: Data(objectId.utf8))
-        var v: UInt64 = 0
-        for b in digest.prefix(8) { v = v << 8 | UInt64(b) }
-        v &= 0x7fff_ffff_ffff_ffff
-        if v <= FSItem.Identifier.rootDirectory.rawValue { v += 3 }
-        return FSItem.Identifier(rawValue: v)!
+    /// The daemon's inode numbers are persistent (step 5's mount core), so they are the file
+    /// IDs: the root is FSKit's root, and every other inode is shifted past FSKit's reserved 0–2.
+    static func identifier(_ ino: UInt64, root: UInt64) -> FSItem.Identifier {
+        ino == root ? .rootDirectory : FSItem.Identifier(rawValue: ino + 2) ?? .invalid
     }
+}
+
+/// A daemon handle: the attributes bound with it at open, and the session it belongs to (a
+/// handle means nothing to a later session).
+struct OpenFile {
+    let fh: UInt64
+    let attr: BridgeAttr
+    let session: BridgeSession
 }

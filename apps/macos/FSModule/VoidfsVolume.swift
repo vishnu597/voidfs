@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// A read-only voidfs drive as an FSKit volume. Metadata comes from folder listings (§4.9), bytes
-// from ranged GETs, extended attributes from §4.8, and the change feed (§5.6) invalidates what
-// other machines change.
+// A drive as a read-only FSKit volume, served by the daemon through the app's launch agent
+// (Shared/BridgeClient.swift). The daemon's session answers every call; its invalidation relay says
+// what changed, here or on other machines, and the volume makes the kernel forget it with revokes.
 
 import FSKit
 import Foundation
@@ -10,39 +10,25 @@ import os
 
 func posix(_ code: Int32) -> Error { fs_errorForPOSIXError(code) }
 
-func posix(_ error: Error) -> Error {
-    if let e = error as? VoidfsError { return posix(e.errno) }
-    return error
-}
-
 /// Mount options, from `mount -o k=v,…` or the activate options.
 struct VolumeOptions {
-    /// How long a folder listing is trusted without a change-feed notice.
-    var dirTTL: Duration = .seconds(5)
     /// `f_iosize`. Measured on macOS 27.0: the kernel sends reads of at most 1 MiB whatever this
     /// says (256 KiB, 4 MiB and 16 MiB were tried).
     var ioSize = 1 << 20
-    var changeFeed = true
     var uid = getuid()
     var gid = getgid()
 
     mutating func apply(_ args: [String]) {
         var i = 0
         while i < args.count {
-            let a = args[i]
             let value = i + 1 < args.count ? args[i + 1] : ""
-            switch a {
+            switch args[i] {
             case "-u": uid = uid_t(value) ?? uid; i += 1
             case "-g": gid = gid_t(value) ?? gid; i += 1
             case "-o":
                 for kv in value.split(separator: ",") {
                     let p = kv.split(separator: "=", maxSplits: 1).map(String.init)
-                    switch (p.first, p.count > 1 ? p[1] : nil) {
-                    case ("ttl", let v?): dirTTL = .milliseconds(Int(v) ?? 5000)
-                    case ("iosize", let v?): ioSize = Int(v) ?? ioSize
-                    case ("nofeed", _): changeFeed = false
-                    default: break
-                    }
+                    if p.first == "iosize", p.count > 1 { ioSize = Int(p[1]) ?? ioSize }
                 }
                 i += 1
             default: break
@@ -52,78 +38,100 @@ struct VolumeOptions {
     }
 }
 
-/// Counts file system calls, so the spike can relate `ls` or `cp` to requests.
-final class OpStats: @unchecked Sendable {
-    private let lock = OSAllocatedUnfairLock(initialState: (ops: [String: Int](), readSizes: [Int: Int]()))
+/// Names looked up in a folder and not found, up to a bound; past it, any name.
+struct Missed {
+    var names: Set<String> = []
+    var any = false
 
-    func count(_ op: String) { lock.withLock { $0.ops[op, default: 0] += 1 } }
-
-    func read(_ length: Int) {
-        lock.withLock { s in
-            s.ops["read", default: 0] += 1
-            var bucket = 4096
-            while bucket < length { bucket <<= 1 }
-            s.readSizes[bucket, default: 0] += 1
-        }
+    mutating func insert(_ name: String) {
+        if any { return }
+        if names.count >= 16_384 { (names, any) = ([], true) } else { names.insert(name) }
     }
 
-    func dump() -> String {
-        lock.withLock { s in
-            let ops = s.ops.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
-            let sizes = s.readSizes.sorted { $0.key < $1.key }.map { "≤\($0.key / 1024)K:\($0.value)" }.joined(separator: " ")
-            return "ops: \(ops) | read sizes: \(sizes)"
-        }
-    }
-
-    func reset() { lock.withLock { $0 = ([:], [:]) } }
+    func matches(_ changed: Set<String>) -> Bool { any || !names.isDisjoint(with: changed) }
 }
 
-/// A folder's children as of one listing.
-struct DirCache {
-    var children: [VoidfsItem]
-    var byName: [String: VoidfsItem]
-    var fetched: ContinuousClock.Instant
-    var verifier: UInt64
-    var stale = false
+/// A folder's entries as of one enumeration, at one namespace generation. Every invalidation
+/// names the folders on a changed key's path, so a listing kept until one names its folder
+/// answers lookups too, misses included (the spike's listing did; `ls -l` and Finder look up an
+/// AppleDouble `._name` for every file).
+struct Listing {
+    var names: [String] = []
+    var attrs: [BridgeAttr] = []
+    var generation: UInt64 = 0
+    /// Each name's position, by its NFC form, as the daemon matches names; -1 where two share one.
+    var index: [String: Int] = [:]
+
+    mutating func indexNames() {
+        index.reserveCapacity(names.count)
+        for (i, name) in names.enumerated() {
+            let key = name.precomposedStringWithCanonicalMapping
+            index[key] = index[key] == nil ? i : -1
+        }
+    }
 }
 
 final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler, FSVolume.XattrHandler, FSVolume.DataCacheHandler, @unchecked Sendable {
-    let client: VoidfsClient
-    let drive: DriveInfo
+    let client: BridgeClient
+    let drive: String
+    let root: UInt64
     var options = VolumeOptions()
     private let log = Logger(subsystem: "dev.voidfs", category: "fs")
-    private let ops = OpStats()
-    private let root: VoidfsItem
+    private let rootItem: VoidfsItem
+    private let caseSensitive: Bool
 
     // Everything below is guarded by `lock`, which is never held across an await or a call into
-    // FSKit.
+    // FSKit (setCacheState may call back into the volume).
     private let lock = NSLock()
-    private var items: [String: VoidfsItem] = [:]
-    private var dirs: [FSItem.Identifier: DirCache] = [:]
-    private var inflight: [FSItem.Identifier: Task<DirCache, Error>] = [:]
-    private var xattrCache: [String: [String: Data]] = [:]
-    private var nextVerifier: UInt64 = 1
-    private var seq: UInt64
-    private var feed: Task<Void, Never>?
-    /// The bridge to the daemon through the app's agent: spike-only hooks use it until item 3
-    /// moves the volume onto it.
-    private let bridge = BridgeClient()
+    private var session: BridgeSession
+    private var connecting: Task<BridgeSession, Error>?
+    private var lastAttempt: (ContinuousClock.Instant, Error)?
+    /// The current incarnation of each inode the kernel was given.
+    private var items: [UInt64: VoidfsItem] = [:]
+    /// Incarnations, current or retired, with a daemon handle open.
+    private var open: [ObjectIdentifier: VoidfsItem] = [:]
+    private var listings: [UInt64: Listing] = [:]
+    private var listed = 0
+    /// Counts invalidations; a listing fetched across one isn't kept.
+    private var epoch: UInt64 = 0
+    /// Names in each folder the kernel was told are missing, which it may have cached.
+    private var misses: [UInt64: Missed] = [:]
+    private var missedNames = 0
+    /// Folders whose purge waits for files open below them to close.
+    private var pending: Set<UInt64> = []
+    private var unmounted = false
+    private var offline = false
+    /// The feed's position, as the relay's events carry it.
+    private var seq: UInt64 = 0
+    private var revoked = (ok: 0, benign: 0, failed: 0)
 
-    init(client: VoidfsClient, drive: DriveInfo, volumeID: FSVolume.Identifier) {
+    /// Revokes run in order, here and nowhere else.
+    private let revokes = DispatchQueue(label: "dev.voidfs.fs.revoke")
+    private static let listingLimit = 200_000
+    private static let missesLimit = 200_000
+
+    init(client: BridgeClient, session: BridgeSession, drive: String, volumeID: FSVolume.Identifier) {
         self.client = client
+        self.session = session
         self.drive = drive
-        self.seq = drive.seq
-        root = VoidfsItem(objectId: "", id: .rootDirectory, info: ItemInfo(root: parseTimestamp(drive.createdAt)), parentID: .parentOfRoot)
-        super.init(volumeID: volumeID, volumeName: FSFileName(string: drive.displayName ?? drive.alias ?? client.target.drive))
+        root = session.info.root
+        rootItem = VoidfsItem(ino: root, id: .rootDirectory, parent: 0, kind: .folder)
+        let capabilities = (try? JSONSerialization.jsonObject(with: session.info.capabilities)) as? [String: Any]
+        caseSensitive = capabilities?["caseSensitive"] as? Bool ?? true
+        super.init(volumeID: volumeID, volumeName: FSFileName(string: session.info.drive))
+        session.listen { [weak self, weak session] event in
+            guard let self, let session else { return }
+            self.relay(event, from: session)
+        }
     }
 
     // MARK: - Properties FSKit reads
 
     var maximumLinkCount: Int { 1 }
-    var maximumNameLength: Int { 255 }
+    var maximumNameLength: Int { Bridge.maxName }
     var restrictsOwnershipChanges: Bool { true }
     var truncatesLongNames: Bool { false }
-    var maximumXattrSize: Int { 64 << 10 }
+    var maximumXattrSize: Int { Bridge.maxXattr }
     var maximumFileSize: UInt64 { 5 << 40 }
     var requestedMountOptions: FSVolume.MountOptions { .readOnly }
 
@@ -133,11 +141,11 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         c.supportsHardLinks = false
         c.supports2TBFiles = true
         c.supports64BitObjectIDs = true
+        c.supportsPersistentObjectIDs = true
         c.supportsFastStatFS = true
         c.supportsHiddenFiles = true
         c.doesNotSupportSettingFilePermissions = true
-        // Keys are case-sensitive byte strings (spec/format.md §7.6).
-        c.caseFormat = .sensitive
+        c.caseFormat = caseSensitive ? .sensitive : .insensitive
         return c
     }
 
@@ -146,11 +154,10 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         s.blockSize = 4096
         s.ioSize = options.ioSize
         let total: UInt64 = 1 << 50
-        let used = min(drive.usageBytes ?? 0, total)
         s.totalBytes = total
-        s.usedBytes = used
-        s.availableBytes = total - used
-        s.freeBytes = total - used
+        s.usedBytes = 0
+        s.availableBytes = total
+        s.freeBytes = total
         s.totalFiles = 1 << 32
         s.freeFiles = 1 << 31
         return s
@@ -160,8 +167,8 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     func activate(options taskOptions: FSTaskOptions) async throws -> FSActivateResult {
         options.apply(taskOptions.taskOptions)
-        log.notice("activate \(taskOptions.taskOptions, privacy: .public) uid=\(getuid()) euid=\(geteuid()) home=\(NSHomeDirectory(), privacy: .public) requested lookup attrs=\(String(FSLookupItemResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public) getattr attrs=\(String(FSGetAttributesResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public) read attrs=\(String(FSReadFileResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public)")
-        return FSActivateResult(rootItem: root)!
+        log.notice("activate \(taskOptions.taskOptions, privacy: .public): drive \(self.drive, privacy: .public), root inode \(self.root); wanted attributes: lookup \(String(FSLookupItemResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public), getattr \(String(FSGetAttributesResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public), read \(String(FSReadFileResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public)")
+        return FSActivateResult(rootItem: rootItem)!
     }
 
     func deactivate(options: FSDeactivateOptions = []) async throws {
@@ -170,9 +177,12 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     // macOS 27.0 (26A428) sends `activateVolumeWithOptions:` and `deactivateVolumeWithOptions:`,
     // while the Xcode 27 beta SDK (26A5353p) declares `activateWithOptions:` and
-    // `deactivateWithOptions:`. Answer to both until the SDK and the OS agree.
+    // `deactivateWithOptions:`. Answer to both until the SDK and the OS agree. Rechecked on
+    // macOS 27.0.1 (26A434) with Xcode 27 beta 27A5194q: still needed, the first mount without
+    // it crashes on an unrecognized selector.
     @objc(activateVolumeWithOptions:replyHandler:)
     func activateVolume(options: FSTaskOptions, replyHandler reply: @escaping (FSActivateResult?, Error?) -> Void) {
+        log.notice("activate arrived as activateVolumeWithOptions:")
         Task {
             do { reply(try await activate(options: options), nil) } catch { reply(nil, error) }
         }
@@ -186,457 +196,593 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     }
 
     func mount(options taskOptions: FSTaskOptions) async throws {
-        options.apply(taskOptions.taskOptions)
-        log.notice("mount \(taskOptions.taskOptions, privacy: .public) ttl=\(self.options.dirTTL, privacy: .public) iosize=\(self.options.ioSize) feed=\(self.options.changeFeed)")
-        if options.changeFeed {
-            feed = Task.detached { [weak self] in await self?.runChangeFeed() }
-        }
+        log.notice("mount \(taskOptions.taskOptions, privacy: .public)")
     }
 
     func unmount() async {
-        feed?.cancel()
-        log.notice("unmount; \(self.statsLine(), privacy: .public)")
+        let s: BridgeSession = lock.withLock {
+            unmounted = true
+            connecting?.cancel()
+            return session
+        }
+        let stats = lock.withLock { revoked }
+        log.notice("unmount: revokes \(stats.ok) ok, \(stats.benign) of items the kernel had let go, \(stats.failed) failed")
+        // The daemon may be gone (it unmounts as it stops): don't hold the unmount up.
+        let release = Task { try? await s.release() }
+        _ = await withTaskGroup(of: Void.self) { group in
+            group.addTask { await release.value }
+            group.addTask { try? await Task.sleep(for: .seconds(2)) }
+            await group.next()
+            group.cancelAll()
+        }
     }
 
     func synchronize(flags: FSSyncFlags) async throws {}
 
-    // MARK: - Names and attributes
+    // MARK: - The session
 
-    func attributes(of item: VoidfsItem, _ info: ItemInfo) -> FSItem.Attributes {
-        let a = FSItem.Attributes()
-        switch info.kind {
-        case .file: a.type = .file
-        case .folder: a.type = .directory
-        case .symlink: a.type = .symlink
+    /// The live session: the current one while its relay runs, otherwise a new one. Without its
+    /// relay the volume would miss invalidations, so a session whose relay ended is replaced, and
+    /// everything the kernel holds is revoked once the new one's relay is live.
+    private func live() async throws -> BridgeSession {
+        let (current, task, failed): (BridgeSession?, Task<BridgeSession, Error>?, Error?) = lock.withLock {
+            if unmounted { return (nil, nil, posix(ENXIO)) }
+            if session.isWatching { return (session, nil, nil) }
+            if let connecting { return (nil, connecting, nil) }
+            // Calls fail fast between attempts while the daemon or the agent is away.
+            if let (at, error) = lastAttempt, ContinuousClock.now - at < .milliseconds(250) { return (nil, nil, error) }
+            let t = Task { try await self.reconnect() }
+            connecting = t
+            return (nil, t, nil)
         }
-        a.mode = info.mode & 0o7777
-        a.linkCount = info.kind == .folder ? 2 : 1
-        a.uid = options.uid
-        a.gid = options.gid
-        a.flags = 0
-        a.size = info.kind == .symlink ? UInt64(info.target?.utf8.count ?? 0) : info.size
-        a.allocSize = (a.size + 4095) & ~4095
-        a.fileID = item.id
-        a.parentID = item.parentID
-        a.modifyTime = info.mtime
-        a.changeTime = info.mtime
-        a.accessTime = info.mtime
-        a.birthTime = info.mtime
-        a.addedTime = info.mtime
-        a.backupTime = timespec()
-        a.supportsLimitedXAttrs = false
-        a.inhibitKernelOffloadedIO = false
-        return a
+        if let current { return current }
+        if let failed { throw failed }
+        return try await task!.value
     }
 
-    private func snapshot(_ item: VoidfsItem) -> ItemInfo { lock.withLock { item.info } }
-
-    private func attributes(of item: VoidfsItem) -> FSItem.Attributes { attributes(of: item, snapshot(item)) }
-
-    /// The children of `dir`, from the cache while it is fresh. When the server cannot be reached,
-    /// a stale listing is better than an error, so browsing keeps working offline.
-    private func listing(_ dir: VoidfsItem) async throws -> DirCache {
-        let ttl = options.dirTTL
-        let (cached, task): (DirCache?, Task<DirCache, Error>?) = lock.withLock {
-            let cached = dirs[dir.id]
-            if let c = cached, !c.stale, ContinuousClock.now - c.fetched < ttl { return (c, nil) }
-            if let t = inflight[dir.id] { return (cached, t) }
-            let key = dir.info.key
-            let t = Task { try await self.fetch(dir, key: key) }
-            inflight[dir.id] = t
-            return (cached, t)
-        }
-        guard let task else { return cached! }
+    private func reconnect() async throws -> BridgeSession {
         do {
-            return try await task.value
-        } catch let e as VoidfsError {
-            if case .network = e, let c = cached {
-                log.error("listing \(dir.info.key, privacy: .public) failed (\(e.description, privacy: .public)); serving the cached one")
-                return c
+            let s = try await client.open(drive: drive, readOnly: true)
+            guard s.info.root == root else {
+                try? await s.release()
+                throw Bridge.error(ESTALE, "OtherDrive", "the drive's root changed: mount it again")
             }
-            throw e
-        }
-    }
-
-    private func fetch(_ dir: VoidfsItem, key: String) async throws -> DirCache {
-        let listing: Listing
-        do {
-            listing = try await client.list(prefix: key)
+            s.listen { [weak self, weak s] event in
+                guard let self, let s else { return }
+                self.relay(event, from: s)
+            }
+            let old: BridgeSession = lock.withLock {
+                defer { session = s; connecting = nil; lastAttempt = nil }
+                return session
+            }
+            log.notice("reconnected to the daemon: session generation \(s.info.generation)")
+            try? await old.release()
+            // What changed while the relay was down is unknown.
+            resync("the relay was down")
+            return s
         } catch {
-            lock.withLock { inflight[dir.id] = nil }
+            lock.withLock { connecting = nil; lastAttempt = (.now, error) }
+            log.error("reconnecting to the daemon: \(error.localizedDescription, privacy: .public)")
             throw error
         }
-        let (cache, changed) = lock.withLock { install(listing, in: dir, key: key) }
-        revokeInKernel(changed)
-        return cache
     }
 
-    /// Records a fresh listing of `dir`, reusing the items already known. Returns the items whose
-    /// content changed. Called with the lock held.
-    private func install(_ listing: Listing, in dir: VoidfsItem, key: String) -> (DirCache, [VoidfsItem]) {
-        inflight[dir.id] = nil
-        var changed: [VoidfsItem] = []
-        var children: [VoidfsItem] = []
-        var byName: [String: VoidfsItem] = [:]
-        children.reserveCapacity(listing.entries.count)
-        for e in listing.entries {
-            let info = ItemInfo(key: key + e.name, entry: e)
-            let item: VoidfsItem
-            if let existing = items[e.objectId] {
-                if existing.info.etag != info.etag { changed.append(existing) }
-                existing.info = info
-                existing.parentID = dir.id
-                item = existing
-            } else {
-                item = VoidfsItem(objectId: e.objectId, id: VoidfsItem.fileID(for: e.objectId), info: info, parentID: dir.id)
-                items[e.objectId] = item
+    /// Keeps reconnecting while nothing else calls, so invalidations resume.
+    private func keepConnected() {
+        Task.detached { [weak self] in
+            var delay: Duration = .milliseconds(250)
+            while let self, !self.lock.withLock({ self.unmounted }) {
+                if (try? await self.live()) != nil { return }
+                try? await Task.sleep(for: delay)
+                delay = min(delay * 2, .seconds(5))
             }
-            children.append(item)
-            let name = info.name
-            byName[name] = item
-            let nfc = name.precomposedStringWithCanonicalMapping
-            if nfc != name { byName[nfc] = item }
         }
-        let cache = DirCache(children: children, byName: byName, fetched: .now, verifier: nextVerifier)
-        nextVerifier += 1
-        dirs[dir.id] = cache
-        seq = max(seq, listing.seq)
-        return (cache, changed)
+    }
+
+    /// Runs `call` on the live session; a session lost meanwhile is replaced once.
+    private func call<T>(_ body: (BridgeSession) async throws -> T) async throws -> T {
+        for attempt in 0..<2 {
+            let s: BridgeSession
+            do { s = try await live() } catch { throw failure(error) }
+            do {
+                return try await body(s)
+            } catch {
+                let e = Bridge.errno(error)
+                if e == ESTALE, attempt == 0, !s.isWatching { continue }
+                if e == ENETDOWN, lock.withLock({ () -> Bool in defer { offline = true }; return !offline }) {
+                    log.notice("offline: the daemon can't reach the server; serving what it has cached")
+                }
+                throw failure(error)
+            }
+        }
+        throw posix(ESTALE)
+    }
+
+    /// The errno FSKit returns. The daemon or the agent being away is `EIO` to the caller.
+    private func failure(_ error: Error) -> Error {
+        let e = Bridge.errno(error)
+        return posix(e == ECONNREFUSED ? EIO : e)
+    }
+
+    // MARK: - Invalidations
+
+    private func relay(_ event: BridgeEvent?, from s: BridgeSession) {
+        guard lock.withLock({ session === s && !unmounted }) else { return }
+        guard let event else {
+            log.notice("the invalidation relay ended; reconnecting")
+            keepConnected()
+            return
+        }
+        // The server's feed moved on (local changes don't advance it): an offline mount is current.
+        let back = lock.withLock { () -> Bool in
+            defer { seq = max(seq, event.seq) }
+            guard offline, event.seq > seq, !event.resync else { return false }
+            offline = false
+            return true
+        }
+        if back { log.notice("the feed delivered changes again at sequence \(event.seq): the mount is current again") }
+        if event.resync || event.all {
+            // The feed reconnected or lost track: a missed generation means relisting everything.
+            resync("resync at generation \(event.generation)")
+            return
+        }
+        invalidate(event)
+    }
+
+    /// Makes the kernel forget what `event` names. Changed files and symbolic links are retired and
+    /// revoked, so their next lookup makes a new incarnation, and each folder named is revoked
+    /// after them. The kernel also caches a name it was told is missing, until a revoke of the
+    /// folder takes effect, which happens only once the kernel holds nothing below the folder:
+    /// a vnode pins its parent. So when a changed name was looked up and missed in a folder, the
+    /// folder's whole known subtree is revoked first, deepest first. Files open below it (or a
+    /// working directory in it) still hold it: its purge is tried again as they close.
+    private func invalidate(_ event: BridgeEvent) {
+        let changed = Set((event.objects + event.subtrees).flatMap(Self.components))
+        let targets: [VoidfsItem] = lock.withLock {
+            epoch += 1
+            var files: [VoidfsItem] = []
+            var folders: [VoidfsItem] = []
+            var purged: [VoidfsItem] = []
+            for ino in event.inodes {
+                if let l = listings.removeValue(forKey: ino) { listed -= l.names.count }
+                guard let item = ino == root ? rootItem : items[ino] else { continue }
+                if item.kind == .folder {
+                    folders.append(item)
+                    if let missed = misses[ino], missed.matches(changed) {
+                        misses[ino] = nil
+                        if ino == root {
+                            log.notice("a name missed in the drive's top folder now exists: it shows by path once the drive is mounted again")
+                        } else {
+                            purged += subtree(ino)
+                            if openBelow(ino) { pending.insert(ino) }
+                        }
+                    }
+                } else {
+                    retire(item)
+                    files.append(item)
+                }
+            }
+            var seen = Set<ObjectIdentifier>()
+            return (files + purged + folders).filter { seen.insert(ObjectIdentifier($0)).inserted }
+        }
+        revoke(targets)
+    }
+
+    /// The names along a changed key: any of them may be a name that now exists.
+    static func components(_ key: String) -> [String] {
+        key.split(separator: "/").map(String.init)
+    }
+
+    /// Everything the kernel may hold below `folder`, deepest first. Called with the lock held.
+    private func subtree(_ folder: UInt64) -> [VoidfsItem] {
+        var children: [UInt64: [VoidfsItem]] = [:]
+        for item in items.values { children[item.parent, default: []].append(item) }
+        for item in open.values where item.retired { children[item.parent, default: []].append(item) }
+        var out: [VoidfsItem] = []
+        var seen = Set<ObjectIdentifier>()
+        func walk(_ ino: UInt64, _ depth: Int) {
+            guard depth < 256 else { return }
+            for child in children[ino] ?? [] where seen.insert(ObjectIdentifier(child)).inserted {
+                if child.kind == .folder { walk(child.ino, depth + 1) }
+                out.append(child)
+            }
+        }
+        walk(folder, 0)
+        return out
+    }
+
+    /// Whether a file is open below `folder`. Called with the lock held.
+    private func openBelow(_ folder: UInt64) -> Bool {
+        open.values.contains { ancestors($0).contains(folder) }
+    }
+
+    /// Called with the lock held.
+    private func ancestors(_ item: VoidfsItem) -> [UInt64] {
+        var out: [UInt64] = []
+        var at = item.parent
+        while out.count < 256 {
+            out.append(at)
+            guard at != root, let up = items[at] else { break }
+            at = up.parent
+        }
+        return out
+    }
+
+    /// Everything the kernel holds is forgotten, deepest first. The daemon's feed resyncs when it
+    /// reconnects to the server, so this is also when an offline mount becomes current again.
+    private func resync(_ why: String) {
+        let (targets, wasOffline): ([VoidfsItem], Bool) = lock.withLock {
+            defer { offline = false }
+            epoch += 1
+            listings.removeAll()
+            listed = 0
+            misses.removeAll()
+            let all = subtree(root) + [rootItem]
+            for item in all where item.kind != .folder { retire(item) }
+            if !open.isEmpty { pending.insert(root) }
+            return (all, offline)
+        }
+        log.notice("\(why, privacy: .public): revoking \(targets.count) items\(wasOffline ? "; the feed resumed, and the mount is current again" : "", privacy: .public)")
+        revoke(targets)
+    }
+
+    /// Called with the lock held.
+    private func retire(_ item: VoidfsItem) {
+        guard item !== rootItem else { return }
+        item.retired = true
+        if items[item.ino] === item { items[item.ino] = nil }
+    }
+
+    /// The kernel refuses every cache action on the volume's root item (`kIOReturnBadArgument`,
+    /// measured on macOS 27.0.1), so the top folder is never revoked: its listing stays fresh
+    /// because folders are opened without kernel caching, but a name the kernel was told is
+    /// missing there stays missing to path lookups until the drive is mounted again.
+    private func revoke(_ targets: [VoidfsItem]) {
+        let targets = targets.filter { $0 !== rootItem }
+        guard !targets.isEmpty else { return }
+        revokes.async { [weak self] in
+            guard let self else { return }
+            for item in targets {
+                let error = self.setCacheState(for: item, cacheMode: .none, coherencyType: .noCache, action: .revoke)
+                self.note(error, item)
+            }
+        }
+    }
+
+    /// The kernel refuses a revoke of an item it has already let go (reclaimed, or never held):
+    /// `kIOReturnBadArgument`, expected and harmless. Anything else means a cache may be stale.
+    private func note(_ error: Error?, _ item: VoidfsItem) {
+        guard let error else {
+            lock.withLock { revoked.ok += 1 }
+            log.debug("revoke \(item.ino) ok")
+            return
+        }
+        let e = error as NSError
+        if e.domain == NSOSStatusErrorDomain, e.code == -536870206 {
+            lock.withLock { revoked.benign += 1 }
+            log.debug("revoke \(item.ino): the kernel holds no such item")
+        } else {
+            lock.withLock { revoked.failed += 1 }
+            log.error("revoke \(item.ino) failed, its cache may be stale: \(e.domain, privacy: .public) \(e.code)")
+        }
+    }
+
+    /// After a file below a pending folder closes or goes: the purges that waited for it.
+    private func released(_ item: VoidfsItem) {
+        let targets: [VoidfsItem] = lock.withLock {
+            var out: [VoidfsItem] = []
+            for folder in ancestors(item) where pending.contains(folder) && !openBelow(folder) {
+                pending.remove(folder)
+                guard let f = folder == root ? rootItem : items[folder] else { continue }
+                out += subtree(folder) + [f]
+            }
+            return out
+        }
+        if !targets.isEmpty {
+            log.debug("purging again now the files open below have closed: \(targets.count) items")
+            revoke(targets)
+        }
+    }
+
+    // MARK: - Names and attributes
+
+    private func fid(_ ino: UInt64) -> FSItem.Identifier { VoidfsItem.identifier(ino, root: root) }
+
+    func attributes(_ a: BridgeAttr, parent: UInt64) -> FSItem.Attributes {
+        let r = FSItem.Attributes()
+        switch a.kind {
+        case .folder: r.type = .directory
+        case .symlink: r.type = .symlink
+        default: r.type = .file
+        }
+        r.mode = a.mode & 0o7777
+        r.linkCount = a.kind == .folder ? 2 : 1
+        r.uid = options.uid
+        r.gid = options.gid
+        r.flags = 0
+        r.size = a.kind == .symlink ? UInt64(a.target?.utf8.count ?? 0) : a.size
+        r.allocSize = (r.size + 4095) & ~4095
+        r.fileID = fid(a.ino)
+        r.parentID = a.ino == root ? .parentOfRoot : fid(parent)
+        let t = timespec(tv_sec: Int(a.mtimeSeconds), tv_nsec: Int(a.mtimeNanoseconds))
+        r.modifyTime = t
+        r.changeTime = t
+        r.accessTime = t
+        r.birthTime = t
+        r.addedTime = t
+        r.backupTime = timespec()
+        r.supportsLimitedXAttrs = false
+        r.inhibitKernelOffloadedIO = false
+        return r
+    }
+
+    /// The current incarnation of what a lookup found.
+    private func incarnation(_ a: BridgeAttr, parent: UInt64) -> VoidfsItem {
+        if a.ino == root { return rootItem }
+        return lock.withLock {
+            if let item = items[a.ino] {
+                item.parent = parent
+                item.kind = a.kind
+                return item
+            }
+            let item = VoidfsItem(ino: a.ino, id: fid(a.ino), parent: parent, kind: a.kind)
+            items[a.ino] = item
+            return item
+        }
+    }
+
+    /// An open incarnation's attributes are those bound at open; others are current.
+    private func attr(_ item: VoidfsItem) async throws -> BridgeAttr {
+        if let h = lock.withLock({ item.handle }) { return h.attr }
+        return try await call { try await $0.getattr(item.ino) }
     }
 
     func lookupItem(named name: FSFileName, in directory: FSItem, context: FSContext) async throws -> FSLookupItemResult {
         guard let dir = directory as? VoidfsItem else { throw posix(EINVAL) }
+        // voidfs names are UTF-8.
         guard let n = name.string else { throw posix(ENOENT) }
-        ops.count("lookup")
-        if n == ".voidfs-bench" {
-            await selfBenchmark()
-            throw posix(ENOENT)
-        }
-        // The kernel caches a name's ENOENT, so a hook takes a `~<anything>` suffix to run again.
-        let hook = n.split(separator: "~", maxSplits: 1).first.map(String.init) ?? n
-        if hook == ".voidfs-xpc" {
-            // Spike instrumentation: the bare hop to the app's agent, 500 x 4 KiB.
-            let scenario = BridgeScenario(client: bridge, drive: client.target.drive, another: { BridgeClient() }) { [log] line in log.notice("xpc \(line, privacy: .public)") }
-            do { scenario.distribution("XPC ping 4 KiB to \(Bridge.service)", try await scenario.timed(500) { _ = try await bridge.ping(Data(count: 4096)) }) }
-            catch { log.notice("xpc \(Bridge.service, privacy: .public): \(error.localizedDescription, privacy: .public)") }
-            throw posix(ENOENT)
-        }
-        if hook == ".voidfs-bridge" || hook.hasPrefix(".voidfs-bridge-") {
-            // Spike instrumentation: the bridge to the daemon, end to end from this sandbox
-            // (Shared/BridgeScenario.swift). It runs detached; its lines go to the log.
-            let scenario = BridgeScenario(client: bridge, drive: client.target.drive, another: { BridgeClient() }) { [log] line in log.notice("bridge \(line, privacy: .public)") }
-            let mode = String(hook.dropFirst(".voidfs-bridge".count))
-            Task.detached {
-                switch mode {
-                case "": await scenario.main()
-                case "-daemon-restart": await scenario.restart("daemon")
-                case "-agent-restart": await scenario.restart("agent")
-                case let m where m.hasPrefix("-remote:"): await scenario.remote(key: String(m.dropFirst("-remote:".count)))
-                default: scenario.say("unknown bridge hook \(mode)")
-                }
+        var found: BridgeAttr?
+        if let l = lock.withLock({ listings[dir.ino] }) {
+            switch l.index[n.precomposedStringWithCanonicalMapping] {
+            case nil:
+                missed(n, in: dir.ino)
+                throw posix(ENOENT)
+            case let i? where i >= 0: found = l.attrs[i]
+            default: break // two names alike: the daemon says EILSEQ
             }
-            throw posix(ENOENT)
         }
-        if n.hasPrefix(".voidfs-cache:") {
-            // Spike instrumentation: `.voidfs-cache:<action>:<mode>:<coherency>:<key with + for />`
-            // calls setCacheState on a known item, to find what makes the kernel forget.
-            let p = n.split(separator: ":", maxSplits: 4).map(String.init)
-            if p.count == 5, let a = Int(p[1]), let m = Int(p[2]), let c = Int(p[3]),
-               let action = FSVolume.KernelCacheCoherencyAction(rawValue: a),
-               let mode = FSVolume.DataCacheMode(rawValue: m), let coherency = FSVolume.KernelCacheCoherencyType(rawValue: c) {
-                let key = p[4].replacingOccurrences(of: "+", with: "/")
-                let target: VoidfsItem? = key.isEmpty ? root : lock.withLock { items.values.first { $0.info.key == key } }
-                if let target {
-                    let err = await Task.detached { self.setCacheState(for: target, cacheMode: mode, coherencyType: coherency, action: action) }.value
-                    log.notice("setCacheState \(key, privacy: .public) action=\(a) mode=\(m) coherency=\(c): \(err.map { String(describing: $0) } ?? "ok", privacy: .public)")
-                } else {
-                    log.notice("setCacheState: no item \(key, privacy: .public)")
-                }
+        let a: BridgeAttr
+        do {
+            if let found { a = found } else { a = try await call { try await $0.lookup(dir.ino, n) } }
+        } catch {
+            if (error as NSError).code == Int(ENOENT) { missed(n, in: dir.ino) }
+            throw error
+        }
+        let item = incarnation(a, parent: dir.ino)
+        return FSLookupItemResult(foundItem: item, itemName: name, itemAttributes: attributes(a, parent: dir.ino))!
+    }
+
+    /// Remembers a miss the kernel may cache. Past the bound, every folder matches any name.
+    private func missed(_ name: String, in folder: UInt64) {
+        lock.withLock {
+            misses[folder, default: Missed()].insert(name)
+            missedNames += 1
+            if missedNames > Self.missesLimit {
+                for key in misses.keys { misses[key] = Missed(any: true) }
+                missedNames = 0
             }
-            throw posix(ENOENT)
         }
-        if n.hasPrefix(".voidfs-stats") {
-            log.notice("stats: \(self.statsLine(), privacy: .public)")
-            if n == ".voidfs-stats-reset" { ops.reset(); client.stats.reset() }
-            throw posix(ENOENT)
-        }
-        let c: DirCache
-        do { c = try await listing(dir) } catch { throw posix(error) }
-        guard let item = c.byName[n] ?? c.byName[n.precomposedStringWithCanonicalMapping] else {
-            ops.count("lookup-miss")
-            log.debug("lookup miss \(dir.info.key, privacy: .public)\(n, privacy: .public)")
-            throw posix(ENOENT)
-        }
-        let info = snapshot(item)
-        log.debug("lookup hit \(info.key, privacy: .public) \(UInt(bitPattern: ObjectIdentifier(item).hashValue), format: .hex)")
-        return FSLookupItemResult(foundItem: item, itemName: FSFileName(string: info.name), itemAttributes: attributes(of: item, info))!
     }
 
     func reclaimItem(_ item: FSItem) async throws {
-        guard let item = item as? VoidfsItem, item !== root else { return }
-        ops.count("reclaim")
-        let reclaimed = lock.withLock {
-            item.tryReclaim {
-                self.items[item.objectId] = nil
-                self.dirs[item.id] = nil
-                self.xattrCache[item.objectId] = nil
-                // The parent's cached listing still holds this instance. Re-list before the next
-                // lookup, so the kernel never gets back an item the volume no longer tracks (a
-                // revoke aimed at the tracked twin would then silently miss).
-                self.dirs[item.parentID]?.stale = true
-            }
+        guard let item = item as? VoidfsItem, item !== rootItem else { return }
+        let handle: OpenFile? = lock.withLock {
+            if items[item.ino] === item { items[item.ino] = nil }
+            open[ObjectIdentifier(item)] = nil
+            defer { item.handle = nil }
+            return item.handle
         }
-        log.debug("reclaim \(item.info.key, privacy: .public): \(reclaimed ? "released" : "kept, still referenced")")
+        if let handle { try? await handle.session.close(handle.fh) }
+        released(item)
     }
 
     func attributes(_ desiredAttributes: FSItem.GetAttributesRequest, of item: FSItem, context: FSContext) async throws -> FSGetAttributesResult {
         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
-        ops.count("getattr")
-        return FSGetAttributesResult(attributes: attributes(of: item))!
+        return FSGetAttributesResult(attributes: attributes(try await attr(item), parent: lock.withLock { item.parent }))!
+    }
+
+    /// The folder's entries: a listing kept until an invalidation names the folder, fetched in
+    /// pages at one namespace generation (a page that raced a change answers `EAGAIN`, which the
+    /// session retries; pages of different generations start again).
+    private func listing(_ dir: UInt64) async throws -> Listing {
+        if let l = lock.withLock({ listings[dir] }) { return l }
+        for _ in 0..<4 {
+            let mark = lock.withLock { epoch }
+            var (l, complete): (Listing, Bool) = try await call { s in
+                var l = Listing()
+                var after: String?
+                while true {
+                    let page = try await s.readdir(dir, after: after, limit: s.info.maxEntries)
+                    if l.generation != 0, page.generation != l.generation { return (l, false) }
+                    l.generation = max(page.generation, 1)
+                    l.names += page.names
+                    l.attrs += page.attrs
+                    if page.names.count < s.info.maxEntries { return (l, true) }
+                    after = page.names.last
+                }
+            }
+            guard complete else { continue }
+            l.indexNames()
+            lock.withLock {
+                guard epoch == mark else { return }
+                if listed + l.names.count > Self.listingLimit { listings.removeAll(); listed = 0 }
+                listings[dir] = l
+                listed += l.names.count
+            }
+            return l
+        }
+        throw posix(EAGAIN)
     }
 
     func enumerateDirectory(_ directory: FSItem, startingAt cookie: FSDirectoryCookie, verifier: FSDirectoryVerifier, attributes wanted: FSItem.GetAttributesRequest?, packer: FSDirectoryEntryPacker, context: FSContext) async throws -> FSEnumerateDirectoryResult {
         guard let dir = directory as? VoidfsItem else { throw posix(ENOTDIR) }
-        ops.count(wanted == nil ? "readdir" : "readdir+attrs")
-        let c: DirCache
-        do { c = try await listing(dir) } catch { throw posix(error) }
+        let l = try await listing(dir.ino)
+        let done = FSEnumerateDirectoryResult(verifier: l.generation)!
         // Positions: with no attributes wanted, 0 is ".", 1 is "..", and child k is k + 2.
         let dots = wanted == nil ? 2 : 0
         var pos = Int(cookie.rawValue)
         if pos < dots {
             if pos == 0 {
-                guard packer.packEntry(name: FSFileName(string: "."), itemType: .directory, itemID: dir.id, nextCookie: FSDirectoryCookie(rawValue: 1), attributes: nil) else {
-                    return FSEnumerateDirectoryResult(verifier: c.verifier)!
-                }
+                guard packer.packEntry(name: FSFileName(string: "."), itemType: .directory, itemID: dir.id, nextCookie: FSDirectoryCookie(rawValue: 1), attributes: nil) else { return done }
                 pos = 1
             }
-            guard packer.packEntry(name: FSFileName(string: ".."), itemType: .directory, itemID: dir.parentID, nextCookie: FSDirectoryCookie(rawValue: 2), attributes: nil) else {
-                return FSEnumerateDirectoryResult(verifier: c.verifier)!
-            }
+            let up = dir === rootItem ? FSItem.Identifier.parentOfRoot : fid(lock.withLock { dir.parent })
+            guard packer.packEntry(name: FSFileName(string: ".."), itemType: .directory, itemID: up, nextCookie: FSDirectoryCookie(rawValue: 2), attributes: nil) else { return done }
             pos = 2
         }
-        let skip = pos - dots
-        let infos = lock.withLock { c.children.dropFirst(skip).map { ($0, $0.info) } }
-        for (item, info) in infos {
+        var index = pos - dots
+        while index < l.names.count {
+            let a = l.attrs[index]
+            let type: FSItem.ItemType = a.kind == .folder ? .directory : a.kind == .symlink ? .symlink : .file
             pos += 1
-            let type: FSItem.ItemType = info.kind == .folder ? .directory : info.kind == .symlink ? .symlink : .file
-            if !packer.packEntry(name: FSFileName(string: info.name), itemType: type, itemID: item.id, nextCookie: FSDirectoryCookie(rawValue: UInt64(pos)), attributes: wanted == nil ? nil : attributes(of: item, info)) {
+            if !packer.packEntry(name: FSFileName(string: l.names[index]), itemType: type, itemID: fid(a.ino), nextCookie: FSDirectoryCookie(rawValue: UInt64(pos)), attributes: wanted == nil ? nil : attributes(a, parent: dir.ino)) {
                 break
             }
+            index += 1
         }
-        return FSEnumerateDirectoryResult(verifier: c.verifier)!
+        return done
     }
 
     func readSymbolicLink(_ item: FSItem, context: FSContext) async throws -> FSReadSymlinkResult {
         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
-        let info = snapshot(item)
-        return FSReadSymlinkResult(contents: FSFileName(string: info.target ?? ""), symlinkAttributes: attributes(of: item, info))!
+        let a = try await attr(item)
+        var target = a.target
+        if target == nil { target = try await call { try await $0.readlink(item.ino) } }
+        return FSReadSymlinkResult(contents: FSFileName(string: target ?? ""), symlinkAttributes: attributes(a, parent: lock.withLock { item.parent }))!
     }
 
-    // MARK: - Reads
+    // MARK: - Opens and reads
 
-    func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> FSReadFileResult {
-        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
-        let info = snapshot(item)
-        ops.read(length)
-        let attrs = attributes(of: item, info)
-        guard offset >= 0, UInt64(offset) < info.size else { return FSReadFileResult(bytesRead: 0, itemAttributes: attrs)! }
-        let n = min(length, buffer.length, Int(info.size - UInt64(offset)))
-        let data: Data
-        do { data = try await client.read(key: info.key, offset: UInt64(offset), length: n) } catch {
-            log.error("read \(info.key, privacy: .public) @\(offset)+\(n): \(String(describing: error), privacy: .public)")
-            throw posix(error)
+    /// The incarnation's daemon handle: opened at its first open (or read), bound to the version
+    /// current then, and kept until the kernel closes or reclaims it.
+    private func handle(_ item: VoidfsItem) async throws -> OpenFile {
+        let task: Task<OpenFile, Error> = lock.withLock {
+            if let h = item.handle { return Task { h } }
+            if let t = item.opening { return t }
+            let t = Task {
+                do {
+                    let f = try await self.call { s in
+                        let (fh, a) = try await s.open(item.ino, write: false)
+                        return OpenFile(fh: fh, attr: a, session: s)
+                    }
+                    self.lock.withLock {
+                        item.handle = f
+                        item.opening = nil
+                        self.open[ObjectIdentifier(item)] = item
+                    }
+                    return f
+                } catch {
+                    self.lock.withLock { item.opening = nil }
+                    throw error
+                }
+            }
+            item.opening = t
+            return t
         }
-        let copied = buffer.withUnsafeMutableBytes { dst in data.copyBytes(to: dst) }
-        return FSReadFileResult(bytesRead: copied, itemAttributes: attrs)!
+        return try await task.value
     }
-
-    // MARK: - Extended attributes
-
-    private func loadXattrs(_ item: VoidfsItem, key: String) async throws -> [String: Data] {
-        if let x = lock.withLock({ xattrCache[item.objectId] }) { return x }
-        let attrs: Attrs
-        do { attrs = try await client.attrs(key: key) } catch { throw posix(error) }
-        let x = attrs.xattrs.compactMapValues { Data(base64Encoded: $0) }
-        lock.withLock { xattrCache[item.objectId] = x }
-        return x
-    }
-
-    func xattrs(of item: FSItem, context: FSContext) async throws -> FSListXattrsResult {
-        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
-        ops.count("listxattr")
-        let info = snapshot(item)
-        guard info.hasXattrs else { return FSListXattrsResult(xattrNames: [])! }
-        let x = try await loadXattrs(item, key: info.key)
-        return FSListXattrsResult(xattrNames: x.keys.sorted().map { FSFileName(string: $0) })!
-    }
-
-    func xattr(named name: FSFileName, of item: FSItem, context: FSContext) async throws -> FSGetXattrResult {
-        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
-        ops.count("getxattr:\(name.string ?? "?")")
-        let info = snapshot(item)
-        guard info.hasXattrs, let n = name.string else { throw posix(ENOATTR) }
-        guard let v = try await loadXattrs(item, key: info.key)[n] else { throw posix(ENOATTR) }
-        return FSGetXattrResult(xattrValue: v)!
-    }
-
-    func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext) async throws -> FSSetXattrResult {
-        ops.count("setxattr:\(name.string ?? "?")")
-        throw posix(EROFS)
-    }
-
-    // MARK: - Kernel data cache
 
     func open(_ item: FSItem, modes: FSVolume.OpenModes, cacheMode: FSVolume.DataCacheMode, context: FSContext) async throws -> FSOpenItemResult {
-        ops.count(modes.contains(.write) ? "open-write" : "open")
+        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
         if modes.contains(.write) { throw posix(EROFS) }
+        if item.kind == .file { _ = try await handle(item) }
+        // A folder's listing is the extension's to cache (`listings`, kept by the relay): the
+        // kernel's, once granted, outlives every revoke of the top folder (see `revoke`).
+        if item.kind == .folder { return FSOpenItemResult(grantedCoherency: .noCache) }
         return FSOpenItemResult(grantedCoherency: cacheMode == .none ? .noCache : .readCache)
     }
 
     func close(_ item: FSItem, context: FSContext) async {
-        ops.count("close")
+        guard let item = item as? VoidfsItem else { return }
+        let handle: OpenFile? = lock.withLock {
+            open[ObjectIdentifier(item)] = nil
+            defer { item.handle = nil }
+            return item.handle
+        }
+        if let handle { try? await handle.session.close(handle.fh) }
+        released(item)
     }
 
     func upgrade(_ item: FSItem, cacheMode: FSVolume.DataCacheMode, context: FSContext) async throws -> FSUpgradeItemResult {
-        ops.count("upgrade")
-        return FSUpgradeItemResult(grantedCoherency: cacheMode == .none ? .noCache : .readCache)
+        FSUpgradeItemResult(grantedCoherency: cacheMode == .none ? .noCache : .readCache)
     }
 
-    /// Makes the kernel forget `items`, so the next access looks them up again and gets fresh
-    /// attributes. Measured on macOS 27.0: `.invalidate` drops cached pages but keeps the cached
-    /// size, so the next read is torn (new bytes cut at the old length); only `.revoke` also drops
-    /// the attributes and, on a folder, its negative name-cache entries. Runs detached: the
-    /// kernel may call back into the volume, so no lock may be held and no handler may wait on it.
-    private func revokeInKernel(_ items: [VoidfsItem]) {
-        guard !items.isEmpty else { return }
-        Task.detached { [self] in
-            for item in items {
-                let err = setCacheState(for: item, cacheMode: .none, coherencyType: .noCache, action: .revoke)
-                log.info("revoke \(item.info.key, privacy: .public) \(UInt(bitPattern: ObjectIdentifier(item).hashValue), format: .hex): \(err.map { String(describing: $0) } ?? "ok", privacy: .public)")
-            }
-        }
-    }
-
-    // MARK: - Change feed
-
-    private func runChangeFeed() async {
-        var backoff: Duration = .seconds(1)
-        while !Task.isCancelled {
-            let since = lock.withLock { seq }
+    func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> FSReadFileResult {
+        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
+        var f = try await handle(item)
+        let parent = lock.withLock { item.parent }
+        guard offset >= 0, UInt64(offset) < f.attr.size else { return FSReadFileResult(bytesRead: 0, itemAttributes: attributes(f.attr, parent: parent))! }
+        let n = UInt64(min(length, buffer.length, Int(f.attr.size - UInt64(offset))))
+        var data: Data
+        do {
+            // A handle goes with its session (the daemon or the agent restarted): reopen, and go
+            // on only if the same version is still current.
+            if !f.session.isWatching { f = try await reopen(item, f) }
             do {
-                let c = try await client.changes(since: since, wait: 20)
-                backoff = .seconds(1)
-                apply(c)
-            } catch VoidfsError.http(410, _) {
-                log.notice("change feed expired at \(since); dropping every cached listing")
-                let fresh = try? await client.describe()
-                lock.withLock {
-                    for id in dirs.keys { dirs[id]?.stale = true }
-                    xattrCache.removeAll()
-                    if let s = fresh?.seq { seq = s }
-                }
-            } catch {
-                if Task.isCancelled { return }
-                log.error("change feed: \(String(describing: error), privacy: .public); retrying in \(backoff, privacy: .public)")
-                try? await Task.sleep(for: backoff)
-                backoff = min(backoff * 2, .seconds(30))
+                data = try await f.session.read(f.fh, offset: UInt64(offset), length: n)
+            } catch let error where Bridge.errno(error) == ESTALE && !f.session.isWatching {
+                f = try await reopen(item, f)
+                data = try await f.session.read(f.fh, offset: UInt64(offset), length: n)
             }
+        } catch {
+            log.error("read \(item.ino) @\(offset)+\(n): \(error.localizedDescription, privacy: .public)")
+            throw failure(error)
         }
+        let copied = buffer.withUnsafeMutableBytes { dst in data.copyBytes(to: dst) }
+        return FSReadFileResult(bytesRead: copied, itemAttributes: attributes(f.attr, parent: parent))!
     }
 
-    private func apply(_ c: Changes) {
-        guard !c.changes.isEmpty else {
-            lock.withLock { seq = max(seq, c.seq) }
-            return
+    private func reopen(_ item: VoidfsItem, _ old: OpenFile) async throws -> OpenFile {
+        let f = try await call { s in
+            let (fh, a) = try await s.open(item.ino, write: false)
+            return OpenFile(fh: fh, attr: a, session: s)
         }
-        let started = ContinuousClock.now
-        let revoke = lock.withLock { record(c) }
-        log.info("change feed: \(c.changes.count) changes to seq \(c.seq) applied in \(ContinuousClock.now - started, privacy: .public)")
-        revokeInKernel(revoke)
-    }
-
-    /// Marks the listings a batch of changes touched as stale, and returns what the kernel must
-    /// forget, in order: every known item that changed, then every known folder whose set of
-    /// names changed, after its known children (so a name the kernel cached as missing is looked
-    /// up again). Called with the lock held.
-    private func record(_ c: Changes) -> [VoidfsItem] {
-        var revoke: [ObjectIdentifier: VoidfsItem] = [:]
-        var revokeLast: [ObjectIdentifier: VoidfsItem] = [:]
-        var folders: [String: VoidfsItem] = ["": root]
-        for item in items.values where item.info.kind == .folder {
-            folders[item.info.key] = item
+        guard f.attr.objectId == old.attr.objectId, f.attr.versionId == old.attr.versionId, f.attr.size == old.attr.size else {
+            try? await f.session.close(f.fh)
+            log.notice("read \(item.ino): its version changed while the daemon was away; the open file is stale")
+            throw posix(ESTALE)
         }
-        for ch in c.changes {
-            let known = ch.objectId.flatMap { items[$0] }
-            let namesChanged = known == nil || ch.op == "delete" || ch.fromKey != nil
-            for key in [ch.key, ch.fromKey].compactMap({ $0 }) {
-                guard let folder = folders[Self.parentKey(key)] else { continue }
-                dirs[folder.id]?.stale = true
-                if namesChanged {
-                    // Measured on macOS 27.0: while the kernel holds any child of a folder, a
-                    // revoke of the folder leaves its negative name-cache entries in place. Revoke
-                    // the children the kernel may hold first, then the folder.
-                    for child in items.values where child.parentID == folder.id {
-                        revoke[ObjectIdentifier(child)] = child
-                    }
-                    revokeLast[ObjectIdentifier(folder)] = folder
-                }
-            }
-            if let from = ch.fromKey, from.hasSuffix("/") {
-                // A folder rename is one change: move every known descendant's key along.
-                for item in items.values where item.info.key.hasPrefix(from) {
-                    item.info.key = ch.key + item.info.key.dropFirst(from.count)
-                }
-            }
-            if let known {
-                xattrCache[known.objectId] = nil
-                revoke[ObjectIdentifier(known)] = known
-            }
+        let kept = lock.withLock { () -> Bool in
+            guard item.handle?.fh == old.fh, item.handle?.session === old.session else { return false }
+            item.handle = f
+            return true
         }
-        seq = max(seq, c.seq)
-        for id in revokeLast.keys { revoke[id] = nil }
-        return Array(revoke.values) + Array(revokeLast.values)
+        if !kept { try? await f.session.close(f.fh) }
+        return lock.withLock { item.handle } ?? f
     }
 
-    private static func parentKey(_ key: String) -> String {
-        var k = Substring(key)
-        if k.hasSuffix("/") { k = k.dropLast() }
-        guard let slash = k.lastIndex(of: "/") else { return "" }
-        return String(k[...slash])
+    // MARK: - Extended attributes
+
+    func xattrs(of item: FSItem, context: FSContext) async throws -> FSListXattrsResult {
+        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
+        guard try await attr(item).hasXattrs else { return FSListXattrsResult(xattrNames: [])! }
+        let names = try await call { try await $0.listxattr(item.ino) }
+        return FSListXattrsResult(xattrNames: names.map { FSFileName(string: $0) })!
     }
 
-    /// Spike instrumentation: random 4 KiB reads of media/big.bin issued from inside the
-    /// extension, in the calling handler's context and in a detached user-initiated task, to
-    /// separate the process's HTTP cost from the FSKit call path.
-    private func selfBenchmark() async {
-        func run() async -> String {
-            var lat: [Double] = []
-            for _ in 0..<200 {
-                let off = UInt64.random(in: 0..<(1 << 30) - 4096) & ~4095
-                let t = ContinuousClock.now
-                _ = try? await client.read(key: "media/big.bin", offset: off, length: 4096)
-                let d = ContinuousClock.now - t
-                lat.append(Double(d.components.attoseconds) / 1e15 + Double(d.components.seconds) * 1000)
-            }
-            lat.sort()
-            return String(format: "p50 %.2f ms p90 %.2f ms (qos %d)", lat[100], lat[180], qos_class_self().rawValue)
-        }
-        let inline = await run()
-        let detached = await Task.detached(priority: .userInitiated) { await run() }.value
-        log.notice("self-benchmark: handler context \(inline, privacy: .public); detached userInitiated \(detached, privacy: .public)")
+    func xattr(named name: FSFileName, of item: FSItem, context: FSContext) async throws -> FSGetXattrResult {
+        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
+        guard let n = name.string, try await attr(item).hasXattrs else { throw posix(ENOATTR) }
+        return FSGetXattrResult(xattrValue: try await call { try await $0.getxattr(item.ino, n) })!
     }
 
-    private func statsLine() -> String {
-        let http = client.stats.snapshot().sorted { $0.key < $1.key }.map { k, v in
-            String(format: "%@=%d (%.1f ms avg, %.1f MiB)", k, v.count, Double(v.nanos) / Double(max(v.count, 1)) / 1e6, Double(v.bytes) / 1_048_576)
-        }.joined(separator: " ")
-        return "\(ops.dump()) | http: \(http)"
+    func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext) async throws -> FSSetXattrResult {
+        throw posix(EROFS)
     }
 
-    // MARK: - Everything that would write
+    // MARK: - Everything that would write (item 4)
 
     func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, context: FSContext) async throws -> FSCreateItemResult {
-        ops.count("create:\(name.string ?? "?")")
         throw posix(EROFS)
     }
 
@@ -649,22 +795,18 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     }
 
     func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext) async throws -> FSRenameItemResult {
-        ops.count("rename")
         throw posix(EROFS)
     }
 
     func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext) async throws -> FSRemoveItemResult {
-        ops.count("remove")
         throw posix(EROFS)
     }
 
     func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem, context: FSContext) async throws -> FSSetAttributesResult {
-        ops.count("setattr")
         throw posix(EROFS)
     }
 
     func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> FSWriteFileResult {
-        ops.count("write")
         throw posix(EROFS)
     }
 }
