@@ -47,6 +47,14 @@ fn overlay(c: &Connection, parent: Ino, name: &str, ino: Option<Ino>, owner: Ino
     Ok(())
 }
 
+/// Takes a local-only file's name out of the view without a tombstone: no publication will
+/// settle one, and a `.DS_Store` in the drive that it shadowed shows again.
+fn unshadow(c: &Connection, parent: Ino, name: &str) -> Result<()> {
+    c.execute("DELETE FROM mount_overlay WHERE parent=?1 AND name=?2", params![parent, name])?;
+    c.execute("DELETE FROM mount_overlay_publications WHERE parent=?1 AND name=?2", params![parent, name])?;
+    Ok(())
+}
+
 fn changed(c: &Connection, dir: Ino) -> Result<()> {
     c.execute("UPDATE mount_dirs SET generation=generation+1 WHERE ino=?1", [dir])?;
     c.execute("UPDATE mount_inodes SET generation=generation+1 WHERE ino=?1", [dir])?;
@@ -108,22 +116,24 @@ impl Session {
                 let parent_key = directory(tx, &drive, root, parent, offline)?;
                 if child(tx, &drive, parent, &name)?.is_some() { return Err(FsError::Exists); }
                 let key = key(&parent_key, &name, kind == Kind::Folder)?;
+                let local = kind == Kind::File && local_only(&name);
                 let attrs = FolderEntry { name: if kind == Kind::Folder { format!("{name}/") } else { name.clone() }, kind,
                     object_id: String::new(), version_id: None, size: (kind == Kind::File).then_some(0), etag: None,
                     mtime: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)), mode: Some(format!("{mode:04o}")), has_xattrs: false, target: None };
-                tx.execute("INSERT INTO mount_inodes(drive, attrs, generation, sync) VALUES (?1, ?2, 1, 'pending')", params![drive, serde_json::to_string(&attrs).expect("JSON")])?;
+                tx.execute("INSERT INTO mount_inodes(drive, attrs, generation, sync) VALUES (?1, ?2, 1, ?3)",
+                    params![drive, serde_json::to_string(&attrs).expect("JSON"), if local { "local" } else { "pending" }])?;
                 let ino = tx.last_insert_rowid() as Ino;
                 if kind == Kind::Folder { tx.execute("INSERT INTO mount_dirs(ino, listed) VALUES (?1, 1)", [ino])?; }
                 tx.execute("INSERT INTO mount_xattrs(ino, attrs, dirty) VALUES (?1, '{}', 1)", [ino])?;
                 overlay(tx, parent, &name, Some(ino), ino)?;
                 changed(tx, parent)?;
-                publication::inherit(tx,&drive,root,ino)?;
+                if !local { publication::inherit(tx,&drive,root,ino)?; }
                 let mut entry = Entry::new(&drive, &key, if kind == Kind::Folder { Op::Folder } else { Op::Put }, StoredBase::Absent);
                 entry.mount_ino = Some(ino);
                 entry.attrs = Attrs { mode: Some(mode), mtime: attrs.mtime.clone(), ..Default::default() };
                 let attr = node(tx, &drive, ino)?.ok_or(FsError::Stale)?.attr()?;
                 let change = LocalChange { invalidations: vec![invalidation(key, kind == Kind::Folder)], inodes: vec![parent, ino], namespace: true };
-                Ok(((attr, change), vec![entry]))
+                Ok(((attr, change), if local { Vec::new() } else { vec![entry] }))
             }).await;
             match result { Err(FsError::Again) => continue, other => return other }
         }
@@ -164,14 +174,20 @@ impl Session {
                     if !names(tx, n.ino)?.is_empty() { return Err(FsError::NotEmpty); }
                 } else if n.entry.kind == Kind::Folder { return Err(FsError::IsDir); }
                 let key = key(&parent_key, &actual, folder)?;
-                let entry = entry(&drive, &key, Op::Delete, &n)?;
-                overlay(tx, parent, &actual, None, n.ino)?;
-                n.sync = publication::pending(tx, n.ino)?;
+                let entries = if n.sync == Sync::Local {
+                    unshadow(tx, parent, &actual)?;
+                    Vec::new()
+                } else {
+                    let entry = entry(&drive, &key, Op::Delete, &n)?;
+                    overlay(tx, parent, &actual, None, n.ino)?;
+                    n.sync = publication::pending(tx, n.ino)?;
+                    vec![entry]
+                };
                 n.generation += 1;
                 save_node(tx, &n)?;
                 changed(tx, parent)?;
                 let change = LocalChange { invalidations: vec![invalidation(key, folder)], inodes: vec![parent, n.ino], namespace: true };
-                Ok((((), change), vec![entry]))
+                Ok((((), change), entries))
             }).await;
             match result { Err(FsError::Again) => continue, other => return other }
         }
@@ -208,7 +224,8 @@ impl Session {
                 let (attr, change) = queue.mount_transaction(move |tx| {
                     let (mut n, key) = mutation_node(tx, &drive, root, ino, offline)?;
                     let current = n.attr()?;
-                    let mut entry = Entry::new(&drive, &key, Op::Attrs, mutation_base(&n)?);
+                    let local = n.sync == Sync::Local;
+                    let mut entry = Entry::new(&drive, &key, Op::Attrs, if local { StoredBase::Absent } else { mutation_base(&n)? });
                     if let Some(mode) = mode.filter(|mode| *mode != current.mode) {
                         n.entry.mode = Some(format!("{mode:04o}"));
                         entry.attrs.mode = Some(mode);
@@ -224,7 +241,7 @@ impl Session {
                     n.sync = publication::pending(tx, ino)?;
                     save_node(tx, &n)?;
                     entry.mount_ino = Some(ino);
-                    Ok(((n.attr()?, notify::attribute(tx, &drive, root, ino)?), vec![entry]))
+                    Ok(((n.attr()?, notify::attribute(tx, &drive, root, ino)?), if local { Vec::new() } else { vec![entry] }))
                 }).await?;
                 data.attributes_changed(ino, &attr);
                 local.send(change);
@@ -247,6 +264,7 @@ impl Session {
             self.prepare_parent(to_parent).await?;
             let source_name = from_name.clone();
             let source = self.db(move |c, d, _| Ok(child(c, d, from_parent, &source_name))).await??.ok_or(FsError::NotFound)?.1;
+            if source.entry.kind == Kind::File && (source.sync == Sync::Local) != local_only(&to_name) { return Err(FsError::CrossDevice); }
             self.prepare_mutation(source.ino).await?;
             let target_name = to_name.clone();
             let target = self.db(move |c, d, _| Ok(child(c, d, to_parent, &target_name))).await??;
@@ -286,17 +304,21 @@ impl Session {
                         directory(tx, &drive, root, old.ino, offline)?;
                         if !names(tx, old.ino)?.is_empty() { return Err(FsError::NotEmpty); }
                     } else if n.entry.kind == Kind::Folder { return Err(FsError::NotDir); }
-                    entries.push(entry(&drive, &key(&to_key, &name, old.entry.kind == Kind::Folder)?, Op::Delete, &old)?);
+                    if old.sync != Sync::Local { entries.push(entry(&drive, &key(&to_key, &name, old.entry.kind == Kind::Folder)?, Op::Delete, &old)?); }
                     overlay(tx, to_parent, &name, None, old.ino)?;
                     old.sync = publication::pending(tx, old.ino)?;
                     old.generation += 1;
                     save_node(tx, &old)?;
                 }
-                let mut rename = entry(&drive, &from, Op::Rename, &n)?;
-                rename.to_key = Some(to.clone());
-                rename.replace = false;
-                entries.push(rename);
-                overlay(tx, from_parent, &actual, None, n.ino)?;
+                if n.sync == Sync::Local {
+                    unshadow(tx, from_parent, &actual)?;
+                } else {
+                    let mut rename = entry(&drive, &from, Op::Rename, &n)?;
+                    rename.to_key = Some(to.clone());
+                    rename.replace = false;
+                    entries.push(rename);
+                    overlay(tx, from_parent, &actual, None, n.ino)?;
+                }
                 overlay(tx, to_parent, &to_name, Some(n.ino), n.ino)?;
                 n.entry.name = if n.entry.kind == Kind::Folder { format!("{to_name}/") } else { to_name };
                 n.sync = publication::pending(tx, n.ino)?;

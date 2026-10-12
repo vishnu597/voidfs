@@ -89,7 +89,9 @@ pub(crate) fn recover_overlays(c: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The state a local change leaves: a local-only file stays so.
 pub(crate) fn pending(c: &Connection, ino: Ino) -> Result<Sync> {
+    if c.query_row("SELECT 1 FROM mount_inodes WHERE ino=?1 AND sync='local'", [ino], |_| Ok(())).optional()?.is_some() { return Ok(Sync::Local); }
     if c.query_row("SELECT 1 FROM mount_conflicts WHERE ino=?1 UNION ALL SELECT 1 FROM mount_conflict_blockers WHERE ino=?1", [ino], |_| Ok(())).optional()?.is_some() { return Ok(Sync::Conflict); }
     let entry: Option<i64> = c.query_row("SELECT entry_id FROM mount_inodes WHERE ino=?1", [ino], |r| r.get(0))?;
     let blocked = entry.map(|id| blocked(c, id)).transpose()?.flatten();

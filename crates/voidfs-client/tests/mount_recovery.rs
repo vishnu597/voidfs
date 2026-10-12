@@ -20,7 +20,7 @@ use voidfs_server::test_server::TestServer;
 fn plenty(_: &Path) -> std::io::Result<u64> { Ok(1 << 50) }
 
 fn staging(compact_garbage: u64) -> StagingConfig {
-    StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, compact_garbage }
+    StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, disk_flush: None, compact_garbage }
 }
 
 async fn open(dir: &Path, client: &Client) -> (Arc<Store>, Cache, Queue) {
@@ -300,7 +300,7 @@ async fn a_save_whose_reply_was_lost_is_known_as_its_own() {
     f.publish().await;
     assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Saved, "{:?}", f.queue.status().await.unwrap().items);
     assert!(f.proxy.seen().iter().filter(|r| r.starts_with("PUT /drv/new")).count() >= 2, "{:?}", f.proxy.seen());
-    assert_eq!(f.remote.list_versions("drv", "new", true).await.unwrap().len(), 2, "the create and the content landed once each");
+    assert_eq!(f.remote.list_versions("drv", "new", true).await.unwrap().len(), 1, "the create, with its content folded in, landed once");
     assert_eq!(f.remote.get_object("drv", "new", ReadOptions::default()).await.unwrap().body, Bytes::from_static(b"made once"));
 }
 
@@ -376,7 +376,7 @@ async fn an_edit_whose_reply_was_lost_is_known_as_its_own() {
     assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Saved, "{:?}", f.queue.status().await.unwrap().items);
     assert!(ns.conflict(ino).await.unwrap().is_none());
     assert_eq!(f.remote.get_object("drv", "f", ReadOptions::default()).await.unwrap().body, Bytes::from_static(b"Jello World"));
-    assert_eq!(versions(&f, "f").await, ["put", "write", "attrs"], "the edit landed once");
+    assert_eq!(versions(&f, "f").await, ["put", "write"], "the edit, with its mode and times, landed once");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

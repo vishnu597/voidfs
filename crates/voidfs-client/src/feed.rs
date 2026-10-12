@@ -33,6 +33,8 @@ pub struct FeedEvent {
     /// The position this brings the watcher to.
     pub seq: u64,
     pub invalidations: Vec<Invalidation>,
+    /// The batch's changes, from which `invalidations` came; none for a relisting.
+    pub changes: Vec<Change>,
 }
 
 fn folder_key(key: &str) -> String {
@@ -114,19 +116,19 @@ async fn run(client: Client, drive: String, since: u64, conn: Option<Connectivit
                 failures = 0;
                 if let Some(c) = &conn { c.answered(false); }
                 if !reconnect || !resync { continue; }
-                FeedEvent { drive: drive.clone(), seq: since, invalidations: vec![Invalidation::All] }
+                FeedEvent { drive: drive.clone(), seq: since, invalidations: vec![Invalidation::All], changes: Vec::new() }
             },
             Ok(ChangeWatchEvent::Changes(batch)) => {
                 failures = 0;
                 if let Some(c) = &conn {
                     c.answered(false);
                 }
-                FeedEvent { drive: drive.clone(), seq: batch.seq, invalidations: invalidations(&batch.changes) }
+                FeedEvent { drive: drive.clone(), seq: batch.seq, invalidations: invalidations(&batch.changes), changes: batch.changes }
             }
             Err(e) if e.status() == Some(410) || e.code() == Some("ChangesExpired") => match client.list_folder_page(&drive, "", None).await {
                 Ok(page) => {
                     watch = client.watch_changes(&drive, page.seq);
-                    FeedEvent { drive: drive.clone(), seq: page.seq, invalidations: vec![Invalidation::All] }
+                    FeedEvent { drive: drive.clone(), seq: page.seq, invalidations: vec![Invalidation::All], changes: Vec::new() }
                 }
                 Err(_) => {
                     failures += 1;

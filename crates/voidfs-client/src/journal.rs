@@ -346,6 +346,14 @@ pub(crate) fn insert(c: &Connection, e: &mut Entry) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Writes what a later edit folded into a queued entry: its bytes and attributes.
+pub(crate) fn amend(c: &Connection, e: &Entry) -> rusqlite::Result<()> {
+    let attrs = (!e.attrs.is_empty()).then(|| serde_json::to_string(&e.attrs).unwrap_or_default());
+    c.execute("UPDATE entries SET source = ?2, staged = ?3, stamp = ?4, size = ?5, attrs = ?6 WHERE id = ?1",
+        params![e.id, e.source.as_ref().map(|p| p.to_string_lossy().into_owned()), e.staged, e.stamp.map(|s| s.encode()), e.size as i64, attrs])?;
+    Ok(())
+}
+
 /// Writes the fields that change as an entry is published.
 pub(crate) fn update(c: &Connection, e: &Entry) -> rusqlite::Result<()> {
     c.execute(

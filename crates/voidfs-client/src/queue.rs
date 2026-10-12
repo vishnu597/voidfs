@@ -59,6 +59,11 @@ pub struct QueueConfig {
     /// While it says the server can't be reached, nothing is published; the queue goes on once
     /// it can be.
     pub connectivity: Option<Connectivity>,
+    /// A mount's new file waits this long after its create before its creating put goes: the
+    /// bytes, mode, times and xattrs that follow fold into that put instead of each making a
+    /// version (step 5, item 4). Zero holds nothing; a put that hasn't started still takes what
+    /// follows.
+    pub create_hold: Duration,
 }
 
 impl Default for QueueConfig {
@@ -72,8 +77,26 @@ impl Default for QueueConfig {
             memory_bytes: 256 * MIB,
             retry_max: Duration::from_secs(60),
             connectivity: None,
+            create_hold: Duration::from_secs(1),
         }
     }
+}
+
+/// Folds `e` into the creating put `into`: its mode and times, xattrs, or whole new bytes.
+/// Returns the staged copy the new bytes replace.
+fn fold(into: &mut Entry, e: &Entry) -> Option<PathBuf> {
+    if e.attrs.mode.is_some() { into.attrs.mode = e.attrs.mode; }
+    if e.attrs.mtime.is_some() { into.attrs.mtime = e.attrs.mtime.clone(); }
+    if e.op == Op::Put {
+        // A whole put carries the inode's every xattr.
+        into.attrs.xattrs = e.attrs.xattrs.clone();
+        let replaced = std::mem::replace(&mut into.source, e.source.clone()).filter(|_| into.staged);
+        (into.staged, into.stamp, into.size) = (e.staged, e.stamp, e.size);
+        return replaced;
+    }
+    for (name, value) in &e.attrs.xattrs { into.attrs.xattrs.insert(name.clone(), value.clone()); }
+    for name in &e.attrs.remove_xattrs { into.attrs.xattrs.remove(name); }
+    None
 }
 
 /// What a pause, a resume or a cancel applies to.
@@ -374,6 +397,29 @@ impl Queue {
         Arc::ptr_eq(&self.0.store, store)
     }
 
+    /// The new file's creating put that `e` folds into: not started, its inode's latest entry
+    /// at the same key, and `e` the inode's next edit of its mode, times, xattrs or whole bytes.
+    fn fold_target(tx: &rusqlite::Transaction<'_>, st: &QState, e: &Entry) -> rusqlite::Result<Option<Entry>> {
+        use rusqlite::OptionalExtension;
+        let (Some(ino), StoredBase::Entry(base)) = (e.mount_ino, &e.base) else { return Ok(None); };
+        let foldable = match e.op { Op::Attrs => e.attrs.content_type.is_none(), Op::Put => true, _ => false };
+        if !foldable || e.batch.is_some() { return Ok(None); }
+        let Some(p) = st.pending.get(base) else { return Ok(None); };
+        if !(p.mount && p.op == Op::Put && p.base == StoredBase::Absent && p.mount_ino == Some(ino) && p.drive == e.drive && p.key == e.key
+            && p.state == State::Queued && p.batch.is_none() && p.published_version.is_none() && p.upload_id.is_none()
+            && !st.running.contains_key(&p.id) && !st.may_have_landed.contains(&p.id)) { return Ok(None); }
+        let latest = tx.query_row("SELECT entry_id FROM mount_inodes WHERE ino=?1 AND drive=?2", rusqlite::params![ino, e.drive], |r| r.get::<_, Option<EntryId>>(0)).optional()?.flatten();
+        Ok((latest == Some(p.id)).then(|| p.clone()))
+    }
+
+    /// How much longer a mount's new file holds its creating put back, if it does ([`QueueConfig::create_hold`]).
+    fn held(&self, e: &Entry, now: i64) -> Option<Duration> {
+        if self.0.cfg.create_hold.is_zero() || !(e.mount && e.op == Op::Put && e.base == StoredBase::Absent && e.state == State::Queued && e.published_version.is_none()) { return None; }
+        let hold = i64::try_from(self.0.cfg.create_hold.as_millis()).unwrap_or(i64::MAX);
+        let age = now.saturating_sub(e.created);
+        (age < hold).then(|| Duration::from_millis((hold - age) as u64))
+    }
+
     pub(crate) fn register_mount_publisher(&self, drive: &str, publisher: std::sync::Weak<crate::mount::data::Staged>) {
         let mut publishers = self.0.mount_publishers.lock().unwrap_or_else(|p| p.into_inner());
         publishers.retain(|_, publisher| publisher.strong_count() > 0);
@@ -461,10 +507,18 @@ impl Queue {
                     Ok(result) => result,
                     Err(err) => return Ok(Err(err)),
                 };
+                let mut folded = Vec::new();
                 for i in 0..entries.len() {
                     let (earlier, rest) = entries.split_at_mut(i);
                     let e = &mut rest[0];
                     e.mount = true;
+                    if let Some(mut into) = Self::fold_target(&tx, &st, e)? {
+                        let replaced = fold(&mut into, e);
+                        journal::amend(&tx, &into)?;
+                        crate::mount::publication::stamp(&tx, &into)?;
+                        folded.push((i, into, replaced));
+                        continue;
+                    }
                     // A new inode must check absence even when an older inode occupied this
                     // key. Its ordering dependency is independent of its version guard.
                     if !matches!(e.base, StoredBase::Absent | StoredBase::Entry(_)) {
@@ -485,12 +539,19 @@ impl Queue {
                     crate::mount::publication::stamp(&tx, e)?;
                 }
                 tx.commit()?;
-                Ok(Ok((value, entries)))
+                // A folded entry is its target, amended: the queue publishes that one.
+                let mut replaced = Vec::new();
+                for (i, into, old) in folded.into_iter().rev() {
+                    entries[i] = into;
+                    replaced.extend(old);
+                }
+                Ok(Ok((value, entries, replaced)))
             }).map_err(crate::mount::FsError::from)??;
-            let (value, entries) = committed;
+            let (value, entries, replaced) = committed;
             for e in entries {
                 st.pending.insert(e.id, e);
             }
+            for path in replaced { let _ = std::fs::remove_file(path); }
             st.idle = false;
             Ok(value)
         }).await.map_err(crate::Error::from).map_err(crate::mount::FsError::from)?;
@@ -961,6 +1022,7 @@ impl Queue {
             Err(_) => return (Vec::new(), Some(Duration::from_secs(1))),
         };
         let now = Instant::now();
+        let now_ms = journal::now_ms();
         let mut free = self.0.cfg.uploads.saturating_sub(st.runs);
         let mut runs = Vec::new();
         let mut wait: Option<Duration> = None;
@@ -987,6 +1049,10 @@ impl Queue {
             }
             // Anything earlier it depends on must be finished first.
             if ids[..i].iter().any(|p| depends(&st.pending[p], e)) {
+                continue;
+            }
+            if !st.may_have_landed.contains(id) && let Some(d) = self.held(e, now_ms) {
+                wait = Some(wait.map_or(d, |w: Duration| w.min(d)));
                 continue;
             }
             let mut run = vec![e.clone()];
@@ -1173,6 +1239,8 @@ impl Queue {
                     let key = run[0].published_key.clone().or_else(|| run[0].to_key.clone()).unwrap_or_else(|| run[0].key.clone());
                     let key = if run[0].op == Op::Folder && !key.ends_with('/') { format!("{key}/") } else { key };
                     if let Some(version) = version.clone() {
+                        // Before the inode settles: the feed reports this version as this Mac's own.
+                        if let Some(publisher) = self.mount_publisher(&run[0].drive) { publisher.published(&key, &version); }
                         for e in &mut run { e.published_version = Some(version.clone()); e.published_key = Some(key.clone()); }
                         let (this, entries, v, k) = (self.clone(), run.clone(), version.clone(), key.clone());
                         if let Err(e) = blocking(move || this.acknowledge(&entries, &v, &k, false)).await {
@@ -1441,7 +1509,7 @@ mod tests {
     async fn paused(dir: &Path) -> Queue {
         let store = Arc::new(Store::open(dir).unwrap());
         store.set_meta("paused", "1").unwrap();
-        Queue::open(store, client("http://127.0.0.1:1"), QueueConfig::default()).await.unwrap()
+        Queue::open(store, client("http://127.0.0.1:1"), QueueConfig { create_hold: Duration::ZERO, ..Default::default() }).await.unwrap()
     }
 
     fn local_inode(tx: &rusqlite::Transaction<'_>) -> crate::mount::Result<u64> {

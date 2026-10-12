@@ -189,6 +189,10 @@ pub struct InvalidationEvent {
     pub generation: u64,
     pub seq: u64,
     pub resync: bool,
+    /// A change made on this Mac, through any session of the drive (`seq` is unchanged); the
+    /// others come from the feed, without this Mac's own publications.
+    #[serde(default)]
+    pub local: bool,
     pub invalidations: Vec<Invalidation>,
     pub inodes: Vec<u64>,
 }

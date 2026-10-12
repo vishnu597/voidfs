@@ -31,6 +31,9 @@ pub struct StagingConfig {
     pub min_free_bytes: u64,
     pub free_space: Option<fn(&Path) -> io::Result<u64>>,
     pub quiet_period: Option<Duration>,
+    /// How soon after a write its staged bytes are made durable on disk, without publishing
+    /// them: FSKit passes no `fsync` on, so this bounds what a power loss takes (step 5, item 4).
+    pub disk_flush: Option<Duration>,
     /// A flush rewrites a staging file without its overwritten bytes once they exceed both this
     /// and the bytes still in use.
     pub compact_garbage: u64,
@@ -38,7 +41,7 @@ pub struct StagingConfig {
 
 impl Default for StagingConfig {
     fn default() -> Self {
-        Self { min_free_bytes: 256 * 1024 * 1024, free_space: None, quiet_period: Some(Duration::from_secs(2)), compact_garbage: 64 * 1024 * 1024 }
+        Self { min_free_bytes: 256 * 1024 * 1024, free_space: None, quiet_period: Some(Duration::from_secs(2)), disk_flush: Some(Duration::from_secs(1)), compact_garbage: 64 * 1024 * 1024 }
     }
 }
 

@@ -26,8 +26,8 @@ impl Env {
         let client = client(endpoint);
         let store = Arc::new(Store::open(dir).unwrap());
         let cache = Cache::open(store.clone(), Arc::new(ApiFetcher::new(client.clone())), CacheConfig { min_free_bytes: 0, free_space: Some(plenty), ..Default::default() }).await.unwrap();
-        let queue = Queue::open(store.clone(), client.clone(), QueueConfig { retry_max: Duration::from_millis(50), ..Default::default() }).await.unwrap();
-        let cfg = StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, compact_garbage: 0 };
+        let queue = Queue::open(store.clone(), client.clone(), QueueConfig { retry_max: Duration::from_millis(50), create_hold: Duration::ZERO, ..Default::default() }).await.unwrap();
+        let cfg = StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, disk_flush: None, compact_garbage: 0 };
         let session = Session::new_writable_with_config(store, client.clone(), cache.clone(), queue.clone(), DRIVE, Connectivity::default(), cfg).await.unwrap();
         session.recovered().await;
         Env { client, cache, queue, session }
@@ -94,6 +94,9 @@ async fn scenario(name: &str, dir: &Path, endpoint: &str) {
         }
         "publish" => {
             ns.write(fh, 0, Bytes::from_static(b"data")).await.unwrap();
+            // The create goes on its own (nothing holds it here): the content's put is guarded
+            // by its version, not folded into it.
+            env.publish().await;
             // A published entry still held open when the process dies.
             let _reader = ns.open(ino, false).await.unwrap();
             ns.close(fh).await.unwrap();
@@ -192,7 +195,7 @@ async fn killed_after_freezing_a_flush_drops_its_copies_and_flushes_again() {
     assert_eq!(env.session.getattr(ino).await.unwrap().sync, Sync::Saving, "opening the writer queued what the crash left unflushed");
     assert_eq!(env.read(ino).await, Bytes::from_static(b"data"));
     env.publish().await;
-    assert_eq!(env.remote().await, (Bytes::from_static(b"data"), 2));
+    assert_eq!(env.remote().await, (Bytes::from_static(b"data"), 1), "the flushed bytes folded into the create's put");
     assert_eq!(env.session.getattr(ino).await.unwrap().sync, Sync::Saved);
     env.close().await;
 }
@@ -202,9 +205,9 @@ async fn killed_after_a_flush_commits_publishes_its_entries_once() {
     let (dir, server) = crashed("fsync", "flush.committed", 1).await;
     let env = Env::open(dir.path(), &server.endpoint).await;
     let ino = env.file().await;
-    assert_eq!(env.unfinished().await.len(), 2, "the create and the flushed bytes are queued");
+    assert_eq!(env.unfinished().await.len(), 1, "the flushed bytes folded into the queued create");
     env.publish().await;
-    assert_eq!(env.remote().await, (Bytes::from_static(b"data"), 2));
+    assert_eq!(env.remote().await, (Bytes::from_static(b"data"), 1));
     assert_eq!(env.session.getattr(ino).await.unwrap().sync, Sync::Saved);
     env.close().await;
 }
@@ -226,9 +229,10 @@ async fn killed_after_a_put_lands_the_restart_knows_it_as_its_own() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_after_an_edit_rename_attrs_or_delete_lands_the_restart_knows_it_as_its_own() {
-    for (scenario, point, key, expected) in [("patch", "patch.sent", "file", &["put", "put", "write", "attrs"][..]),
-        ("rename", "rename.sent", "renamed", &["put", "put", "rename"][..]),
-        ("attrs", "attrs.sent", "file", &["put", "put", "attrs"][..]), ("delete", "delete.sent", "file", &[][..])] {
+    // One version each: the create's put carries the bytes, and an edit's request its mode and times.
+    for (scenario, point, key, expected) in [("patch", "patch.sent", "file", &["put", "write"][..]),
+        ("rename", "rename.sent", "renamed", &["put", "rename"][..]),
+        ("attrs", "attrs.sent", "file", &["put", "attrs"][..]), ("delete", "delete.sent", "file", &[][..])] {
         let (dir, server) = crashed(scenario, point, 1).await;
         let env = Env::open(dir.path(), &server.endpoint).await;
         env.publish().await;

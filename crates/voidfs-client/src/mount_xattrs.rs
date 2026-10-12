@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD;
 use voidfs_sdk::ReadOptions;
 
 use super::*;
-use crate::journal::{Entry, Op};
+use crate::journal::{Entry, Op, StoredBase};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XattrMode { Set, Create, Replace }
@@ -163,7 +163,8 @@ impl Session {
                 if !m.dirty && m.version != current.entry.version_id { return Err(FsError::Again); }
                 let mut attrs = m.attrs;
                 let exists = attrs.contains_key(&name);
-                let mut entry = Entry::new(&drive, &current_key, Op::Attrs, mutation_base(&current)?);
+                let local = current.sync == Sync::Local;
+                let mut entry = Entry::new(&drive, &current_key, Op::Attrs, if local { StoredBase::Absent } else { mutation_base(&current)? });
                 match value {
                     Some((bytes, mode)) => {
                         if mode == XattrMode::Create && exists { return Err(FsError::Exists); }
@@ -185,7 +186,7 @@ impl Session {
                 save_memo(tx, ino, &current.entry.version_id, &attrs, true)?;
                 entry.mount_ino = Some(ino);
                 let change = notify::attribute(tx, &drive, root, ino)?;
-                Ok((((), change), vec![entry]))
+                Ok((((), change), if local { Vec::new() } else { vec![entry] }))
             }).await;
             match result { Err(FsError::Again) => continue, other => return other }
         }

@@ -60,6 +60,7 @@ impl From<FsError> for Failure {
             FsError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "TooLarge"),
             FsError::Ambiguous => (StatusCode::CONFLICT, "Ambiguous"),
             FsError::Again => (StatusCode::SERVICE_UNAVAILABLE, "Again"),
+            FsError::CrossDevice => (StatusCode::CONFLICT, "CrossDevice"),
             FsError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Io"),
         };
         Self::new(status, code, error)

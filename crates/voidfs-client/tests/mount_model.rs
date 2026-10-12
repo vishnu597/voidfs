@@ -149,7 +149,7 @@ impl Mount {
         let queue = Queue::open(store.clone(), self.client.clone(), QueueConfig { retry_max: Duration::from_millis(50), ..Default::default() }).await.unwrap();
         queue.pause(Scope::All).await.unwrap();
         // A small compaction threshold, so that overwrites compact during the run.
-        let cfg = StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, compact_garbage: 4096 };
+        let cfg = StagingConfig { min_free_bytes: 0, free_space: Some(plenty), quiet_period: None, disk_flush: None, compact_garbage: 4096 };
         let session = Session::new_writable_with_config(store, self.client.clone(), cache.clone(), queue.clone(), &self.drive, Connectivity::default(), cfg).await.unwrap();
         self.open = Some((cache, queue, session));
     }
