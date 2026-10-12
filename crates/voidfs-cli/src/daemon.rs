@@ -17,6 +17,8 @@ use crate::output::{Failure, Out, Result, count, size};
 const START_WAIT: Duration = Duration::from_secs(20);
 /// How long `stop` waits for the daemon to let go of the state directory.
 const STOP_WAIT: Duration = Duration::from_secs(60);
+/// How often `daemon run` looks for new conflicts to log.
+const CONFLICT_LOOK: Duration = Duration::from_secs(5);
 /// A log larger than this is moved to `daemon.log.1` when the daemon starts.
 const LOG_MAX: u64 = 8 << 20;
 /// The connection variables a daemon `start` launches must not see: it reads `daemon.json`.
@@ -93,6 +95,19 @@ fn log(msg: &str) {
     let _ = writeln!(std::io::stderr().lock(), "{} {msg}", Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true));
 }
 
+/// Logs each file that went into conflict since the last look (a mount's save the drive refused
+/// because it changed since), once, by drive and key, and again if it goes into conflict anew.
+async fn log_conflicts(queue: &voidfs_client::Queue, logged: &mut std::collections::BTreeSet<(String, String)>) {
+    let Ok(items) = queue.conflicts().await else { return };
+    let now: std::collections::BTreeSet<(String, String)> = items.iter().map(|i| (i.drive.clone(), i.key.clone())).collect();
+    logged.retain(|k| now.contains(k));
+    for i in &items {
+        if logged.insert((i.drive.clone(), i.key.clone())) {
+            log(&format!("{} ({}:{}, entry {})", crate::uploads::conflict(i), i.drive, i.key, i.id));
+        }
+    }
+}
+
 /// The connection the daemon should use: the one given, else what `daemon.json` holds.
 pub fn connection(conn: &Connection, dir: &Path) -> Result<voidfs_sdk::Config> {
     if let Some(c) = conn.config(|n| std::env::var(n).ok())? {
@@ -136,6 +151,7 @@ pub async fn run(conn: &Connection, opts: &DaemonOptions) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let sig = |k: SignalKind| signal(k).map_err(|e| Failure::new("InternalError", format!("signals: {e}")));
     let (mut term, mut int, mut hup) = (sig(SignalKind::terminate())?, sig(SignalKind::interrupt())?, sig(SignalKind::hangup())?);
+    let (mut look, mut logged) = (tokio::time::interval(CONFLICT_LOOK), std::collections::BTreeSet::new());
     let why = loop {
         tokio::select! {
             _ = daemon.stop_asked() => break "asked to stop",
@@ -143,6 +159,7 @@ pub async fn run(conn: &Connection, opts: &DaemonOptions) -> Result<()> {
             _ = int.recv() => break "SIGINT",
             // The terminal that started it went away: the daemon outlives it.
             _ = hup.recv() => log("SIGHUP: ignored"),
+            _ = look.tick() => log_conflicts(daemon.queue(), &mut logged).await,
         }
     };
     log(&format!("stopping ({why})"));
@@ -331,7 +348,7 @@ fn uploads_line(u: &api::Uploads) -> String {
         return if u.paused { "idle · paused".into() } else { "idle".into() };
     }
     let mut parts = Vec::new();
-    for (n, what) in [(u.uploading, "uploading"), (u.queued, "queued"), (u.failed, "failed")] {
+    for (n, what) in [(u.uploading, "uploading"), (u.queued, "queued"), (u.failed, "failed"), (u.conflicts, "in conflict")] {
         if n > 0 {
             parts.push(format!("{n} {what}"));
         }
@@ -417,5 +434,7 @@ mod tests {
         assert_eq!(uploads_line(&u), "idle · paused");
         u = api::Uploads { uploading: 2, queued: 3, unpublished: 5, unpublished_bytes: 3 << 20, bandwidth: Some(1 << 20), paused_items: 1, ..Default::default() };
         assert_eq!(uploads_line(&u), "2 uploading, 3 queued · 3.0 MiB to send · 1 paused · limit 1.0 MiB/s");
+        u = api::Uploads { failed: 1, conflicts: 2, unpublished: 5, unpublished_bytes: 30, ..Default::default() };
+        assert_eq!(uploads_line(&u), "1 failed, 2 in conflict · 30 B to send");
     }
 }

@@ -932,6 +932,20 @@ impl Queue {
         .await
     }
 
+    /// The entries the drive refused because it changed since their base (a mount's guarded
+    /// saves), as `status` lists them, without reading the rest of the journal.
+    pub async fn conflicts(&self) -> Result<Vec<Item>> {
+        let this = self.clone();
+        blocking(move || {
+            let entries = this.0.store.with(|c| journal::conflicted(c))?;
+            Ok(entries.into_iter().map(|e| Item {
+                id: e.id, paused: false, drive: e.drive, key: e.key, to_key: e.to_key, op: e.op, state: e.state, batch: e.batch,
+                size: e.size, sent: e.sent, version: e.version, conflict: e.conflict, error: e.error,
+            }).collect())
+        })
+        .await
+    }
+
     /// Waits until nothing is left that could be published now: everything is finished, paused,
     /// waiting on something paused, or failed and waiting for a resume.
     pub async fn settle(&self) {

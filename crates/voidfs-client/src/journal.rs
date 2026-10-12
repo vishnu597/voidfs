@@ -368,6 +368,13 @@ pub(crate) fn unfinished(c: &Connection) -> rusqlite::Result<Vec<Entry>> {
     q.query_map([], from_row)?.collect()
 }
 
+/// Entries a guarded publication refused because the drive changed since: failed, with the
+/// version it found.
+pub(crate) fn conflicted(c: &Connection) -> rusqlite::Result<Vec<Entry>> {
+    let mut q = c.prepare(&format!("SELECT {COLUMNS} FROM entries WHERE state = 'failed' AND conflict IS NOT NULL ORDER BY id"))?;
+    q.query_map([], from_row)?.collect()
+}
+
 pub(crate) fn all(c: &Connection) -> rusqlite::Result<Vec<Entry>> {
     let mut q = c.prepare(&format!("SELECT {COLUMNS} FROM entries ORDER BY id"))?;
     q.query_map([], from_row)?.collect()
