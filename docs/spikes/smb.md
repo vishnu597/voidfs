@@ -50,9 +50,9 @@ can be embedded beside the Rust daemon. Raw output is in
   In two runs some READs got no reply; in one of them the application read wrong bytes **without
   an error**. Bounding the server's daemon reads fixed it in three later runs; the cause was not
   found (§4.6).
-- **Recommendation for the open decision (§8): SMB by default, with voidfs's own server; FSKit
-  kept behind the adapter boundary, read-only, until Apple fixes the miss.** The decision is the
-  user's.
+- **Recommendation (§8): SMB by default, with voidfs's own server; FSKit kept behind the adapter
+  boundary, read-only, until Apple fixes the miss.** **Decided 12 October: the user kept FSKit as
+  the default and waits for Apple to fix the miss**; no SMB server is built.
 
 ## 2. What was built
 
@@ -297,7 +297,11 @@ read-only adapter behind the adapter boundary (no writable FSKit work) and filin
 for the pinned miss; if Apple fixes it, FSKit can be reconsidered. SMB fails the 5-second
 requirement only for folders never listed, by seconds, where FSKit fails it indefinitely and in the
 cases users meet first (a folder in Finder with a file open). The SMB client also reaches `/Volumes`
-without a helper. The cost is the server. This decision is the user's; item 4 waits for it.
+without a helper. The cost is the server.
+
+**Decided 12 October:** the user kept FSKit as the default, the 5 October decision, and waits for
+Apple to fix the pinned miss rather than build an SMB server. Item 4, writable FSKit, comes next,
+and item 3's blocker stays open. This spike stays as the evidence if the decision is revisited.
 
 ## 9. Limits of this spike
 

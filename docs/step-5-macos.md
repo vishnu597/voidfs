@@ -19,7 +19,8 @@ follows other machines' changes, except that FSKit keeps a name this Mac missed 
 is in use (and in the top folder until remount), which reopens the SMB decision before item 4.
 **Item 6's SMB feasibility spike is done** ([12 October](#smb-feasibility-spike-12-october)): the
 Mac's SMB client shows those names within milliseconds when the server breaks SMB 3.x directory
-leases, no existing server fits, and the FSKit/SMB/both decision now waits for the user.
+leases, but no existing server fits. The user kept FSKit as the default and waits for Apple to
+fix the miss; item 4 is next.
 The later deliverables remain an implementation plan; no writable adapter, platform service
 installation, new protocol field or format feature is delivered by this slice.*
 
@@ -61,7 +62,7 @@ SMB callbacks remain later work.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
-| FSKit, SMB or both | **Accepted 5 October: FSKit first, keep the adapter boundary, evaluate SMB only if the compatibility gate fails.** Preserve the native-module decision and the existing spike. **Reopened 10 October** by item 3's release blocker ([a name missed while its folder is in use](#the-blocker-a-name-missed-while-its-folder-is-in-use)): item 6's SMB feasibility spike runs next, before item 4. **The spike, 12 October** ([SMB spike](spikes/smb.md)): smbfs pins no miss, and with directory leases broken it shows every case of the blocker in 25–45 ms through the daemon; no reusable server fits (licenses, no leases), so SMB means voidfs's own server in the daemon. Recommended there: SMB by default with that server, FSKit kept read-only behind the adapter boundary. **The decision is the user's and is pending.** | SMB first could avoid FSKit-specific cache and entitlement constraints, but needs a reusable SMB server, a license review and proof of Mac semantics. Shipping both now doubles adapter and coherence validation. SpaceFS's default SMB is evidence to evaluate, not evidence that voidfs's SMB adapter already exists. |
+| FSKit, SMB or both | **Accepted 5 October: FSKit first, keep the adapter boundary, evaluate SMB only if the compatibility gate fails.** Preserve the native-module decision and the existing spike. **Reopened 10 October** by item 3's release blocker ([a name missed while its folder is in use](#the-blocker-a-name-missed-while-its-folder-is-in-use)): item 6's SMB feasibility spike runs next, before item 4. **The spike, 12 October** ([SMB spike](spikes/smb.md)): smbfs pins no miss, and with directory leases broken it shows every case of the blocker in 25–45 ms through the daemon; no reusable server fits (licenses, no leases), so SMB means voidfs's own server in the daemon. Recommended there: SMB by default with that server, FSKit kept read-only behind the adapter boundary. **Decided 12 October: FSKit stays the default.** The user chose to wait for Apple to fix the pinned miss rather than build an SMB server; item 4 (writable FSKit) is next, and the blocker stays open. | SMB first could avoid FSKit-specific cache and entitlement constraints, but needs a reusable SMB server, a license review and proof of Mac semantics. Shipping both now doubles adapter and coherence validation. SpaceFS's default SMB is evidence to evaluate, not evidence that voidfs's SMB adapter already exists. |
 | Minimum OS | **Keep macOS 27 for FSKit.** Recheck the final SDK/runtime before release. | Any lower minimum requires a separate coherence strategy and an explicit change to the recorded platform decision. An SMB adapter would need its own measured minimum; it does not automatically lower the app's minimum. |
 | Rust/Swift boundary | **Accepted 5 October: keep the Rust daemon and socket; add a thin Swift XPC bridge for the sandboxed extension.** | A Swift agent embedding Rust through UniFFI follows the original spike, but replaces the now-built daemon host and adds bindings/build work. A direct extension-to-socket path is smaller only if a signed sandbox test proves access and notifications. |
 | Cache and journal ownership | **One daemon owns mutable state; shared cache files are read through leases.** | An extension-owned core repeats state per drive and loses its process on eject. Neither a bridge nor an extension may independently open the writable state database. |
@@ -266,7 +267,8 @@ both were deferred in step 4 and are not implied by this plan.
 **SMB feasibility spike done, 12 October; the application matrix is not started.** The spike ran
 item 3's coherence cases over the Mac's SMB client, through the daemon's mount core, and checked
 the servers and the checklist below ([SMB feasibility spike](#smb-feasibility-spike-12-october),
-[the spike](spikes/smb.md)). Choosing the default adapter is the user's decision, pending.
+[the spike](spikes/smb.md)). On 12 October the user kept FSKit as the default adapter, so the matrix
+runs on writable FSKit after item 4.
 
 Start this rig alongside item 3, and run it again after item 4. Use Finder, a code repo and
 Premiere, Resolve, Final Cut, Blender and Office on the target macOS. Record app/OS versions,
@@ -1784,12 +1786,13 @@ not in the workspace today. NetFS mounts such a share in `/Volumes` as the user,
 | The macOS SMB client against the same mount core and rig | `coherence.py`, `holdprobe.py`, `negprobe.py` through the daemon's session: spike §4.5 |
 | Loopback with per-user authentication; a remote peer cannot reach it | 127.0.0.1 only, the LAN address refused; NTLMv2 per user, with smbfs reusing a same-host session's credentials within one macOS user: spike §4.7 |
 | Caches, lease breaks and open-handle snapshots under feed changes, measured | Spike §3 and §4 |
-| The chosen default passes the matrix and the two-Mac scenario | Not started: no adapter is chosen, and no writable SMB server exists |
+| The chosen default passes the matrix and the two-Mac scenario | Not started: FSKit is the default, and the matrix runs after item 4 |
 
-**The FSKit/SMB/both decision is pending with the user.** The spike recommends SMB by default with
+**Decided 12 October: FSKit stays the default.** The spike recommended SMB by default with
 voidfs's own server, FSKit's read-only adapter kept behind the adapter boundary, and a Feedback to
-Apple for the pinned miss ([spike §8](spikes/smb.md#8-recommendation-fskit-smb-or-both)).
-Item 4 waits for the decision.
+Apple for the pinned miss ([spike §8](spikes/smb.md#8-recommendation-fskit-smb-or-both)). The
+user kept FSKit and chose to wait for Apple to fix the miss rather than build an SMB server.
+Item 4, writable FSKit, comes next; item 3's blocker stays open.
 
 Validation: the spike changes no Rust. 719 workspace tests pass (9 ignored), and workspace clippy
 passes with warnings denied. Spec validation passes 56 cases / 432 steps, and the five
