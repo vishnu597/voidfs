@@ -1,0 +1,62 @@
+# Excerpts of the spike server's log (smbspike.py --log), local backend, SMB 3.1.1
+
+## The first CREATE of a mount carries Apple's AAPL context (the spike ignores it)
+1791746384.515 conn 1 TREE_CONNECT \\127.0.0.1\SPIKE
+1791746384.678 conn 1 CREATE '' disp=1 opts=0x1 access=0x100080 ctx=MxAc -> fid=1 dir
+1791746384.678 conn 1 CREATE '' disp=1 opts=0x1 access=0x100080 ctx=AAPL,MxAc -> fid=2 dir
+1791746384.679 conn 1 CREATE '' disp=1 opts=0x1 access=0x100080 ctx=MxAc -> fid=3 dir
+
+## A folder only looked up, never listed: its CREATEs ask for no lease (ctx= is empty), so no break reaches it; the miss is looked up again only when the folder's attributes expire (2.5 s here)
+1791747920.903 conn 1 CREATE 'probe-1791747920-40532' disp=1 opts=0x1 access=0x100081 ctx= -> fid=16 dir
+1791747920.903 conn 1 QUERY_DIRECTORY 'probe-1791747920-40532' pattern='unlisted-young-no' class=37 -> 1 entries
+1791747920.904 conn 1 CREATE 'probe-1791747920-40532/unlisted-young-no' disp=1 opts=0x1 access=0x100081 ctx= -> fid=17 dir
+1791747920.904 conn 1 QUERY_DIRECTORY 'probe-1791747920-40532/unlisted-young-no' pattern='a.txt' class=37 -> 1 entries
+1791747920.904 conn 1 CREATE 'probe-1791747920-40532/unlisted-young-no' disp=1 opts=0x1 access=0x100081 ctx= -> fid=18 dir
+1791747920.904 conn 1 QUERY_DIRECTORY 'probe-1791747920-40532/unlisted-young-no' pattern='new-unlisted-young-no-1.txt' class=37 -> 0 entries
+1791747920.928 changed 1 probe-1791747920-40532/unlisted-young-no/new-unlisted-young-no-1.txt  
+1791747923.467 conn 1 CREATE '' disp=1 opts=0x1 access=0x100081 ctx= -> fid=19 dir
+1791747923.468 conn 1 QUERY_DIRECTORY '' pattern='probe-1791747920-40532' class=37 -> 1 entries
+1791747923.469 conn 1 CREATE 'probe-1791747920-40532' disp=1 opts=0x1 access=0x100081 ctx= -> fid=20 dir
+1791747923.469 conn 1 QUERY_DIRECTORY 'probe-1791747920-40532' pattern='unlisted-young-no' class=37 -> 1 entries
+1791747923.469 conn 1 CREATE 'probe-1791747920-40532/unlisted-young-no' disp=1 opts=0x1 access=0x100081 ctx= -> fid=21 dir
+
+## An open file overwritten by another machine (coherence-311-full-crashed.txt): the app's handle (fid=41) reads the old bytes; smbfs refreshes the size by path (fid=44), and fstat shows the new size
+1791747741.864 conn 1 CREATE 'coherence-1791747741-38546/grows.bin' disp=1 opts=0x0 access=0x20081 ctx=MxAc,DH2Q,RqLs -> fid=41 size=12 lease=0x3
+1791747741.888 changed 3 coherence-1791747741-38546/grows.bin  
+1791747741.888 conn 1 LEASE_BREAK 'coherence-1791747741-38546/grows.bin' 0x3 -> 0x0 ack=True
+1791747741.888 conn 1 LEASE_BREAK ack 'coherence-1791747741-38546/grows.bin' state=0x0
+1791747741.889 conn 1 CREATE 'coherence-1791747741-38546' disp=1 opts=0x1 access=0x100081 ctx= -> fid=42 dir
+1791747741.889 conn 1 QUERY_DIRECTORY 'coherence-1791747741-38546' pattern='grows.bin' class=37 -> 1 entries
+1791747741.901 conn 1 CLOSE 'coherence-1791747741-38546/grows.bin' fid=41
+1791747741.901 conn 1 CREATE 'coherence-1791747741-38546' disp=1 opts=0x1 access=0x100081 ctx= -> fid=43 dir
+1791747741.901 conn 1 QUERY_DIRECTORY 'coherence-1791747741-38546' pattern='grows.bin' class=37 -> 1 entries
+1791747741.902 conn 1 CREATE 'coherence-1791747741-38546/grows.bin' disp=1 opts=0x0 access=0x20081 ctx=MxAc,DH2Q,RqLs -> fid=44 size=32 lease=0x3
+1791747741.902 conn 1 CLOSE 'coherence-1791747741-38546/grows.bin' fid=44
+
+## A file this Mac had read, renamed by another machine: the new name's entry has the old file ID, and smbfs opens the node's old name
+1791747742.116 conn 1 QUERY_DIRECTORY 'coherence-1791747741-38546' pattern='renamed.txt' class=37 -> 1 entries
+1791747742.151 changed 5 coherence-1791747741-38546/renamed-to.txt old=coherence-1791747741-38546/renamed.txt 
+1791747742.151 conn 1 LEASE_BREAK 'coherence-1791747741-38546/renamed.txt' 0x3 -> 0x0 ack=True
+1791747742.151 conn 1 CLOSE 'coherence-1791747741-38546/renamed.txt' fid=25
+1791747742.152 conn 1 CREATE 'coherence-1791747741-38546' disp=1 opts=0x1 access=0x100081 ctx= -> fid=53 dir
+1791747742.153 conn 1 QUERY_DIRECTORY 'coherence-1791747741-38546' pattern='renamed.txt' class=37 -> 0 entries
+1791747742.153 conn 1 CREATE '' disp=1 opts=0x1 access=0x100080 ctx=MxAc -> fid=54 dir
+1791747742.153 conn 1 CREATE 'coherence-1791747741-38546' disp=1 opts=0x1 access=0x100081 ctx=RqLs -> fid=55 dir lease=0x3
+1791747742.153 conn 1 QUERY_DIRECTORY 'coherence-1791747741-38546' pattern='*' class=37 -> 10 entries
+1791747742.165 conn 1 CREATE 'coherence-1791747741-38546' disp=1 opts=0x1 access=0x100081 ctx= -> fid=56 dir
+1791747742.165 conn 1 QUERY_DIRECTORY 'coherence-1791747741-38546' pattern='renamed-to.txt' class=37 -> 1 entries
+1791747742.165 conn 1 CREATE 'coherence-1791747741-38546/renamed.txt' disp=1 opts=0x0 access=0x20081 ctx=MxAc,DH2Q,RqLs -> NAME_NOT_FOUND
+1791747742.179 conn 1 CLOSE 'coherence-1791747741-38546/sub/inside.txt' fid=33
+1791747742.179 conn 1 CLOSE 'coherence-1791747741-38546/deleted-open.txt' fid=31
+1791747742.179 conn 1 CLOSE 'coherence-1791747741-38546/deleted.txt' fid=29
+1791747742.179 conn 1 CLOSE 'coherence-1791747741-38546/renamed-open.txt' fid=27
+
+## Logons (auth-server.log): the wrong user and guest are refused; a wrong password is refused unless this user already has a session to 127.0.0.1 as the same name, whose credentials smbfs reuses
+1791747355.444 conn 1 SESSION_SETUP user=spike sid=0x1000 client_mode=1 signed_req=False mic=yes
+1791747355.644 conn 2 SESSION_SETUP logon failure
+1791747355.669 conn 3 SESSION_SETUP logon failure
+1791747355.670 conn 3 SESSION_SETUP logon failure
+1791747357.709 conn 4 SESSION_SETUP user=spike sid=0x1000 client_mode=1 signed_req=False mic=yes
+1791747357.738 conn 5 SESSION_SETUP user=spike sid=0x1000 client_mode=1 signed_req=False mic=yes
+1791747399.053 conn 2 SESSION_SETUP logon failure
+1791747452.455 conn 1 SESSION_SETUP logon failure
