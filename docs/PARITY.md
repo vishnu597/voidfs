@@ -138,7 +138,11 @@ billing or plans), this page says so.
     complete with a release blocker** (10 October): FSKit keeps a name this Mac looked up and
     missed while anything below its folder is in use, and in the drive's top folder until
     remount, so the SMB decision is reopened; SMB's feasibility spike (item 6) comes before the
-    writable mount (item 4).
+    writable mount (item 4). **The SMB spike is done** (12 October, [spike](spikes/smb.md)): the
+    Mac's SMB client shows the names FSKit keeps, in 25–45 ms through the daemon, when the server
+    breaks SMB 3.x directory leases; no existing server fits, so SMB would mean voidfs's own
+    server in the daemon. The user kept FSKit as the default (12 October) and waits for Apple
+    to fix the miss; the writable mount (item 4) is next.
     Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -147,7 +151,7 @@ billing or plans), this page says so.
 |---|---|---|
 | Platform order | **Full Mac parity first** (steps 1–8), then Linux (step 9) | Full Mac parity includes search, previews and video review. Linux servers use S3 and the SDKs until the Linux mount lands |
 | Minimum macOS | **macOS 27** (decided 2026-09-27) | SpaceFS states macOS 26.4 as its minimum; its app bundles declare 26.0. voidfs gives up macOS 26 because only macOS 27 lets a module evict the kernel's caches when another machine changes a file ([spike §5](spikes/fskit.md#5-kernel-caching-and-coherence)) |
-| Mac architecture | Rust daemon and socket, thin Swift XPC bridge, thin FSKit extension | Accepted 2026-10-05. FSKit first; evaluate SMB if its compatibility gate fails. [Step 5 decisions](step-5-macos.md#1-starting-point-and-decisions) |
+| Mac architecture | Rust daemon and socket, thin Swift XPC bridge, thin FSKit extension | Accepted 2026-10-05. FSKit first; evaluate SMB if its compatibility gate fails. [Step 5 decisions](step-5-macos.md#1-starting-point-and-decisions). The adapter was reopened on 2026-10-10 by FSKit's release blocker; the [SMB spike](spikes/smb.md) (2026-10-12) recommended SMB by default with voidfs's own server; the user kept FSKit (2026-10-12) and waits for Apple to fix the pinned miss |
 | Hosting | Self-hosted only | No billing, plans or trials to match. The hosted edge network is matched by deploying near users (step 10) |
 
 ## 3. Scorecard
@@ -222,7 +226,7 @@ The 28 P0 items, which a credible v1 needs:
 | SpaceFS | voidfs today |
 |---|---|
 | S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 55 conformance cases, path or virtual-host addressing, direct uploads where the bucket binds checksums (AWS S3, R2, MinIO and versitygw do), and storage credentials through provider minting with a startup scope check. MinIO, live R2 and live AWS pass. Missing: display names, copy-mode forks |
-| macOS app: writable mount (a loopback SMB server by default since 0.2.333, or FSKit), transfers (pause, resume, speed limits), a disk and a memory cache, pinned files, previews, video reviews, Space Search, Finder badges | Read-only FSKit mount and a menu-bar shell |
+| macOS app: writable mount (a loopback SMB server by default since 0.2.333, or FSKit), transfers (pause, resume, speed limits), a disk and a memory cache, pinned files, previews, video reviews, Space Search, Finder badges | Read-only FSKit mount and a menu-bar shell; an SMB feasibility spike ([spike](spikes/smb.md)) |
 | `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version, and `update` | `void`: drives, drive create/show/delete/undelete, fork, history, show, restore, upload (foreground or daemon-backed with `--detach`), uploads with pause/resume/cancel and a limit, status, daemon run/start/stop/restart/status/info/install/uninstall, and mount/unmount/mounts with remembered mounts. JSON output everywhere. Mounting is read-only FSKit (step 5, item 3); account commands wait for step 6 ([step-4-client.md](step-4-client.md)). |
 | Linux FUSE mount | None (step 9) |
 | Web app: sign-in, settings, access keys, billing | None (billing does not apply) |
@@ -871,7 +875,10 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      sandboxed extension to it, and the app shares the CLI's daemon and store: item 2 is complete.
      The read-only FSKit adapter reads through the daemon and follows other machines' changes:
      item 3 is complete with a release blocker, a name missed while its folder is in use, which
-     reopens the SMB decision before any writable adapter.
+     reopens the SMB decision before any writable adapter. Item 6's SMB feasibility spike is
+     done: the Mac's SMB client shows those names given directory-lease breaks, and voidfs would
+     need its own SMB server ([spike](spikes/smb.md)). The user kept FSKit as the default and
+     waits for Apple to fix the miss.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
@@ -888,7 +895,11 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
-   - **Status (2026-10-10):** items 1–3 of 10 done, item 3 with a release blocker that reopens
+   - **Status (2026-10-12):** items 1–3 of 10 done, item 3 with a release blocker; item 6's SMB
+     feasibility spike done ([step 5](step-5-macos.md#smb-feasibility-spike-12-october)), with SMB
+     by default on voidfs's own server recommended. The user kept FSKit as the default and waits
+     for Apple to fix the pinned miss; item 4, writable FSKit, is next and the blocker stays open.
+     Before that, on 2026-10-10: items 1–3 of 10 done, item 3 with a release blocker that reopens
      the SMB decision ([step 5](step-5-macos.md#the-blocker-a-name-missed-while-its-folder-is-in-use)).
      Before that, on 2026-10-08: item 1 of 10 done; item 2 begun. The mount session has a
      persistent namespace with stable inodes, indexed equivalent-name lookup, per-directory
@@ -981,6 +992,10 @@ plain objects, file locking, offline pinning.
   and the S3 layer from this Mac ([bench/results/space-endpoint](../bench/results/space-endpoint/README.md)).
   Not observed: the web app (share links, previews, video review, audit), its launcher's search,
   and forks and second drives, which its individual plan refuses.
+- **FSKit's pinned miss** (step 5's release blocker): on 2026-10-12 the user kept FSKit as the
+  default and waits for Apple to fix it, rather than build the SMB server the
+  [SMB spike](spikes/smb.md#8-recommendation-fskit-smb-or-both) recommended. A Feedback to Apple
+  is not filed yet.
 - **CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), added 2026-09-29): tests,
   clippy and the spec's cases; the conformance suite, boto3, rclone and the admin endpoints over
   memory, local disk, versitygw and MinIO; the Compose files; and on `main`, the release GC model

@@ -1,0 +1,24 @@
+# Reading media/big.bin (1 GiB) through the daemon-backed SMB mount
+
+## Run 1 (reads.log): spike server without a bound on daemon reads, 512 MiB read twice, then the first 64 MiB compared
+read 512 MiB in 244.21 s: 2 MB/s
+read 512 MiB in 0.07 s: 7693 MB/s
+/tmp/vsmb.tStVSt/mnt/media/big.bin /tmp/vsmb.tStVSt/big.bin differ: char 51380225, line 201081
+READ requests by length: {524288: 700, 262144: 192, 1048576: 124}
+most READs in flight at once: 39
+READs started 1016 answered 1002 ; never answered (MiB): [49, 50, 52, 53, 54, 55, 65, 66, 67, 68, 69, 70, 81, 82]
+READs smbfs sent twice (MiB): [97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112]
+
+## Run 2: the same server, the first 192 MiB read once (readcheck.sh)
+The reader failed: TimeoutError: [Errno 60] Operation timed out
+426 READs answered (median 13 ms, max 86 ms); 6 never answered: MiB 33, 34, 49, 50, 51, 52
+
+## Runs 3-5: daemon reads bounded (SPIKE_DAEMON_READS, default 24), Busy retried, 10 s timeout
+run 3 (bound 24, daemon cache warm): 0 of 192 MiB pieces differ; no timeouts, no Busy
+run 4 (bound 64, warm): 0 of 192 MiB pieces differ; no timeouts, no Busy
+run 5 (bound 64, a fresh daemon, cold): 0 of 192 MiB pieces differ; no timeouts, no Busy; at most 24 READs in flight
+
+## Straight at the daemon (dread3-5, dabandon): no reply ever went missing
+40 concurrent 512 KiB reads, cold: 32 ok, 8 Busy (EAGAIN, 1-2 ms), twice, also reusing the connections
+4 rounds of 32 and of 28 concurrent 1 MiB reads of cold blocks: all ok
+a cold block's first reader dropped after 0, 2, 10 or 50 ms: the other readers and a later one all ok (8 blocks)

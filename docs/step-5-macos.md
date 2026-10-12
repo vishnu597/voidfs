@@ -6,7 +6,7 @@ and shared feeds, guarded publication and retained conflicts added 7 October; re
 advertised capabilities, setting mode and mtime, and recognizing lost replies to edits, renames
 and attribute changes added 8 October; the signed-bundle probe, the rest of the session calls,
 the Swift bridge and one daemon for the CLI and the app added 9 October; read-only FSKit on the
-daemon added 10 October. **Item 1 is complete**
+daemon added 10 October; the SMB feasibility spike added 12 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -17,6 +17,10 @@ CLI's daemon and store, which the user accepted in place of a move into the App 
 the extension reads through the daemon, `void mount` mounts with the `fskit` adapter, and the mount
 follows other machines' changes, except that FSKit keeps a name this Mac missed while its folder
 is in use (and in the top folder until remount), which reopens the SMB decision before item 4.
+**Item 6's SMB feasibility spike is done** ([12 October](#smb-feasibility-spike-12-october)): the
+Mac's SMB client shows those names within milliseconds when the server breaks SMB 3.x directory
+leases, but no existing server fits. The user kept FSKit as the default and waits for Apple to
+fix the miss; item 4 is next.
 The later deliverables remain an implementation plan; no writable adapter, platform service
 installation, new protocol field or format feature is delivered by this slice.*
 
@@ -58,7 +62,7 @@ SMB callbacks remain later work.
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
-| FSKit, SMB or both | **Accepted 5 October: FSKit first, keep the adapter boundary, evaluate SMB only if the compatibility gate fails.** Preserve the native-module decision and the existing spike. **Reopened 10 October** by item 3's release blocker ([a name missed while its folder is in use](#the-blocker-a-name-missed-while-its-folder-is-in-use)): item 6's SMB feasibility spike runs next, before item 4. | SMB first could avoid FSKit-specific cache and entitlement constraints, but needs a reusable SMB server, a license review and proof of Mac semantics. Shipping both now doubles adapter and coherence validation. SpaceFS's default SMB is evidence to evaluate, not evidence that voidfs's SMB adapter already exists. |
+| FSKit, SMB or both | **Accepted 5 October: FSKit first, keep the adapter boundary, evaluate SMB only if the compatibility gate fails.** Preserve the native-module decision and the existing spike. **Reopened 10 October** by item 3's release blocker ([a name missed while its folder is in use](#the-blocker-a-name-missed-while-its-folder-is-in-use)): item 6's SMB feasibility spike runs next, before item 4. **The spike, 12 October** ([SMB spike](spikes/smb.md)): smbfs pins no miss, and with directory leases broken it shows every case of the blocker in 25–45 ms through the daemon; no reusable server fits (licenses, no leases), so SMB means voidfs's own server in the daemon. Recommended there: SMB by default with that server, FSKit kept read-only behind the adapter boundary. **Decided 12 October: FSKit stays the default.** The user chose to wait for Apple to fix the pinned miss rather than build an SMB server; item 4 (writable FSKit) is next, and the blocker stays open. | SMB first could avoid FSKit-specific cache and entitlement constraints, but needs a reusable SMB server, a license review and proof of Mac semantics. Shipping both now doubles adapter and coherence validation. SpaceFS's default SMB is evidence to evaluate, not evidence that voidfs's SMB adapter already exists. |
 | Minimum OS | **Keep macOS 27 for FSKit.** Recheck the final SDK/runtime before release. | Any lower minimum requires a separate coherence strategy and an explicit change to the recorded platform decision. An SMB adapter would need its own measured minimum; it does not automatically lower the app's minimum. |
 | Rust/Swift boundary | **Accepted 5 October: keep the Rust daemon and socket; add a thin Swift XPC bridge for the sandboxed extension.** | A Swift agent embedding Rust through UniFFI follows the original spike, but replaces the now-built daemon host and adds bindings/build work. A direct extension-to-socket path is smaller only if a signed sandbox test proves access and notifications. |
 | Cache and journal ownership | **One daemon owns mutable state; shared cache files are read through leases.** | An extension-owned core repeats state per drive and loses its process on eject. Neither a bridge nor an extension may independently open the writable state database. |
@@ -260,6 +264,12 @@ both were deferred in step 4 and are not implied by this plan.
 
 ### Item 6. App compatibility and the SMB gate
 
+**SMB feasibility spike done, 12 October; the application matrix is not started.** The spike ran
+item 3's coherence cases over the Mac's SMB client, through the daemon's mount core, and checked
+the servers and the checklist below ([SMB feasibility spike](#smb-feasibility-spike-12-october),
+[the spike](spikes/smb.md)). On 12 October the user kept FSKit as the default adapter, so the matrix
+runs on writable FSKit after item 4.
+
 Start this rig alongside item 3, and run it again after item 4. Use Finder, a code repo and
 Premiere, Resolve, Final Cut, Blender and Office on the target macOS. Record app/OS versions,
 operation, resulting bytes/metadata, recoverability and known limitations. Missing paid apps or
@@ -287,7 +297,8 @@ without duplicate services. Store app credentials in the shared Keychain rather 
 JSON file. Do not put secrets in mount URLs, arguments, status output or logs.
 
 Add the privileged helper only for creating/validating mountpoints and mounting/unmounting in
-`/Volumes`. Authenticate the requesting app/user and allow only voidfs's intended resources and
+`/Volumes`. An SMB adapter may not need it: NetFS mounted the spike's loopback share in `/Volumes`
+as the user ([SMB spike §4.7](spikes/smb.md#47-authentication-reach-and-mounting)). Authenticate the requesting app/user and allow only voidfs's intended resources and
 paths, including symlink/race checks; bucket access and journaling stay in the per-user daemon.
 Test authorization failure, helper absence, busy eject, orderly stop and login restoration.
 
@@ -1722,3 +1733,71 @@ passes 56 cases / 432 steps, and the five credential-script tests pass. Local me
 versitygw interoperability passes; boto3 is unavailable locally, and CI supplies it and checks
 MinIO and Docker Compose. `xcodebuild` builds the app, the extension and the probe with no
 warnings in the Swift sources.
+
+### SMB feasibility spike, 12 October
+
+Item 3's blocker made item 6's SMB gate the next step. The spike is written up in
+[docs/spikes/smb.md](spikes/smb.md), with its server, probes and raw output in
+[`bench/results/mac-smb-spike`](../bench/results/mac-smb-spike/README.md). It answers the first
+question, whether the Mac's SMB client shows what FSKit keeps: **yes, given a server that pushes
+changes.** smbfs keeps no miss because something is in use; it drops a folder's cached misses
+when the server breaks the folder's SMB 3.x directory lease, completes a change notification on
+it, or reports a newer folder time.
+
+A spike server written for it (Python, read-only, loopback, NTLMv2 per user) served the daemon's
+mount core through the `/v1/fs` session, turning the watch stream into lease breaks and change
+notifications. The daemon needed no change. Against item 3's results on the same Mac:
+
+| Case, through the daemon | FSKit (item 3) | SMB, the spike's final server |
+|---|---|---|
+| A name missed, then created elsewhere, a sibling held open (`negprobe.py`, `holdprobe.py`) | Not found while anything below the folder is in use | 32–38 ms, every hold |
+| The same in the top folder | Not found until remount | 21–38 ms |
+| An open file renamed or deleted elsewhere: its old name | Still finds it while open | Gone within the 2-second check; 1 ms after a rename (`renameprobe.py`) |
+| An open file overwritten elsewhere: its path while open | The version open (limit) | The version open (limit) |
+| `coherence.py`, three runs | 0 failed, 6 `limit` lines | 0 failed, 2 `limit` lines; median 25 ms, at most 32 ms |
+| A name missed in a folder this Mac never listed and isn't watching | Not found while in use | 2.0–2.8 s (smbfs's timer); 30 s in a folder older than five minutes |
+
+The server has to earn this: each of these was measured to matter.
+
+1. Break directory leases on every change below them, and complete change notifications.
+2. Report folder times that move with changes in the folder. The core keeps a folder at its first
+   object's time and the top folder at 1970, and smbfs drops a miss without a push only when the
+   folder's time advances.
+3. Give a file a new ID when another machine renames it. Otherwise smbfs reopens a file it had
+   read by its old name, and the new name never opens.
+4. Answer a session that holds an older version open with that version, by path too. Otherwise
+   `fstat` on the open file shows the new size while reads return the opened bytes.
+5. Queue its calls to the core below the daemon's 32 and answer every READ. In two early runs some
+   READs went unanswered under smbfs's 24–39 in flight; once the application got wrong bytes with
+   no error. Bounding the calls fixed three later runs, and the cause is not known.
+
+No existing server fits: Samba is GPLv3 over local files; go-smb2 (fuse-t's) is AGPL or
+commercial with leasing switched off; the MIT `smb-server` crate has neither leases nor change
+notifications and needs Rust 1.95; SMBLibrary is .NET; Apple's server is File Sharing. An SMB
+adapter means voidfs's own SMB 3.1.1 server in the daemon, which also needs MD4, RC4 and AES-CMAC,
+not in the workspace today. NetFS mounts such a share in `/Volumes` as the user, without a helper.
+
+| Item 6's SMB gate asks for | Where it is |
+| --- | --- |
+| A contained spike, before choosing SMB as default | `bench/results/mac-smb-spike/smbspike.py`, outside shipped paths; nothing chosen |
+| A maintained reusable server and its license | [Spike §5](spikes/smb.md#5-servers-to-embed-or-run-beside-the-daemon): none fits |
+| Bounded reads, write/flush, xattrs/streams, Unicode/case, rename-over, delete-on-close | Spike §5's checklist: reads bounded and measured; the rest is what voidfs's server must build |
+| Lease, oplock and change-notify hooks | Built and measured: spike §4 and §6 |
+| The macOS SMB client against the same mount core and rig | `coherence.py`, `holdprobe.py`, `negprobe.py` through the daemon's session: spike §4.5 |
+| Loopback with per-user authentication; a remote peer cannot reach it | 127.0.0.1 only, the LAN address refused; NTLMv2 per user, with smbfs reusing a same-host session's credentials within one macOS user: spike §4.7 |
+| Caches, lease breaks and open-handle snapshots under feed changes, measured | Spike §3 and §4 |
+| The chosen default passes the matrix and the two-Mac scenario | Not started: FSKit is the default, and the matrix runs after item 4 |
+
+**Decided 12 October: FSKit stays the default.** The spike recommended SMB by default with
+voidfs's own server, FSKit's read-only adapter kept behind the adapter boundary, and a Feedback to
+Apple for the pinned miss ([spike §8](spikes/smb.md#8-recommendation-fskit-smb-or-both)). The
+user kept FSKit and chose to wait for Apple to fix the miss rather than build an SMB server.
+Item 4, writable FSKit, comes next; item 3's blocker stays open.
+
+Validation: the spike changes no Rust. 719 workspace tests pass (9 ignored), and workspace clippy
+passes with warnings denied. Spec validation passes 56 cases / 432 steps, and the five
+credential-script tests pass. Local memory, fs and versitygw interoperability passes; boto3 is
+unavailable locally, and CI supplies it and checks MinIO and Docker Compose. The spike's server and
+test daemons were stopped and their directories removed; nothing was installed, File Sharing
+stayed off, and `~/Library/Application Support/voidfs` and the `/Applications` build were not
+touched.
