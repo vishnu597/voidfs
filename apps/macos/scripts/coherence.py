@@ -159,12 +159,14 @@ def rename(src, dst, hold):
     data = contents(p)
     fd = open_nocache(p) if hold else None
     at = remote("rename", f"{run}/{src}", f"{run}/{dst}")
-    t = watch(at, {"gone": lambda: not exists(p), "listed": lambda: listed(folder, dst)}, 2.0 if hold else LIMIT)
-    opens = t["listed"] is not None and contents(q) == data
+    # The new name opening is watched for too: a mount can list it before it opens.
+    t = watch(at, {"gone": lambda: not exists(p), "listed": lambda: listed(folder, dst), "opens": lambda: contents(q) == data},
+              2.0 if hold else LIMIT)
+    opens = t["listed"] is not None and t["opens"] is not None
     if not hold:
-        check(f"{src} → {dst}: a rename, a sibling held open, shows within {LIMIT:.0f} s: old name gone ({ms(t['gone'])}), new name listed ({ms(t['listed'])}) and opens", t["gone"] is not None and opens)
+        check(f"{src} → {dst}: a rename, a sibling held open, shows within {LIMIT:.0f} s: old name gone ({ms(t['gone'])}), new name listed ({ms(t['listed'])}) and opens ({ms(t['opens'])})", t["gone"] is not None and opens)
         return
-    check(f"{src} → {dst}: open while renamed, it still reads it; the new name is listed ({ms(t['listed'])}) and opens", read_all(fd) == data and opens)
+    check(f"{src} → {dst}: open while renamed, it still reads it; the new name is listed ({ms(t['listed'])}) and opens ({ms(t['opens'])})", read_all(fd) == data and opens)
     if t["gone"] is None:
         limit(f"{src}: while it is open here, its old name still finds it")
     closed = time.time()
