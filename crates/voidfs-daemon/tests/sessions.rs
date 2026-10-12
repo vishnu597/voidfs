@@ -70,6 +70,16 @@ async fn raw_refused(response: reqwest::Response, status: u16, code: &str, errno
     assert_eq!((error.error.code.as_str(), error.error.errno), (code, errno.errno()));
 }
 
+#[track_caller]
+fn busy<T: std::fmt::Debug>(result: Result<T, FsClientError>, message: &str) {
+    match result {
+        Err(FsClientError::Api { status: 503, code, message: got, errno }) => {
+            assert_eq!((code.as_str(), got.as_str(), errno), ("Busy", message, FsError::Again.errno()));
+        }
+        other => panic!("expected Busy ({message}), got {other:?}"),
+    }
+}
+
 fn route(session: &FsClient, operation: &str) -> String { format!("http://localhost/v1/fs/{}/{operation}", session.info().id) }
 
 fn post(http: &reqwest::Client, session: &FsClient, operation: &str, value: serde_json::Value) -> reqwest::RequestBuilder {
@@ -312,6 +322,31 @@ async fn raw_io_and_page_limits_refuse_work_without_changing_bytes() {
     f.daemon.stop().await;
 }
 
+/// `Busy` is `EAGAIN` with the limit it reached as its message, not the core's `EAGAIN` message
+/// (a listing that raced a change).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_names_the_limit_it_reached() {
+    let f = Fixture::new("busy", &[("data", Bytes::from_static(b"data"))]).await;
+    let session = f.client.session("drive", true).await.unwrap();
+    let ino = session.lookup(session.info().root, "data").await.unwrap().ino;
+    let mut handles = Vec::new();
+    while handles.len() < fs::MAX_HANDLES { handles.push(session.open(ino, false).await.unwrap().fh); }
+    busy(session.open(ino, false).await, &format!("too many handles open in this session (at most {})", fs::MAX_HANDLES));
+    session.close(handles.pop().unwrap()).await.unwrap();
+    handles.push(session.open(ino, false).await.unwrap().fh);
+    let mut watches = Vec::new();
+    while watches.len() < fs::MAX_WATCHES { watches.push(session.watch().await.unwrap()); }
+    busy(session.watch().await, &format!("too many watches open (at most {})", fs::MAX_WATCHES));
+    let mut sessions = vec![session.clone()];
+    while sessions.len() < fs::MAX_SESSIONS { sessions.push(f.client.session("drive", true).await.unwrap()); }
+    busy(f.client.session("drive", true).await, &format!("too many sessions open (at most {})", fs::MAX_SESSIONS));
+    sessions.pop().unwrap().release().await.unwrap();
+    sessions.push(f.client.session("drive", true).await.unwrap());
+    drop(watches);
+    for session in sessions { session.release().await.unwrap(); }
+    f.daemon.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incomplete_request_bodies_consume_call_slots_and_controls_stay_responsive() {
     let f = Fixture::new("admission", &[]).await;
@@ -348,7 +383,9 @@ async fn incomplete_request_bodies_consume_call_slots_and_controls_stay_responsi
             tokio::task::yield_now().await;
         }
     }).await.expect("all incomplete request bodies hold their admission slots");
-    raw_refused(busy, 503, "Busy", FsError::Again).await;
+    assert_eq!(busy.status().as_u16(), 503);
+    let error: fs::FsErrorBody = serde_json::from_slice(&busy.bytes().await.unwrap()).unwrap();
+    assert_eq!((error.error.code.as_str(), error.error.message, error.error.errno), ("Busy", format!("too many calls in flight (at most {})", fs::MAX_CALLS), FsError::Again.errno()));
     tokio::time::timeout(Duration::from_secs(3), f.client.status()).await.expect("status remains responsive when filesystem calls are full").unwrap();
     drop(held);
     until("dropped request bodies return the call permits", async || session.getattr(session.info().root).await.is_ok()).await;

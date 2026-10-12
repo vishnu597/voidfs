@@ -193,7 +193,8 @@ watch stream were enough.
 smbfs read `media/big.bin` in 256 KiB, 512 KiB and 1 MiB READs (8 MiB negotiated, the daemon's
 `maxIo`), with up to **39 in flight** in one run and 24 in another. The daemon allows 32 calls at
 once and answers `Busy` (EAGAIN) beyond, so a server must queue its calls to the daemon. `Busy`
-carries EAGAIN's message, "namespace changed during enumeration; retry", which is about listings.
+carried EAGAIN's message, "namespace changed during enumeration; retry", which is about listings;
+since this was traced it names the limit it reached ("too many calls in flight (at most 32)").
 
 In the first two runs some READs got no reply from the daemon side of the spike (14 of 1,016 and
 6 of 432, clustered in a few 8 MiB blocks). In the first, the application's sequential read

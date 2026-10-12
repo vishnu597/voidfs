@@ -723,7 +723,10 @@ returns `EAGAIN`. Local attribute-only edits preserve page generations.
 
 Admission bounds are 32 active drives, 256 logical sessions, 1,024 handles per consumer, 32
 in-flight calls, 64 watches, 8 MiB binary I/O, 256 directory entries, 64 KiB request JSON and
-1 MiB response JSON. A 64-event broadcast ring never grows for a slow consumer. Events collapse
+1 MiB response JSON. A call refused at the session, handle, call or watch bound, or while the
+daemon stops, is `Busy` (`EAGAIN`) naming that bound or the stop; until 12 October it carried the
+core's `EAGAIN` message, about a listing that raced a change. A 64-event broadcast ring never
+grows for a slow consumer. Events collapse
 to full resync above 64 KiB, 1,024 invalidations or 4,096 inode IDs. Admission happens before
 reading a request body and remains held through owned core work and response transmission;
 long-lived watches use their separate limit. Controls retain their existing admission path.
@@ -1804,3 +1807,15 @@ unavailable locally, and CI supplies it and checks MinIO and Docker Compose. The
 test daemons were stopped and their directories removed; nothing was installed, File Sharing
 stayed off, and `~/Library/Application Support/voidfs` and the `/Applications` build were not
 touched.
+
+**The unanswered READs, later on 12 October.** They were the spike's own: its server started each
+SMB command as a task with no reference, and Python's garbage collector freed READs waiting for
+the daemon's reply (duty 5 above; [spike §4.6](spikes/smb.md#46-reads)). Reproduced without SMB,
+the daemon answered every READ, so its call path is unchanged. Its `Busy` now names the bound it
+reached, or the daemon stopping, instead of the core's `EAGAIN` message about a listing that raced
+a change: `busy_names_the_limit_it_reached` (`voidfs-daemon/tests/sessions.rs`) reaches the handle,
+watch and session bounds, the admission test checks the call bound's message, and both fail on the
+old message. The spike's server now keeps its tasks. Validation: 720 workspace tests pass
+(9 ignored), and workspace clippy passes with warnings denied; spec validation passes 56 cases /
+432 steps, and the five credential-script tests pass. The test daemons used `mktemp` state
+directories, since removed, against a local memory-store server, since stopped.
