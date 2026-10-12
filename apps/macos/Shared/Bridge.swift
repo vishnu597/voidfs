@@ -215,18 +215,20 @@ enum Bridge {
 }
 
 /// One of the daemon's invalidation events: changed object keys and subtrees, the inodes they
-/// touch, or everything (`all`, always with `resync` after a gap or at the start).
+/// touch, or everything (`all`, always with `resync` after a gap or at the start). A `local` one
+/// is a change made on this Mac; the others come from the feed, without this Mac's publications.
 @objc(VoidfsBridgeEvent) final class BridgeEvent: NSObject, NSSecureCoding {
     let generation: UInt64
     let seq: UInt64
     let resync: Bool
+    let local: Bool
     let all: Bool
     let objects: [String]
     let subtrees: [String]
     let inodes: [UInt64]
 
-    init(generation: UInt64, seq: UInt64, resync: Bool, all: Bool, objects: [String], subtrees: [String], inodes: [UInt64]) {
-        (self.generation, self.seq, self.resync, self.all) = (generation, seq, resync, all)
+    init(generation: UInt64, seq: UInt64, resync: Bool, local: Bool = false, all: Bool, objects: [String], subtrees: [String], inodes: [UInt64]) {
+        (self.generation, self.seq, self.resync, self.local, self.all) = (generation, seq, resync, local, all)
         (self.objects, self.subtrees, self.inodes) = (objects, subtrees, inodes)
     }
 
@@ -236,6 +238,7 @@ enum Bridge {
         c.encode(Int64(bitPattern: generation), forKey: "g")
         c.encode(Int64(bitPattern: seq), forKey: "s")
         c.encode(resync, forKey: "r")
+        c.encode(local, forKey: "l")
         c.encode(all, forKey: "a")
         c.encode(objects as NSArray, forKey: "o")
         c.encode(subtrees as NSArray, forKey: "t")
@@ -247,7 +250,7 @@ enum Bridge {
               let subtrees = c.decodeArrayOfObjects(ofClass: NSString.self, forKey: "t") as [String]?,
               let inodes = c.decodeArrayOfObjects(ofClass: NSNumber.self, forKey: "i") else { return nil }
         (self.generation, self.seq) = (UInt64(bitPattern: c.decodeInt64(forKey: "g")), UInt64(bitPattern: c.decodeInt64(forKey: "s")))
-        (self.resync, self.all, self.objects, self.subtrees) = (c.decodeBool(forKey: "r"), c.decodeBool(forKey: "a"), objects, subtrees)
+        (self.resync, self.local, self.all, self.objects, self.subtrees) = (c.decodeBool(forKey: "r"), c.decodeBool(forKey: "l"), c.decodeBool(forKey: "a"), objects, subtrees)
         self.inodes = inodes.map(\.uint64Value)
     }
 }

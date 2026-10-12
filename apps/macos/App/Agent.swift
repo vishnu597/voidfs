@@ -559,7 +559,7 @@ enum Wire {
             default: return nil
             }
         }
-        return BridgeEvent(generation: generation.uint64Value, seq: seq.uint64Value, resync: resync, all: all, objects: objects, subtrees: subtrees, inodes: inodes.map(\.uint64Value))
+        return BridgeEvent(generation: generation.uint64Value, seq: seq.uint64Value, resync: resync, local: o["local"] as? Bool ?? false, all: all, objects: objects, subtrees: subtrees, inodes: inodes.map(\.uint64Value))
     }
 
     /// RFC 3339 in UTC, as the daemon writes it (`Z`, up to nine fraction digits).

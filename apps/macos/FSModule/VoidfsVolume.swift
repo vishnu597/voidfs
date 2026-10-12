@@ -17,6 +17,16 @@ struct VolumeOptions {
     var ioSize = 1 << 20
     var uid = getuid()
     var gid = getgid()
+    /// `mount -r` (FSKit passes it as `-o ro`).
+    var readOnly = false
+    /// What a write open is granted at most.
+    var writeCoherency: FSVolume.KernelCacheCoherencyType = .writeThrough
+    /// Probe knobs (item 4's measurements): a pause before each write is staged, and a log line
+    /// for every data callback.
+    var writeDelay: Duration?
+    var trace = false
+    var readGrant: FSVolume.KernelCacheCoherencyType?
+    var fullWrite = false
 
     mutating func apply(_ args: [String]) {
         var i = 0
@@ -25,15 +35,44 @@ struct VolumeOptions {
             switch args[i] {
             case "-u": uid = uid_t(value) ?? uid; i += 1
             case "-g": gid = gid_t(value) ?? gid; i += 1
+            case "-r": readOnly = true
+            case "-w": readOnly = false
             case "-o":
                 for kv in value.split(separator: ",") {
                     let p = kv.split(separator: "=", maxSplits: 1).map(String.init)
-                    if p.first == "iosize", p.count > 1 { ioSize = Int(p[1]) ?? ioSize }
+                    switch (p.first ?? "", p.count > 1 ? p[1] : nil) {
+                    case ("iosize", let v?): ioSize = Int(v) ?? ioSize
+                    case ("ro", nil), ("rdonly", nil): readOnly = true
+                    case ("rw", nil): readOnly = false
+                    case ("coherency", let v?):
+                        switch v {
+                        case "nocache": writeCoherency = .noCache
+                        case "readcache": writeCoherency = .readCache
+                        case "writethrough": writeCoherency = .writeThrough
+                        case "writeback": writeCoherency = .writeBack
+                        default: break
+                        }
+                    case ("writedelay", let v?): writeDelay = Int(v).map { .milliseconds($0) }
+                    case ("readgrant", let v?):
+                        readGrant = ["nocache": .noCache, "readcache": .readCache, "writethrough": .writeThrough, "writeback": .writeBack][v]
+                    case ("trace", _): trace = true
+                    case ("fullwrite", _): fullWrite = true
+                    default: break
+                    }
                 }
                 i += 1
             default: break
             }
             i += 1
+        }
+    }
+
+    /// What the kernel gets for `requested`, at most `ceiling`, as the cache modes allow.
+    static func grant(_ requested: FSVolume.DataCacheMode, ceiling: FSVolume.KernelCacheCoherencyType) -> FSVolume.KernelCacheCoherencyType {
+        switch requested {
+        case .readWriteWithCache: return ceiling
+        case .readWithCache: return ceiling == .noCache ? .noCache : .readCache
+        default: return .noCache
         }
     }
 }
@@ -107,13 +146,15 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     /// Revokes run in order, here and nowhere else.
     private let revokes = DispatchQueue(label: "dev.voidfs.fs.revoke")
+    private let pushes = DispatchQueue(label: "dev.voidfs.fs.push", attributes: .concurrent)
     private static let listingLimit = 200_000
     private static let missesLimit = 200_000
 
-    init(client: BridgeClient, session: BridgeSession, drive: String, volumeID: FSVolume.Identifier) {
+    init(client: BridgeClient, session: BridgeSession, drive: String, options: VolumeOptions, volumeID: FSVolume.Identifier) {
         self.client = client
         self.session = session
         self.drive = drive
+        self.options = options
         root = session.info.root
         rootItem = VoidfsItem(ino: root, id: .rootDirectory, parent: 0, kind: .folder)
         let capabilities = (try? JSONSerialization.jsonObject(with: session.info.capabilities)) as? [String: Any]
@@ -133,7 +174,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     var truncatesLongNames: Bool { false }
     var maximumXattrSize: Int { Bridge.maxXattr }
     var maximumFileSize: UInt64 { 5 << 40 }
-    var requestedMountOptions: FSVolume.MountOptions { .readOnly }
+    var requestedMountOptions: FSVolume.MountOptions { options.readOnly ? .readOnly : [] }
 
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let c = FSVolume.SupportedCapabilities()
@@ -144,7 +185,8 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         c.supportsPersistentObjectIDs = true
         c.supportsFastStatFS = true
         c.supportsHiddenFiles = true
-        c.doesNotSupportSettingFilePermissions = true
+        c.supportsSparseFiles = true
+        c.doesNotSupportSettingFilePermissions = false
         c.caseFormat = caseSensitive ? .sensitive : .insensitive
         return c
     }
@@ -165,8 +207,23 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     // MARK: - Life cycle
 
+    /// The mount's options arrive here, not at load: the session `loadResource` opened is
+    /// read-only, and a writable mount replaces it with a writable one now.
     func activate(options taskOptions: FSTaskOptions) async throws -> FSActivateResult {
         options.apply(taskOptions.taskOptions)
+        if !options.readOnly {
+            let s = try await client.open(drive: drive, readOnly: false)
+            guard s.info.root == root else {
+                try? await s.release()
+                throw Bridge.error(ESTALE, "OtherDrive", "the drive's root changed: mount it again")
+            }
+            s.listen { [weak self, weak s] event in
+                guard let self, let s else { return }
+                self.relay(event, from: s)
+            }
+            let old: BridgeSession = lock.withLock { defer { session = s }; return session }
+            try? await old.release()
+        }
         log.notice("activate \(taskOptions.taskOptions, privacy: .public): drive \(self.drive, privacy: .public), root inode \(self.root); wanted attributes: lookup \(String(FSLookupItemResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public), getattr \(String(FSGetAttributesResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public), read \(String(FSReadFileResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public)")
         return FSActivateResult(rootItem: rootItem)!
     }
@@ -217,7 +274,9 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         }
     }
 
-    func synchronize(flags: FSSyncFlags) async throws {}
+    func synchronize(flags: FSSyncFlags) async throws {
+        log.notice("synchronize flags \(flags.rawValue)")
+    }
 
     // MARK: - The session
 
@@ -242,7 +301,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     private func reconnect() async throws -> BridgeSession {
         do {
-            let s = try await client.open(drive: drive, readOnly: true)
+            let s = try await client.open(drive: drive, readOnly: options.readOnly)
             guard s.info.root == root else {
                 try? await s.release()
                 throw Bridge.error(ESTALE, "OtherDrive", "the drive's root changed: mount it again")
@@ -320,13 +379,28 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
             offline = false
             return true
         }
+        let local = event.local && !event.resync && !event.all
         if back { log.notice("the feed delivered changes again at sequence \(event.seq): the mount is current again") }
         if event.resync || event.all {
             // The feed reconnected or lost track: a missed generation means relisting everything.
             resync("resync at generation \(event.generation)")
             return
         }
-        invalidate(event)
+        if options.trace { log.notice("event \(local ? "local" : "remote", privacy: .public) seq \(event.seq) gen \(event.generation) inodes \(event.inodes, privacy: .public) objects \(event.objects, privacy: .public)") }
+        if local { changedHere(event) } else { invalidate(event) }
+    }
+
+    /// A change made on this Mac, through any session of the drive's core: everything already
+    /// shows it (the core's shared local view), so nothing is revoked. Listings that name it go,
+    /// and open files read their attributes again.
+    private func changedHere(_ event: BridgeEvent) {
+        lock.withLock {
+            epoch += 1
+            for ino in event.inodes {
+                if let l = listings.removeValue(forKey: ino) { listed -= l.names.count }
+                for item in open.values where item.ino == ino { item.stale = true }
+            }
+        }
     }
 
     /// Makes the kernel forget what `event` names. Changed files and symbolic links are retired and
@@ -531,10 +605,30 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         }
     }
 
-    /// An open incarnation's attributes are those bound at open; others are current.
+    /// An open incarnation's attributes are those bound at open, as this Mac's changes leave them
+    /// (the core's shared local view); others are current.
     private func attr(_ item: VoidfsItem) async throws -> BridgeAttr {
-        if let h = lock.withLock({ item.handle }) { return h.attr }
-        return try await call { try await $0.getattr(item.ino) }
+        let (h, stale) = lock.withLock { (item.handle, item.stale) }
+        guard let h else { return try await call { try await $0.getattr(item.ino) } }
+        guard stale else { return h.attr }
+        lock.withLock { item.stale = false }
+        do {
+            let a = try await h.session.handleAttr(h.fh)
+            settle(item, h, a)
+            return a
+        } catch {
+            lock.withLock { item.stale = true }
+            if Bridge.errno(error) == ESTALE || Bridge.errno(error) == EBADF { return h.attr }
+            throw failure(error)
+        }
+    }
+
+    /// Keeps `a` as the attributes of the item's handle `h`, if it still has it.
+    private func settle(_ item: VoidfsItem, _ h: OpenFile, _ a: BridgeAttr) {
+        lock.withLock {
+            guard item.handle?.fh == h.fh, item.handle?.session === h.session else { return }
+            item.handle?.attr = a
+        }
     }
 
     func lookupItem(named name: FSFileName, in directory: FSItem, context: FSContext) async throws -> FSLookupItemResult {
@@ -661,45 +755,85 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         return FSReadSymlinkResult(contents: FSFileName(string: target ?? ""), symlinkAttributes: attributes(a, parent: lock.withLock { item.parent }))!
     }
 
-    // MARK: - Opens and reads
+    // MARK: - Opens, reads and writes
 
-    /// The incarnation's daemon handle: opened at its first open (or read), bound to the version
-    /// current then, and kept until the kernel closes or reclaims it.
-    private func handle(_ item: VoidfsItem) async throws -> OpenFile {
-        let task: Task<OpenFile, Error> = lock.withLock {
-            if let h = item.handle { return Task { h } }
-            if let t = item.opening { return t }
-            let t = Task {
-                do {
-                    let f = try await self.call { s in
-                        let (fh, a) = try await s.open(item.ino, write: false)
-                        return OpenFile(fh: fh, attr: a, session: s)
-                    }
-                    self.lock.withLock {
-                        item.handle = f
-                        item.opening = nil
-                        self.open[ObjectIdentifier(item)] = item
-                    }
-                    return f
-                } catch {
-                    self.lock.withLock { item.opening = nil }
-                    throw error
+    /// The incarnation's daemon handle: opened at its first open (or read), and kept until the
+    /// kernel closes or reclaims it. A write open, or a write that arrives without one (pages
+    /// pushed after the last close), turns it into a writable handle. Its version may be newer
+    /// than the read handle's, by this Mac's own publications: what the kernel caches is still
+    /// what the core shows. A retired incarnation (another computer's version replaced it, or it
+    /// was removed here) gets no new handle: its cached pages are not of what the core shows.
+    private func handle(_ item: VoidfsItem, write: Bool = false) async throws -> OpenFile {
+        while true {
+            let task: Task<OpenFile, Error> = try lock.withLock {
+                if let h = item.handle, h.write || !write { return Task { h } }
+                if let t = item.opening { return t }
+                if item.retired, write {
+                    log.error("write \(item.ino): the file was replaced or removed since the kernel cached it; refused")
+                    throw posix(ESTALE)
                 }
+                let old = item.handle
+                let t = Task {
+                    do {
+                        let f = try await self.call { s in
+                            let (fh, a) = try await s.open(item.ino, write: write)
+                            return OpenFile(fh: fh, attr: a, session: s, write: write)
+                        }
+                        self.lock.withLock {
+                            item.handle = f
+                            item.opening = nil
+                            item.stale = old != nil
+                            self.open[ObjectIdentifier(item)] = item
+                        }
+                        if let old { try? await old.session.close(old.fh) }
+                        return f
+                    } catch {
+                        self.lock.withLock { item.opening = nil }
+                        throw error
+                    }
+                }
+                item.opening = t
+                return t
             }
-            item.opening = t
-            return t
+            let f = try await task.value
+            if f.write || !write { return f }
         }
-        return try await task.value
     }
 
     func open(_ item: FSItem, modes: FSVolume.OpenModes, cacheMode: FSVolume.DataCacheMode, context: FSContext) async throws -> FSOpenItemResult {
         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
-        if modes.contains(.write) { throw posix(EROFS) }
-        if item.kind == .file { _ = try await handle(item) }
+        let write = modes.contains(.write)
+        if write && options.readOnly { throw posix(EROFS) }
+        if item.kind == .file, lock.withLock({ item.mapped }) { await push(item) }
+        if item.kind == .file { _ = try await handle(item, write: write) }
         // A folder's listing is the extension's to cache (`listings`, kept by the relay): the
         // kernel's, once granted, outlives every revoke of the top folder (see `revoke`).
-        if item.kind == .folder { return FSOpenItemResult(grantedCoherency: .noCache) }
-        return FSOpenItemResult(grantedCoherency: cacheMode == .none ? .noCache : .readCache)
+        let granted: FSVolume.KernelCacheCoherencyType
+        if item.kind == .folder { granted = .noCache }
+        else if write { granted = VolumeOptions.grant(cacheMode, ceiling: options.writeCoherency) }
+        else if let g = options.readGrant { granted = g }
+        else { granted = cacheMode == .none ? .noCache : .readCache }
+        if options.trace { log.notice("open \(item.ino) modes \(modes.rawValue) cache \(cacheMode.rawValue) granted \(granted.rawValue)") }
+        return FSOpenItemResult(grantedCoherency: granted)
+    }
+
+    /// Pushes the kernel's dirty pages of `item` to `write`. Measured on macOS 27.0.1, with every
+    /// grant and with kernel caching left to FSKit: once a shared mapping's pages are pushed with
+    /// no descriptor open (msync after close), the mapping's later stores are dropped at the next
+    /// open of the file unless something pushed them first (sync(2), the periodic sync, unmount).
+    /// So that open pushes them first.
+    private func push(_ item: VoidfsItem) async {
+        let start = ContinuousClock.now
+        let ceiling = options.writeCoherency
+        let error: Error? = await withCheckedContinuation { done in
+            pushes.async { done.resume(returning: self.setCacheState(for: item, cacheMode: .readWriteWithCache, coherencyType: ceiling, action: .push)) }
+        }
+        if let error {
+            let e = error as NSError
+            log.error("push \(item.ino) before an open failed, a mapping's latest stores may be lost: \(e.domain, privacy: .public) \(e.code)")
+        } else if options.trace {
+            log.notice("push \(item.ino) before an open, in \(ContinuousClock.now - start, privacy: .public)")
+        }
     }
 
     func close(_ item: FSItem, context: FSContext) async {
@@ -709,17 +843,26 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
             defer { item.handle = nil }
             return item.handle
         }
-        if let handle { try? await handle.session.close(handle.fh) }
+        let start = ContinuousClock.now
+        if let handle {
+            do { try await handle.session.close(handle.fh) }
+            catch { log.error("close \(item.ino): \(error.localizedDescription, privacy: .public)") }
+        }
+        if options.trace { log.notice("close \(item.ino) \(handle?.write == true ? "writable" : "read", privacy: .public) in \(ContinuousClock.now - start, privacy: .public)") }
         released(item)
     }
 
     func upgrade(_ item: FSItem, cacheMode: FSVolume.DataCacheMode, context: FSContext) async throws -> FSUpgradeItemResult {
-        FSUpgradeItemResult(grantedCoherency: cacheMode == .none ? .noCache : .readCache)
+        let write = (item as? VoidfsItem).flatMap { i in lock.withLock { i.handle?.write } } ?? false
+        let granted = write ? VolumeOptions.grant(cacheMode, ceiling: options.writeCoherency) : cacheMode == .none ? .noCache : .readCache
+        if options.trace { log.notice("upgrade \((item as? VoidfsItem)?.ino ?? 0) cache \(cacheMode.rawValue) granted \(granted.rawValue)") }
+        return FSUpgradeItemResult(grantedCoherency: granted)
     }
 
     func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> FSReadFileResult {
         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
         var f = try await handle(item)
+        if lock.withLock({ item.stale }) { f.attr = try await attr(item) }
         let parent = lock.withLock { item.parent }
         guard offset >= 0, UInt64(offset) < f.attr.size else { return FSReadFileResult(bytesRead: 0, itemAttributes: attributes(f.attr, parent: parent))! }
         let n = UInt64(min(length, buffer.length, Int(f.attr.size - UInt64(offset))))
@@ -742,14 +885,61 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         return FSReadFileResult(bytesRead: copied, itemAttributes: attributes(f.attr, parent: parent))!
     }
 
+    /// Stages the bytes in the daemon's core: the write is acknowledged once they survive a crash
+    /// of this process, the agent or the daemon (step 5 §1).
+    func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> FSWriteFileResult {
+        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
+        if options.readOnly { throw posix(EROFS) }
+        guard offset >= 0 else { throw posix(EINVAL) }
+        let start = ContinuousClock.now
+        if let delay = options.writeDelay { try? await Task.sleep(for: delay) }
+        let opened = lock.withLock { item.handle?.write == true }
+        var f = try await handle(item, write: true)
+        if !opened {
+            lock.withLock { item.mapped = true }
+            log.notice("write \(item.ino) @\(offset)+\(contents.count) without a write open: a writable handle opened for it")
+        }
+        var a: BridgeAttr
+        do {
+            if !f.session.isWatching { f = try await reopen(item, f) }
+            do {
+                a = try await stage(f, offset, contents)
+            } catch let error where Bridge.errno(error) == ESTALE && !f.session.isWatching {
+                f = try await reopen(item, f)
+                a = try await stage(f, offset, contents)
+            }
+        } catch {
+            log.error("write \(item.ino) @\(offset)+\(contents.count): \(error.localizedDescription, privacy: .public)")
+            throw failure(error)
+        }
+        settle(item, f, a)
+        if options.trace { log.notice("write \(item.ino) @\(offset)+\(contents.count) staged in \(ContinuousClock.now - start, privacy: .public), size \(a.size)") }
+        return FSWriteFileResult(bytesWritten: contents.count, itemAttributes: attributes(a, parent: lock.withLock { item.parent }), freeSpace: FSFreeSpace.noUpdate)!
+    }
+
+    /// Writes `data` at `offset` in pieces of at most `maxIo`, and returns the attributes after.
+    private func stage(_ f: OpenFile, _ offset: off_t, _ data: Data) async throws -> BridgeAttr {
+        let max = Int(f.session.info.maxIo)
+        var at = 0
+        while at < data.count {
+            let piece = data.subdata(in: at..<min(at + max, data.count))
+            let n = try await f.session.write(f.fh, offset: UInt64(offset) + UInt64(at), data: piece)
+            guard n == piece.count else { throw posix(EIO) }
+            at += n
+        }
+        if options.fullWrite { try await f.session.fsync(f.fh) }
+        return try await f.session.handleAttr(f.fh)
+    }
+
     private func reopen(_ item: VoidfsItem, _ old: OpenFile) async throws -> OpenFile {
         let f = try await call { s in
-            let (fh, a) = try await s.open(item.ino, write: false)
-            return OpenFile(fh: fh, attr: a, session: s)
+            let (fh, a) = try await s.open(item.ino, write: old.write)
+            return OpenFile(fh: fh, attr: a, session: s, write: old.write)
         }
-        guard f.attr.objectId == old.attr.objectId, f.attr.versionId == old.attr.versionId, f.attr.size == old.attr.size else {
+        // A writable handle's own staged bytes outlive the daemon; its size is theirs.
+        guard f.attr.objectId == old.attr.objectId, f.attr.versionId == old.attr.versionId, old.write || f.attr.size == old.attr.size else {
             try? await f.session.close(f.fh)
-            log.notice("read \(item.ino): its version changed while the daemon was away; the open file is stale")
+            log.notice("\(old.write ? "write" : "read", privacy: .public) \(item.ino): its version changed while the daemon was away; the open file is stale")
             throw posix(ESTALE)
         }
         let kept = lock.withLock { () -> Bool in
@@ -776,37 +966,140 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         return FSGetXattrResult(xattrValue: try await call { try await $0.getxattr(item.ino, n) })!
     }
 
+    /// Every name is stored, so the kernel never falls back to AppleDouble `._` files.
     func setXattr(named name: FSFileName, to value: Data?, on item: FSItem, policy: FSVolume.SetXattrPolicy, context: FSContext) async throws -> FSSetXattrResult {
-        throw posix(EROFS)
+        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
+        if options.readOnly { throw posix(EROFS) }
+        guard let n = name.string else { throw posix(EINVAL) }
+        if options.trace { log.notice("setxattr \(item.ino) \(n, privacy: .public) policy \(policy.rawValue) \(value?.count ?? -1) bytes") }
+        if policy == .delete {
+            try await call { try await $0.removexattr(item.ino, n) }
+        } else {
+            guard let value else { throw posix(EINVAL) }
+            let how = policy == .mustCreate ? 1 : policy == .mustReplace ? 2 : 0
+            try await call { try await $0.setxattr(item.ino, n, value, how: how) }
+        }
+        lock.withLock { item.stale = item.handle != nil }
+        return FSSetXattrResult(freeSpace: FSFreeSpace.noUpdate)!
     }
 
-    // MARK: - Everything that would write (item 4)
+    // MARK: - Names and attributes changed here
+
+    /// Forgets the listings of `folders` before and after a change of this volume's, so that no
+    /// listing fetched across it is kept (the relay's event for it may come later).
+    private func changing<T>(_ folders: [UInt64], _ body: () async throws -> T) async throws -> T {
+        func forget() {
+            lock.withLock {
+                epoch += 1
+                for ino in folders { if let l = listings.removeValue(forKey: ino) { listed -= l.names.count } }
+            }
+        }
+        forget()
+        defer { forget() }
+        return try await body()
+    }
+
+    private func folderAttributes(_ dir: VoidfsItem) async throws -> FSItem.Attributes {
+        attributes(try await call { try await $0.getattr(dir.ino) }, parent: lock.withLock { dir.parent })
+    }
 
     func createItem(named name: FSFileName, type: FSItem.ItemType, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, context: FSContext) async throws -> FSCreateItemResult {
-        throw posix(EROFS)
+        guard let dir = directory as? VoidfsItem else { throw posix(EINVAL) }
+        if options.readOnly { throw posix(EROFS) }
+        guard let n = name.string else { throw posix(EINVAL) }
+        guard type == .file || type == .directory else { throw posix(ENOTSUP) }
+        let folder = type == .directory
+        let mode = newAttributes.isValid(.mode) ? newAttributes.mode & 0o7777 : folder ? 0o755 : 0o644
+        var a = try await changing([dir.ino]) { try await call { try await $0.create(dir.ino, n, mode: mode, directory: folder) } }
+        var consumed: FSItem.Attribute = newAttributes.isValid(.mode) ? [.mode] : []
+        if newAttributes.isValid(.modifyTime) {
+            let t = newAttributes.modifyTime
+            a = try await call { try await $0.setattr(a.ino, mtime: (Int64(t.tv_sec), Int32(t.tv_nsec))) }
+            consumed.insert(.modifyTime)
+        }
+        newAttributes.consumedAttributes = consumed
+        if options.trace { log.notice("create \(folder ? "folder" : "file", privacy: .public) \(a.ino) in \(dir.ino) mode \(String(mode, radix: 8), privacy: .public) asked \(newAttributes.isValid(.size) ? "size " : "", privacy: .public)\(newAttributes.isValid(.uid) ? "uid " : "", privacy: .public)\(newAttributes.isValid(.flags) ? "flags " : "", privacy: .public)\(newAttributes.isValid(.birthTime) ? "birth " : "", privacy: .public)") }
+        let item = incarnation(a, parent: dir.ino)
+        return FSCreateItemResult(newItem: item, newItemName: name, newItemAttributes: attributes(a, parent: dir.ino), directoryAttributes: try await folderAttributes(dir), freeSpace: FSFreeSpace.noUpdate)!
     }
 
     func createSymbolicLink(named name: FSFileName, in directory: FSItem, attributes newAttributes: FSItem.SetAttributesRequest, linkContents contents: FSFileName, context: FSContext) async throws -> FSCreateSymlinkResult {
-        throw posix(EROFS)
+        if options.readOnly { throw posix(EROFS) }
+        throw posix(ENOTSUP)
     }
 
     func createLink(to item: FSItem, named name: FSFileName, in directory: FSItem, context: FSContext) async throws -> FSCreateLinkResult {
-        throw posix(EROFS)
+        guard let item = item as? VoidfsItem, let dir = directory as? VoidfsItem, let n = name.string else { throw posix(EINVAL) }
+        if options.readOnly { throw posix(EROFS) }
+        // Refused by the core (`ENOTSUP`): one error mapping for every callback.
+        let a = try await call { try await $0.link(item.ino, dir.ino, n) }
+        return FSCreateLinkResult(linkName: name, linkAttributes: attributes(a, parent: dir.ino), directoryAttributes: try await folderAttributes(dir), freeSpace: FSFreeSpace.noUpdate)!
     }
 
     func renameItem(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName, to destinationName: FSFileName, inDirectory destinationDirectory: FSItem, overItem: FSItem?, context: FSContext) async throws -> FSRenameItemResult {
-        throw posix(EROFS)
+        guard let item = item as? VoidfsItem, let from = sourceDirectory as? VoidfsItem, let to = destinationDirectory as? VoidfsItem,
+              let fromName = sourceName.string, let toName = destinationName.string else { throw posix(EINVAL) }
+        if options.readOnly { throw posix(EROFS) }
+        let over = overItem as? VoidfsItem
+        var overAttr: BridgeAttr?
+        if let over { overAttr = try await attr(over) }
+        if options.trace { log.notice("rename \(item.ino) \(from.ino)/\(fromName, privacy: .public) → \(to.ino)/\(toName, privacy: .public) over \(over?.ino ?? 0)") }
+        try await changing([from.ino, to.ino]) { try await call { try await $0.rename(from.ino, fromName, to.ino, toName) } }
+        lock.withLock {
+            item.parent = to.ino
+            item.stale = item.handle != nil
+            if let over { retire(over) }
+        }
+        return FSRenameItemResult(newName: destinationName, renamedItemAttributes: attributes(try await attr(item), parent: to.ino),
+                                  sourceDirectoryAttributes: try await folderAttributes(from), destinationDirectoryAttributes: try await folderAttributes(to),
+                                  overItemAttributes: overAttr.map { attributes($0, parent: to.ino) }, freeSpace: FSFreeSpace.noUpdate)!
     }
 
+    /// The name goes; the item stays readable and writable through descriptors opened before
+    /// (the core keeps an unlinked file's bytes until its last handle closes).
     func removeItem(_ item: FSItem, named name: FSFileName, from directory: FSItem, context: FSContext) async throws -> FSRemoveItemResult {
-        throw posix(EROFS)
+        guard let item = item as? VoidfsItem, let dir = directory as? VoidfsItem, let n = name.string else { throw posix(EINVAL) }
+        if options.readOnly { throw posix(EROFS) }
+        let before = try await attr(item)
+        if options.trace { log.notice("remove \(item.ino) \(dir.ino)/\(n, privacy: .public)") }
+        try await changing([dir.ino, item.ino]) { try await call { try await $0.remove(dir.ino, n, directory: item.kind == .folder) } }
+        lock.withLock { retire(item) }
+        return FSRemoveItemResult(itemAttributes: attributes(before, parent: dir.ino), directoryAttributes: try await folderAttributes(dir), freeSpace: FSFreeSpace.noUpdate)!
     }
 
+    /// Size through the item's writable handle (one is opened if the file isn't open for
+    /// writing), and mode and modification time through the core's `setattr`. Ownership, flags
+    /// and the other times aren't stored: they aren't consumed, and FSKit answers for them.
     func setAttributes(_ newAttributes: FSItem.SetAttributesRequest, on item: FSItem, context: FSContext) async throws -> FSSetAttributesResult {
-        throw posix(EROFS)
-    }
-
-    func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> FSWriteFileResult {
-        throw posix(EROFS)
+        guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
+        if options.readOnly { throw posix(EROFS) }
+        var consumed: FSItem.Attribute = []
+        if newAttributes.isValid(.size) {
+            if item.kind == .file {
+                let f = try await handle(item, write: true)
+                try await f.session.truncate(f.fh, size: newAttributes.size)
+                lock.withLock { item.stale = true }
+            }
+            consumed.insert(.size)
+        }
+        let mode = newAttributes.isValid(.mode) ? newAttributes.mode & 0o7777 : nil
+        let t = newAttributes.isValid(.modifyTime) ? newAttributes.modifyTime : nil
+        if mode != nil || t != nil {
+            let a = try await call { try await $0.setattr(item.ino, mode: mode, mtime: t.map { (Int64($0.tv_sec), Int32($0.tv_nsec)) }) }
+            if mode != nil { consumed.insert(.mode) }
+            if t != nil { consumed.insert(.modifyTime) }
+            lock.withLock { item.stale = item.handle != nil }
+            if lock.withLock({ item.handle == nil }) {
+                newAttributes.consumedAttributes = consumed
+                return FSSetAttributesResult(attributes: attributes(a, parent: lock.withLock { item.parent }), freeSpace: FSFreeSpace.noUpdate)!
+            }
+        }
+        if options.trace {
+            let asked = [(FSItem.Attribute.size, "size"), (.mode, "mode"), (.uid, "uid"), (.gid, "gid"), (.flags, "flags"), (.accessTime, "atime"), (.modifyTime, "mtime"), (.changeTime, "ctime"), (.birthTime, "birth"), (.backupTime, "backup"), (.addedTime, "added")]
+                .filter { newAttributes.isValid($0.0) }.map(\.1).joined(separator: " ")
+            log.notice("setattr \(item.ino): \(asked, privacy: .public)")
+        }
+        newAttributes.consumedAttributes = consumed
+        return FSSetAttributesResult(attributes: attributes(try await attr(item), parent: lock.withLock { item.parent }), freeSpace: FSFreeSpace.noUpdate)!
     }
 }
