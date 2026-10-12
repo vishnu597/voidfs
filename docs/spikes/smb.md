@@ -3,7 +3,8 @@
 *2026-10-11 and 12. MacBook Pro, Apple M5 Pro; macOS 27.0.1 (26A434), smbfs 7.0, no `nsmb.conf`.
 Server: this spike's own SMB 2.1/3.1.1 server (Python) on 127.0.0.1, over a local folder or the
 daemon's mount core; release `voidfs-server` (memory store) and `void daemon` built from main at
-8f1589d.*
+8f1589d. The unanswered READs (§4.6) were traced later on 12 October, without SMB, against
+`void daemon` built from main at 37c29be.*
 
 Step 5's item 3 ended with a release blocker: FSKit keeps a name this Mac looked up and missed
 while anything below its folder is in use, and in the drive's top folder until remount
@@ -46,10 +47,10 @@ can be embedded beside the Rust daemon. Raw output is in
 - **Mac plumbing works:** NTLMv2 per user, bound to loopback (the LAN address is refused);
   `NetFSMountURLSync` mounts into **`/Volumes` as the user, with no privileged helper**; smbfs sends
   Apple's AAPL create context on its first open.
-- **Open problem, read path:** smbfs kept up to 39 READs in flight, over the daemon's 32 calls.
-  In two runs some READs got no reply; in one of them the application read wrong bytes **without
-  an error**. Bounding the server's daemon reads fixed it in three later runs; the cause was not
-  found (§4.6).
+- **Read path:** smbfs kept up to 39 READs in flight, over the daemon's 32 calls, so a server must
+  queue them. In two runs some READs got no reply; in one of them the application read wrong bytes
+  **without an error**. The spike lost those READs: Python's garbage collector freed READ tasks the
+  server kept no reference to while they waited, and the daemon answered every one (§4.6).
 - **Recommendation (§8): SMB by default, with voidfs's own server; FSKit kept behind the adapter
   boundary, read-only, until Apple fixes the miss.** **Decided 12 October: the user kept FSKit as
   the default and waits for Apple to fix the miss**; no SMB server is built.
@@ -191,16 +192,54 @@ watch stream were enough.
 
 smbfs read `media/big.bin` in 256 KiB, 512 KiB and 1 MiB READs (8 MiB negotiated, the daemon's
 `maxIo`), with up to **39 in flight** in one run and 24 in another. The daemon allows 32 calls at
-once and answers `Busy` (EAGAIN) beyond, so a server must queue its calls to the daemon.
+once and answers `Busy` (EAGAIN) beyond, so a server must queue its calls to the daemon. `Busy`
+carries EAGAIN's message, "namespace changed during enumeration; retry", which is about listings.
 
 In the first two runs some READs got no reply from the daemon side of the spike (14 of 1,016 and
 6 of 432, clustered in a few 8 MiB blocks). In the first, the application's sequential read
 completed **without an error, but the bytes from 49 MiB, the first unanswered READ, differed from
 the file**; in the second, the read failed with `ETIMEDOUT`. With the spike's daemon reads
 bounded to 24, `Busy` retried and a 10 s timeout, three runs (one with a fresh daemon and a cold
-cache, one unbounded) matched the file in full with no timeout. Straight against the daemon,
-40 concurrent cold reads, reused connections and a dropped first reader never lost a reply. Which
-side hung is **not known**, and why smbfs returned bytes for an unanswered READ is not known either.
+cache, one unbounded) matched the file in full with no timeout.
+
+**The spike lost those READs; the daemon answered every one.** The spike started each SMB command
+as a task (`asyncio.ensure_future`) and kept no reference to it. The event loop holds tasks
+weakly, and a client stream's protocol holds its `StreamReader` weakly (Python 3.8 on), so a READ
+waiting for the daemon's reply was reachable only from itself: task, coroutine, reader, the
+reader's waiter, task. Python's cycle collector freed such READs while they waited ("Task was
+destroyed but it is pending!"), and smbfs never got their replies. The longer a READ waited, the
+likelier a collection caught it, and unbounded they waited long: 39 in flight against the
+daemon's 32 calls, each handle's reads taken one at a time by the core, and some waiting for a
+cold block, which fits the clusters. The 10 s `wait_for` fixed it by accident, because the loop
+holds its timer and the timer holds the task; the bound alone did not.
+
+Reproduced without SMB on 12 October, on fresh daemons (cold), with READs of 256 KiB–1 MiB on one
+handle, 39 in flight, and each `Busy` sent again (`lostreads.py` and `lostreads_conn.py`, output in
+`reads.txt`):
+
+| The unbounded spike's READ (`DaemonBackend._request`, no timeout), as a task with no reference | Never answered |
+|---|---|
+| The GC as it runs, each READ costing what the SMB side's did (2,000 objects, 60 ms) | 36 of 349 |
+| The GC as it runs, little work per READ (1.5 s in all) | 0 of 349 |
+| `gc.collect()` every 50 ms | 39, then stalled |
+| The same, bounded to 24 without the timeout | 39, then stalled |
+| The same with `wait_for`, with the server's `DaemonBackend.read`, or with the tasks kept | 0 of 349 |
+| The spike's own `Conn.run` fed READ frames, `gc.collect()` every 50 ms: as run, and with its tasks kept | 39 then stalled; 0 of 349 |
+
+Each lost READ was a task destroyed while pending. The daemon's replies to them arrived after
+their readers were gone: on every such connection, the bytes received parse as complete replies,
+nothing missing. Straight at the daemon with every task kept (`daemonreads.py`), six cold runs:
+8,441 READs, sent again after 1,164 `Busy` answers, and 634 getattrs, over 1–8 handles, 39–64 in
+flight, with slow readers in two runs. Every call was answered, every byte matched, and all 32
+call slots were free after each run.
+
+The SMB runs' own stderr, where Python reports a task destroyed while pending, went with their
+scratch directory, so the cause rests on this reproduction: the same code path loses READs the
+same way, the daemon loses none, and the change that ended the SMB runs' losses is the one that
+ends them here. The server now keeps its tasks (`Conn.spawn`); its other daemon calls, which have
+no timeout, were exposed too. Why smbfs handed the application bytes for a READ that got no
+answer, without an error, is still not known.
+
 Throughput was not measured: the Python server is the bottleneck (cold reads ran at 2 MB/s
 including the stalls).
 
@@ -277,7 +316,9 @@ Beyond the protocol, the measurements give the server these duties:
    video tools (writes, locks, streams, AAPL, compound requests, credits) and its test matrix.
 3. **The never-listed folder** stays a limit: 2–30 s, beyond the 5-second requirement for old
    folders. Apps that `stat` known paths without listing (build tools, editors' lock files) hit it.
-4. **The read-path hang** (§4.6) is unexplained, and the wrong-bytes outcome is the worst kind.
+4. **An unanswered READ can reach the application as wrong bytes, without an error** (§4.6). The
+   spike's unanswered READs were its own bug, but any server bug that drops a READ is silent
+   corruption, so the server's tests must check the bytes read.
 5. **A network volume is different in Finder**: Spotlight indexing, Trash and Time Machine treat
    SMB volumes as remote. Not tested.
 6. **New dependencies:** NTLM needs MD4 and RC4 and 3.1.1 signing needs AES-CMAC; the workspace has
@@ -289,7 +330,7 @@ Beyond the protocol, the measurements give the server these duties:
 | Option | What it leaves unsolved |
 |---|---|
 | **FSKit by default** (the 5 October decision) | The release blocker itself: a missed name stays while anything below its folder is in use, and at the top until remount, with no API to clear it ([step 5](../step-5-macos.md#the-blocker-a-name-missed-while-its-folder-is-in-use)); only Apple can fix it. Also the old names of open renamed and deleted files, the `fskit.mount` entitlement or a helper for `/Volumes`, and macOS 27 only |
-| **SMB by default, voidfs's own server** (recommended) | A never-listed, unwatched folder's misses take 2–30 s; building and maintaining an SMB server (writes, xattrs, AAPL, locks); the read-path hang to explain; network-volume behaviour in Finder; Apple changing smbfs |
+| **SMB by default, voidfs's own server** (recommended) | A never-listed, unwatched folder's misses take 2–30 s; building and maintaining an SMB server (writes, xattrs, AAPL, locks); smbfs turning an unanswered READ into wrong bytes; network-volume behaviour in Finder; Apple changing smbfs |
 | **Both** | Both lists until one is dropped; twice the durability and coherence validation, an explicit default and adapter-specific remembered mounts (item 6's done-when), and no silent switch for a live writable mount |
 
 The recommendation is **SMB by default with voidfs's own server in the daemon**, keeping FSKit's
@@ -311,4 +352,5 @@ and item 3's blocker stays open. This spike stays as the evidence if the decisio
 - The server was Python: no throughput, latency under load or memory numbers for SMB itself.
 - Not tested: a second macOS account (credential sharing across uids), sleep and reconnect,
   `nsmb.conf` settings, Finder's handling of the mount (sidebar, Trash, Spotlight), macOS 26.
-- The read-path hang was not reproduced or explained (§4.6).
+- Why smbfs gave the application bytes for a READ that got no answer was not found; the
+  unanswered READs themselves were the spike's (§4.6).

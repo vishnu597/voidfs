@@ -1767,9 +1767,12 @@ The server has to earn this: each of these was measured to matter.
    read by its old name, and the new name never opens.
 4. Answer a session that holds an older version open with that version, by path too. Otherwise
    `fstat` on the open file shows the new size while reads return the opened bytes.
-5. Queue its calls to the core below the daemon's 32 and answer every READ. In two early runs some
-   READs went unanswered under smbfs's 24–39 in flight; once the application got wrong bytes with
-   no error. Bounding the calls fixed three later runs, and the cause is not known.
+5. Queue its calls to the core below the daemon's 32 and answer every READ: a READ that got no
+   answer once reached the application as wrong bytes, with no error. The READs unanswered in two
+   early runs were the spike's own, found later that day: Python's garbage collector freed READ
+   tasks the server kept no reference to while they waited for the daemon, and the daemon answered
+   every one ([spike §4.6](spikes/smb.md#46-reads)). Reproduced without SMB; the spike's server
+   now keeps its tasks.
 
 No existing server fits: Samba is GPLv3 over local files; go-smb2 (fuse-t's) is AGPL or
 commercial with leasing switched off; the MIT `smb-server` crate has neither leases nor change
