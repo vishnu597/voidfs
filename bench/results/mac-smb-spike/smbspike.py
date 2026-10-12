@@ -762,7 +762,17 @@ class Conn:
         self.wlock = asyncio.Lock()
         self.pending = {}  # async id -> Open with a notify outstanding
         self.handle_refs = {}  # backend handle -> opens sharing it (--hold-open-version)
+        self.tasks = set()
         self.args = server.args
+
+    def spawn(self, coro):
+        # Keep every task: the loop holds tasks weakly, and a client stream holds its reader weakly,
+        # so a task waiting for the daemon's reply is otherwise garbage. The GC collected such READs
+        # and they were never answered (docs/spikes/smb.md §4.6).
+        task = asyncio.ensure_future(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
 
     # -- transport
 
@@ -786,7 +796,7 @@ class Conn:
                     if command in (NEGOTIATE, SESSION_SETUP):
                         await self.handle(data)
                     else:
-                        asyncio.ensure_future(self.handle(data))
+                        self.spawn(self.handle(data))
                 else:
                     log(f"conn {self.id} unsupported frame {data[:4]!r}")
                     break
@@ -1372,14 +1382,14 @@ class Conn:
         log(f"conn {self.id} CHANGE_NOTIFY {o.path!r} filter={cfilter:#x} tree={bool(flags & 1)} async={async_id} queued={len(o.pending_changes)}")
         if o.pending_changes:
             changes, o.pending_changes = o.pending_changes, []
-            asyncio.get_event_loop().call_soon(lambda: asyncio.ensure_future(self.deliver(o, changes)))
+            asyncio.get_event_loop().call_soon(lambda: self.spawn(self.deliver(o, changes)))
         return S_PENDING, error_body(), {"async_id": async_id}
 
     def cancel(self, ctx):
         o = self.pending.get(ctx["async_id"]) if ctx["async_id"] is not None else next((p for p in self.pending.values() if p.notify and p.notify[0] == ctx["mid"]), None)
         log(f"conn {self.id} CANCEL async={ctx['async_id']} mid={ctx['mid']} -> {'found' if o else 'nothing'}")
         if o is not None:
-            asyncio.ensure_future(self.complete_notify(o, S_CANCELLED, b""))
+            self.spawn(self.complete_notify(o, S_CANCELLED, b""))
 
     async def complete_notify(self, o, status, data):
         if not o.notify:
@@ -1419,7 +1429,7 @@ class Conn:
                 if rel is None:
                     continue
                 if o.notify:
-                    asyncio.ensure_future(self.deliver(o, [(act, rel.replace("/", "\\"))]))
+                    self.spawn(self.deliver(o, [(act, rel.replace("/", "\\"))]))
                 elif len(o.pending_changes) < 64:
                     o.pending_changes.append((act, rel.replace("/", "\\")))
             for lease in list(self.leases.values()):
@@ -1427,7 +1437,7 @@ class Conn:
                     continue
                 hit = (lease.path == p) or (lease.is_dir and lease.path == parent) or (subtree and (lease.path == p or lease.path.startswith(p + "/")))
                 if hit:
-                    asyncio.ensure_future(self.break_lease(lease, lease.state & ~LEASE_R if lease.is_dir else 0))
+                    self.spawn(self.break_lease(lease, lease.state & ~LEASE_R if lease.is_dir else 0))
             if self.args.break_ancestor and not any(l.state and l.is_dir and l.path == parent for l in self.leases.values()):
                 # The folder holds no lease (this Mac never listed it): break the nearest folder
                 # above it that does, so the Mac looks the folder up again and sees its new time.
@@ -1437,16 +1447,16 @@ class Conn:
                     held = [l for l in self.leases.values() if l.state and l.is_dir and l.path == up]
                     if held:
                         for lease in held:
-                            asyncio.ensure_future(self.break_lease(lease, lease.state & ~LEASE_R))
+                            self.spawn(self.break_lease(lease, lease.state & ~LEASE_R))
                         break
 
     def changed_all(self):
         for o in list(self.opens.values()):
             if o.is_dir and o.notify:
-                asyncio.ensure_future(self.complete_notify(o, S_NOTIFY_ENUM_DIR, b""))
+                self.spawn(self.complete_notify(o, S_NOTIFY_ENUM_DIR, b""))
         for lease in list(self.leases.values()):
             if lease.state:
-                asyncio.ensure_future(self.break_lease(lease, 0))
+                self.spawn(self.break_lease(lease, 0))
 
     async def break_lease(self, lease, new_state):
         if not self.args.breaks:

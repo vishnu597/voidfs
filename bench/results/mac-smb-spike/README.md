@@ -9,12 +9,15 @@ nothing was installed, File Sharing stayed off, and `nsmb.conf` was left as it w
 
 | File | What |
 |---|---|
-| `smbspike.py` | The spike's SMB 2.1/3.1.1 server (Python standard library and CommonCrypto through `ctypes`): NTLMv2 per user with SPNEGO and signing, read-only CREATE/READ/QUERY_INFO/QUERY_DIRECTORY, file and directory leases (v1/v2) and their breaks, CHANGE_NOTIFY, bound to 127.0.0.1 only. It serves a local folder (`--local`, with a control socket for another machine's changes) or the daemon's `/v1/fs` session (`--daemon`, `--drive`), turning the change feed into breaks and notifications. Its switches are the configurations below |
+| `smbspike.py` | The spike's SMB 2.1/3.1.1 server (Python standard library and CommonCrypto through `ctypes`): NTLMv2 per user with SPNEGO and signing, read-only CREATE/READ/QUERY_INFO/QUERY_DIRECTORY, file and directory leases (v1/v2) and their breaks, CHANGE_NOTIFY, bound to 127.0.0.1 only. It serves a local folder (`--local`, with a control socket for another machine's changes) or the daemon's `/v1/fs` session (`--daemon`, `--drive`), turning the change feed into breaks and notifications. Its switches are the configurations below. The runs here used it as of 37c29be; it has kept a reference to every task it starts since the unanswered READs were traced to their loss ([spike §4.6](../../../docs/spikes/smb.md#46-reads)) |
 | `localpeer.py` | Another machine for `--local`: makes a change in the served folder (a put writes a new file and renames it over, as a new version replaces the old) and tells the server, as the feed would |
 | `smbprobe.py` | A name looked up and missed, then created by another machine: milliseconds until it is found by path (or listed, `--poll list`), for each of the FSKit blocker's holds (nothing, a sibling file open, the folder as cwd, the top folder), a folder this Mac never listed (`unlisted`), a young or day-old folder, with or without a kqueue watcher |
 | `holdprobe.py`, `negprobe.py` | Item 3's probes ([mac-fskit-daemon](../mac-fskit-daemon/)), unchanged |
 | `renameprobe.py` | Another machine renames a file this Mac had listed, had read, or still has open: until the new name is listed and opens |
 | `netfsmount.py` | Mounts an SMB URL the way Finder's Connect to Server does (`NetFSMountURLSync`, no UI), to see where it lands |
+| `daemonreads.py` | smbfs's READs straight at the daemon's session, without SMB: a sliding window of 256 KiB–1 MiB READs over pooled connections, `Busy` sent again, every task kept and every reply checked against the seed's copy; then the daemon's free call slots |
+| `lostreads.py` | The unbounded spike's READ (`DaemonBackend._request`, no timeout) in tasks with no reference, as the server started them, under the GC as it runs or `gc.collect()` every 50 ms, against the bound, a timeout and kept tasks; parses what reached connections whose reader was gone |
+| `lostreads_conn.py` | A `smbspike.py`'s own `Conn.run` fed SMB2 READ frames, under `gc.collect()`: the server as run (37c29be) against this one, which keeps its tasks |
 
 `apps/macos/scripts/coherence.py` is the item 3 script; this spike changed it to watch for a
 renamed file's new name opening, not only being listed (over SMB the first crashed it).
@@ -54,7 +57,7 @@ the other machine); otherwise a local folder did.
 | `coherence-311-*.txt`, `coherence-21-full.txt` | `coherence.py` on the local folder: `full-crashed` is the first run (the rename crash), `full-2` after the script's fix |
 | `coherence-d311-full.txt`, `coherence-d311-best.txt`, `coherence-d311-final-{1,2,3}.txt` | `coherence.py` through the daemon: no server switches, `best`, and three runs of `final` |
 | `probe-d311-*.txt`, `probe-d-unlisted-*.txt`, `*-d311-best.txt`, `*-d311-final.txt` | The probes through the daemon |
-| `reads.txt` | `media/big.bin` read through the daemon-backed mount: READ sizes and how many were in flight, and the runs where READs got no reply |
+| `reads.txt` | `media/big.bin` read through the daemon-backed mount: READ sizes and how many were in flight, and the runs where READs got no reply; then the three scripts above, which found that the spike lost those READs |
 | `server-log-excerpts.txt` | The server log behind the findings: the AAPL context, a never-listed folder's lookups, the open file's size, the rename, the logons |
 
 Times are from the other machine's commit (`mount_peer` and `localpeer.py` print it) to the first

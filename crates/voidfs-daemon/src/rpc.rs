@@ -31,7 +31,11 @@ impl Failure {
         Self { status, error: fs::FsError { code: code.into(), message: error.to_string(), errno: error.errno() } }
     }
     fn invalid() -> Self { Self::new(StatusCode::BAD_REQUEST, "InvalidArgument", FsError::InvalidArgument) }
-    fn busy() -> Self { Self::new(StatusCode::SERVICE_UNAVAILABLE, "Busy", FsError::Again) }
+    /// `EAGAIN` with the limit reached, or the daemon stopping, as its message: the core's own
+    /// `EAGAIN` message is about a listing that raced a change.
+    fn busy(why: impl Into<String>) -> Self {
+        Self { status: StatusCode::SERVICE_UNAVAILABLE, error: fs::FsError { code: "Busy".into(), message: why.into(), errno: FsError::Again.errno() } }
+    }
     fn large() -> Self { Self::new(StatusCode::PAYLOAD_TOO_LARGE, "TooLarge", FsError::InvalidArgument) }
 }
 
@@ -167,9 +171,11 @@ impl Calls {
     }
 }
 
+const STOPPING: &str = "the daemon is stopping";
+
 async fn admit(State(s): State<Arc<Shared>>, mut request: Request, next: Next) -> Result<Response, Failure> {
-    if *s.closing.borrow() { return Err(Failure::busy()); }
-    let permit = Arc::new(s.rpc.calls.clone().try_acquire_owned().map_err(|_| Failure::busy())?);
+    if *s.closing.borrow() { return Err(Failure::busy(STOPPING)); }
+    let permit = Arc::new(s.rpc.calls.clone().try_acquire_owned().map_err(|_| Failure::busy(format!("too many calls in flight (at most {})", fs::MAX_CALLS)))?);
     request.extensions_mut().insert(permit.clone());
     let watch = request.uri().path().ends_with("/watch");
     let response = next.run(request).await;
@@ -237,7 +243,7 @@ async fn create(State(s): State<Arc<Shared>>, request: Request) -> Result<Respon
     let _permit = permit;
     if new.version != fs::VERSION { return Err(Failure::new(StatusCode::UPGRADE_REQUIRED, "UnsupportedVersion", FsError::Unsupported)); }
     if new.drive.is_empty() || new.drive.len() > 1024 || new.drive.contains(['/', '\0']) { return Err(Failure::invalid()); }
-    let slot = s.rpc.sessions.clone().try_acquire_owned().map_err(|_| Failure::busy())?;
+    let slot = s.rpc.sessions.clone().try_acquire_owned().map_err(|_| Failure::busy(format!("too many sessions open (at most {})", fs::MAX_SESSIONS)))?;
     let drive = s.sessions.drive_for_rpc(&s, &new.drive).await?;
     let generation = drive.core.generation();
     let id = session_id()?;
@@ -248,8 +254,8 @@ async fn create(State(s): State<Arc<Shared>>, request: Request) -> Result<Respon
         gate: Arc::new(RwLock::new(())), closed: watch::Sender::new(false), _slot: slot });
     {
         let mut active = s.rpc.active.lock().unwrap_or_else(|p| p.into_inner());
-        if *s.closing.borrow() { return Err(Failure::busy()); }
-        if active.contains_key(&id) { return Err(Failure::busy()); }
+        if *s.closing.borrow() { return Err(Failure::busy(STOPPING)); }
+        if active.contains_key(&id) { return Err(Failure::busy("a new session's id is already in use")); }
         active.insert(id, access);
     }
     answer(info)
@@ -291,7 +297,7 @@ async fn call(State(s): State<Arc<Shared>>, Path((id, op)): Path<(String, String
         "open" => {
             let q: fs::Open = decode(&bytes)?;
             if q.write { access.writable()?; }
-            let slot = access.slots.clone().try_acquire_owned().map_err(|_| Failure::busy())?;
+            let slot = access.slots.clone().try_acquire_owned().map_err(|_| Failure::busy(format!("too many handles open in this session (at most {})", fs::MAX_HANDLES)))?;
             let fh = core.open(q.ino, q.write).await?;
             access.handles.lock().unwrap_or_else(|p| p.into_inner()).insert(fh, slot);
             answer(fs::Opened { fh, attr: core.handle_attr(fh)? })
@@ -459,7 +465,7 @@ async fn watch_events(State(s): State<Arc<Shared>>, Path(id): Path<String>, requ
     let access = s.rpc.access(&id, &request)?;
     let _gate = access.gate.read().await;
     if *access.closed.borrow() { return Err(Failure::new(StatusCode::CONFLICT, "StaleSession", FsError::Stale)); }
-    let permit = s.rpc.watches.clone().try_acquire_owned().map_err(|_| Failure::busy())?;
+    let permit = s.rpc.watches.clone().try_acquire_owned().map_err(|_| Failure::busy(format!("too many watches open (at most {})", fs::MAX_WATCHES)))?;
     let rx = access.drive.subscribe();
     let initial = access.drive.event(true);
     let closed = access.closed.subscribe();
