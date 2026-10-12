@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// A drive as a read-only FSKit volume, served by the daemon through the app's launch agent
+// A drive as an FSKit volume, served by the daemon through the app's launch agent
 // (Shared/BridgeClient.swift). The daemon's session answers every call; its invalidation relay says
 // what changed, here or on other machines, and the volume makes the kernel forget it with revokes.
 
@@ -19,14 +19,12 @@ struct VolumeOptions {
     var gid = getgid()
     /// `mount -r` (FSKit passes it as `-o ro`).
     var readOnly = false
-    /// What a write open is granted at most.
-    var writeCoherency: FSVolume.KernelCacheCoherencyType = .writeThrough
-    /// Probe knobs (item 4's measurements): a pause before each write is staged, and a log line
-    /// for every data callback.
-    var writeDelay: Duration?
+    /// A log line for every data and namespace callback (`-o trace`).
     var trace = false
-    var readGrant: FSVolume.KernelCacheCoherencyType?
-    var fullWrite = false
+    /// What a write open is granted at most. Measured (step 5, item 4): with writeBack a write
+    /// returns before the module sees it, and killing the extension lost acknowledged bytes; with
+    /// writeThrough write(2) returns after the bytes are staged.
+    static let writeCoherency: FSVolume.KernelCacheCoherencyType = .writeThrough
 
     mutating func apply(_ args: [String]) {
         var i = 0
@@ -44,19 +42,7 @@ struct VolumeOptions {
                     case ("iosize", let v?): ioSize = Int(v) ?? ioSize
                     case ("ro", nil), ("rdonly", nil): readOnly = true
                     case ("rw", nil): readOnly = false
-                    case ("coherency", let v?):
-                        switch v {
-                        case "nocache": writeCoherency = .noCache
-                        case "readcache": writeCoherency = .readCache
-                        case "writethrough": writeCoherency = .writeThrough
-                        case "writeback": writeCoherency = .writeBack
-                        default: break
-                        }
-                    case ("writedelay", let v?): writeDelay = Int(v).map { .milliseconds($0) }
-                    case ("readgrant", let v?):
-                        readGrant = ["nocache": .noCache, "readcache": .readCache, "writethrough": .writeThrough, "writeback": .writeBack][v]
                     case ("trace", _): trace = true
-                    case ("fullwrite", _): fullWrite = true
                     default: break
                     }
                 }
@@ -67,11 +53,11 @@ struct VolumeOptions {
         }
     }
 
-    /// What the kernel gets for `requested`, at most `ceiling`, as the cache modes allow.
-    static func grant(_ requested: FSVolume.DataCacheMode, ceiling: FSVolume.KernelCacheCoherencyType) -> FSVolume.KernelCacheCoherencyType {
+    /// What the kernel gets for `requested`: at most `writeCoherency`, as the cache modes allow.
+    static func grant(_ requested: FSVolume.DataCacheMode) -> FSVolume.KernelCacheCoherencyType {
         switch requested {
-        case .readWriteWithCache: return ceiling
-        case .readWithCache: return ceiling == .noCache ? .noCache : .readCache
+        case .readWriteWithCache: return writeCoherency
+        case .readWithCache: return writeCoherency == .noCache ? .noCache : .readCache
         default: return .noCache
         }
     }
@@ -178,28 +164,38 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let c = FSVolume.SupportedCapabilities()
-        c.supportsSymbolicLinks = true
+        // A drive can hold one, but nothing on the wire creates it (`ln -s` is ENOTSUP).
+        c.supportsSymbolicLinks = false
         c.supportsHardLinks = false
         c.supports2TBFiles = true
         c.supports64BitObjectIDs = true
         c.supportsPersistentObjectIDs = true
         c.supportsFastStatFS = true
-        c.supportsHiddenFiles = true
+        // `chflags hidden` isn't kept (the core stores no flags, though §4.8 has `hidden`).
+        c.supportsHiddenFiles = false
         c.supportsSparseFiles = true
         c.doesNotSupportSettingFilePermissions = false
         c.caseFormat = caseSensitive ? .sensitive : .insensitive
         return c
     }
 
+    /// Space as this Mac's disk has it: writes are staged there before they publish, so what it
+    /// has free bounds a copy (Finder checks before it starts). A drive has no quota to show.
     var volumeStatistics: FSStatFSResult {
         let s = FSStatFSResult(fileSystemTypeName: "voidfs")
         s.blockSize = 4096
         s.ioSize = options.ioSize
-        let total: UInt64 = 1 << 50
-        s.totalBytes = total
-        s.usedBytes = 0
-        s.availableBytes = total
-        s.freeBytes = total
+        var disk = statfs()
+        if statfs(NSHomeDirectory(), &disk) == 0 {
+            let block = UInt64(disk.f_bsize)
+            s.totalBytes = UInt64(disk.f_blocks) * block
+            s.availableBytes = UInt64(disk.f_bavail) * block
+            s.freeBytes = UInt64(disk.f_bfree) * block
+            s.usedBytes = s.totalBytes - min(s.totalBytes, s.freeBytes)
+        } else {
+            s.totalBytes = 1 << 50
+            (s.availableBytes, s.freeBytes, s.usedBytes) = (s.totalBytes, s.totalBytes, 0)
+        }
         s.totalFiles = 1 << 32
         s.freeFiles = 1 << 31
         return s
@@ -274,8 +270,17 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         }
     }
 
+    /// Never called on macOS 27.0.1: not for fsync, F_FULLFSYNC, sync(2) or unmount (step 5,
+    /// item 4's measurements). The daemon makes staged bytes durable within a second of a write
+    /// instead; should this come, every writable handle is flushed now.
     func synchronize(flags: FSSyncFlags) async throws {
-        log.notice("synchronize flags \(flags.rawValue)")
+        let handles = lock.withLock { open.values.compactMap(\.handle).filter(\.write) }
+        log.notice("synchronize flags \(flags.rawValue): \(handles.count) writable handles")
+        var failed: Error?
+        for h in handles {
+            do { try await h.session.fsync(h.fh) } catch { failed = failed ?? error }
+        }
+        if let failed { throw failure(failed) }
     }
 
     // MARK: - The session
@@ -391,16 +396,24 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     }
 
     /// A change made on this Mac, through any session of the drive's core: everything already
-    /// shows it (the core's shared local view), so nothing is revoked. Listings that name it go,
-    /// and open files read their attributes again.
+    /// shows it (the core's shared local view), so nothing is revoked, except a folder holding a
+    /// name the kernel was told is missing and another session (the CLI, say) made since: the
+    /// volume's own creates and renames forget their misses first (`naming`). Listings that name
+    /// the change go, and open files read their attributes again.
     private func changedHere(_ event: BridgeEvent) {
-        lock.withLock {
+        let changed = Set((event.objects + event.subtrees).flatMap(Self.components))
+        let targets: [VoidfsItem] = lock.withLock {
             epoch += 1
+            var targets: [VoidfsItem] = []
             for ino in event.inodes {
                 if let l = listings.removeValue(forKey: ino) { listed -= l.names.count }
                 for item in open.values where item.ino == ino { item.stale = true }
+                if let below = purge(ino, changed), let folder = items[ino] { targets += below + [folder] }
             }
+            var seen = Set<ObjectIdentifier>()
+            return targets.filter { seen.insert(ObjectIdentifier($0)).inserted }
         }
+        revoke(targets)
     }
 
     /// Makes the kernel forget what `event` names. Changed files and symbolic links are retired and
@@ -422,15 +435,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
                 guard let item = ino == root ? rootItem : items[ino] else { continue }
                 if item.kind == .folder {
                     folders.append(item)
-                    if let missed = misses[ino], missed.matches(changed) {
-                        misses[ino] = nil
-                        if ino == root {
-                            log.notice("a name missed in the drive's top folder now exists: it shows by path once the drive is mounted again")
-                        } else {
-                            purged += subtree(ino)
-                            if openBelow(ino) { pending.insert(ino) }
-                        }
-                    }
+                    purged += purge(ino, changed) ?? []
                 } else {
                     retire(item)
                     files.append(item)
@@ -440,6 +445,19 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
             return (files + purged + folders).filter { seen.insert(ObjectIdentifier($0)).inserted }
         }
         revoke(targets)
+    }
+
+    /// When `changed` holds a name the kernel was told is missing in folder `ino`: everything it
+    /// may hold below the folder, to revoke before the folder. Called with the lock held.
+    private func purge(_ ino: UInt64, _ changed: Set<String>) -> [VoidfsItem]? {
+        guard let missed = misses[ino], missed.matches(changed) else { return nil }
+        misses[ino] = nil
+        if ino == root {
+            log.notice("a name missed in the drive's top folder now exists: it shows by path once the drive is mounted again")
+            return nil
+        }
+        if openBelow(ino) { pending.insert(ino) }
+        return subtree(ino)
     }
 
     /// The names along a changed key: any of them may be a name that now exists.
@@ -668,6 +686,17 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         }
     }
 
+    /// The kernel learns of `name` in `folder` from this call's reply, not from a lookup, so a
+    /// miss it was told of needs no purge when the change's own event comes back. Forgotten before
+    /// the call (its event may come first), and remembered again if the call fails.
+    private func naming<T>(_ name: String, in folder: UInt64, _ body: () async throws -> T) async throws -> T {
+        let was = lock.withLock { misses[folder]?.names.remove(name) != nil }
+        do { return try await body() } catch {
+            if was { missed(name, in: folder) }
+            throw error
+        }
+    }
+
     func reclaimItem(_ item: FSItem) async throws {
         guard let item = item as? VoidfsItem, item !== rootItem else { return }
         let handle: OpenFile? = lock.withLock {
@@ -810,8 +839,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         // kernel's, once granted, outlives every revoke of the top folder (see `revoke`).
         let granted: FSVolume.KernelCacheCoherencyType
         if item.kind == .folder { granted = .noCache }
-        else if write { granted = VolumeOptions.grant(cacheMode, ceiling: options.writeCoherency) }
-        else if let g = options.readGrant { granted = g }
+        else if write { granted = VolumeOptions.grant(cacheMode) }
         else { granted = cacheMode == .none ? .noCache : .readCache }
         if options.trace { log.notice("open \(item.ino) modes \(modes.rawValue) cache \(cacheMode.rawValue) granted \(granted.rawValue)") }
         return FSOpenItemResult(grantedCoherency: granted)
@@ -824,9 +852,8 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     /// So that open pushes them first.
     private func push(_ item: VoidfsItem) async {
         let start = ContinuousClock.now
-        let ceiling = options.writeCoherency
         let error: Error? = await withCheckedContinuation { done in
-            pushes.async { done.resume(returning: self.setCacheState(for: item, cacheMode: .readWriteWithCache, coherencyType: ceiling, action: .push)) }
+            pushes.async { done.resume(returning: self.setCacheState(for: item, cacheMode: .readWriteWithCache, coherencyType: VolumeOptions.writeCoherency, action: .push)) }
         }
         if let error {
             let e = error as NSError
@@ -854,7 +881,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     func upgrade(_ item: FSItem, cacheMode: FSVolume.DataCacheMode, context: FSContext) async throws -> FSUpgradeItemResult {
         let write = (item as? VoidfsItem).flatMap { i in lock.withLock { i.handle?.write } } ?? false
-        let granted = write ? VolumeOptions.grant(cacheMode, ceiling: options.writeCoherency) : cacheMode == .none ? .noCache : .readCache
+        let granted = write ? VolumeOptions.grant(cacheMode) : cacheMode == .none ? .noCache : .readCache
         if options.trace { log.notice("upgrade \((item as? VoidfsItem)?.ino ?? 0) cache \(cacheMode.rawValue) granted \(granted.rawValue)") }
         return FSUpgradeItemResult(grantedCoherency: granted)
     }
@@ -892,7 +919,6 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         if options.readOnly { throw posix(EROFS) }
         guard offset >= 0 else { throw posix(EINVAL) }
         let start = ContinuousClock.now
-        if let delay = options.writeDelay { try? await Task.sleep(for: delay) }
         let opened = lock.withLock { item.handle?.write == true }
         var f = try await handle(item, write: true)
         if !opened {
@@ -927,7 +953,6 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
             guard n == piece.count else { throw posix(EIO) }
             at += n
         }
-        if options.fullWrite { try await f.session.fsync(f.fh) }
         return try await f.session.handleAttr(f.fh)
     }
 
@@ -1010,7 +1035,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         guard type == .file || type == .directory else { throw posix(ENOTSUP) }
         let folder = type == .directory
         let mode = newAttributes.isValid(.mode) ? newAttributes.mode & 0o7777 : folder ? 0o755 : 0o644
-        var a = try await changing([dir.ino]) { try await call { try await $0.create(dir.ino, n, mode: mode, directory: folder) } }
+        var a = try await naming(n, in: dir.ino) { try await changing([dir.ino]) { try await call { try await $0.create(dir.ino, n, mode: mode, directory: folder) } } }
         var consumed: FSItem.Attribute = newAttributes.isValid(.mode) ? [.mode] : []
         if newAttributes.isValid(.modifyTime) {
             let t = newAttributes.modifyTime
@@ -1044,7 +1069,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         var overAttr: BridgeAttr?
         if let over { overAttr = try await attr(over) }
         if options.trace { log.notice("rename \(item.ino) \(from.ino)/\(fromName, privacy: .public) → \(to.ino)/\(toName, privacy: .public) over \(over?.ino ?? 0)") }
-        try await changing([from.ino, to.ino]) { try await call { try await $0.rename(from.ino, fromName, to.ino, toName) } }
+        try await naming(toName, in: to.ino) { try await changing([from.ino, to.ino]) { try await call { try await $0.rename(from.ino, fromName, to.ino, toName) } } }
         lock.withLock {
             item.parent = to.ino
             item.stale = item.handle != nil

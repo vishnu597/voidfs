@@ -2,9 +2,10 @@
 //
 // writeprobe: when does a write on a mounted volume reach the file system module? Each step prints
 // its wall-clock time and how long the call took, so that a module whose write callback is slowed
-// (the voidfs module's `-o writedelay=<ms>`) shows which calls wait for it: a write(2) that takes
-// the delay was written through; one that returns at once left dirty pages in the kernel, and the
-// call that takes the delay later (fsync, close, msync, munmap, sync) is the one that pushed them.
+// (step 5, item 4 measured with a `writedelay` option of the voidfs module, since removed) shows
+// which calls wait for it: a write(2) that takes the delay was written through; one that returns
+// at once left dirty pages in the kernel, and the call that takes the delay later (fsync, close,
+// msync, munmap, sync) is the one that pushed them.
 //
 //     cc -O2 -o writeprobe writeprobe.c && writeprobe <folder on the volume> <test>
 //
