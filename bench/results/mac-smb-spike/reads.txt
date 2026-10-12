@@ -22,3 +22,54 @@ run 5 (bound 64, a fresh daemon, cold): 0 of 192 MiB pieces differ; no timeouts,
 40 concurrent 512 KiB reads, cold: 32 ok, 8 Busy (EAGAIN, 1-2 ms), twice, also reusing the connections
 4 rounds of 32 and of 28 concurrent 1 MiB reads of cold blocks: all ok
 a cold block's first reader dropped after 0, 2, 10 or 50 ms: the other readers and a later one all ok (8 blocks)
+
+## Found later on 12 October, without SMB: the spike lost the READs; the daemon answered them
+A local memory-store voidfs-server seeded by mount_seed, and `void daemon` built from main at 37c29be, a fresh state
+directory (cold cache) for each run below. SOCK is its socket; LOCAL is mount_seed's copy of media/big.bin.
+
+### daemonreads.py
+$ daemonreads.py SOCK LOCAL --mib 1024
+1879 READs over 1024 MiB in 1.4 s, 1 fh, at most 39 in flight; {'connections': 39, 'read busy': 160, 'read ok': 1879}; wrong bytes at MiB []; latency median 25 ms, max 69 ms
+then 40 getattrs at once: {200: 32, 503: 8}
+$ daemonreads.py SOCK LOCAL --mib 1024 --handles 4 --meta 0.3
+1879 READs over 1024 MiB in 1.4 s, 4 fh, at most 39 in flight; {'connections': 60, 'getattr busy': 13, 'read busy': 194, 'getattr ok': 533, 'read ok': 1879}; wrong bytes at MiB []; latency median 26 ms, max 68 ms
+then 40 getattrs at once: {200: 32, 503: 8}
+$ daemonreads.py SOCK LOCAL --mib 1024 --window 64 --handles 2 --chunk 65536
+1879 READs over 1024 MiB in 1.1 s, 2 fh, at most 64 in flight; {'connections': 64, 'read busy': 548, 'read ok': 1879}; wrong bytes at MiB []; latency median 32 ms, max 75 ms
+then 40 getattrs at once: {200: 32, 503: 8}
+$ daemonreads.py SOCK LOCAL --mib 256 --cpu-ms 60 --meta 0.2
+472 READs over 256 MiB in 28.7 s, 1 fh, at most 39 in flight; {'connections': 45, 'read busy': 166, 'getattr busy': 1, 'getattr ok': 87, 'read ok': 472}; wrong bytes at MiB []; latency median 2131 ms, max 5106 ms
+then 40 getattrs at once: {200: 32, 503: 8}
+$ daemonreads.py SOCK LOCAL --mib 256 --window 48 --handles 3 --cpu-ms 30 --chunk 16384 --busy-delay 0.01
+472 READs over 256 MiB in 14.5 s, 3 fh, at most 48 in flight; {'connections': 48, 'read busy': 23, 'read ok': 472}; wrong bytes at MiB []; latency median 1348 ms, max 2848 ms
+then 40 getattrs at once: {200: 32, 503: 8}
+$ daemonreads.py SOCK LOCAL --mib 1024 --handles 8 --seed 7
+1860 READs over 1024 MiB in 1.4 s, 8 fh, at most 39 in flight; {'connections': 39, 'read busy': 73, 'read ok': 1860}; wrong bytes at MiB []; latency median 25 ms, max 68 ms
+then 40 getattrs at once: {200: 32, 503: 8}
+### lostreads.py
+$ lostreads.py SOCK LOCAL natural
+natural: 349 READs, 349 answered, 14 Busy sent again, 0 never answered (MiB []), done in 1.5 s; wrong bytes 0; tasks destroyed while pending 0; 0 connections received bytes after their reader was gone, 0 of them complete replies with nothing missing (0 replies)
+natural: then 32 reads at once on new connections: 32 answered, 0 Busy
+$ lostreads.py SOCK LOCAL natural --garbage 2000 --cpu-ms 60 --stall 30
+natural: 349 READs, 313 answered, 7 Busy sent again, 36 never answered (MiB [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]), done in 50.2 s; wrong bytes 0; tasks destroyed while pending 36; 36 connections received bytes after their reader was gone, 36 of them complete replies with nothing missing (178 replies)
+natural: then 32 reads at once on new connections: 32 answered, 0 Busy
+$ lostreads.py SOCK LOCAL collect
+collect: 76 READs, 37 answered, 7 Busy sent again, 39 never answered (MiB [4, 6, 9, 12, 15, 17, 20, 23, 24, 25, 26, 27]), stalled in 16.1 s; wrong bytes 0; tasks destroyed while pending 39; 39 connections received bytes after their reader was gone, 39 of them complete replies with nothing missing (87 replies)
+collect: then 32 reads at once on new connections: 32 answered, 0 Busy
+$ lostreads.py SOCK LOCAL bound
+bound: 122 READs, 83 answered, 0 Busy sent again, 39 never answered (MiB [6, 9, 12, 15, 17, 20, 23, 25, 26, 27, 28, 29]), stalled in 16.1 s; wrong bytes 0; tasks destroyed while pending 39; 39 connections received bytes after their reader was gone, 39 of them complete replies with nothing missing (126 replies)
+bound: then 32 reads at once on new connections: 32 answered, 0 Busy
+$ lostreads.py SOCK LOCAL timeout
+timeout: 349 READs, 349 answered, 14 Busy sent again, 0 never answered (MiB []), done in 1.5 s; wrong bytes 0; tasks destroyed while pending 0; 0 connections received bytes after their reader was gone, 0 of them complete replies with nothing missing (0 replies)
+timeout: then 32 reads at once on new connections: 32 answered, 0 Busy
+$ lostreads.py SOCK LOCAL spike
+spike: 349 READs, 349 answered, 0 Busy sent again, 0 never answered (MiB []), done in 1.5 s; wrong bytes 0; tasks destroyed while pending 0; 0 connections received bytes after their reader was gone, 0 of them complete replies with nothing missing (0 replies)
+spike: then 32 reads at once on new connections: 32 answered, 0 Busy
+$ lostreads.py SOCK LOCAL kept
+kept: 349 READs, 349 answered, 7 Busy sent again, 0 never answered (MiB []), done in 1.5 s; wrong bytes 0; tasks destroyed while pending 0; 0 connections received bytes after their reader was gone, 0 of them complete replies with nothing missing (0 replies)
+kept: then 32 reads at once on new connections: 32 answered, 0 Busy
+### lostreads_conn.py
+$ lostreads_conn.py smbspike.py at 37c29be SOCK
+smbspike.py at 37c29be: 140 READs, 101 answered, 7 Busy sent again, 39 never answered (MiB [4, 6, 9, 12, 15, 17, 20, 23, 26, 28, 29, 30]), stalled in 15.1 s; tasks destroyed while pending 39
+$ lostreads_conn.py smbspike.py (keeps its tasks) SOCK
+smbspike.py (keeps its tasks): 349 READs, 349 answered, 7 Busy sent again, 0 never answered (MiB []), done in 0.4 s; tasks destroyed while pending 0
