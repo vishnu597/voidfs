@@ -3,7 +3,8 @@
 //! user, with `mount -F -t voidfs voidfs://<drive> <mountpoint>`. The resource names only the
 //! drive: this daemon holds the server and key. The module reaches the daemon through the app's
 //! launch agent, with a session and an invalidation watch of its own, so the feed has nothing to
-//! tell the adapter here. The module is read-only until item 4.
+//! tell the adapter here. Mounts are writable (item 4) unless asked read-only (`mount -r`), so a
+//! writable mount remembered while the module was read-only comes back writable.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -76,10 +77,6 @@ async fn run(program: &Path, args: Vec<OsString>) -> Result<String, String> {
 impl Adapter for FsKit {
     fn name(&self) -> &str {
         "fskit"
-    }
-
-    fn writable(&self) -> bool {
-        false
     }
 
     fn mount<'a>(&'a self, spec: &'a MountSpec, _core: &'a Core) -> BoxFuture<'a, Result<Arc<dyn Mounted>, String>> {

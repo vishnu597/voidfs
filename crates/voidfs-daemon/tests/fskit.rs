@@ -90,7 +90,7 @@ fn new_mount(drive: &str, mountpoint: &Path) -> NewMount {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fskit_mounts_with_the_system_mount_read_only_and_comes_back_or_is_adopted_when_the_daemon_starts() {
+async fn fskit_mounts_with_the_system_mount_and_comes_back_or_is_adopted_when_the_daemon_starts() {
     let server = TestServer::start().await.unwrap();
     voidfs_sdk::Client::new(sdk(&server)).unwrap().create_drive("footage", Default::default()).await.unwrap();
     let dir = tempfile::Builder::new().prefix("vdk").tempdir_in(std::env::temp_dir()).unwrap();
@@ -99,9 +99,9 @@ async fn fskit_mounts_with_the_system_mount_read_only_and_comes_back_or_is_adopt
     let (d, c) = start(&server, dir.path(), &commands).await;
 
     let m = c.mount(&new_mount("footage", &mp)).await.unwrap();
-    assert_eq!((m.adapter.as_str(), m.state.as_str(), m.read_only), ("fskit", "mounted", true), "read-only until the module can write");
+    assert_eq!((m.adapter.as_str(), m.state.as_str(), m.read_only), ("fskit", "mounted", false), "writable: the module writes");
     let real = std::fs::canonicalize(&mp).unwrap();
-    assert_eq!(commands.calls(), [format!("mount -F -t voidfs -r voidfs://footage {}", real.display())], "the resource names only the drive, at the real path");
+    assert_eq!(commands.calls(), [format!("mount -F -t voidfs voidfs://footage {}", real.display())], "the resource names only the drive, at the real path");
     assert!(commands.table().contains(&format!("voidfs://footage on {} (voidfs,", real.display())));
     let view = c.mounts().await.unwrap();
     assert_eq!((view.remembered.len(), view.remembered[0].adapter.as_str(), view.remembered[0].read_only), (1, "fskit", false), "remembered as asked");
@@ -140,6 +140,11 @@ async fn fskit_mounts_with_the_system_mount_read_only_and_comes_back_or_is_adopt
     let before = commands.calls().len();
     assert_eq!(c.unmount(&mp.display().to_string()).await.unwrap().unmounted, [mp.display().to_string()]);
     assert_eq!(commands.calls().len(), before);
+
+    // Asked read-only, `mount -r`.
+    let m = c.mount(&NewMount { read_only: true, ..new_mount("footage", &mp) }).await.unwrap();
+    assert!(m.read_only);
+    assert_eq!(commands.calls().last().unwrap(), &format!("mount -F -t voidfs -r voidfs://footage {}", real.display()));
     d.stop().await;
 }
 
