@@ -39,8 +39,8 @@ billing or plans), this page says so.
   - garbage collection, whose protocol is model-checked
     ([RFC 0002](../rfcs/0002-gc-safe-against-writers.md));
   - 38 conformance cases passing on local disk (the first 35 on Cloudflare R2 too).
-- **Almost everything a person touches is missing:** a writable mount, accounts and a web app,
-  search and share links. The first SDK, for Rust, exists (step 4, item 1): the official AWS SDK
+- **Almost everything a person touches is missing:** a finished Mac drive, accounts and a web
+  app, search and share links. The first SDK, for Rust, exists (step 4, item 1): the official AWS SDK
   for S3 with a typed call for every extension, one error type and the retry rule. So does a CLI
   on the protocol, `void` (step 4, item 2): drives, forks, history, show, restore and a foreground
   upload, with JSON output everywhere. The client core exists (step 4, items 3–6): a block
@@ -50,7 +50,9 @@ billing or plans), this page says so.
   queue that pause, resume and cancel anything, resume after a restart, and cap bandwidth at once;
   and a change-feed client and a connectivity state that fails fast offline. A per-user daemon
   runs it, with uploads that outlive it; a file changed in one place goes up as a direct upload;
-  and reads come straight from the bucket where the server issues storage credentials.
+  and reads come straight from the bucket where the server issues storage credentials. The Mac's
+  FSKit mount reads and writes through that daemon (step 5, items 3–4), with two release
+  blockers open.
 - **Performance is measured locally, not yet in SpaceFS's setup.** SpaceFS publishes 49
   benchmark scenarios; [`bench/`](../bench/README.md) runs all of them against voidfs and the bare
   bucket underneath it.
@@ -142,7 +144,11 @@ billing or plans), this page says so.
     Mac's SMB client shows the names FSKit keeps, in 25–45 ms through the daemon, when the server
     breaks SMB 3.x directory leases; no existing server fits, so SMB would mean voidfs's own
     server in the daemon. The user kept FSKit as the default (12 October) and waits for Apple
-    to fix the miss; the writable mount (item 4) is next.
+    to fix the miss. **The mount writes** ([writable FSKit](step-5-macos.md#writable-fskit-12-october),
+    item 4, 12 October): Finder copies and edits, atomic saves, mmap writes and xattrs work
+    through the daemon's durable core, and killing the extension or the daemon loses no
+    acknowledged byte. Item 4 is not complete: `RENAME_SWAP` overwrites on every FSKit volume (a
+    release blocker, for Apple), and resource forks over 64 KiB need a protocol change.
     Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -166,7 +172,7 @@ Every item of the plan's checklist (§3, 65 items, including the Finder integrat
 | Storage backends (B1–B8) | 2 | 1 | 5 | Local disk, AWS S3, Cloudflare R2, MinIO (built from source in CI) and versitygw work, and rclone works against the server. A capability probe checks the bucket at start. Storage credentials pass scoped-read checks on MinIO, live R2 and live AWS after correcting the read role's bucket ARNs. No other providers tried, no stored bucket credentials, no adopt or export |
 | Server (S1–S9) | 3 | 3 | 3 | Full S3 subset, path and virtual-host addressing, extensions and change feed (long poll and SSE), direct uploads where the bucket binds checksums, and storage credentials where STS or Cloudflare's API passes the scoped-read check, on one node. Missing: a disk cache tier, several nodes, several regions, quotas |
 | Accounts and web (C1–C10) | 0 | 1 | 9 | Static keys from command-line flags only |
-| Clients (D1–D12) | 0 | 5 | 7 | A read-only macOS mount and its menu-bar shell (the spike), the CLI on the protocol, `void` (step 4, item 2), the client core (item 3): block cache, write journal and upload queue, change-feed client, and the daemon that runs it, with uploads handed to it and the mount table (item 4), direct uploads (item 5), and reads straight from the bucket with storage credentials (item 6). Mounting is read-only through the daemon (step 5, item 3, FSKit), with no Finder integration, Linux or Windows |
+| Clients (D1–D12) | 0 | 5 | 7 | A read-only macOS mount and its menu-bar shell (the spike), the CLI on the protocol, `void` (step 4, item 2), the client core (item 3): block cache, write journal and upload queue, change-feed client, and the daemon that runs it, with uploads handed to it and the mount table (item 4), direct uploads (item 5), and reads straight from the bucket with storage credentials (item 6). Mounting is writable through the daemon (step 5, items 3 and 4, FSKit), with no Finder integration, Linux or Windows |
 | SDKs, agents, search (A1–A7) | 0 | 1 | 6 | A Rust SDK on the official AWS SDK, with a typed call for every extension (step 4, item 1) and direct uploads (item 5). Stock S3 SDKs, boto3, rclone and curl work. No TypeScript, Python or Go SDK, MCP server or search |
 | Operations (O1–O6) | 1 | 2 | 3 | One binary, with a Compose file. Health checks and Prometheus metrics on a port of their own. A benchmark harness run locally, against R2 and AWS S3 for the small objects, and in CI, not yet in SpaceFS's setup. No tracing, Helm chart, fuzzing or audit |
 | **Total** | **16** | **14** | **35** | Of the 28 P0 items: 14 done, 9 partly, 5 missing |
@@ -198,13 +204,15 @@ verification does not change the scorecard counts.
   upload queue, and the change-feed client with connectivity; and the per-user daemon that runs
   it on a socket, with uploads handed to it that outlive it, the mount table and the remembered
   mounts it brings back when it starts, at login through a launchd agent (item 4, done on 3
-  October). It mounts read-only with FSKit since step 5's item 3 (10 October).
-- D3 is read-only, D6's cache and read-ahead reach the mount through the daemon since step 5's
-  item 3, and D11 is the spike's shell, which now asks the daemon to mount.
+  October). It mounts with FSKit since step 5's item 3 (10 October), writable since item 4
+  (12 October).
+- D3 writes since step 5's item 4, but for `RENAME_SWAP` (FSKit overwrites) and resource forks
+  over 64 KiB; D6's cache and read-ahead reach the mount through the daemon since item 3, and D11
+  is the spike's shell, which now asks the daemon to mount.
 - D9 has the commands that need no account (`void`, step 4, item 2), and since 3 October `void
   daemon run|start|stop|restart|status|info|install|uninstall`, `void status`, `void upload
   --detach`, `void uploads` with pause, resume, cancel and a limit, and `void
-  mount|unmount|mounts` (item 4), which mount read-only with FSKit since step 5's item 3: not yet login,
+  mount|unmount|mounts` (item 4), which mount with FSKit since step 5's item 3, writable since its item 4: not yet login,
   workspaces, minting keys or self-update.
 - A1 has the Rust SDK; TypeScript (P0) waits for step 7, with Python and Go (P1).
 - O4 has health checks and metrics, not tracing or structured logs. O5 has run locally, against R2
@@ -226,8 +234,8 @@ The 28 P0 items, which a credible v1 needs:
 | SpaceFS | voidfs today |
 |---|---|
 | S3-compatible endpoint with extensions (protocol v1) | Protocol 1 with 55 conformance cases, path or virtual-host addressing, direct uploads where the bucket binds checksums (AWS S3, R2, MinIO and versitygw do), and storage credentials through provider minting with a startup scope check. MinIO, live R2 and live AWS pass. Missing: display names, copy-mode forks |
-| macOS app: writable mount (a loopback SMB server by default since 0.2.333, or FSKit), transfers (pause, resume, speed limits), a disk and a memory cache, pinned files, previews, video reviews, Space Search, Finder badges | Read-only FSKit mount and a menu-bar shell; an SMB feasibility spike ([spike](spikes/smb.md)) |
-| `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version, and `update` | `void`: drives, drive create/show/delete/undelete, fork, history, show, restore, upload (foreground or daemon-backed with `--detach`), uploads with pause/resume/cancel and a limit, status, daemon run/start/stop/restart/status/info/install/uninstall, and mount/unmount/mounts with remembered mounts. JSON output everywhere. Mounting is read-only FSKit (step 5, item 3); account commands wait for step 6 ([step-4-client.md](step-4-client.md)). |
+| macOS app: writable mount (a loopback SMB server by default since 0.2.333, or FSKit), transfers (pause, resume, speed limits), a disk and a memory cache, pinned files, previews, video reviews, Space Search, Finder badges | A writable FSKit mount through the daemon (no `RENAME_SWAP`, forks up to 64 KiB) and a menu-bar shell; an SMB feasibility spike ([spike](spikes/smb.md)) |
+| `spacefs` CLI and mount daemon (macOS and Linux): login, whoami, drives, drive, workspace, use, keys, mount, unmount, mounts, uploads, upload, status, daemon, history, show, restore, version, and `update` | `void`: drives, drive create/show/delete/undelete, fork, history, show, restore, upload (foreground or daemon-backed with `--detach`), uploads with pause/resume/cancel and a limit, status, daemon run/start/stop/restart/status/info/install/uninstall, and mount/unmount/mounts with remembered mounts. JSON output everywhere. Mounting is writable FSKit (step 5, items 3 and 4); account commands wait for step 6 ([step-4-client.md](step-4-client.md)). |
 | Linux FUSE mount | None (step 9) |
 | Web app: sign-in, settings, access keys, billing | None (billing does not apply) |
 | SDKs: TypeScript, Python, Go, Rust (MIT), each on the official AWS SDK | Rust (`crates/voidfs-sdk`): the official AWS SDK for S3, a typed call for every extension, one error type, the retry rule, and direct uploads, opt-in as SpaceFS's are (step 4, item 5). Not yet: TypeScript, Python, Go |
@@ -878,7 +886,9 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      reopens the SMB decision before any writable adapter. Item 6's SMB feasibility spike is
      done: the Mac's SMB client shows those names given directory-lease breaks, and voidfs would
      need its own SMB server ([spike](spikes/smb.md)). The user kept FSKit as the default and
-     waits for Apple to fix the miss.
+     waits for Apple to fix the miss. The volume writes through the core (item 4), with a flush
+     within a second standing in for the fsync FSKit doesn't pass on; `RENAME_SWAP` overwrites on
+     every FSKit volume, a second release blocker.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
@@ -895,7 +905,11 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
-   - **Status (2026-10-12):** items 1–3 of 10 done, item 3 with a release blocker; item 6's SMB
+   - **Status (2026-10-12, later):** items 1–3 of 10 done, item 3 with a release blocker; item 4
+     built and not complete ([step 5](step-5-macos.md#writable-fskit-12-october)): the mount
+     writes, and `RENAME_SWAP` overwriting on every FSKit volume is a release blocker the user
+     accepted (a Feedback for Apple drafted), with resource forks over 64 KiB waiting on an RFC.
+     Before that, on 2026-10-12: items 1–3 of 10 done, item 3 with a release blocker; item 6's SMB
      feasibility spike done ([step 5](step-5-macos.md#smb-feasibility-spike-12-october)), with SMB
      by default on voidfs's own server recommended. The user kept FSKit as the default and waits
      for Apple to fix the pinned miss; item 4, writable FSKit, is next and the blocker stays open.

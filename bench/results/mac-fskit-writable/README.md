@@ -4,14 +4,15 @@
 a memory-store `voidfs-server` on 127.0.0.1:9000, a test daemon in a `mktemp -d` state
 directory, the development-signed build of `voidfs.app` from `apps/macos/build`, and the drive
 `wtest` mounted with `mount -F -t voidfs -o <options> voidfs://wtest /tmp/vw`. Q1–Q5 used the
-volume's probe options (commit 0005389): `coherency=nocache|readcache|writethrough|writeback`
+volume's probe options (commit 2edbdc7): `coherency=nocache|readcache|writethrough|writeback`
 (the most a write open is granted), `writedelay=<ms>` (a pause before each write callback stages
 its bytes, so that a slow call shows which system call waited for it), `readgrant=…` and `trace`
-(a log line per callback). The answers chose writeThrough, and 4675e44 removed the options but
+(a log line per callback). The answers chose writeThrough, and 8a11a2f removed the options but
 `trace`. The probes are `apps/macos/scripts/writeprobe.c` and `semantics.c` and, here,
 `mmapseq.c`, `swap.c`, `bulk.c`, `ffs.c`, `atomic.c` and `locks.c`. `raw/` has their outputs and
 the extension's log of the data and namespace callbacks. [Final build](#the-final-build) has the
-checks run on the finished item.
+checks run on the finished item. Daemon version lines in `raw/` name the commit the binary was built
+from before the branch was rebased (the daemon's code is d80e71a's).
 
 ## Q1. When do writes reach the module, and does fsync?
 
@@ -101,7 +102,7 @@ on its own file, and they behave as on APFS (below).
 
 ## The final build
 
-12 October, the volume at 4675e44 and the daemon at 0bb432d, mounted with `void mount wtest
+12 October, the volume at 8a11a2f and the daemon at d80e71a, mounted with `void mount wtest
 /tmp/vw` through the daemon (`raw/mounts.txt`), on a memory server whose pool has
 `multi-object-versions`.
 
@@ -152,7 +153,7 @@ the `mmapseq` sequences that lost a store (Q3) keep both, on the server too.
 `kill -9`, a 1 MiB copy, an appended file, and 64 KiB still open, are all on the server, each
 file one `put` and one `attrs`. With a file open at the kill, FSKit keeps a dead mount ("connect
 called on dead mount entry" in fskitd's log): every call answers `EIO`, the open file's `close`
-too, and it stays so. `void unmount` clears it. 0bb432d makes a daemon starting mount a dead
+too, and it stays so. `void unmount` clears it. d80e71a makes a daemon starting mount a dead
 mount anew, so `void daemon restart` brings the volume back (seen). With nothing open the volume
 is unmounted, and `void daemon restart` mounts it again.
 
