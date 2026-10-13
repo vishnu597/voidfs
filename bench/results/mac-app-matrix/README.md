@@ -510,12 +510,13 @@ Developer-ID agent launch constraint may still require the user to toggle Login 
 and in, or reboot. Do not reset background-item/security settings to force it. Verify defaults,
 registration paths, absence of test mounts/processes, and absence of shared daemon state again.
 Retain the raw evidence in this repository, then remove the owned server store, staged/cache
-data, synthetic datasets, compiler caches, temporary app copies and DMGs. Final cleanup and
-registration restoration are **pending in this working draft** and must be recorded before the
-run is declared finished.
+data, synthetic datasets, compiler caches, temporary app copies and DMGs. The completed cleanup
+and registration restoration are recorded below.
 
 ## Final verification and cleanup
 
-The combined client/daemon/module fixes pass the [local workspace tests](raw/combined-workspace-tests.txt.gz) and [all-target clippy](raw/combined-workspace-clippy.txt); protocol validation (56 cases/432 steps) and five credential-script checks pass. Local memory, filesystem and Versity interoperability runs pass; local system Python lacks boto3, so that client is explicitly skipped locally and covered by each PR's required CI jobs. See `raw/combined-workspace-tests.txt`, `raw/combined-workspace-clippy.txt` and `raw/combined-interop-*.txt`. [Recorded required CI](raw/fix-pr-ci.json) for #62–#65 is green; #63–#65 were retargeted to main before their shared fixture-fix base is merged. These follow-up PRs remain open for review.
+The combined client/daemon/module fixes pass the [local workspace tests](raw/combined-workspace-tests.txt.gz) and [all-target clippy](raw/combined-workspace-clippy.txt); protocol validation (56 cases/432 steps) and five credential-script checks pass. Local memory, filesystem and Versity interoperability runs pass; local system Python lacks boto3, so that client is explicitly skipped locally and covered by each PR's required CI jobs. See `raw/combined-workspace-tests.txt.gz`, `raw/combined-workspace-clippy.txt` and `raw/combined-interop-*.txt`. [Recorded required CI](raw/fix-pr-ci.json) captures the passing #62–#65 heads before the final fixture/documentation updates; #63–#65 were retargeted to main before their shared fixture-fix base is merged. These follow-up PRs remain open for review.
+
+The first rig PR run exposed another setup race in the local `.DS_Store` fixtures. Both now keep publication paused through setup, retaining every assertion. The [focused fixture evidence](../mac-ds-store-fixtures/README.md) records the original CI failure, 40/40 repeated runs, the 24-test suite and scoped clippy. The rig also includes the scheduler-independent hold-count assertion from #64, whose timing-flake evidence remains preserved in the upload-control corpus. Exact-head PR CI validates these final test changes separately from the recorded combined run.
 
 All three test mounts were normally unmounted, and only the test daemon/server/logger PIDs were stopped. The installed `/Applications/voidfs.app` and its enabled agent registration were restored; the temporary state-directory preference was deleted. Shared daemon state remained absent. All synthetic datasets, temporary free-app copies and newly created Rust/Swift build scratch were removed; [cleanup evidence](raw/cleanup.json) records each owned path and the recovered disk space. No production drive, real credentials, library, specification or security setting was changed.

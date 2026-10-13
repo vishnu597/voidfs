@@ -14,7 +14,7 @@ Validation on macOS 27.0.1 /26A434, October 13, 2026:
 - A 503 returned after the first committed PUT causes the source to reopen. Guarded replay receives 412, recognizes its own marker, and succeeds with one server version. Per-item final progress is one file; aggregate bandwidth counts both attempts.
 - A 32 MiB fixture bounds a peer that stops reading before the final chunk, a peer holding response headers after consuming the whole request, and a peer holding its response body.
 - Pause and cancel signaled after the first 64 KiB hash read stop before a second read.
-- Private source/build mutations reproduce failures for the old multipart route, weakened absence guard, pre-upload HTTP read timeout, final-only progress and uninterruptible hash prepass. The refined code passes. Mutation artifacts never replace shared build outputs.
+- Private source mutations reproduce failures for the old multipart route, weakened absence guard, pre-upload HTTP read timeout, final-only progress and uninterruptible hash prepass. The refined code passes. The first mutation runs reused the test target; the real source was then touched and rebuilt, and its library/daemon checks passed. Later mutation runs used separate build targets. All owned mutation sources and build scratch were removed after evidence collection.
 
 Independent review found the signing, immutable source, guards, retry recognition, conflict retention, progress accounting and bounded buffering sound after the timeout/progress/Stop refinements. The watchdog also rechecks latest activity at expiry so an obsolete timer cannot expire a fresh deadline or intentional pacing.
 

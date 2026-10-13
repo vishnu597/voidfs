@@ -985,7 +985,6 @@ async fn write_new(ns: &Session, parent: u64, name: &str, body: &'static [u8]) -
 async fn a_ds_store_stays_on_this_mac_across_a_restart_and_nearby_names_publish() {
     let f = Fixture::new(Backend::Api).await;
     let ns = f.session().await;
-    f.queue.resume(Scope::All).await.unwrap();
     // As Finder writes one: create, FinderInfo, truncate, bytes, close.
     let created = ns.create(ns.root(), ".DS_Store", 0o644).await.unwrap();
     assert_eq!(created.sync, Sync::Local);
@@ -1000,6 +999,7 @@ async fn a_ds_store_stays_on_this_mac_across_a_restart_and_nearby_names_publish(
     // Names near it are the user's own and publish.
     let nearby = ["DS_Store", ".DS_Store.txt", "._notes", ".ds_store", ".localized"];
     for name in nearby { write_new(&ns, ns.root(), name, b"mine").await; }
+    f.queue.resume(Scope::All).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), f.queue.settle()).await.expect("publication settles");
     let journaled: i64 = f.db().query_row("SELECT count(*) FROM entries WHERE key GLOB '*.DS_Store'", [], |r| r.get(0)).unwrap();
     assert_eq!(journaled, 0, "nothing about a .DS_Store is journaled");
@@ -1022,7 +1022,6 @@ async fn a_ds_store_stays_on_this_mac_across_a_restart_and_nearby_names_publish(
 async fn a_local_ds_store_renames_only_as_one_and_shadows_the_drives_own() {
     let f = Fixture::new(Backend::Api).await;
     let ns = f.session().await;
-    f.queue.resume(Scope::All).await.unwrap();
     write_new(&ns, ns.root(), ".DS_Store", b"local").await;
     write_new(&ns, ns.root(), "plain", b"plain").await;
     let empty = ns.mkdir(ns.root(), "empty", 0o755).await.unwrap().ino;
