@@ -2394,6 +2394,227 @@ mod tests {
     }
 
 
+    async fn large_new_file_session(endpoint: &str, peer: Client) -> (tempfile::TempDir, Queue, crate::mount::Session) {
+        large_new_file_session_with_timeout(endpoint, peer, Duration::from_secs(120)).await
+    }
+
+    async fn large_new_file_session_with_timeout(endpoint: &str, peer: Client, timeout: Duration) -> (tempfile::TempDir, Queue, crate::mount::Session) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap()); store.set_meta("paused", "1").unwrap();
+        let client = Client::new(voidfs_sdk::Config { timeout, ..self::client(endpoint).config().clone() }).unwrap();
+        let q = Queue::open(store.clone(), client, QueueConfig { multipart_from: 5 * MIB, memory_bytes: 128 * 1024, create_hold: Duration::ZERO, ..Default::default() }).await.unwrap();
+        let cache = crate::Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(peer.clone())), Default::default()).await.unwrap();
+        let session = crate::mount::Session::new_writable_with_config(store, peer, cache, q.clone(), "drive", Default::default(), crate::mount::StagingConfig { min_free_bytes: 0, quiet_period: None, ..Default::default() }).await.unwrap();
+        (dir, q, session)
+    }
+
+    #[tokio::test]
+    async fn a_large_new_mount_file_publishes_through_a_guarded_bounded_stream() {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let peer = client(&server.endpoint); peer.create_drive("drive", Default::default()).await.unwrap();
+        let (_dir, q, session) = large_new_file_session_with_timeout(&server.endpoint, peer.clone(), Duration::from_millis(300)).await;
+        let attr = session.create(session.root(), "file", 0o600).await.unwrap();
+        let fh = session.open(attr.ino, true).await.unwrap();
+        let bytes = Bytes::from(vec![0x5a; (5 * MIB + 37) as usize]);
+        session.write(fh, 0, bytes.clone()).await.unwrap(); session.fsync(fh).await.unwrap();
+        q.set_bandwidth(Some(5 * MIB)).await.unwrap();
+        let started = std::time::Instant::now();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let item = q.status().await.unwrap().items.remove(0);
+                assert_ne!(item.state, State::Done, "progress must be visible while the streamed PUT is still running");
+                if item.sent > 0 {
+                    assert!(item.sent < bytes.len() as u64, "midstream progress precedes the final piece: {item:?}");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the current streamed attempt reports progress");
+        tokio::time::timeout(Duration::from_secs(15), q.settle()).await.unwrap();
+        let item = q.status().await.unwrap().items.remove(0);
+        assert_eq!(item.state, State::Done, "large mount creation must not select unguarded multipart completion: {item:?}");
+        assert_eq!(item.sent, bytes.len() as u64);
+        let remote = peer.get_object("drive", "file", Default::default()).await.unwrap();
+        assert_eq!(remote.body, bytes);
+        assert!(started.elapsed() >= Duration::from_millis(800), "streaming must observe the shared upload limit");
+        assert_eq!(q.bytes_sent(), bytes.len() as u64, "every streamed content piece counts toward the queue's rate");
+        assert_eq!(remote.meta.mode.as_deref(), Some("0600"));
+        assert!(remote.meta.mtime.is_some());
+        assert!(remote.meta.metadata.contains_key(publish::MARKER));
+        assert_eq!(peer.list_versions("drive", "file", true).await.unwrap().len(), 1);
+        assert_eq!(session.read(fh, 0, bytes.len() as u64).await.unwrap(), bytes);
+        session.close(fh).await.unwrap(); q.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_guarded_file_stream_bounds_a_stalled_peer_and_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        let bytes = vec![0x5a; (32 * MIB) as usize];
+        std::fs::write(&path, &bytes).unwrap();
+        let sha = hex::encode(Sha256::digest(&bytes));
+        for phase in ["upload", "headers", "body"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let consumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let task = tokio::spawn({
+                let consumed = consumed.clone();
+                let size = bytes.len();
+                async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    if phase != "upload" {
+                        let mut header = Vec::new();
+                        while !header.ends_with(b"\r\n\r\n") {
+                            let mut byte = [0u8]; socket.read_exact(&mut byte).await.unwrap(); header.push(byte[0]);
+                        }
+                        assert!(String::from_utf8_lossy(&header).to_lowercase().contains("if-none-match: *"));
+                        let mut block = vec![0u8; 64 * 1024];
+                        let mut remaining = size;
+                        while remaining > 0 {
+                            let n = socket.read(&mut block[..remaining.min(64 * 1024)]).await.unwrap();
+                            assert!(n > 0); remaining -= n;
+                        }
+                        consumed.store(true, Ordering::SeqCst);
+                        if phase == "body" {
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nx-amz-version-id: 1.0\r\n\r\nx").await.unwrap();
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            });
+            let client = Client::new(voidfs_sdk::Config { timeout: Duration::from_millis(300), max_attempts: 1, ..self::client(&endpoint).config().clone() }).unwrap();
+            let progress = Arc::new(AtomicU64::new(0));
+            let error = tokio::time::timeout(Duration::from_secs(3), client.put_object_file("drive", "file", &path, &sha,
+                voidfs_sdk::PutOptions { if_none_match_any: true, ..Default::default() }, Some(progress.clone()))).await.expect("a stalled peer remains bounded").unwrap_err();
+            assert!(matches!(error, voidfs_sdk::Error::Transport { sent: true, .. }), "{phase}: {error:?}");
+            assert!(error.to_string().contains("timed out"), "{phase}: {error}");
+            if phase == "upload" {
+                assert!(progress.load(Ordering::Relaxed) < bytes.len() as u64, "the peer stalled before the last piece was requested");
+            } else {
+                assert!(consumed.load(Ordering::SeqCst), "the exact-length body finished before the {phase} timeout");
+                assert_eq!(progress.load(Ordering::Relaxed), bytes.len() as u64);
+            }
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_mount_creation_keeps_its_absence_guard_when_a_peer_creates_during_upload() {
+        use futures::StreamExt;
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let peer = client(&server.endpoint); peer.create_drive("drive", Default::default()).await.unwrap();
+        let began = Arc::new(tokio::sync::Notify::new()); let release = Arc::new(tokio::sync::Notify::new());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback({
+            let (began, release, requests, guarded, upstream, http) = (began.clone(), release.clone(), requests.clone(), guarded.clone(), server.endpoint.clone(), reqwest::Client::new());
+            move |request: axum::extract::Request| {
+                let (began, release, requests, guarded, upstream, http) = (began.clone(), release.clone(), requests.clone(), guarded.clone(), upstream.clone(), http.clone());
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let mut body = body.into_data_stream();
+                    let first = if parts.method == axum::http::Method::PUT && parts.uri.path() == "/drive/file" && parts.uri.query().is_none() {
+                        guarded.store(parts.headers.get("if-none-match").is_some_and(|v| v == "*"), Ordering::SeqCst);
+                        assert!(parts.headers.get("x-amz-content-sha256").unwrap().len() == 64);
+                        let first = body.next().await.expect("an actual body chunk arrived").unwrap();
+                        assert!(!first.is_empty());
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        began.notify_one(); release.notified().await;
+                        Some(first)
+                    } else { None };
+                    let head = parts.method == axum::http::Method::HEAD;
+                    let mut forwarded = http.request(parts.method, format!("{}{}", upstream, parts.uri.path_and_query().unwrap()));
+                    for (name, value) in &parts.headers { forwarded = forwarded.header(name, value); }
+                    let stream = futures::stream::iter(first.into_iter().map(Ok::<_, axum::Error>)).chain(body);
+                    let response = forwarded.body(reqwest::Body::wrap_stream(stream)).send().await.unwrap();
+                    let mut returned = axum::response::Response::builder().status(response.status());
+                    for (name, value) in response.headers() {
+                        if !matches!(name.as_str(), "transfer-encoding" | "connection") && (head || name.as_str() != "content-length") { returned = returned.header(name, value); }
+                    }
+                    returned.body(axum::body::Body::from(response.bytes().await.unwrap())).unwrap()
+                }
+            }
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (_dir, q, session) = large_new_file_session(&endpoint, peer.clone()).await;
+        let attr = session.create(session.root(), "file", 0o600).await.unwrap();
+        let fh = session.open(attr.ino, true).await.unwrap();
+        let bytes = Bytes::from(vec![0x6b; (5 * MIB + 37) as usize]);
+        session.write(fh, 0, bytes.clone()).await.unwrap(); session.fsync(fh).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), began.notified()).await.expect("stream starts before the competing creation");
+        let other = peer.put_object("drive", "file", "peer wins", Default::default()).await.unwrap();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(15), q.settle()).await.unwrap();
+        let item = q.status().await.unwrap().items.remove(0);
+        assert_eq!((item.state, item.conflict.as_deref()), (State::Failed, Some(other.version_id.as_str())), "{item:?}");
+        assert!(guarded.load(Ordering::SeqCst), "the streamed PUT carries If-None-Match: *");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "a rejected absence guard is never retried unguarded");
+        assert_eq!(peer.get_object("drive", "file", Default::default()).await.unwrap().body.as_ref(), b"peer wins");
+        assert_eq!(peer.list_versions("drive", "file", true).await.unwrap().len(), 1);
+        let conflict = session.conflict(attr.ino).await.unwrap().unwrap();
+        assert!(conflict.local_retained && conflict.remote_retained && conflict.error.is_none(), "{conflict:?}");
+        assert_eq!(session.read_conflict(attr.ino, crate::mount::ConflictSide::Local, 0, bytes.len() as u64).await.unwrap(), bytes);
+        assert_eq!(session.read_conflict(attr.ino, crate::mount::ConflictSide::Remote, 0, 9).await.unwrap().as_ref(), b"peer wins");
+        session.close(fh).await.unwrap(); q.close().await; task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_retried_large_mount_creation_reopens_the_stream_and_recognizes_its_own_version() {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let peer = client(&server.endpoint); peer.create_drive("drive", Default::default()).await.unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback({
+            let (requests, upstream, http) = (requests.clone(), server.endpoint.clone(), reqwest::Client::new());
+            move |request: axum::extract::Request| {
+                let (requests, upstream, http) = (requests.clone(), upstream.clone(), http.clone());
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let put = parts.method == axum::http::Method::PUT && parts.uri.path() == "/drive/file" && parts.uri.query().is_none();
+                    if put { assert_eq!(parts.headers.get("if-none-match").unwrap(), "*"); }
+                    let head = parts.method == axum::http::Method::HEAD;
+                    let mut forwarded = http.request(parts.method, format!("{}{}", upstream, parts.uri.path_and_query().unwrap()));
+                    for (name, value) in &parts.headers { forwarded = forwarded.header(name, value); }
+                    let response = forwarded.body(reqwest::Body::wrap_stream(body.into_data_stream())).send().await.unwrap();
+                    if put && requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        assert!(response.status().is_success(), "the first streamed put landed before its answer was lost");
+                        let _ = response.bytes().await.unwrap();
+                        return axum::response::Response::builder().status(503).header("content-type", "application/xml")
+                            .body(axum::body::Body::from("<Error><Code>ServiceUnavailable</Code><Message>answer lost after commit</Message><RequestId>retry</RequestId></Error>")).unwrap();
+                    }
+                    let mut returned = axum::response::Response::builder().status(response.status());
+                    for (name, value) in response.headers() {
+                        if !matches!(name.as_str(), "transfer-encoding" | "connection") && (head || name.as_str() != "content-length") { returned = returned.header(name, value); }
+                    }
+                    returned.body(axum::body::Body::from(response.bytes().await.unwrap())).unwrap()
+                }
+            }
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (_dir, q, session) = large_new_file_session(&endpoint, peer.clone()).await;
+        let attr = session.create(session.root(), "file", 0o600).await.unwrap();
+        let fh = session.open(attr.ino, true).await.unwrap();
+        let bytes = Bytes::from(vec![0x7c; (5 * MIB + 37) as usize]);
+        session.write(fh, 0, bytes.clone()).await.unwrap(); session.fsync(fh).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), q.settle()).await.unwrap();
+        let item = q.status().await.unwrap().items.remove(0);
+        assert_eq!(item.state, State::Done, "the retry's 412 belongs to our own guarded first attempt: {item:?}");
+        assert_eq!(item.sent, bytes.len() as u64, "per-item progress is the current attempt, not both retries combined");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(q.bytes_sent(), 2 * bytes.len() as u64, "each reopened stream is paced and counted");
+        assert_eq!(peer.get_object("drive", "file", Default::default()).await.unwrap().body, bytes);
+        assert_eq!(peer.list_versions("drive", "file", true).await.unwrap().len(), 1);
+        session.close(fh).await.unwrap(); q.close().await; task.abort();
+    }
+
     #[tokio::test]
     async fn a_conflict_keeps_exact_remote_metadata_when_its_sparse_bytes_cannot_be_reserved() {
         let (_dir, q, client, session, _server) = publication_session().await;
