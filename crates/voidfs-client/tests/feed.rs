@@ -99,7 +99,7 @@ async fn a_resync_watch_invalidates_an_idle_drive_when_its_stream_reopens() {
     let client = client_for(&endpoint, Config { max_attempts: 1, timeout: Duration::from_millis(300), ..Default::default() });
     let mut watch = FeedWatch::start_with_resync(client, "drv", 17, None);
     let event = tokio::time::timeout(Duration::from_secs(5), watch.next()).await.expect("idle reconnect invalidation").unwrap();
-    assert_eq!(event, FeedEvent { drive: "drv".into(), seq: 17, invalidations: vec![Invalidation::All] });
+    assert_eq!(event, FeedEvent { drive: "drv".into(), seq: 17, invalidations: vec![Invalidation::All], changes: Vec::new() });
     drop(watch);
     server.abort();
     let _ = server.await;

@@ -39,8 +39,15 @@ pub type Ino = u64;
 pub type Fh = u64;
 pub type Result<T> = std::result::Result<T, FsError>;
 
+/// `Local`: a file this Mac keeps to itself ([`local_only`]); nothing it does is published.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Sync { Saved, Pending, Saving, Conflict, Error }
+pub enum Sync { Saved, Pending, Saving, Conflict, Error, Local }
+
+/// Names whose new files stay on this Mac: Finder rewrites `.DS_Store` whenever a window's view
+/// changes, and each rewrite would be a version every other computer downloads. Exact and
+/// case-sensitive, as Finder writes it; a `.DS_Store` already in the drive shows and syncs as
+/// any file does (step 5, item 4).
+pub fn local_only(name: &str) -> bool { name == ".DS_Store" }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Attr {
@@ -97,6 +104,9 @@ pub enum FsError {
     Ambiguous,
     #[error("namespace changed during enumeration; retry")]
     Again,
+    /// A rename between a file kept on this Mac and a published name: `mv` copies instead.
+    #[error("a local-only file and a published name can't be renamed into each other")]
+    CrossDevice,
     #[error("{0}")]
     Io(String),
 }
@@ -149,7 +159,8 @@ impl FsError {
                 #[cfg(target_os = "macos")] { libc::ENOATTR }
                 #[cfg(not(target_os = "macos"))] { libc::ENODATA }
             },
-            Self::Ambiguous => libc::EILSEQ, Self::Again => libc::EAGAIN, Self::BadHandle => libc::EBADF, Self::Io(_) => libc::EIO,
+            Self::Ambiguous => libc::EILSEQ, Self::Again => libc::EAGAIN, Self::BadHandle => libc::EBADF, Self::CrossDevice => libc::EXDEV,
+            Self::Io(_) => libc::EIO,
         }
     }
 }
@@ -209,6 +220,7 @@ fn node(c: &Connection, drive: &str, ino: Ino) -> rusqlite::Result<Option<Node>>
         let sync: String = r.get(2)?;
         let sync = match sync.as_str() {
             "saved" => Sync::Saved, "pending" => Sync::Pending, "saving" => Sync::Saving, "conflict" => Sync::Conflict, "error" => Sync::Error,
+            "local" => Sync::Local,
             _ => return Err(rusqlite::Error::InvalidQuery),
         };
         Ok(Node { ino, entry: decode_json(&r.get::<_, String>(0)?)?, generation: r.get(1)?, sync, entry_id: r.get(3)?, remote_key: r.get(4)? })
@@ -257,9 +269,10 @@ const DESCENDANTS: &str = "WITH RECURSIVE children(ino) AS (
         UNION SELECT n.ino FROM mount_names n JOIN children p ON n.parent=p.ino WHERE NOT EXISTS
         (SELECT 1 FROM mount_overlay o WHERE o.parent=n.parent AND o.name=n.name)) SELECT ino FROM children";
 
-/// Whether the inode, or anything under it, holds local changes not yet published.
+/// Whether the inode, or anything under it, holds local changes not yet published. A local-only
+/// file holds none: it goes with a folder removed elsewhere.
 fn pending_under(c: &Connection, ino: Ino) -> rusqlite::Result<bool> {
-    c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM mount_inodes WHERE sync<>'saved' AND ino IN ({DESCENDANTS}))"), [ino], |r| r.get(0))
+    c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM mount_inodes WHERE sync NOT IN ('saved', 'local') AND ino IN ({DESCENDANTS}))"), [ino], |r| r.get(0))
 }
 
 fn descendants(c: &Connection, ino: Ino) -> rusqlite::Result<Vec<Ino>> {
@@ -313,6 +326,58 @@ fn affected_inodes(c: &Connection, drive: &str, root: Ino, changes: &[Invalidati
     Ok(affected)
 }
 
+/// Where a remote key leads in the local view.
+enum At { Missing, Deleted, Node(Box<Node>) }
+
+fn at(c: &Connection, drive: &str, root: Ino, key: &str) -> rusqlite::Result<At> {
+    let mut ino = root;
+    for name in key.split('/').filter(|name| !name.is_empty()) {
+        match c.query_row("SELECT ino FROM mount_overlay WHERE parent=?1 AND name=?2", params![ino, name], |r| r.get::<_, Option<Ino>>(0)).optional()? {
+            Some(None) => return Ok(At::Deleted),
+            Some(Some(child)) => ino = child,
+            None => match c.query_row("SELECT ino FROM mount_names WHERE parent=?1 AND name=?2", params![ino, name], |r| r.get::<_, Ino>(0)).optional()? {
+                Some(child) => ino = child,
+                None => return Ok(At::Missing),
+            },
+        }
+    }
+    Ok(node(c, drive, ino)?.map_or(At::Missing, |n| At::Node(Box::new(n))))
+}
+
+/// Whether a folder above `key` was moved here and not yet published: what is under its remote
+/// key shows under its new name.
+fn moved_from(c: &Connection, drive: &str, root: Ino, key: &str) -> rusqlite::Result<bool> {
+    let bases = key.trim_end_matches('/').match_indices('/').map(|(end, _)| key[..=end].to_owned()).collect::<Vec<_>>();
+    if bases.is_empty() { return Ok(false); }
+    let mut q = c.prepare("SELECT ino, remote_key FROM mount_inodes INDEXED BY mount_pending_remote_key
+        WHERE drive=?1 AND sync<>'saved' AND remote_key IN (SELECT value FROM json_each(?2))")?;
+    let pending = q.query_map(params![drive, serde_json::to_string(&bases).expect("JSON")], |r| Ok((r.get::<_, Ino>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (ino, remote) in pending {
+        let here = chain(c, drive, root, ino)?.map(|path| path.into_iter().skip(1).map(|(_, name)| format!("{name}/")).collect::<String>());
+        if here.as_deref() != Some(remote.as_str()) { return Ok(true); }
+    }
+    Ok(false)
+}
+
+/// Whether the local view already shows a feed change from another computer: a deletion of a
+/// name it doesn't have, or a change at a name with unpublished local edits, which keep the view
+/// until their own publication settles them (or conflicts). A change that moved something away
+/// from a name the view still shows is not shown, nor anything under a folder moved here and not
+/// yet published.
+fn shown(c: &Connection, drive: &str, root: Ino, change: &voidfs_sdk::Change) -> rusqlite::Result<bool> {
+    if moved_from(c, drive, root, &change.key)? { return Ok(false); }
+    if let Some(from) = &change.from_key {
+        if moved_from(c, drive, root, from)? { return Ok(false); }
+        if let At::Node(n) = at(c, drive, root, from)? && n.sync == Sync::Saved { return Ok(false); }
+    }
+    Ok(match at(c, drive, root, &change.key)? {
+        At::Missing => change.op == "delete",
+        At::Deleted => true,
+        At::Node(n) => n.sync != Sync::Saved
+            || (change.op != "delete" && n.entry.object_id == change.object_id && n.entry.version_id.as_deref() == Some(change.version_id.as_str())),
+    })
+}
+
 fn parent(c: &Connection, ino: Ino) -> rusqlite::Result<Option<(Ino, String)>> {
     c.query_row("SELECT parent, name FROM mount_overlay WHERE ino=?1 UNION ALL
         SELECT parent, name FROM mount_names n WHERE ino=?1 AND NOT EXISTS
@@ -364,7 +429,7 @@ fn mutation_base(n: &Node) -> Result<crate::journal::StoredBase> {
 }
 
 fn save_node(c: &Connection, n: &Node) -> Result<()> {
-    let sync = match n.sync { Sync::Saved => "saved", Sync::Pending => "pending", Sync::Saving => "saving", Sync::Conflict => "conflict", Sync::Error => "error" };
+    let sync = match n.sync { Sync::Saved => "saved", Sync::Pending => "pending", Sync::Saving => "saving", Sync::Conflict => "conflict", Sync::Error => "error", Sync::Local => "local" };
     c.execute("UPDATE mount_inodes SET attrs=?2, generation=?3, sync=?4 WHERE ino=?1", params![n.ino, serde_json::to_string(&n.entry).expect("JSON"), n.generation, sync])?;
     Ok(())
 }
@@ -557,7 +622,7 @@ impl Session {
                 Ok(state)
             }).await??;
             let (n, key) = state;
-            if ino == self.root || n.entry_id.is_some() || n.entry.version_id.as_ref().is_some_and(|v| !v.is_empty()) { return Ok(()); }
+            if ino == self.root || n.sync == Sync::Local || n.entry_id.is_some() || n.entry.version_id.as_ref().is_some_and(|v| !v.is_empty()) { return Ok(()); }
             if offline { return Err(FsError::Offline); }
             let base_key = n.remote_key.as_deref().unwrap_or(&key);
             let attrs = self.patient(async { match self.client.attributes(&self.drive, base_key, Default::default()).await {
@@ -962,6 +1027,31 @@ impl Session {
             Ok(affected.into_iter().collect())
         }).await
     }
+
+    /// Invalidates what a feed batch affects, as [`Session::invalidate`] does, and returns the
+    /// invalidations and inodes of the changes the local view doesn't already show, for the
+    /// mount's observers. Already shown are this Mac's own publications coming back (a version
+    /// it published at that key, or the one the inode records) and what [`shown`] describes.
+    pub async fn invalidate_feed(&self, changes: &[voidfs_sdk::Change]) -> Result<(Vec<Invalidation>, Vec<Ino>)> {
+        let all = crate::feed::invalidations(changes);
+        let own = changes.iter().map(|c| self.data.own(&c.key, &c.version_id)).collect::<Vec<_>>();
+        let changes = changes.to_vec();
+        self.db(move |c, d, root| {
+            let tx = c.transaction()?;
+            let mut foreign = Vec::new();
+            for (change, own) in changes.into_iter().zip(own) {
+                if !own && !shown(&tx, d, root, &change)? { foreign.push(change); }
+            }
+            let foreign = crate::feed::invalidations(&foreign);
+            let reported = affected_inodes(&tx, d, root, &foreign)?;
+            for ino in affected_inodes(&tx, d, root, &all)? {
+                tx.execute("UPDATE mount_dirs SET listed=0, generation=generation+1 WHERE ino=?1", [ino])?;
+                tx.execute("UPDATE mount_inodes SET generation=generation+1 WHERE ino=?1", [ino])?;
+            }
+            tx.commit()?;
+            Ok((foreign, reported.into_iter().collect()))
+        }).await
+    }
 }
 
 #[cfg(test)]
@@ -1144,7 +1234,7 @@ mod tests {
             (FsError::IsDir, libc::EISDIR), (FsError::NotDir, libc::ENOTDIR), (FsError::NoSpace, libc::ENOSPC),
             (FsError::ReadOnly, libc::EROFS), (FsError::Unsupported, libc::ENOTSUP), (FsError::Stale, libc::ESTALE),
             (FsError::Offline, libc::ENETDOWN), (FsError::Permission, libc::EACCES), (FsError::InvalidName, libc::EINVAL),
-            (FsError::Ambiguous, libc::EILSEQ), (FsError::Again, libc::EAGAIN), (FsError::Io("test".into()), libc::EIO)] {
+            (FsError::Ambiguous, libc::EILSEQ), (FsError::Again, libc::EAGAIN), (FsError::CrossDevice, libc::EXDEV), (FsError::Io("test".into()), libc::EIO)] {
             assert_eq!(e.errno(), errno);
         }
         assert_eq!(FsError::from(Error::from(std::io::Error::from_raw_os_error(libc::ENOSPC))), FsError::NoSpace);

@@ -262,3 +262,45 @@ fn uploads_watch_until_the_daemon_stops() {
     };
     assert!(status.success(), "{status}");
 }
+
+/// A mount's guarded save that the drive refused (step 5, item 4): `uploads` and `status` say
+/// conflict, not failed, and the daemon's log says so once.
+#[test]
+fn a_mounts_conflict_shows_in_uploads_status_and_the_log() {
+    let f = Fixture::new("conflict");
+    f.drive("footage");
+    f.put("footage", "notes.txt", "base bytes");
+    let s = State::new(&f, "k");
+    s.void(&["daemon", "start"]).ok();
+    s.void(&["uploads", "pause", "--all"]).ok();
+    let client = voidfs_daemon::DaemonClient::new(&s.socket());
+    let session = f.block(client.session("footage", false)).unwrap();
+    f.block(async {
+        let ino = session.lookup(session.info().root, "notes.txt").await.unwrap().ino;
+        let fh = session.open(ino, true).await.unwrap().fh;
+        session.write(fh, 0, bytes::Bytes::from_static(b"LOCAL")).await.unwrap();
+        session.close(fh).await.unwrap();
+    });
+    let theirs = f.put("footage", "notes.txt", "another Mac's bytes");
+    s.void(&["uploads", "resume", "--all"]).ok();
+    wait_for(&s, "the save is refused", |v| item(v, "notes.txt")["state"] == "failed");
+
+    let said = format!("conflict: the drive changed (now version {theirs}); this Mac keeps its copy");
+    let table = s.void(&["uploads"]).ok().out();
+    assert!(table.contains(&said) && !table.contains("failed: 412"), "{table}");
+    assert!(lines(&table).last().unwrap().starts_with("0 uploading, 0 queued, 1 in conflict · "), "{table}");
+    let page = s.void(&["status"]).ok().out();
+    assert!(page.contains("uploads   1 in conflict · "), "{page}");
+    assert_eq!(s.void(&["status", "--json"]).ok().json()["uploads"]["conflicts"], 1);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !std::fs::read_to_string(s.dir.join("daemon.log")).unwrap().contains(&said) {
+        assert!(Instant::now() < deadline, "the log says it");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(6));
+    let log = std::fs::read_to_string(s.dir.join("daemon.log")).unwrap();
+    assert_eq!(log.matches(&said).count(), 1, "once: {log}");
+    assert!(log.contains(":notes.txt, entry "), "{log}");
+    assert_eq!(f.text("footage", "notes.txt"), "another Mac's bytes", "nothing published over it");
+    f.block(session.release()).unwrap();
+}

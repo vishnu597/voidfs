@@ -18,8 +18,8 @@ use common::client_for;
 use rusqlite::Connection;
 use voidfs_client::mount::{ConflictSide, FsError, RenameMode, Session, StagingConfig, Sync, XattrMode};
 use voidfs_client::{ApiFetcher, BucketConfig, BucketFetcher, Cache, CacheConfig, Connectivity, Fetch,
-    Invalidation, Queue, QueueConfig, Scope, State, Store};
-use voidfs_sdk::{AttributesUpdate, Client, Config, Kind, PutOptions, ReadOptions};
+    Invalidation, Queue, QueueConfig, Scope, State, Store, invalidations};
+use voidfs_sdk::{AttributesUpdate, Change, Client, Config, Kind, PutOptions, ReadOptions};
 use voidfs_server::test_server::{Rules, TestServer};
 
 #[derive(Clone, Copy)]
@@ -182,7 +182,14 @@ impl Fixture {
         drop(old_cache);
         drop(old_queue);
         drop(store);
-        let store = Arc::new(Store::open(state.path()).unwrap());
+        // As a restarted process waits for the old one to exit: a disk flush may still hold it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let store = loop {
+            match Store::open(state.path()) {
+                Err(voidfs_client::Error::Locked(_)) if std::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(5)).await,
+                store => break Arc::new(store.unwrap()),
+            }
+        };
         let cache = cache(store.clone(), client.clone(), connectivity.clone(), backend).await;
         let queue = Queue::open(store.clone(), client.clone(), queue_config(&connectivity)).await.unwrap();
         let f = Self { _server, proxy, remote, client, state, store, cache, queue, connectivity, backend };
@@ -769,5 +776,298 @@ async fn delayed_xattr_ack_preserves_the_later_complete_map_until_saved() {
     ns.invalidate(&[Invalidation::Object("file".into())]).await.unwrap();
     assert_eq!(ns.getxattr(ino, "user.tag").await.unwrap(), b"external", "the complete map becomes clean after its last guarded acknowledgement");
     assert!(!f.db().query_row("SELECT dirty FROM mount_xattrs WHERE ino=?1", [ino], |r| r.get::<_, bool>(0)).unwrap());
+    f.queue.close().await;
+}
+
+fn change(op: &str, key: &str, from_key: Option<&str>, object_id: &str, version_id: &str) -> Change {
+    Change { op: op.into(), key: key.into(), from_key: from_key.map(Into::into), object_id: object_id.into(), version_id: version_id.into(),
+        kind: Kind::File, seq: None, time: None }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_feed_reports_other_computers_changes_and_not_this_macs_own() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    f.put("saved", b"saved").await;
+    f.put("from", b"from").await;
+    f.put("dir/inside", b"inside").await;
+    let since = f.remote.changes("drv", 0, Duration::ZERO).await.unwrap().seq;
+    let saved = ns.lookup(ns.root(), "saved").await.unwrap().ino;
+    ns.lookup(ns.root(), "from").await.unwrap();
+    let dir = ns.lookup(ns.root(), "dir").await.unwrap();
+    let inside = ns.lookup(dir.ino, "inside").await.unwrap();
+    // This Mac's own publications coming back: a new file, an edit and a rename.
+    let created = ns.create(ns.root(), "own", 0o600).await.unwrap();
+    let fh = ns.open(created.ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"own")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    let fh = ns.open(saved, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"edit")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    ns.rename(ns.root(), "from", ns.root(), "to", RenameMode::Exclusive).await.unwrap();
+    f.publish().await;
+    // A second edit: the first's version is no longer the one the inode records.
+    let fh = ns.open(saved, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"again")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    f.publish().await;
+    let own = f.remote.changes("drv", since, Duration::ZERO).await.unwrap();
+    assert!(own.changes.iter().filter(|c| c.key == "saved").count() >= 2, "{:?}", own.changes);
+    let ops = own.changes.iter().map(|c| (c.op.as_str(), c.key.as_str())).collect::<Vec<_>>();
+    assert!(["own", "saved", "to"].iter().all(|key| ops.iter().any(|(_, k)| k == key)) && ops.iter().any(|(op, _)| *op == "rename"), "{ops:?}");
+    let generation = |ino| f.db().query_row("SELECT generation FROM mount_inodes WHERE ino=?1", [ino], |r| r.get::<_, i64>(0)).unwrap();
+    let before = generation(saved);
+    assert_eq!(ns.invalidate_feed(&own.changes).await.unwrap(), (Vec::new(), Vec::new()), "this Mac's own publications are not news");
+    assert!(generation(saved) > before, "the session still invalidates what its own publications changed");
+
+    // Other computers' changes: an edit, a new name, a rename and a delete.
+    f.put("to", b"elsewhere").await;
+    f.put("other", b"other").await;
+    f.remote.rename("drv", "own", "renamed", Default::default()).await.unwrap();
+    f.remote.delete_object("drv", "saved", Default::default()).await.unwrap();
+    let foreign = f.remote.changes("drv", own.seq, Duration::ZERO).await.unwrap();
+    assert_eq!(foreign.changes.len(), 4);
+    let (reported, inodes) = ns.invalidate_feed(&foreign.changes).await.unwrap();
+    assert_eq!(reported, invalidations(&foreign.changes));
+    assert!(inodes.contains(&ns.root()) && inodes.contains(&saved) && inodes.contains(&created.ino), "{inodes:?}");
+
+    // What the local view already shows: a name with an unpublished edit, a rename not yet
+    // acknowledged, and the delete of a name it doesn't have. A change to a name it shows as
+    // saved, or a rename from one, is news.
+    f.queue.pause(Scope::All).await.unwrap();
+    let to = ns.lookup(ns.root(), "to").await.unwrap();
+    let other = ns.lookup(ns.root(), "other").await.unwrap();
+    let fh = ns.open(to.ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"pending")).await.unwrap();
+    ns.rename(ns.root(), "renamed", ns.root(), "moved", RenameMode::Exclusive).await.unwrap();
+    ns.rename(ns.root(), "dir", ns.root(), "dir2", RenameMode::Exclusive).await.unwrap();
+    let shown = [
+        change("put", "to", None, to.object_id.as_deref().unwrap(), "remote"),
+        change("rename", "moved", Some("renamed"), "created", "remote"),
+        change("delete", "never", None, "missing", "remote"),
+    ];
+    for one in &shown {
+        assert_eq!(ns.invalidate_feed(std::slice::from_ref(one)).await.unwrap(), (Vec::new(), Vec::new()), "{one:?}");
+    }
+    let news = [
+        change("put", "other", None, other.object_id.as_deref().unwrap(), "remote"),
+        change("rename", "to", Some("other"), other.object_id.as_deref().unwrap(), "remote"),
+        change("put", "never", None, "missing", "remote"),
+        // Inside a folder this Mac moved and hasn't published: the local view shows it elsewhere.
+        change("put", "dir/inside", None, inside.object_id.as_deref().unwrap(), "remote"),
+    ];
+    for one in &news {
+        let (reported, inodes) = ns.invalidate_feed(std::slice::from_ref(one)).await.unwrap();
+        assert_eq!(reported, invalidations(std::slice::from_ref(one)), "{one:?}");
+        assert!(!inodes.is_empty(), "{one:?}");
+    }
+    ns.close(fh).await.unwrap();
+    f.queue.close().await;
+}
+
+async fn history(f: &Fixture, key: &str) -> Vec<String> {
+    f.remote.list_versions("drv", key, true).await.unwrap().into_iter().map(|v| v.operation).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_files_bytes_mode_times_and_xattrs_go_up_with_its_creating_put() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    f.queue.resume(Scope::All).await.unwrap();
+    // As Finder copies a file: create, provenance, bytes, mode and dates, close.
+    let mtime = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    let created = ns.create(ns.root(), "copied", 0o600).await.unwrap();
+    ns.setxattr(created.ino, "com.apple.provenance", &[1, 2, 3], XattrMode::Set).await.unwrap();
+    let fh = ns.open(created.ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"copied bytes")).await.unwrap();
+    ns.setxattr(created.ino, "user.empty", &[], XattrMode::Set).await.unwrap();
+    ns.setattr(created.ino, Some(0o640), Some(mtime)).await.unwrap();
+    let (normal, full) = ns.staging_commits();
+    ns.close(fh).await.unwrap();
+    assert_eq!(ns.staging_commits(), (normal, full + 1), "the close is one FULL staging commit");
+    let entries: i64 = f.db().query_row("SELECT count(*) FROM entries WHERE key='copied'", [], |r| r.get(0)).unwrap();
+    assert_eq!(entries, 1, "the create, xattrs, mode, dates and bytes are one journal entry");
+    tokio::time::timeout(Duration::from_secs(10), f.queue.settle()).await.expect("publication settles");
+    // A put can't carry xattrs: they are the version after it (protocol §4.8).
+    assert_eq!(history(&f, "copied").await, ["put", "attrs"]);
+    assert_eq!(f.body("copied").await, Some(Bytes::from_static(b"copied bytes")));
+    let saved = ns.lookup(ns.root(), "copied").await.unwrap();
+    assert_eq!((saved.sync, saved.mode, saved.mtime, saved.size), (Sync::Saved, 0o640, mtime, 12));
+    assert_eq!(ns.getxattr(saved.ino, "com.apple.provenance").await.unwrap(), [1, 2, 3]);
+    assert_eq!(ns.getxattr(saved.ino, "user.empty").await.unwrap(), Vec::<u8>::new());
+    let attrs = f.remote.attributes("drv", "copied", ReadOptions::default()).await.unwrap();
+    assert_eq!(attrs.xattrs.keys().collect::<Vec<_>>(), ["com.apple.provenance", "user.empty"]);
+    // Without xattrs, one version.
+    let plain = ns.create(ns.root(), "plain", 0o644).await.unwrap();
+    let fh = ns.open(plain.ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"plain")).await.unwrap();
+    ns.setattr(plain.ino, None, Some(mtime)).await.unwrap();
+    ns.close(fh).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), f.queue.settle()).await.expect("publication settles");
+    assert_eq!(history(&f, "plain").await, ["put"]);
+    assert_eq!(ns.lookup(ns.root(), "plain").await.unwrap().mtime, mtime);
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_file_written_past_the_hold_publishes_its_create_first() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    f.queue.resume(Scope::All).await.unwrap();
+    let created = ns.create(ns.root(), "slow", 0o644).await.unwrap();
+    let fh = ns.open(created.ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"first")).await.unwrap();
+    let hold = QueueConfig::default().create_hold;
+    assert_eq!(hold, Duration::from_secs(1));
+    tokio::time::timeout(hold * 5, async { while f.body("slow").await.is_none() { tokio::time::sleep(Duration::from_millis(20)).await; } })
+        .await.expect("the create goes once the hold ends");
+    ns.write(fh, 5, Bytes::from_static(b" second")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), f.queue.settle()).await.expect("publication settles");
+    assert_eq!(history(&f, "slow").await, ["put", "put"]);
+    assert_eq!(f.body("slow").await, Some(Bytes::from_static(b"first second")));
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_sets_its_mode_and_times_in_its_own_request() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    let (ino, fh) = existing(&f, &ns).await;
+    ns.write(fh, 0, Bytes::from_static(b"AB")).await.unwrap();
+    let mtime = ns.handle_attr(fh).unwrap().mtime;
+    ns.close(fh).await.unwrap();
+    f.publish().await;
+    assert_eq!(history(&f, "file").await, ["put", "write"], "no attributes version after the edit");
+    let saved = ns.getattr(ino).await.unwrap();
+    assert_eq!((saved.sync, saved.mtime, saved.mode), (Sync::Saved, mtime, 0o640));
+    let attrs = f.remote.attributes("drv", "file", ReadOptions::default()).await.unwrap();
+    assert_eq!(attrs.mode.as_deref(), Some("0640"));
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewrite_in_place_is_one_version() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    let (ino, fh) = existing(&f, &ns).await;
+    // As O_TRUNC and a save in place: truncate to nothing, then the new bytes.
+    ns.truncate(fh, 0).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"new")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    f.publish().await;
+    assert_eq!(history(&f, "file").await, ["put", "write"], "no empty version before the new bytes");
+    assert_eq!(f.body("file").await, Some(Bytes::from_static(b"new")));
+    // The truncate stays when the writes leave bytes it cleared.
+    let fh = ns.open(ino, true).await.unwrap();
+    ns.truncate(fh, 0).await.unwrap();
+    ns.write(fh, 4, Bytes::from_static(b"gap")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    f.publish().await;
+    assert_eq!(f.body("file").await, Some(Bytes::from_static(b"\0\0\0\0gap")));
+    assert_eq!(ns.read(ns.open(ino, false).await.unwrap(), 0, 64).await.unwrap(), Bytes::from_static(b"\0\0\0\0gap"));
+    f.queue.close().await;
+}
+
+async fn names(ns: &Session, dir: u64) -> Vec<String> {
+    ns.readdir(dir, None, 100).await.unwrap().into_iter().map(|(name, _)| name).collect()
+}
+
+async fn write_new(ns: &Session, parent: u64, name: &str, body: &'static [u8]) -> u64 {
+    let created = ns.create(parent, name, 0o644).await.unwrap();
+    let fh = ns.open(created.ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(body)).await.unwrap();
+    ns.close(fh).await.unwrap();
+    created.ino
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ds_store_stays_on_this_mac_across_a_restart_and_nearby_names_publish() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    f.queue.resume(Scope::All).await.unwrap();
+    // As Finder writes one: create, FinderInfo, truncate, bytes, close.
+    let created = ns.create(ns.root(), ".DS_Store", 0o644).await.unwrap();
+    assert_eq!(created.sync, Sync::Local);
+    ns.setxattr(created.ino, "com.apple.FinderInfo", &[0; 32], XattrMode::Set).await.unwrap();
+    let fh = ns.open(created.ino, true).await.unwrap();
+    ns.truncate(fh, 0).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"Bud1 view")).await.unwrap();
+    ns.setattr(created.ino, Some(0o600), None).await.unwrap();
+    ns.close(fh).await.unwrap();
+    let dir = ns.mkdir(ns.root(), "dir", 0o755).await.unwrap().ino;
+    write_new(&ns, dir, ".DS_Store", b"Bud1 dir").await;
+    // Names near it are the user's own and publish.
+    let nearby = ["DS_Store", ".DS_Store.txt", "._notes", ".ds_store", ".localized"];
+    for name in nearby { write_new(&ns, ns.root(), name, b"mine").await; }
+    tokio::time::timeout(Duration::from_secs(10), f.queue.settle()).await.expect("publication settles");
+    let journaled: i64 = f.db().query_row("SELECT count(*) FROM entries WHERE key GLOB '*.DS_Store'", [], |r| r.get(0)).unwrap();
+    assert_eq!(journaled, 0, "nothing about a .DS_Store is journaled");
+    assert_eq!((f.body(".DS_Store").await, f.body("dir/.DS_Store").await), (None, None));
+    for name in nearby { assert_eq!(f.body(name).await, Some(Bytes::from_static(b"mine")), "{name}"); }
+    let (f, ns) = f.restart(ns).await;
+    tokio::time::timeout(Duration::from_secs(10), f.queue.settle()).await.expect("recovery settles");
+    assert_eq!(f.body(".DS_Store").await, None, "recovery doesn't publish it either");
+    let saved = ns.lookup(ns.root(), ".DS_Store").await.unwrap();
+    assert_eq!((saved.ino, saved.sync, saved.mode, saved.size), (created.ino, Sync::Local, 0o600, 9));
+    assert_eq!(ns.read(ns.open(saved.ino, false).await.unwrap(), 0, 64).await.unwrap(), Bytes::from_static(b"Bud1 view"));
+    assert_eq!(ns.getxattr(saved.ino, "com.apple.FinderInfo").await.unwrap(), [0; 32]);
+    assert!(names(&ns, ns.root()).await.contains(&".DS_Store".to_owned()));
+    let inner = ns.lookup(dir, ".DS_Store").await.unwrap();
+    assert_eq!(ns.read(ns.open(inner.ino, false).await.unwrap(), 0, 64).await.unwrap(), Bytes::from_static(b"Bud1 dir"));
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_ds_store_renames_only_as_one_and_shadows_the_drives_own() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    f.queue.resume(Scope::All).await.unwrap();
+    write_new(&ns, ns.root(), ".DS_Store", b"local").await;
+    write_new(&ns, ns.root(), "plain", b"plain").await;
+    let empty = ns.mkdir(ns.root(), "empty", 0o755).await.unwrap().ino;
+    // Crossing between a local-only file and a published name is EXDEV: `mv` copies instead.
+    assert_eq!(ns.rename(ns.root(), ".DS_Store", ns.root(), "named", RenameMode::Replace).await.unwrap_err(), FsError::CrossDevice);
+    assert_eq!(ns.rename(ns.root(), "plain", empty, ".DS_Store", RenameMode::Replace).await.unwrap_err(), FsError::CrossDevice);
+    assert_eq!(FsError::CrossDevice.errno(), libc::EXDEV);
+    // Into another folder, it stays local.
+    ns.rename(ns.root(), ".DS_Store", empty, ".DS_Store", RenameMode::Replace).await.unwrap();
+    ns.rename(empty, ".DS_Store", ns.root(), ".DS_Store", RenameMode::Replace).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), f.queue.settle()).await.expect("publication settles");
+    assert_eq!(f.body(".DS_Store").await, None);
+    assert_eq!(names(&ns, empty).await, Vec::<String>::new());
+    // One another computer puts in the drive stays behind this Mac's until it goes.
+    f.put(".DS_Store", b"theirs").await;
+    ns.invalidate(&[Invalidation::All]).await.unwrap();
+    let local = ns.lookup(ns.root(), ".DS_Store").await.unwrap();
+    assert_eq!(local.sync, Sync::Local);
+    assert_eq!(ns.read(ns.open(local.ino, false).await.unwrap(), 0, 64).await.unwrap(), Bytes::from_static(b"local"));
+    ns.unlink(ns.root(), ".DS_Store").await.unwrap();
+    let theirs = ns.lookup(ns.root(), ".DS_Store").await.unwrap();
+    assert_eq!(theirs.sync, Sync::Saved);
+    assert_eq!(ns.read(ns.open(theirs.ino, false).await.unwrap(), 0, 64).await.unwrap(), Bytes::from_static(b"theirs"));
+    // The drive's own is an ordinary file: a create can't take its name, and an edit publishes.
+    assert_eq!(ns.create(ns.root(), ".DS_Store", 0o644).await.unwrap_err(), FsError::Exists);
+    let fh = ns.open(theirs.ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"THEIRS")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), f.queue.settle()).await.expect("publication settles");
+    assert_eq!(f.body(".DS_Store").await, Some(Bytes::from_static(b"THEIRS")));
+    let journaled: i64 = f.db().query_row("SELECT count(*) FROM entries WHERE key='.DS_Store' AND op='delete'", [], |r| r.get(0)).unwrap();
+    assert_eq!(journaled, 0, "removing the local one deleted nothing in the drive");
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_removed_elsewhere_goes_with_its_local_ds_store() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    f.put("dir/file", b"file").await;
+    let dir = ns.lookup(ns.root(), "dir").await.unwrap().ino;
+    write_new(&ns, dir, ".DS_Store", b"view").await;
+    f.remote.delete_object("drv", "dir/file", Default::default()).await.unwrap();
+    f.remote.delete_object("drv", "dir/", Default::default()).await.unwrap();
+    ns.invalidate(&[Invalidation::All]).await.unwrap();
+    assert_eq!(names(&ns, ns.root()).await, Vec::<String>::new(), "only local-only names were left in it");
     f.queue.close().await;
 }

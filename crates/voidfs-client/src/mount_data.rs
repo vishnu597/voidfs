@@ -12,6 +12,8 @@ pub(super) struct File {
     pub guard: Mutex<(Attr, String)>,
     timer: AtomicBool,
     touched: Mutex<tokio::time::Instant>,
+    /// A disk flush is due ([`Staged::harden`]).
+    hardening: AtomicBool,
 }
 
 pub(crate) struct Staged {
@@ -22,7 +24,17 @@ pub(crate) struct Staged {
     recovered: tokio::sync::watch::Sender<bool>,
     _lease: Arc<crate::store::MountLease>,
     local: Arc<notify::Observer>,
+    own: Mutex<Own>,
 }
+
+/// The versions this Mac's publications produced, by key, oldest first: the feed reports each
+/// back, and the report is no other computer's change. Bounded, as reports come back in moments.
+#[derive(Default)]
+struct Own { order: std::collections::VecDeque<(String, String)>, set: HashSet<(String, String)> }
+
+const OWN_VERSIONS: usize = 4096;
+
+fn own_key(key: &str, version: &str) -> (String, String) { (key.trim_end_matches('/').to_owned(), version.to_owned()) }
 
 impl Staged {
     pub(super) async fn load(store: Arc<Store>, drive: String, root: Ino, queue: Option<crate::Queue>, cfg: StagingConfig, lease: Arc<crate::store::MountLease>, local: Arc<notify::Observer>) -> Result<Arc<Self>> {
@@ -60,15 +72,31 @@ impl Staged {
                 let n = n.ok_or(FsError::Stale)?;
                 let attr = n.attr()?;
                 let guard = if owned { (attr.clone(), n.remote_key.unwrap_or_else(|| state.record.key.clone())) } else { (state.record.base.clone(), state.record.key.clone()) };
-                Ok((ino, Arc::new(File { state: Arc::new(tokio::sync::Mutex::new(state)), attr: Mutex::new(attr), guard: Mutex::new(guard), timer: AtomicBool::new(false), touched: Mutex::new(tokio::time::Instant::now()) })))
+                Ok((ino, Arc::new(File { state: Arc::new(tokio::sync::Mutex::new(state)), attr: Mutex::new(attr), guard: Mutex::new(guard), timer: AtomicBool::new(false), touched: Mutex::new(tokio::time::Instant::now()), hardening: AtomicBool::new(false) })))
             }).collect::<Result<HashMap<_, _>>>()?;
             Ok::<_, FsError>((files, damaged))
         }).await.map_err(Error::from)??;
-        Ok(Arc::new(Self { store, drive, root, queue, cfg, files: Mutex::new(files), creation: Arc::new(tokio::sync::Mutex::new(())), handles: Mutex::new(Vec::new()), normal_commits: AtomicU64::new(0), full_commits: AtomicU64::new(0), damaged, recovered: tokio::sync::watch::channel(true).0, _lease: lease, local }))
+        Ok(Arc::new(Self { store, drive, root, queue, cfg, files: Mutex::new(files), creation: Arc::new(tokio::sync::Mutex::new(())), handles: Mutex::new(Vec::new()), normal_commits: AtomicU64::new(0), full_commits: AtomicU64::new(0), damaged, recovered: tokio::sync::watch::channel(true).0, _lease: lease, local, own: Mutex::new(Own::default()) }))
     }
 
     /// Whether this inode's staged bytes were lost: opening it fails rather than read other bytes.
     pub(super) fn damaged(&self, ino: Ino) -> bool { self.damaged.contains(&ino) }
+
+    /// Records that this Mac published `version` at `key`, as the server acknowledges it.
+    pub(crate) fn published(&self, key: &str, version: &str) {
+        let mut own = self.own.lock().unwrap_or_else(|p| p.into_inner());
+        let k = own_key(key, version);
+        if !own.set.insert(k.clone()) { return; }
+        own.order.push_back(k);
+        while own.order.len() > OWN_VERSIONS {
+            if let Some(old) = own.order.pop_front() { own.set.remove(&old); }
+        }
+    }
+
+    /// Whether this Mac published `version` at `key`.
+    pub(super) fn own(&self, key: &str, version: &str) -> bool {
+        self.own.lock().unwrap_or_else(|p| p.into_inner()).set.contains(&own_key(key, version))
+    }
 
     /// Drops the stage of an inode no name reaches once no handle has it open: its bytes can't
     /// publish or be read again. Only a local unlink or replacement leaves a staged inode so:
@@ -154,7 +182,7 @@ impl Staged {
                 let guard = (attr.clone(), key.clone());
                 let (store, base) = (self.store.clone(), attr.clone());
                 let state = tokio::task::spawn_blocking(move || stage::Stage::new(&store, base, key)).await.map_err(Error::from)??;
-                let file = Arc::new(File { attr: Mutex::new(attr), state: Arc::new(tokio::sync::Mutex::new(state)), guard: Mutex::new(guard), timer: AtomicBool::new(false), touched: Mutex::new(tokio::time::Instant::now()) });
+                let file = Arc::new(File { attr: Mutex::new(attr), state: Arc::new(tokio::sync::Mutex::new(state)), guard: Mutex::new(guard), timer: AtomicBool::new(false), touched: Mutex::new(tokio::time::Instant::now()), hardening: AtomicBool::new(false) });
                 self.files.lock().unwrap_or_else(|p| p.into_inner()).insert(ino, file.clone());
                 file
             }
@@ -240,6 +268,42 @@ impl Staged {
         });
     }
 
+    /// Makes a write's staged bytes durable on disk within `disk_flush`, whatever writes follow:
+    /// the stage file and its folders are synchronized, then a FULL commit makes the NORMAL
+    /// commits before it durable. Publication stays with the quiet period, fsync and close.
+    fn harden(self: &Arc<Self>, ino: Ino, file: &Arc<File>) {
+        let Some(after) = self.cfg.disk_flush else { return; };
+        if self.queue.is_none() || file.hardening.swap(true, Ordering::AcqRel) { return; }
+        let (weak, weak_file) = (Arc::downgrade(self), Arc::downgrade(file));
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let (Some(this), Some(file)) = (weak.upgrade(), weak_file.upgrade()) else { return; };
+            let creation = this.creation.lock().await;
+            if this.file(ino).is_none_or(|active| !Arc::ptr_eq(&active, &file)) { return; }
+            let state = file.state.clone().lock_owned().await;
+            drop(creation);
+            let revision = state.record.revision;
+            // A flush since synchronized the stage and committed FULL.
+            if revision == state.record.flushed { drop(state); file.hardening.store(false, Ordering::Release); return; }
+            let store = this.store.clone();
+            let synced = tokio::task::spawn_blocking(move || {
+                state.sync()?;
+                store.with(|c| {
+                    let tx = c.transaction()?;
+                    tx.execute("UPDATE mount_staged SET record=record WHERE ino=?1", [ino])?;
+                    tx.commit()
+                })?;
+                Ok::<_, FsError>(())
+            }).await.map_err(|e| FsError::from(Error::from(e))).and_then(|r| r);
+            match synced {
+                Ok(()) => { this.full_commits.fetch_add(1, Ordering::Relaxed); }
+                Err(e) => eprintln!("voidfs mount staged disk flush: {e}"),
+            }
+            file.hardening.store(false, Ordering::Release);
+            if file.state.lock().await.record.revision != revision { this.harden(ino, &file); }
+        });
+    }
+
     async fn finish_timer(self: &Arc<Self>, ino: Ino, file: &Arc<File>, attempted: u64, successful: bool) {
         file.timer.store(false, Ordering::Release);
         let state = file.state.lock().await;
@@ -289,9 +353,12 @@ impl Staged {
         }
         let mut entries = Vec::new();
         let mut sources = Vec::new();
+        // A local-only file's stage is its only copy: a flush makes it durable and queues nothing.
+        let local = file.attr.lock().unwrap_or_else(|p| p.into_inner()).sync == Sync::Local;
         let full = state.record.base.object_id.is_none() && covered(&state.record);
         let frozen = async {
-            if full {
+            if local {
+            } else if full {
                 let record = state.record.clone();
                 let source = state.path.clone();
                 let dir = state.path.parent().ok_or_else(|| FsError::Io("staging path has no parent".into()))?.to_owned();
@@ -306,7 +373,9 @@ impl Staged {
                 entry.size = state.record.size;
                 entries.push(entry);
             } else {
-                if let Some(size) = state.record.reset {
+                // A rewrite in place (O_TRUNC, then the new bytes) is one version, not an empty
+                // one before it.
+                if let Some(size) = state.record.reset && !rewritten(&state.record, size) {
                     let mut entry = Entry::new(&self.drive, "", Op::Truncate, StoredBase::Any);
                     entry.length = size;
                     entries.push(entry);
@@ -348,7 +417,7 @@ impl Staged {
         let result = queue.mount_transaction(move |tx| {
             let mut n = node(tx, &drive, ino)?.ok_or(FsError::Stale)?;
             let previous = n.sync;
-            let linked = chain(tx, &drive, root, ino)?;
+            let linked = chain(tx, &drive, root, ino)?.filter(|_| n.sync != Sync::Local);
             if let Some(path) = linked {
                 let key = path.into_iter().skip(1).map(|(_, name)| name).collect::<Vec<_>>().join("/");
                 entries[0].base = match n.entry_id {
@@ -361,11 +430,9 @@ impl Staged {
                     let json: String = tx.query_row("SELECT attrs FROM mount_xattrs WHERE ino=?1", [ino], |r| r.get(0))?;
                     attrs.xattrs = serde_json::from_str(&json).map_err(|e| FsError::Io(e.to_string()))?;
                     entries[0].attrs = attrs;
-                } else {
-                    let mut entry = Entry::new(&drive, &key, Op::Attrs, StoredBase::Any);
-                    entry.attrs = attrs;
-                    entry.mount_ino = Some(ino);
-                    entries.push(entry);
+                } else if let Some(last) = entries.last_mut() {
+                    // The edit's own request sets them: no attributes version of its own.
+                    last.attrs = attrs;
                 }
                 if !matches!(n.sync, Sync::Conflict | Sync::Error) { n.sync = Sync::Saving; }
             } else { entries.clear(); }
@@ -478,6 +545,20 @@ fn covered(record: &stage::Record) -> bool {
     at >= record.size
 }
 
+/// Whether a flush's writes cover every byte from `from` to the size, so that a truncate to
+/// `from` before them changes nothing they leave.
+fn rewritten(record: &stage::Record, from: u64) -> bool {
+    let mut written = record.extents.iter().flat_map(|extent| record.dirty.iter().map(move |&(start, end)| (extent.start.max(start), extent.end.min(end))))
+        .filter(|(start, end)| start < end).collect::<Vec<_>>();
+    written.sort_unstable();
+    let mut at = from;
+    for (start, end) in written {
+        if start > at { break; }
+        at = at.max(end);
+    }
+    at >= record.size
+}
+
 async fn clean(paths: &[PathBuf]) { for path in paths { let _ = tokio::fs::remove_file(path).await; } }
 
 fn assemble(dir: &std::path::Path, source: &std::path::Path, record: &stage::Record) -> Result<PathBuf> {
@@ -532,6 +613,7 @@ impl Session {
             Ok::<_, FsError>(attr)
         }).await.map_err(Error::from)??;
         self.data.schedule(attr.ino, &file);
+        self.data.harden(attr.ino, &file);
         Ok(len)
     }
 
@@ -555,6 +637,7 @@ impl Session {
             Ok::<_, FsError>(attr)
         }).await.map_err(Error::from)??;
         self.data.schedule(attr.ino, &file);
+        self.data.harden(attr.ino, &file);
         Ok(())
     }
 
@@ -878,7 +961,14 @@ mod tests {
             let ino = session.handle_attr(fh).unwrap().ino;
             let file = session.data.file(ino).unwrap();
             session.fsync(fh).await.unwrap();
-            let before = queue.status().await.unwrap().items.len();
+            // A flush folds into the new file's queued put: the queued bytes show what flushed.
+            let queued = || {
+                let entries = queue.store().with(|c| crate::journal::all(c)).unwrap();
+                let latest = entries.last().unwrap();
+                (entries.len(), latest.op, std::fs::read(latest.source.as_ref().unwrap()).unwrap())
+            };
+            let before = queued();
+            assert_eq!(before, (1, Op::Put, b"first".to_vec()));
             let previous = file.state.lock().await.record.revision;
             session.write(fh, 0, Bytes::from_static(b"later")).await.unwrap();
             assert!(file.timer.load(Ordering::Acquire), "the old timer suppresses both write-side scheduling calls");
@@ -890,20 +980,17 @@ mod tests {
                 while file.timer.load(Ordering::Acquire) { tokio::task::yield_now().await; }
             }).await.unwrap();
             tokio::time::sleep(quiet * 3).await;
-            assert_eq!(queue.status().await.unwrap().items.len(), before);
+            assert_eq!(queued(), before);
             drop(held);
             finishing.await.unwrap();
             if successful || advanced {
                 tokio::time::timeout(Duration::from_secs(3), async {
-                    while queue.status().await.unwrap().items.len() == before { tokio::time::sleep(Duration::from_millis(5)).await; }
+                    while queued() == before { tokio::time::sleep(Duration::from_millis(5)).await; }
                 }).await.expect("the dirty revision still needs a timer after its quiet period has elapsed");
-                let entries = queue.store().with(|c| crate::journal::all(c)).unwrap();
-                let latest = entries.last().unwrap();
-                assert_eq!(latest.op, Op::Put);
-                assert_eq!(std::fs::read(latest.source.as_ref().unwrap()).unwrap(), b"later");
+                assert_eq!(queued(), (1, Op::Put, b"later".to_vec()));
             } else {
                 tokio::time::sleep(quiet * 2).await;
-                assert_eq!(queue.status().await.unwrap().items.len(), before, "an unchanged failed revision does not retry forever");
+                assert_eq!(queued(), before, "an unchanged failed revision does not retry forever");
                 assert!(!file.timer.load(Ordering::Acquire));
             }
             session.close(fh).await.unwrap();
@@ -991,10 +1078,12 @@ mod tests {
         let (dir, session, queue, fh) = fixture().await;
         let journal = || std::fs::read_dir(dir.path().join("journal")).unwrap().count();
         assert_eq!(journal(), 0);
-        session.store.with(|c| c.execute_batch("CREATE TRIGGER refuse_flush BEFORE INSERT ON entries BEGIN SELECT RAISE(ABORT, 'test failure'); END")).unwrap();
+        // The flush folds into the new file's queued put, or queues one of its own.
+        session.store.with(|c| c.execute_batch("CREATE TRIGGER refuse_flush BEFORE INSERT ON entries BEGIN SELECT RAISE(ABORT, 'test failure'); END;
+            CREATE TRIGGER refuse_fold BEFORE UPDATE ON entries BEGIN SELECT RAISE(ABORT, 'test failure'); END")).unwrap();
         assert!(matches!(session.fsync(fh).await, Err(FsError::Io(_))));
         assert_eq!(journal(), 0, "a copy frozen for a commit that failed belongs to no entry");
-        session.store.with(|c| c.execute_batch("DROP TRIGGER refuse_flush")).unwrap();
+        session.store.with(|c| c.execute_batch("DROP TRIGGER refuse_flush; DROP TRIGGER refuse_fold")).unwrap();
         session.fsync(fh).await.unwrap();
         assert_eq!(journal(), 1);
         queue.close().await;

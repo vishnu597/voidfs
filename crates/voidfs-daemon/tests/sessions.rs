@@ -404,7 +404,7 @@ async fn remote_watch_invalidates_metadata_while_open_readers_keep_their_snapsho
     assert!(initial.resync && initial.invalidations.contains(&fs::Invalidation::All));
     let result = f.remote.put_object("drive", "data", "new bytes", Default::default()).await.unwrap();
     let event = matching(&mut watch, |event| event.generation > initial.generation && event.invalidations.contains(&fs::Invalidation::Object("data".into()))).await;
-    assert!(event.seq > initial.seq);
+    assert!(event.seq > initial.seq && !event.local && !initial.local);
     assert!(event.inodes.contains(&original.ino));
     until("feed invalidation makes the new version discoverable", async || session.lookup(session.info().root, "data").await.unwrap().version_id.as_ref() == Some(&result.version_id)).await;
     let current = session.lookup(session.info().root, "data").await.unwrap();
@@ -437,7 +437,7 @@ async fn local_mutations_notify_other_sessions_after_the_new_bytes_are_visible()
     let initial = next(&mut watch).await;
     writer.write(rw, 1, Bytes::from_static(b"X")).await.unwrap();
     let event = matching(&mut watch, |event| event.generation > initial.generation && event.inodes.contains(&ino) && event.invalidations.contains(&fs::Invalidation::Object("data".into()))).await;
-    assert!(!event.resync && event.invalidations == [fs::Invalidation::Object("data".into())]);
+    assert!(!event.resync && event.local && event.invalidations == [fs::Invalidation::Object("data".into())]);
     assert_eq!(reader.read(old, 0, 4).await.unwrap(), Bytes::from_static(b"aXcd"));
     writer.truncate(rw, 2).await.unwrap();
     let resized = matching(&mut watch, |next| next.generation > event.generation && next.inodes.contains(&ino)).await;
@@ -445,6 +445,21 @@ async fn local_mutations_notify_other_sessions_after_the_new_bytes_are_visible()
     assert_eq!(reader.handle_attr(old).await.unwrap().size, 2);
     assert_eq!(reader.read(old, 0, 8).await.unwrap(), Bytes::from_static(b"aX"));
     writer.close(rw).await.unwrap();
+    // The publication comes back through the feed as this Mac's own: news to no session.
+    f.client.resume(&Scope::All).await.unwrap();
+    until("the edit is published", async || f.remote.get_object("drive", "data", Default::default()).await.unwrap().body == Bytes::from_static(b"aX")).await;
+    let published = f.remote.changes("drive", 0, Duration::ZERO).await.unwrap().seq;
+    let mut echoes = 0;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut seq = initial.seq;
+        while seq < published {
+            let event = watch.next().await.expect("watch remains open").unwrap();
+            if event.local { continue; }
+            assert!(event.invalidations.is_empty() && event.inodes.is_empty(), "{event:?}");
+            (seq, echoes) = (event.seq, echoes + 1);
+        }
+    }).await.expect("the feed reaches the published position");
+    assert!(echoes > 0);
     reader.close(old).await.unwrap();
     writer.release().await.unwrap();
     reader.release().await.unwrap();

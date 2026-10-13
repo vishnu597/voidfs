@@ -159,10 +159,20 @@ async fn watch(place: &Place, out: Out, all: bool) -> Result<()> {
 
 fn state(i: &voidfs_client::Item) -> String {
     match i.state {
+        State::Failed if i.conflict.is_some() => conflict(i),
         State::Failed => format!("failed: {}", i.error.as_deref().unwrap_or("")),
         _ if i.paused && !i.state.finished() => "paused".into(),
         State::Done if i.conflict.is_some() => "done, over a newer version".into(),
         s => s.as_str().into(),
+    }
+}
+
+/// A mount's save that the drive refused because it changed since: nothing was published, and
+/// this Mac keeps both its own copy and the drive's (step 5, item 4).
+pub fn conflict(i: &voidfs_client::Item) -> String {
+    match i.conflict.as_deref() {
+        Some(v) if v != "?" => format!("conflict: the drive changed (now version {v}); this Mac keeps its copy"),
+        _ => "conflict: the drive changed; this Mac keeps its copy".into(),
     }
 }
 
@@ -217,8 +227,13 @@ fn totals(l: &UploadList) -> String {
     } else {
         let n = |s: State| q.items.iter().filter(|i| i.state == s).count();
         let mut t = format!("{} uploading, {} queued", n(State::Uploading), n(State::Queued));
-        if n(State::Failed) > 0 {
-            t.push_str(&format!(", {} failed", n(State::Failed)));
+        let failed = q.items.iter().filter(|i| i.state == State::Failed && i.conflict.is_none()).count();
+        if failed > 0 {
+            t.push_str(&format!(", {failed} failed"));
+        }
+        let conflicts: std::collections::BTreeSet<_> = q.items.iter().filter(|i| i.state == State::Failed && i.conflict.is_some()).map(|i| (&i.drive, &i.key)).collect();
+        if !conflicts.is_empty() {
+            t.push_str(&format!(", {} in conflict", conflicts.len()));
         }
         t.push_str(&format!(" · {} to send", size(q.unpublished_bytes)));
         if l.rate > 0 {
@@ -257,5 +272,28 @@ mod tests {
         assert_eq!(parse_rate("0").unwrap(), None);
         assert_eq!(parse_rate("fast").unwrap_err().exit, 2);
         assert_eq!(parse_rate("10 parsecs").unwrap_err().exit, 2);
+    }
+
+    #[test]
+    fn a_mounts_conflict_reads_as_one_not_as_failures() {
+        let item = |id, key: &str, op, conflict: Option<&str>, error: &str| voidfs_client::Item {
+            id, drive: "d-1".into(), key: key.into(), to_key: None, op, state: State::Failed, paused: false, batch: None, size: 6, sent: 0,
+            version: None, conflict: conflict.map(Into::into), error: Some(error.into()),
+        };
+        let precondition = "412 PreconditionFailed: At least one of the preconditions you specified did not hold";
+        let queue = voidfs_client::Status {
+            items: vec![
+                item(1, "notes.txt", voidfs_client::Op::Write, Some("184.0"), precondition),
+                item(2, "notes.txt", voidfs_client::Op::Attrs, Some("184.0"), precondition),
+                item(3, "gone.txt", voidfs_client::Op::Put, Some("?"), "404 NoSuchKey"),
+                item(4, "other.txt", voidfs_client::Op::Put, None, "403 AccessDenied"),
+            ],
+            batches: Vec::new(), paused: false, paused_drives: Vec::new(), bandwidth: None, unpublished: 4, unpublished_bytes: 24,
+        };
+        let text = render(&UploadList { queue, rate: 0, eta_secs: None });
+        assert_eq!(text.matches("conflict: the drive changed (now version 184.0); this Mac keeps its copy").count(), 2, "{text}");
+        assert!(text.contains("conflict: the drive changed; this Mac keeps its copy"), "{text}");
+        assert!(text.contains("failed: 403 AccessDenied") && !text.contains("failed: 412"), "{text}");
+        assert!(text.ends_with("0 uploading, 0 queued, 1 failed, 2 in conflict · 24 B to send"), "{text}");
     }
 }

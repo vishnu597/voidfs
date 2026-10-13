@@ -103,7 +103,14 @@ impl Fixture {
         drop(old_cache);
         drop(old_queue);
         drop(store);
-        let store = Arc::new(Store::open(state.path()).unwrap());
+        // As a restarted process waits for the old one to exit: a disk flush may still hold it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let store = loop {
+            match Store::open(state.path()) {
+                Err(voidfs_client::Error::Locked(_)) if std::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(5)).await,
+                store => break Arc::new(store.unwrap()),
+            }
+        };
         let cache = cache(store.clone(), client.clone(), connectivity.clone(), backend).await;
         let queue = Queue::open(store.clone(), client.clone(), queue_config(&connectivity)).await.unwrap();
         let reopened = Self { _server, proxy, remote, client, state, store, cache, queue, connectivity, backend };
@@ -742,6 +749,49 @@ async fn quiet_period_publishes_open_files_after_the_last_write() {
     assert_eq!(f.body("file").await, Some(Bytes::from_static(b"final56789ab")));
     assert_eq!(ns.read(fh, 0, u64::MAX).await.unwrap(), Bytes::from_static(b"final56789ab"));
     ns.close(fh).await.unwrap();
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_writes_reach_disk_soon_after_without_publishing() {
+    assert_eq!(StagingConfig::default().disk_flush, Some(Duration::from_secs(1)));
+    let f = Fixture::new(Backend::Api).await;
+    let after = Duration::from_millis(150);
+    let ns = f.session_with(StagingConfig { disk_flush: Some(after), ..staging_config() }).await;
+    let (_, fh) = file(&f, &ns).await;
+    let queued = f.queue.status().await.unwrap().items.len();
+    let wait_for = async |full: u64| {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while ns.staging_commits().1 < full {
+            assert!(tokio::time::Instant::now() < deadline, "staged bytes never reached disk");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let (_, full) = ns.staging_commits();
+    // A burst of writes inside the window is one disk flush, and each later write gets its own.
+    for i in 0..5 {
+        ns.write(fh, i, Bytes::from_static(b"x")).await.unwrap();
+    }
+    wait_for(full + 1).await;
+    tokio::time::sleep(after * 2).await;
+    assert_eq!(ns.staging_commits().1, full + 1, "a burst of writes must be flushed to disk once");
+    ns.write(fh, 0, Bytes::from_static(b"second")).await.unwrap();
+    wait_for(full + 2).await;
+    assert_eq!(f.queue.status().await.unwrap().items.len(), queued, "a disk flush must not publish");
+    assert_eq!(ns.handle_attr(fh).unwrap().sync, Sync::Pending);
+    // fsync and close flush and publish; nothing is left for the disk flush to do.
+    ns.write(fh, 0, Bytes::from_static(b"fsync")).await.unwrap();
+    ns.fsync(fh).await.unwrap();
+    let (_, synced) = ns.staging_commits();
+    tokio::time::sleep(after * 3).await;
+    assert_eq!(ns.staging_commits().1, synced, "a flushed file needs no disk flush");
+    ns.write(fh, 0, Bytes::from_static(b"third")).await.unwrap();
+    ns.close(fh).await.unwrap();
+    let (_, closed) = ns.staging_commits();
+    tokio::time::sleep(after * 3).await;
+    assert_eq!(ns.staging_commits().1, closed, "a closed file needs no disk flush");
+    f.publish().await;
+    assert_eq!(f.body("file").await, Some(Bytes::from_static(b"thirdd6789ab")));
     f.queue.close().await;
 }
 

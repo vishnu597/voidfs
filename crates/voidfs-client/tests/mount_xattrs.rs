@@ -142,7 +142,10 @@ async fn local_create_replace_remove_and_empty_values_are_durable() {
     assert!(ns.listxattr(file.ino).await.unwrap().is_empty());
     assert!(f.proxy.seen().is_empty(), "local xattrs required network: {:?}", f.proxy.seen());
     let status = f.queue.status().await.unwrap();
-    assert_eq!(status.unpublished, 6, "failed Create/Replace/Remove must not add entries");
+    assert_eq!(status.unpublished, 1, "the create's put takes the xattr changes");
+    let attrs: String = rusqlite::Connection::open(f.store.dir().join("state.sqlite")).unwrap().query_row("SELECT attrs FROM entries", [], |r| r.get(0)).unwrap();
+    let attrs: serde_json::Value = serde_json::from_str(&attrs).unwrap();
+    assert!(attrs.get("xattrs").is_none_or(|x| x.as_object().is_some_and(|x| x.is_empty())), "as they ended, and no failed change: {attrs}");
     f.queue.close().await;
 }
 

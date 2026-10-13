@@ -260,6 +260,17 @@ fn marker(ctx: &Ctx, e: &Entry) -> String {
     format!("{}.{}", ctx.state_id, e.id)
 }
 
+/// The first entry's attributes, with the mode and times the run's later edits set: a mount
+/// flush carries its file's on its last edit (§4.0's headers go on a write or patch too).
+fn run_attrs(run: &[Entry]) -> Attrs {
+    let mut attrs = run[0].attrs.clone();
+    for e in &run[1..] {
+        if e.attrs.mode.is_some() { attrs.mode = e.attrs.mode; }
+        if e.attrs.mtime.is_some() { attrs.mtime = e.attrs.mtime.clone(); }
+    }
+    attrs
+}
+
 fn put_opts(ctx: &Ctx, e: &Entry, attrs: &Attrs, guard: &Guard) -> PutOptions {
     PutOptions {
         content_type: attrs.content_type.clone(),
@@ -408,7 +419,7 @@ async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
     }
     let body = Bytes::from(body);
     let _mem = ctx.hold(body.len() as u64).await?;
-    let attrs = &e.attrs;
+    let attrs = &run_attrs(run);
     let sent = body.len() as u64;
     let r = ctx.stop.or(ctx.client.put_object(&e.drive, &e.key, body.clone(), put_opts(ctx, e, attrs, &guard))).await?;
     crate::kill::point("publish.sent");
@@ -477,7 +488,8 @@ async fn patch(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
     let total: u64 = edits.iter().map(|e| e.data.len() as u64).sum();
     let _mem = ctx.hold(total).await?;
     let metadata = BTreeMap::from([(MARKER.to_owned(), marker(ctx, e))]);
-    let opts = WriteOptions { size, if_version: guard.version(), metadata, ..Default::default() };
+    let Attrs { mtime, mode, .. } = run_attrs(run);
+    let opts = WriteOptions { size, if_version: guard.version(), metadata, mtime, mode, ..Default::default() };
     let r = if edits.is_empty() {
         // A truncate alone: an empty write at 0 with the size.
         ctx.stop.or(ctx.client.write_at(&e.drive, &e.key, 0, Bytes::new(), opts)).await?

@@ -160,8 +160,15 @@ impl Sessions {
                 let mut invalidations = event.invalidations;
                 loop {
                     let Some(drive) = weak.upgrade() else { return };
-                    match drive.core.invalidate(&invalidations).await {
-                        Ok(inodes) => {
+                    // Observers hear of the changes the local view doesn't show already: this
+                    // Mac's own publications come back through the feed too.
+                    let done = if invalidations.contains(&Invalidation::All) || event.changes.is_empty() {
+                        drive.core.invalidate(&invalidations).await.map(|inodes| (invalidations.clone(), inodes))
+                    } else {
+                        drive.core.invalidate_feed(&event.changes).await
+                    };
+                    match done {
+                        Ok((invalidations, inodes)) => {
                             drive.remote(event.seq, invalidations, inodes);
                             break;
                         }
@@ -244,7 +251,7 @@ impl DriveSession {
 
     pub(crate) fn event(&self, resync: bool) -> api::fs::InvalidationEvent {
         let f = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        api::fs::InvalidationEvent { generation: f.generation, seq: f.seq, resync, invalidations: vec![api::fs::Invalidation::All], inodes: Vec::new() }
+        api::fs::InvalidationEvent { generation: f.generation, seq: f.seq, resync, local: false, invalidations: vec![api::fs::Invalidation::All], inodes: Vec::new() }
     }
 
     pub(crate) fn observe(&self, handle: Arc<dyn Mounted>) {
@@ -274,7 +281,7 @@ impl DriveSession {
                 f.events = f.events.saturating_add(1);
                 f.last = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
             }
-            api::fs::InvalidationEvent { generation: f.generation, seq: f.seq, resync: invalidations.contains(&Invalidation::All),
+            api::fs::InvalidationEvent { generation: f.generation, seq: f.seq, resync: invalidations.contains(&Invalidation::All), local: seq.is_none(),
                 invalidations: invalidations.iter().cloned().map(Into::into).collect(), inodes }
         };
         if event.invalidations.len() > EVENT_INVALIDATIONS || event.inodes.len() > EVENT_INODES

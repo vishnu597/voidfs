@@ -99,6 +99,10 @@ pub struct Uploads {
     pub queued: u64,
     /// Waiting for a resume after a failure the queue doesn't retry by itself.
     pub failed: u64,
+    /// Files whose guarded save the drive refused because it changed since (a mount's
+    /// conflicts): this Mac keeps its copy, unpublished, and the entries aren't in `failed`.
+    #[serde(default)]
+    pub conflicts: u64,
     /// Not finished and held by a pause, of the queue, a drive, a batch or the entry.
     pub paused_items: u64,
     /// Entries not yet published, and the bytes they have left to send.
@@ -122,7 +126,8 @@ impl Uploads {
         Uploads {
             uploading: count(State::Uploading),
             queued: count(State::Queued),
-            failed: count(State::Failed),
+            failed: open().filter(|i| i.state == State::Failed && i.conflict.is_none()).count() as u64,
+            conflicts: open().filter(|i| i.state == State::Failed && i.conflict.is_some()).map(|i| (&i.drive, &i.key)).collect::<std::collections::BTreeSet<_>>().len() as u64,
             paused_items: open().filter(|i| i.paused).count() as u64,
             unpublished: s.unpublished,
             unpublished_bytes: s.unpublished_bytes,
