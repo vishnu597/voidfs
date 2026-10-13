@@ -44,6 +44,59 @@ pub(crate) struct Sessions {
 impl Sessions {
     pub(crate) fn new() -> Self { Self { state: Mutex::new(Registry::default()), creating: Arc::default() } }
 
+    /// Upload controls need identity without opening a filesystem core or starting its feed.
+    /// The same bounded, validated memo supplies both queue spellings when offline.
+    pub(crate) async fn upload_names(&self, s: &Shared, name: &str) -> Result<(String, Vec<String>), Failure> {
+        if name.is_empty() || name.len() > 1024 { return Err(Failure::new(StatusCode::BAD_REQUEST, "InvalidArgument", "invalid drive name")); }
+        let mut closing = s.closing.subscribe();
+        let creation = bootstrap(&mut closing, self.creating.clone().lock_owned()).await?;
+        if self.state.lock().unwrap_or_else(|p| p.into_inner()).closed { return Err(stopping()); }
+        if !self.state.lock().unwrap_or_else(|p| p.into_inner()).loaded {
+            let dir = s.store.dir().to_owned();
+            let aliases = tokio::task::spawn_blocking(move || load_aliases(&dir)).await.map_err(voidfs_client::Error::from)??;
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.aliases = aliases;
+            state.loaded = true;
+        }
+        let (identity, changed) = match bootstrap(&mut closing, s.client.describe_drive(name)).await? {
+            Ok(info) => {
+                let identity = Identity { id: info.drive_id, alias: info.alias, used: 0 };
+                if identity.id.is_empty() || identity.id.len() > 1024 || identity.alias.is_empty() || identity.alias.len() > 1024 {
+                    return Err(Failure::new(StatusCode::BAD_GATEWAY, "InvalidResponse", "invalid drive identity"));
+                }
+                remember_identity(&mut self.state.lock().unwrap_or_else(|p| p.into_inner()).aliases, identity.clone());
+                (Some(identity), true)
+            }
+            Err(error) if error.status().is_none() => (self.state.lock().unwrap_or_else(|p| p.into_inner()).aliases.get(name).cloned(), false),
+            Err(error) => {
+                if error.status() == Some(404) {
+                    let aliases = {
+                        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                        forget_identity(&mut state.aliases, name);
+                        state.aliases.clone()
+                    };
+                    let dir = s.store.dir().to_owned();
+                    let (_creation, saved) = tokio::task::spawn_blocking(move || (creation, save_aliases(&dir, &aliases))).await.map_err(voidfs_client::Error::from)?;
+                    saved?;
+                }
+                return Err(error.into());
+            }
+        };
+        if changed {
+            let aliases = self.state.lock().unwrap_or_else(|p| p.into_inner()).aliases.clone();
+            let dir = s.store.dir().to_owned();
+            let (_creation, saved) = tokio::task::spawn_blocking(move || (creation, save_aliases(&dir, &aliases))).await.map_err(voidfs_client::Error::from)?;
+            saved?;
+        }
+        match identity {
+            Some(identity) => {
+                s.queue.inherit_drive_pause(&identity.alias, &identity.id).await?;
+                Ok((identity.alias.clone(), vec![identity.alias, identity.id]))
+            }
+            None => Ok((name.to_owned(), vec![name.to_owned()])),
+        }
+    }
+
     pub(crate) async fn drive(&self, s: &Shared, name: &str) -> Result<Arc<DriveSession>, Failure> {
         self.open(s, name, true, None).await
     }
@@ -118,6 +171,7 @@ impl Sessions {
                 return Err(e.into());
             }
         };
+        if pinned { s.queue.inherit_drive_pause(&identity.alias, &identity.id).await?; }
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             state.drives.retain(|_, d| d.strong_count() > 0);
@@ -342,6 +396,10 @@ fn load_aliases(dir: &Path) -> voidfs_client::Result<HashMap<String, Identity>> 
         if let Some(current) = identities.get(&identity.id) { *identity = current.clone(); }
     }
     Ok(aliases)
+}
+
+pub(crate) fn queue_aliases(dir: &Path) -> voidfs_client::Result<Vec<(String, String)>> {
+    Ok(load_aliases(dir)?.into_values().map(|identity| (identity.alias, identity.id)).collect::<std::collections::BTreeSet<_>>().into_iter().collect())
 }
 
 fn save_aliases(dir: &Path, aliases: &HashMap<String, Identity>) -> voidfs_client::Result<()> {

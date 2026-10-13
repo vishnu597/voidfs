@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use voidfs_daemon::api::{Build, NewBatch, NewFile, Scope};
 use voidfs_daemon::{ClientError, Daemon, DaemonClient, DaemonConfig};
 use voidfs_server::test_server::{ADMIN_KEY_ID, ADMIN_SECRET, TestServer};
@@ -59,7 +60,9 @@ async fn a_batch_is_checked_before_it_is_queued() {
     let q = c.enqueue(&batch(&id, &[(&f, "a.txt")])).await.unwrap();
     assert_eq!((q.drive.as_str(), q.items, q.bytes), ("footage", 1, 3));
     assert_eq!(c.pause(&Scope::Drive(id.clone())).await.unwrap().items, 1);
-    assert_eq!(c.uploads(false, None).await.unwrap().queue.paused_drives, ["footage"]);
+    let mut paused_names = vec!["footage".to_owned(), id];
+    paused_names.sort();
+    assert_eq!(c.uploads(false, None).await.unwrap().queue.paused_drives, paused_names);
     refused(c.pause(&Scope::Batch(q.batch + 1)).await, 404, "NoSuchUpload");
     refused(c.uploads(false, Some(q.batch + 1)).await, 404, "NoSuchUpload");
     d.stop().await;
@@ -102,4 +105,108 @@ async fn uploads_are_watched_until_the_daemon_stops_and_counted_for_a_rate() {
     });
     end.await.expect("the stream ends when the daemon stops, without waiting out the drain");
     stopping.await.unwrap();
+}
+
+async fn mounted_file(client: &DaemonClient, drive: &str, key: &str) {
+    let session = client.session(drive, false).await.unwrap();
+    let item = session.create(session.info().root, key, 0o640).await.unwrap();
+    let opened = session.open(item.ino, true).await.unwrap().fh;
+    session.write(opened, 0, Bytes::from_static(b"mounted bytes")).await.unwrap();
+    session.close(opened).await.unwrap();
+    session.release().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drive_controls_apply_to_cli_alias_and_mounted_id_entries() {
+    let server = TestServer::start().await.unwrap();
+    let remote = voidfs_sdk::Client::new(sdk(&server)).unwrap();
+    let id = remote.create_drive("footage", Default::default()).await.unwrap().drive_id;
+    remote.create_drive("other", Default::default()).await.unwrap();
+    let dir = state_dir("mixed");
+    let (daemon, client) = start(&server, dir.path()).await;
+    client.pause(&Scope::All).await.unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "imported bytes").unwrap();
+    client.enqueue(&batch("footage", &[(&source, "cli.txt")])).await.unwrap();
+    client.enqueue(&batch("other", &[(&source, "unrelated.txt")])).await.unwrap();
+    mounted_file(&client, "footage", "mount.txt").await;
+    let before = client.uploads(false, None).await.unwrap().queue;
+    let selected = before.items.iter().filter(|item| item.drive == "footage" || item.drive == id).count() as u64;
+    assert!(before.items.iter().any(|item| item.drive == "footage") && before.items.iter().any(|item| item.drive == id), "fixture contains both queue spellings");
+    assert_eq!(client.pause(&Scope::Drive("footage".into())).await.unwrap().items, selected, "alias pause must include mounted stable-ID entries");
+    let paused = client.uploads(false, None).await.unwrap().queue.paused_drives;
+    assert!(paused.contains(&"footage".to_owned()) && paused.contains(&id), "both queue spellings stay paused for future entries: {paused:?}");
+    assert_eq!(client.resume(&Scope::Drive(id.clone())).await.unwrap().items, selected, "ID resume includes CLI aliases too");
+    assert!(client.uploads(false, None).await.unwrap().queue.paused_drives.is_empty());
+    assert_eq!(client.cancel(&Scope::Drive(id.clone())).await.unwrap().items, selected, "ID cancel includes both queue spellings");
+    let remaining = client.uploads(false, None).await.unwrap().queue.items;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!((remaining[0].drive.as_str(), remaining[0].key.as_str()), ("other", "unrelated.txt"), "drive control cannot affect another drive");
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alias_pause_covers_new_mounted_entries_before_the_first_session() {
+    let server = TestServer::start().await.unwrap();
+    let remote = voidfs_sdk::Client::new(sdk(&server)).unwrap();
+    let id = remote.create_drive("footage", Default::default()).await.unwrap().drive_id;
+    let dir = state_dir("future");
+    let (daemon, client) = start(&server, dir.path()).await;
+    client.pause(&Scope::All).await.unwrap();
+    assert_eq!(client.pause(&Scope::Drive("footage".into())).await.unwrap().items, 0);
+    mounted_file(&client, &id, "future.txt").await;
+    client.resume(&Scope::All).await.unwrap();
+    let status = client.uploads(false, None).await.unwrap().queue;
+    assert!(status.paused_drives.contains(&id), "the alias pause predates this session and must bind its stable ID");
+    assert!(status.items.iter().any(|item| item.drive == id && item.key == "future.txt" && item.paused), "a later mounted save is paused");
+    assert!(remote.get_object(&id, "future.txt", Default::default()).await.is_err(), "paused bytes have not reached the service");
+    client.resume(&Scope::Drive(id.clone())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client.uploads(false, None).await.unwrap().queue;
+            if status.items.is_empty() { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("resumed mounted save publishes");
+    assert_eq!(remote.get_object(&id, "future.txt", Default::default()).await.unwrap().body, Bytes::from_static(b"mounted bytes"));
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_alias_pause_is_migrated_before_worker_start_and_offline_controls_share_names() {
+    let server = TestServer::start().await.unwrap();
+    let remote = voidfs_sdk::Client::new(sdk(&server)).unwrap();
+    let id = remote.create_drive("footage", Default::default()).await.unwrap().drive_id;
+    let dir = state_dir("legacy");
+    let mut cfg = DaemonConfig::new(dir.path(), sdk(&server), Build::default());
+    cfg.client.timeout = Duration::from_millis(500);
+    cfg.client.max_attempts = 1;
+    let daemon = Daemon::start(cfg.clone()).await.unwrap();
+    let client = DaemonClient::new(daemon.socket());
+    client.pause(&Scope::All).await.unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "legacy imported bytes").unwrap();
+    client.enqueue(&batch("footage", &[(&source, "cli.txt")])).await.unwrap();
+    mounted_file(&client, "footage", "mount.txt").await;
+    client.pause(&Scope::Drive("footage".into())).await.unwrap();
+    // Faithfully reproduce older daemon state: mounted entries use the ID, but the persistent
+    // drive pause has only the alias. Keep the global gate while constructing that state.
+    daemon.queue().resume(voidfs_client::Scope::Drive(id.clone())).await.unwrap();
+    assert_eq!(client.uploads(false, None).await.unwrap().queue.paused_drives, ["footage"]);
+    daemon.stop().await;
+    let daemon = Daemon::start(cfg).await.unwrap();
+    let client = DaemonClient::new(daemon.socket());
+    let migrated = client.uploads(false, None).await.unwrap().queue.paused_drives;
+    assert!(migrated.contains(&id), "legacy pause must be repaired before the worker starts, without a session/control request: {migrated:?}");
+    client.resume(&Scope::All).await.unwrap();
+    let status = client.uploads(false, None).await.unwrap().queue;
+    assert!(status.items.iter().all(|item| item.paused), "both recovered CLI and mounted entries remain paused after the global gate opens");
+    drop(server);
+    let count = status.items.len() as u64;
+    assert_eq!(client.resume(&Scope::Drive(id.clone())).await.unwrap().items, count, "offline ID uses the validated memo to resume alias entries too");
+    assert!(client.uploads(false, None).await.unwrap().queue.paused_drives.is_empty());
+    assert_eq!(client.pause(&Scope::Drive("footage".into())).await.unwrap().items, count, "offline alias uses the same stable identity");
+    let paused = client.uploads(false, None).await.unwrap().queue.paused_drives;
+    assert!(paused.contains(&id) && paused.contains(&"footage".to_owned()));
+    daemon.stop().await;
 }

@@ -104,6 +104,8 @@ fn fold(into: &mut Entry, e: &Entry) -> Option<PathBuf> {
 pub enum Scope {
     All,
     Drive(String),
+    /// Equivalent names of one drive, such as its display alias and stable server ID.
+    Drives(Vec<String>),
     Batch(BatchId),
     Entry(EntryId),
 }
@@ -281,6 +283,12 @@ impl Queue {
     /// Opens the journal in `store`, and starts publishing what it holds. `client` should not
     /// have an upload bandwidth limit of its own: the queue sets its.
     pub async fn open(store: Arc<Store>, client: Client, cfg: QueueConfig) -> Result<Queue> {
+        Self::open_with_drive_aliases(store, client, cfg, Vec::new()).await
+    }
+
+    /// Opens with already validated alias/ID pairs, inheriting persistent drive pauses before
+    /// the worker can publish an existing mounted entry under the other spelling.
+    pub async fn open_with_drive_aliases(store: Arc<Store>, client: Client, cfg: QueueConfig, aliases: Vec<(String, String)>) -> Result<Queue> {
         let dir = store.dir().join("journal");
         let (s2, d2) = (store.clone(), dir.clone());
         let (entries, paused_all, drives, batches, bw, state_id) = blocking(move || {
@@ -299,6 +307,12 @@ impl Queue {
                     if e.op == Op::Folder && !key.ends_with('/') { key.push('/'); }
                     e.published_key = Some(key); e.published_attrs = false; e.state = State::Queued;
                     journal::update(&tx, &e)?;
+                }
+                for (alias, id) in &aliases {
+                    let paused = tx.query_row("SELECT EXISTS(SELECT 1 FROM paused_drives WHERE drive=?1 OR drive=?2)", rusqlite::params![alias, id], |row| row.get::<_, bool>(0))?;
+                    if paused {
+                        for name in [alias, id] { tx.execute("INSERT OR IGNORE INTO paused_drives(drive) VALUES (?1)", [name])?; }
+                    }
                 }
                 tx.commit()
             })?;
@@ -712,6 +726,24 @@ impl Queue {
         self.set_paused(scope, false).await
     }
 
+    /// A resolved alias and stable ID share any existing drive pause, including pauses written
+    /// by older daemons. New imports and mounted sessions call this before queuing entries.
+    pub async fn inherit_drive_pause(&self, alias: &str, id: &str) -> Result<()> {
+        let names = vec![alias.to_owned(), id.to_owned()];
+        let this = self.clone();
+        blocking(move || {
+            let mut st = this.st();
+            if names.iter().any(|name| st.paused_drives.contains(name)) {
+                set_drive_pauses(&mut st, &this.0.store, &names, true)?;
+                for run in st.pending.values().filter(|entry| names.contains(&entry.drive)).filter_map(|entry| st.running.get(&entry.id)) { run.stop.signal(Why::Pause); }
+            }
+            Ok(())
+        }).await?;
+        self.0.wake.notify_one();
+        self.0.changed.notify_waiters();
+        Ok(())
+    }
+
     async fn set_paused(&self, scope: Scope, paused: bool) -> Result<()> {
         let this = self.clone();
         blocking(move || {
@@ -723,14 +755,9 @@ impl Queue {
                     s.set_meta("paused", if paused { "1" } else { "0" })?;
                 }
                 Scope::Drive(d) => {
-                    if paused {
-                        st.paused_drives.insert(d.clone());
-                        s.with(|c| c.execute("INSERT OR IGNORE INTO paused_drives(drive) VALUES (?1)", [d]).map(drop))?;
-                    } else {
-                        st.paused_drives.remove(d);
-                        s.with(|c| c.execute("DELETE FROM paused_drives WHERE drive = ?1", [d]).map(drop))?;
-                    }
+                    set_drive_pauses(&mut st, s, std::slice::from_ref(d), paused)?;
                 }
+                Scope::Drives(drives) => set_drive_pauses(&mut st, s, drives, paused)?,
                 Scope::Batch(b) => {
                     if paused {
                         st.paused_batches.insert(*b);
@@ -1462,10 +1489,27 @@ impl Queue {
     }
 }
 
+fn set_drive_pauses(state: &mut QState, store: &Store, drives: &[String], paused: bool) -> Result<()> {
+    store.with(|connection| {
+        let transaction = connection.transaction()?;
+        for drive in drives {
+            if paused { transaction.execute("INSERT OR IGNORE INTO paused_drives(drive) VALUES (?1)", [drive])?; }
+            else { transaction.execute("DELETE FROM paused_drives WHERE drive=?1", [drive])?; }
+        }
+        transaction.commit()
+    })?;
+    for drive in drives {
+        if paused { state.paused_drives.insert(drive.clone()); }
+        else { state.paused_drives.remove(drive); }
+    }
+    Ok(())
+}
+
 fn in_scope(e: &Entry, scope: &Scope) -> bool {
     match scope {
         Scope::All => true,
         Scope::Drive(d) => e.drive == *d,
+        Scope::Drives(drives) => drives.contains(&e.drive),
         Scope::Batch(b) => e.batch == Some(*b),
         Scope::Entry(id) => e.id == *id,
     }

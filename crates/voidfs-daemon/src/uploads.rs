@@ -49,14 +49,13 @@ impl Shared {
         Ok(UploadList { queue, rate, eta_secs })
     }
 
-    /// The drive as the server names it, so that a pause by drive finds its uploads whichever
-    /// name they were queued by. Offline, it is taken as given.
+    /// Imports retain their display alias; control includes mounted stable-ID entries too.
+    async fn upload_drive(&self, name: &str) -> Result<(String, Vec<String>), Failure> {
+        self.sessions.upload_names(self, name).await
+    }
+
     pub(crate) async fn drive(&self, name: &str) -> Result<String, Failure> {
-        match self.client.describe_drive(name).await {
-            Ok(d) => Ok(d.alias),
-            Err(e) if e.status().is_some() => Err(e.into()),
-            Err(_) => Ok(name.to_owned()),
-        }
+        Ok(self.upload_drive(name).await?.0)
     }
 }
 
@@ -108,7 +107,7 @@ pub(crate) async fn enqueue(State(s): State<Arc<Shared>>, Json(b): Json<NewBatch
             return Err(bad(format!("{:?}: not a key to upload to", f.key)));
         }
     }
-    let drive = s.drive(&b.drive).await?;
+    let (drive, _) = s.upload_drive(&b.drive).await?;
     let files: Vec<Import> = b.files.iter().map(|f| Import { path: f.path.clone().into(), drive: drive.clone(), key: f.key.clone() }).collect();
     let items = files.len() as u64;
     let batch = s.queue.import(&b.label, files).await?;
@@ -124,28 +123,25 @@ enum Control {
 
 async fn control(s: &Shared, scope: Scope, what: Control) -> Answer<Affected> {
     let scope = match scope {
-        Scope::Drive(d) => Scope::Drive(s.drive(&d).await?),
-        other => other,
-    };
-    let q = s.queue.status().await?;
-    match &scope {
-        Scope::Batch(b) if !q.batches.iter().any(|x| x.id == *b) => return Err(no_upload(format!("no batch {b}"))),
-        Scope::Entry(e) if !q.items.iter().any(|i| i.id == *e) => return Err(no_upload(format!("no upload {e}"))),
-        _ => {}
-    }
-    let applies = |i: &Item| match &scope {
-        Scope::All => true,
-        Scope::Drive(d) => i.drive == *d,
-        Scope::Batch(b) => i.batch == Some(*b),
-        Scope::Entry(e) => i.id == *e,
-    };
-    let items = q.items.iter().filter(|i| !i.state.finished() && applies(i)).count() as u64;
-    let scope = match scope {
         Scope::All => voidfs_client::Scope::All,
-        Scope::Drive(d) => voidfs_client::Scope::Drive(d),
+        Scope::Drive(d) => voidfs_client::Scope::Drives(s.upload_drive(&d).await?.1),
         Scope::Batch(b) => voidfs_client::Scope::Batch(b),
         Scope::Entry(e) => voidfs_client::Scope::Entry(e),
     };
+    let q = s.queue.status().await?;
+    match &scope {
+        voidfs_client::Scope::Batch(b) if !q.batches.iter().any(|x| x.id == *b) => return Err(no_upload(format!("no batch {b}"))),
+        voidfs_client::Scope::Entry(e) if !q.items.iter().any(|i| i.id == *e) => return Err(no_upload(format!("no upload {e}"))),
+        _ => {}
+    }
+    let applies = |i: &Item| match &scope {
+        voidfs_client::Scope::All => true,
+        voidfs_client::Scope::Drive(d) => i.drive == *d,
+        voidfs_client::Scope::Drives(drives) => drives.contains(&i.drive),
+        voidfs_client::Scope::Batch(b) => i.batch == Some(*b),
+        voidfs_client::Scope::Entry(e) => i.id == *e,
+    };
+    let items = q.items.iter().filter(|i| !i.state.finished() && applies(i)).count() as u64;
     match what {
         Control::Pause => s.queue.pause(scope).await?,
         Control::Resume => s.queue.resume(scope).await?,
