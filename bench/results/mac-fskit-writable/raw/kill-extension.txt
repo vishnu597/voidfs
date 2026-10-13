@@ -1,0 +1,105 @@
+# kill -9 of the extension after acknowledged writes (final build, writeThrough)
+closed.bin: 1 MiB copied and closed  fac972d66feb31b1
+edited.txt: written and appended, closed
+19:06:33.386  open O_CREAT|O_RDWR              11.7 ms  ok
+19:06:33.399  wrote 64 KiB, not closed          0.0 ms  ok
+waiting 15 s with the file open (pid 29991)
+$ kill -9 <VoidfsFS pid> at 19:06:33.534, within a second of the writes
+$ mount | grep voidfs
+voidfs://wtest on /private/tmp/vw (voidfs, nodev, nosuid, noowners, noatime, fskit, mounted by vishnu)
+$ void mounts
+DRIVE  MOUNTPOINT       ADAPTER  STATE    SINCE                 FEED
+wtest  /private/tmp/vw  fskit    mounted  2026-10-12T23:03:08Z  at 149
+$ writeprobe after the kill
+19:06:48.404  close                             0.3 ms  Input/output error
+# the server's copies
+closed.bin    fac972d66feb31b1
+edited.txt    line one|line two|
+probe-unflushed  65536 bytes, 0 not 'w'
+$ void history --all wtest ev/kill/
+wtest:ev/kill/, every version of every file in it
+TIME                         FILE             VERSION  SIZE      OPERATION
+2026-10-12T23:06:34.241858Z  closed.bin       144.0    1.0 MiB   put
+2026-10-12T23:06:34.250417Z  closed.bin       145.0    1.0 MiB   attrs      current
+2026-10-12T23:06:34.331155Z  edited.txt       146.0    18 B      put
+2026-10-12T23:06:34.339586Z  edited.txt       147.0    18 B      attrs      current
+2026-10-12T23:06:34.379600Z  probe-unflushed  148.0    64.0 KiB  put
+2026-10-12T23:06:34.386518Z  probe-unflushed  149.0    64.0 KiB  attrs      current
+
+# after the kill: FSKit keeps a dead mount entry (fskitd: "connect called on dead mount entry", auto-connect ECONNREFUSED)
+$ mount | grep voidfs
+voidfs://wtest on /private/tmp/vw (voidfs, nodev, nosuid, noowners, noatime, fskit, mounted by vishnu)
+$ ls /tmp/vw/ev/kill
+ls: /private/tmp/vw/ev/kill: Input/output error
+$ void mounts
+DRIVE  MOUNTPOINT       ADAPTER  STATE    SINCE                 FEED
+wtest  /private/tmp/vw  fskit    mounted  2026-10-12T23:03:08Z  at 149
+$ void unmount /private/tmp/vw
+unmounted /private/tmp/vw, and forgot it
+  (exit 0)
+(nothing mounted)
+
+# again, with the daemon that mounts a dead mount anew when it adopts it (rebuilt 19:13)
+$ void daemon restart
+daemon restarted (pid 31636, socket $VOIDFS_STATE_DIR/daemon.sock)
+  (exit 0)
+$ void mounts
+DRIVE  MOUNTPOINT       ADAPTER  STATE    SINCE                 FEED
+wtest  /private/tmp/vw  fskit    mounted  2026-10-12T23:13:12Z  at 160
+  (exit 0)
+$ kill -9 <VoidfsFS pid>
+$ ls /private/tmp/vw/ev/kill
+ls: /private/tmp/vw/ev/kill: No such file or directory
+  (exit 1)
+$ void daemon restart
+daemon restarted (pid 31652, socket $VOIDFS_STATE_DIR/daemon.sock)
+  (exit 0)
+voidfs://wtest on /private/tmp/vw (voidfs, nodev, nosuid, noowners, noatime, fskit, mounted by vishnu)
+$ ls /private/tmp/vw/ev/kill
+closed.bin
+edited.txt
+probe-unflushed
+second.txt
+  (exit 0)
+$ cat /private/tmp/vw/ev/kill/second.txt
+before the second kill
+  (exit 0)
+$ void mounts
+DRIVE  MOUNTPOINT       ADAPTER  STATE    SINCE                 FEED
+wtest  /private/tmp/vw  fskit    mounted  2026-10-12T23:13:17Z  at 162
+  (exit 0)
+
+# a third kill, with a file held open (as the first)
+$ kill -9 <VoidfsFS pid>
+voidfs://wtest on /private/tmp/vw (voidfs, nodev, nosuid, noowners, noatime, fskit, mounted by vishnu)
+$ ls /private/tmp/vw/ev/kill
+ls: /private/tmp/vw/ev/kill: Input/output error
+  (exit 1)
+probe: 19:13:44.391  close                             0.3 ms  Input/output error
+voidfs://wtest on /private/tmp/vw (voidfs, nodev, nosuid, noowners, noatime, fskit, mounted by vishnu)
+$ ls /private/tmp/vw/ev/kill
+ls: /private/tmp/vw/ev/kill: Input/output error
+  (exit 1)
+$ void daemon restart
+daemon restarted (pid 31772, socket $VOIDFS_STATE_DIR/daemon.sock)
+  (exit 0)
+voidfs://wtest on /private/tmp/vw (voidfs, nodev, nosuid, noowners, noatime, fskit, mounted by vishnu)
+$ ls /private/tmp/vw/ev/kill
+closed.bin
+edited.txt
+probe-unflushed
+second.txt
+  (exit 0)
+$ void show wtest ev/kill/probe-unflushed | wc -c
+   65536
+$ void history --all wtest ev/kill/
+wtest:ev/kill/, every version of every file in it
+TIME                         FILE             VERSION  SIZE      OPERATION
+2026-10-12T23:06:34.241858Z  closed.bin       144.0    1.0 MiB   put
+2026-10-12T23:06:34.250417Z  closed.bin       145.0    1.0 MiB   attrs      current
+2026-10-12T23:06:34.331155Z  edited.txt       146.0    18 B      put
+2026-10-12T23:06:34.339586Z  edited.txt       147.0    18 B      attrs      current
+2026-10-12T23:13:15.834584Z  second.txt       161.0    23 B      put
+2026-10-12T23:13:15.843790Z  second.txt       162.0    23 B      attrs      current
+2026-10-12T23:13:33.356707Z  probe-unflushed  164.0    64.0 KiB  put
+2026-10-12T23:13:33.362384Z  probe-unflushed  165.0    64.0 KiB  attrs      current

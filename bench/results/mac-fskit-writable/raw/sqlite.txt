@@ -1,0 +1,31 @@
+# SQLite on the mount (final build), /usr/bin/sqlite3 3.54.0
+$ sqlite3 rollback.db "create table t(x); begin; insert into t values(1),(2),(3); commit; select count(*) from t;"
+3
+  (exit 0)
+$ sqlite3 rollback.db "pragma integrity_check;"
+ok
+  (exit 0)
+$ sqlite3 wal.db "pragma journal_mode=wal; create table t(x); insert into t values('a'); select * from t;"
+wal
+a
+  (exit 0)
+$ two writers on wal.db (one holds a write transaction for 2 s)
+  second writer at once: Error in 2nd command line argument: database is locked
+  second writer at once: 0
+first writer in
+3000
+a,held,second, after
+$ sqlite3 wal.db "pragma wal_checkpoint(truncate); pragma integrity_check;"
+0|0|0
+ok
+  (exit 0)
+total 96
+drwxr-xr-x@ 2 vishnu  staff      0 Oct 12 19:05 .
+drwxr-xr-x@ 2 vishnu  staff      0 Oct 12 19:03 ..
+-rw-r--r--@ 1 vishnu  staff   8192 Oct 12 19:05 rollback.db
+-rw-r--r--@ 1 vishnu  staff   8192 Oct 12 19:05 wal.db
+-rw-r--r--@ 1 vishnu  staff  32768 Oct 12 19:05 wal.db-shm
+-rw-r--r--@ 1 vishnu  staff      0 Oct 12 19:05 wal.db-wal
+$ void show wtest ev/sqlite/wal.db | sqlite3 (the server's copy)
+a,held,second, after
+ok

@@ -9,19 +9,24 @@ import Foundation
 /// lookup makes a new one. A descriptor opened before the change keeps the retired instance, and
 /// with it the daemon handle opened then: its reads, and the attributes they carry, come from the
 /// version that was current at open (snapshot-at-open), never an old length with new bytes.
-final class VoidfsItem: FSItem {
+final class VoidfsItem: FSItem, @unchecked Sendable {
     let ino: UInt64
     let id: FSItem.Identifier
     /// Guarded by the volume's lock.
     var parent: UInt64
     var kind: BridgeAttr.Kind
     /// The daemon handle opened when the kernel first opened this incarnation, until the kernel
-    /// closes it.
+    /// closes it: read-only, or writable once the kernel opened it for writing.
     var handle: OpenFile?
     /// The open in flight, which other opens and reads of this incarnation wait for.
     var opening: Task<OpenFile, Error>?
     /// A later incarnation answers lookups now.
     var retired = false
+    /// A change made on this Mac touched the inode: the handle's attributes are read again.
+    var stale = false
+    /// Pages came with no open: a shared mapping outlived its descriptors. Each later open
+    /// pushes the kernel's cache first (see `VoidfsVolume.open`).
+    var mapped = false
 
     init(ino: UInt64, id: FSItem.Identifier, parent: UInt64, kind: BridgeAttr.Kind) {
         (self.ino, self.id, self.parent, self.kind) = (ino, id, parent, kind)
@@ -34,10 +39,11 @@ final class VoidfsItem: FSItem {
     }
 }
 
-/// A daemon handle: the attributes bound with it at open, and the session it belongs to (a
-/// handle means nothing to a later session).
+/// A daemon handle: the attributes bound with it at open (then as this Mac's changes leave
+/// them), and the session it belongs to (a handle means nothing to a later session).
 struct OpenFile {
     let fh: UInt64
-    let attr: BridgeAttr
+    var attr: BridgeAttr
     let session: BridgeSession
+    let write: Bool
 }

@@ -1,0 +1,131 @@
+# kill -9 of the daemon after acknowledged writes, publication paused (final build)
+$ void mount wtest /private/tmp/vw
+mounted wtest at /private/tmp/vw (fskit); it comes back when the daemon starts
+  (exit 0)
+$ void uploads pause
+error: the following required arguments were not provided:
+  <ID|--batch <ID>|--drive <DRIVE>|--all>
+
+Usage: void uploads pause <ID|--batch <ID>|--drive <DRIVE>|--all>
+
+For more information, try '--help'.
+  (exit 2)
+big.bin: 3 MiB copied and closed  aa326de5e05fa7fc
+note.txt: written, then appended 1.5 s later
+19:08:37.397  open O_CREAT|O_RDWR              18.1 ms  ok
+19:08:37.420  wrote 64 KiB, not closed          0.0 ms  ok
+waiting 20 s with the file open (pid 30621)
+$ void uploads
+no uploads in progress
+
+nothing to send
+  (exit 0)
+$ kill -9 <daemon pid from void daemon status> at 19:08:38
+$ void daemon status
+daemon not running (socket $VOIDFS_STATE_DIR/daemon.sock)
+  (exit 0)
+$ mount | grep voidfs
+voidfs://wtest on /private/tmp/vw (voidfs, nodev, nosuid, noowners, noatime, fskit, mounted by vishnu)
+$ ls /private/tmp/vw/ev/killd
+ls: fts_read: Input/output error
+  (exit 1)
+$ cat /private/tmp/vw/ev/killd/note.txt
+cat: /private/tmp/vw/ev/killd/note.txt: Input/output error
+  (exit 1)
+$ void daemon start
+daemon started (pid 30707, socket $VOIDFS_STATE_DIR/daemon.sock)
+  (exit 0)
+$ void mounts
+DRIVE  MOUNTPOINT       ADAPTER  STATE    SINCE                 FEED
+wtest  /private/tmp/vw  fskit    mounted  2026-10-12T23:08:48Z  at 160
+  (exit 0)
+$ ls /private/tmp/vw/ev/killd
+big.bin
+note.txt
+probe-unflushed
+  (exit 0)
+$ cat /private/tmp/vw/ev/killd/note.txt
+v1
+v2
+  (exit 0)
+$ writeprobe after the kill
+waiting 20 s with the file open (pid 30621)
+# the server's copies
+big.bin    aa326de5e05fa7fc
+note.txt   v1|v2|
+probe-unflushed  65536 bytes
+$ void history --all wtest ev/killd/
+wtest:ev/killd/, every version of every file in it
+TIME                         FILE             VERSION  SIZE      OPERATION
+2026-10-12T23:08:36.683014Z  big.bin          152.0    3.0 MiB   put
+2026-10-12T23:08:36.691635Z  big.bin          153.0    3.0 MiB   attrs      current
+2026-10-12T23:08:36.775628Z  note.txt         154.0    3 B       put
+2026-10-12T23:08:36.784856Z  note.txt         155.0    3 B       attrs
+2026-10-12T23:08:37.345531Z  note.txt         156.0    6 B       write      current
+2026-10-12T23:08:38.385776Z  probe-unflushed  157.0    0 B       put
+2026-10-12T23:08:38.391827Z  probe-unflushed  158.0    0 B       attrs
+2026-10-12T23:08:48.737606Z  probe-unflushed  159.0    64.0 KiB  put
+2026-10-12T23:08:48.744798Z  probe-unflushed  160.0    64.0 KiB  attrs      current
+  (exit 0)
+
+# again, publication paused (void uploads pause --all)
+$ void uploads pause --all
+paused all uploads (0 unfinished)
+  (exit 0)
+big.bin copied, note.txt written then appended, rw.txt (published earlier) rewritten
+$ void daemon info
+version       0.0.0 (a04078e, 2026-10-12)
+pid           31772
+uptime        22s
+socket        $VOIDFS_STATE_DIR/daemon.sock
+state         $VOIDFS_STATE_DIR
+mounts        1
+restart safe  yes
+journal       6 changes unpublished, 3.0 MiB to send, all of it on disk
+uploading     0 now: a restart sends a file again, or a large one from its last part
+imports       0 waiting, read from where they are: leave them there until they are up
+  (exit 0)
+$ kill -9 <daemon pid from void daemon status>
+$ void show wtest ev/killp/note.txt
+error: ev/killp/note.txt: 404 NoSuchKey: The specified key does not exist
+  (exit 1)
+$ void daemon start
+daemon started (pid 31903, socket $VOIDFS_STATE_DIR/daemon.sock)
+  (exit 0)
+$ void uploads
+ID   DRIVE                                   KEY                SIZE     SENT  STATE
+145  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  ev/killp/          0 B      100%  paused
+146  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  ev/killp/          0 B      100%  paused
+147  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  ev/killp/big.bin   3.0 MiB  0%    paused
+148  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  ev/killp/note.txt  6 B      0%    paused
+149  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  rw.txt             4 B      0%    paused
+150  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  rw.txt             0 B      100%  paused
+
+0 uploading, 6 queued · 3.0 MiB to send · paused
+  (exit 0)
+local, through the mount: big.bin aa326de5e05fa7fc, note.txt v1|v2|, rw.txt old
+$ void show wtest ev/killp/note.txt
+error: ev/killp/note.txt: 404 NoSuchKey: The specified key does not exist
+  (exit 1)
+$ void uploads resume --all
+resumed all uploads (6 unfinished)
+  (exit 0)
+# the server's copies
+big.bin    aa326de5e05fa7fc
+note.txt   v1|v2|
+rw.txt     old
+$ void history --all wtest ev/killp/
+wtest:ev/killp/, every version of every file in it
+TIME                         FILE      VERSION  SIZE     OPERATION
+2026-10-12T23:14:13.866989Z  note.txt  169.0    6 B      put
+2026-10-12T23:14:13.871922Z  big.bin   170.0    3.0 MiB  put
+2026-10-12T23:14:13.873542Z  note.txt  171.0    6 B      attrs      current
+2026-10-12T23:14:13.879562Z  big.bin   172.0    3.0 MiB  attrs      current
+  (exit 0)
+$ void history --all wtest rw.txt
+wtest:rw.txt
+VERSION  TIME                         SIZE  OPERATION
+1.0      2026-10-12T23:03:06.596315Z  6 B   put
+2.0      2026-10-12T23:03:06.601763Z  6 B   attrs
+167.0    2026-10-12T23:14:13.832304Z  4 B   write      current
+  (exit 0)

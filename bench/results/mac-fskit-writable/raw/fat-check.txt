@@ -1,0 +1,36 @@
+== FSKit FAT (msdos, fskit) on a scratch disk image
+renamex_np RENAME_SWAP: ok
+after: a=cat: /Volumes/VFATPROBE/swap/a.txt: No such file or directory b=AAAA
+read after "mc1u": 1
+read after "mc1S2u": 1 2
+read after "mc1S2": 1 2
+read after "mc1S2uy": 1 2
+read after "m1Sc2u": 1 2
+/Volumes/VFATPROBE (msdos, /dev/disk6s1)
+  advertised: CASE_SENSITIVE=no PERSISTENTOBJECTIDS=no SYMBOLICLINKS=yes HARDLINKS=no 2TB_FILESIZE=no EXTENDED_ATTR=no NAMEDSTREAMS=no EXCHANGEDATA=no RENAME_SWAP=no RENAME_EXCL=no CLONE=no FLOCK=yes ADVLOCK=yes ALLOCATE=yes
+  setxattr user.test                                   ok
+    AppleDouble ._a.txt created?                       yes
+  setxattr com.apple.FinderInfo (32 bytes)             ok
+  setxattr com.apple.ResourceFork                      Invalid argument
+    AppleDouble ._b.txt created?                       yes
+  atomic save: rename(save.tmp, a.txt) over a.txt      ok
+    after                                              a=A2
+  renamex_np(a, b, RENAME_SWAP)                        ok
+    after (a swap leaves a=B b=A)                      a=No such file or directory b=A
+  renamex_np(a, b, RENAME_EXCL) onto existing b        File exists
+    after (EEXIST leaves a=A b=B)                      a=A b=B
+  exchangedata(a, b)                                   Operation not supported
+    after                                              a=A b=B
+  clonefile(a, clone)                                  Operation not supported
+  fcntl F_FULLFSYNC                                    ok
+  fcntl F_BARRIERFSYNC                                 ok
+  flock LOCK_EX|LOCK_NB                                ok
+  fcntl F_SETLK write lock                             Resource temporarily unavailable
+  mmap MAP_SHARED write + msync(MS_SYNC)               ok
+    a.txt after the mapped write                       mapped
+  unlink while open                                    ok
+    read from the open descriptor                      still readable
+  link (hard link)                                     Operation not supported
+  symlink                                              ok
+  chmod 0600                                           ok
+  open O_EXLOCK                                        ok

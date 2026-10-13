@@ -6,7 +6,7 @@ and shared feeds, guarded publication and retained conflicts added 7 October; re
 advertised capabilities, setting mode and mtime, and recognizing lost replies to edits, renames
 and attribute changes added 8 October; the signed-bundle probe, the rest of the session calls,
 the Swift bridge and one daemon for the CLI and the app added 9 October; read-only FSKit on the
-daemon added 10 October; the SMB feasibility spike added 12 October. **Item 1 is complete**
+daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -20,9 +20,12 @@ is in use (and in the top folder until remount), which reopens the SMB decision 
 **Item 6's SMB feasibility spike is done** ([12 October](#smb-feasibility-spike-12-october)): the
 Mac's SMB client shows those names within milliseconds when the server breaks SMB 3.x directory
 leases, but no existing server fits. The user kept FSKit as the default and waits for Apple to
-fix the miss; item 4 is next.
-The later deliverables remain an implementation plan; no writable adapter, platform service
-installation, new protocol field or format feature is delivered by this slice.*
+fix the miss. **Item 4 is built and not complete** ([12 October](#writable-fskit-12-october)): the
+volume writes through the daemon's durable core, with a bounded flush in place of the fsync FSKit
+doesn't pass on, but `RENAME_SWAP` overwrites on every FSKit volume (a release blocker the user
+accepted, to be raised with Apple) and resource forks over 64 KiB need a protocol change.
+The later deliverables remain an implementation plan; no platform service installation, new
+protocol field or format feature is delivered by these slices.*
 
 Step 5 is **done when** the daemon mounts a writable drive from the same durable client core the
 CLI uses, Finder and the target applications can save through it, and a signed, notarized app can
@@ -57,8 +60,8 @@ overlay and staged file data. Reads combine shared unpublished edits with each h
 snapshot. The daemon now supplies bounded Rust session RPCs and one shared per-drive feed.
 Guarded publication reconciles exact acknowledgements and retains conflicting versions locally,
 and the core recovers from process kills at each step. The app's launch agent bridges the
-sandboxed extension to the daemon ([9 October](#the-swift-bridge-9-october)); writable FSKit or
-SMB callbacks remain later work.
+sandboxed extension to the daemon ([9 October](#the-swift-bridge-9-october)), and the FSKit volume
+writes through it since item 4 ([12 October](#writable-fskit-12-october)).
 
 | Decision | Choice or remaining recommendation | Alternative and consequence |
 |---|---|---|
@@ -78,7 +81,7 @@ resolution UI remains a later deliverable.
 |---|---|
 | Names | New writes store NFC names, with equivalent NFD lookups, using the approved `unicode-normalization` dependency. Existing remote names stay byte-exact. If multiple names normalize alike, lookup reports ambiguity rather than choosing one. Names remain case-sensitive. |
 | Conflicts | Preserve the local saved data and remote version locally until the user resolves the conflict. Do not automatically publish a conflict sibling visible to other clients. |
-| Write acknowledgement | `write` returns after staging bytes that survive a daemon or extension crash. `fsync`, `F_FULLFSYNC` and `close` flush bytes and metadata to disk. Cloud publication has separate status. |
+| Write acknowledgement | `write` returns after staging bytes that survive a daemon or extension crash. `fsync`, `F_FULLFSYNC` and `close` flush bytes and metadata to disk. Cloud publication has separate status. **On FSKit, accepted 12 October:** FSKit passes no fsync to a module, so staged bytes reach the disk within a second of the last write, and close still flushes ([writable FSKit](#writable-fskit-12-october)). |
 | Files that stay open | **Accepted 6 October: publish after two seconds without writes**, as well as on fsync and close, so an application does not defer cloud publication merely by keeping a file open. |
 
 ### Platform evidence, checked 4 October
@@ -207,6 +210,12 @@ open-sibling case prevents the 5-second requirement, this is a release blocker a
 decision is reopened before adding more app surface.
 
 ### Item 4. Writable FSKit and desktop semantics
+
+**Built, 12 October, not complete:** every bullet is met but two. `RENAME_SWAP` overwrites the
+destination on every FSKit volume, Apple's FAT module included (a release blocker; the user keeps
+building and files a Feedback), and resource forks over 64 KiB need a protocol change. FSKit
+passes no fsync, so the user accepted a flush within a second of the last write in its place.
+The evidence is in [writable FSKit](#writable-fskit-12-october).
 
 Map writable handlers to the durable local operations, not directly to remote SDK mutations.
 Return write success after staging that survives a daemon or extension crash; cloud publish is
@@ -1819,3 +1828,278 @@ old message. The spike's server now keeps its tasks. Validation: 720 workspace t
 (9 ignored), and workspace clippy passes with warnings denied; spec validation passes 56 cases /
 432 steps, and the five credential-script tests pass. The test daemons used `mktemp` state
 directories, since removed, against a local memory-store server, since stopped.
+
+### Writable FSKit, 12 October
+
+The volume writes. Writes, creates, removes, renames, attribute and xattr changes go from the
+extension through the agent to the daemon's durable local operations (item 1's core), never
+straight to the server, and publication follows as before. `void mount` mounts writable;
+`void mount --read-only` passes `mount -r`, and the volume answers `EROFS` to every change. A
+writable mount remembered while the module was read-only comes back writable when the daemon
+starts. **Item 4 is not complete:** `renamex_np(RENAME_SWAP)` overwrites the destination on any
+FSKit volume, which the user made a release blocker, and resource forks over 64 KiB can't be
+stored (below). Evidence is in
+[`bench/results/mac-fskit-writable`](../bench/results/mac-fskit-writable/README.md).
+
+**The questions answered first, on a real mount** (README Q1–Q6). The volume had probe options
+for these (commit 2edbdc7): the most a write open is granted, a delay before each write is
+staged, and a trace of every callback; they were removed once answered (8a11a2f), except the
+trace.
+
+1. FSKit passes no fsync to a module. Under every cache grant, `fsync`, `F_FULLFSYNC`,
+   `F_BARRIERFSYNC`, `sync(2)` and unmount reach the module as nothing at all, and
+   `synchronize(flags:)` is never called. Under writeThrough (and the uncached grants)
+   `write(2)` returns only after the module's write callback, and the last `close(2)` waits for
+   the module's close. Under writeBack `write(2)` returns at once and `fsync` or close push the
+   pages as ordinary writes.
+2. Killing the extension: FSKit doesn't start it again. Under writeThrough every byte `write(2)`
+   acknowledged was staged and published; under writeBack the kernel's pages were lost and
+   `close` still returned 0. **writeThrough it is.**
+3. mmap: `msync` and the last close push a shared mapping's pages as write callbacks, also after
+   the descriptor closed. But once pages were pushed with no descriptor open, FSKit drops the
+   mapping's next stores at the file's next open, silently. The volume now pushes such a file's
+   pages itself at its next open (`setCacheState(…, action: .push)`, about 1 ms), and the stores
+   survive, a remount too.
+4. The volume's own writes came back as events (local ones, and each publication through the
+   feed), and the volume revoked the file it was writing; a page-out after close then failed with
+   `ESTALE` while `msync` returned 0. Fixed in the core and the volume (below).
+5. `semantics.c`: `RENAME_SWAP` returns 0 and replaces the destination; the module receives a
+   plain rename over it. `RENAME_EXCL` returns `EEXIST` from the kernel.
+6. Apple's own FSKit `msdos` module, on a scratch FAT image: `RENAME_SWAP` overwrites there too,
+   so the kernel side does it, and no module can refuse it (FSKit's `renameItem` has no flags).
+
+**Stops answered on 12 October** (each asked once):
+
+- **`RENAME_SWAP` is a release blocker; keep building.** The volume keeps advertising no swap,
+  and a Feedback to Apple is drafted below for the user to file. An app that swaps with it on a
+  voidfs mount loses the destination's bytes; published bytes come back with a restore, and
+  unpublished ones are gone.
+- **A bounded flush stands in for fsync** (§1's write acknowledgement, which said `fsync`,
+  `F_FULLFSYNC` and close flush to disk): with no fsync from FSKit, staged bytes reach the disk
+  within a second of the last write (the table below), and close still flushes. A power loss can
+  take up to that second of acknowledged writes; a daemon or extension crash takes none.
+- Finder and TextEdit were driven with `osascript` on the test mount, and Apple's FAT module was
+  checked on a scratch image without sudo.
+
+**Decisions.**
+
+- **Durability.** What each step leaves, on this Mac and in the drive:
+
+  | When | On this Mac's disk | In the drive |
+  | --- | --- | --- |
+  | `write(2)` returns (writeThrough waits for the module) | Bytes in the stage file and their record committed `NORMAL`: they survive the daemon, the agent or the extension being killed | Nothing yet |
+  | Within 1 s of the last write (`StagingConfig::disk_flush`) | The stage file and its folders synchronized (`F_FULLFSYNC`) and a `FULL` commit: they survive a power loss | Nothing yet |
+  | `fsync`, `F_FULLFSYNC`, `sync(2)` | Nothing more: FSKit doesn't pass them on | |
+  | 2 s without writes, the file still open (§1, 6 October) | Flushed as at close | Queued |
+  | Last close | Flushed: synchronized, `FULL` commit | Queued |
+  | Unmount and eject | The volume releases its session, and the daemon flushes every file it still had open | Queued |
+  | The volume's `synchronize` | Every writable handle flushed (macOS 27.0.1 never calls it) | Queued |
+
+  Publication then runs from the journal (`void uploads`), paused or not, and recovery after a
+  kill publishes each change once (`raw/kill-daemon.txt`).
+- **The volume's own changes aren't news to it.** Every session event now says whether it is
+  local (this Mac, through the daemon's core). For a local event the volume drops the listings
+  that name the change and rereads open files' attributes, but revokes nothing, so a writer's
+  file isn't retired under it. The feed's reports of this Mac's own publications (the versions
+  the queue recorded at done, kept for the last 4,096) and of names whose unpublished edits the
+  view already shows reach no session at all: `Session::invalidate_feed` drops them. Other
+  computers' changes invalidate as before.
+- **A name the kernel was told is missing and that this Mac then creates** shows at once: the
+  volume forgets the miss before a create or rename to it (and remembers it again if the call
+  fails), and a change through another session of the core (the CLI's upload into the mounted
+  folder, say) that names a missed name revokes its folder, as other computers' changes do.
+  Item 3's blocker is about other computers' names in a folder in use, and stays open.
+- **Fewer versions for a new file or an edit.** An edit sets its mode and mtime in its own write
+  or patch request (protocol §4.0), so it no longer adds an `attrs` version. A new file's
+  creating put waits 1 s (`QueueConfig::create_hold`), and the bytes, mode, times and xattrs
+  that follow within it fold into that put (`journal::amend`), so a copied file is one put
+  instead of put and write. A truncate to the start followed by bytes that cover the file (an
+  `O_TRUNC` save in place) is one version, not an empty one first. The hold is time-only:
+  holding while a file stays open would defeat §1's quiet period, so a file written for more
+  than a second publishes its empty create first, then its bytes. On the mount every new file
+  also has an `attrs` version, because macOS sets `com.apple.provenance` on every file a process
+  writes and a put can't carry xattrs (an item 9 candidate):
+
+  | On the mount | Before | Now |
+  | --- | --- | --- |
+  | A new file (`cp`, a Finder copy) | put, write (or put, put), attrs | put, attrs |
+  | An edit, then close | write, attrs | write |
+  | A save in place (`O_TRUNC`, then the bytes) | an empty version, then write | write |
+  | A new file still open after 1 s | | put (empty), then put |
+  | A TextEdit save | | about 6 (below) |
+
+- **Names.** Only `.DS_Store` is local housekeeping. One this Mac creates stays on this Mac
+  (`Sync::Local`): nothing about it is journaled, its stage keeps it across restarts, it renames
+  only to another `.DS_Store` (`EXDEV` otherwise), and a folder deleted elsewhere goes with it.
+  A `.DS_Store` already in the drive (from another client) shows and syncs as any file does: the
+  server ignores a folder delete while the folder has children, so hiding it would bring deleted
+  folders back. Every other name is the user's and publishes, the ones near it included:
+
+  | Name | Treatment, seen on the mount |
+  | --- | --- |
+  | `.DS_Store` | Local to this Mac |
+  | `DS_Store`, `.DS_Store.txt`, `.ds_store` (on a case-sensitive drive) | Ordinary files |
+  | `._name` (AppleDouble) | An ordinary file. The volume keeps xattrs natively, so macOS writes none (seen with Finder, `cp` and TextEdit) |
+  | `.localized`, `.hidden` | Ordinary files |
+  | `.Trashes`, `.fseventsd`, `.Spotlight-V100` | Never created: Move to Trash deletes at once (the drive's recently deleted brings it back), and Spotlight doesn't index the volume (`mdutil`: unknown indexing state) |
+  | SQLite's `-journal`, `-wal`, `-shm` | Ordinary files |
+
+- **Capabilities.** No symbolic links (no wire operation creates one; `ln -s` answers `ENOTSUP`),
+  no hidden flag (`chflags hidden` isn't kept, though §4.8 has `hidden`), no hard links, swap,
+  `exchangedata` or cloning; sparse files, xattrs up to 64 KiB, open-unlink, persistent file
+  IDs. The kernel answers `RENAME_EXCL` itself.
+- **Size.** `df` and Finder see this Mac's disk, where writes are staged before they publish, so
+  Finder's free-space check before a copy means something. A drive has no quota to show.
+- **Killed processes.** Killing the daemon leaves the mount answering `EIO` until `void daemon
+  start` adopts it, then the same mount works with every acknowledged byte. Killing the
+  extension with a file open leaves FSKit's mount dead ("connect called on dead mount entry":
+  `EIO` everywhere, `close` too), and FSKit doesn't start the extension again; with nothing open,
+  the volume is unmounted. A starting daemon now adopts a mount only if its top folder lists
+  within 5 s, and otherwise runs `umount -f` and mounts it again, so `void daemon restart` brings
+  the volume back (d80e71a).
+- **Atomic saves.** A rename over an existing name keeps the replaced object (protocol §4.7): a
+  descriptor opened before reads the old bytes, a new open the new ones, and the drive keeps
+  both. A safe save (TextEdit: a `.sb-` folder, the new file in it, the original renamed aside,
+  the new one renamed in, the rest deleted) is about 6 versions and a new object per save, so
+  `void history` of the file lists the newest object's versions, and the earlier drafts are in
+  recently deleted, where a folder restore to before the save finds them. Whether a save should
+  keep one object's history (a client fold or a protocol change) is a question for later.
+- **Locks are this Mac's.** fcntl, flock and `O_EXLOCK` locks are held against other processes
+  and released, as on APFS, and none of them reaches the server: two Macs don't coordinate
+  through them. SQLite works on the mount, rollback journal and WAL.
+- **Conflicts.** A mount's save that the drive refused because it changed since (412, or 404 or
+  409 for a rename or delete) keeps this Mac's bytes on the mount and the other computer's in
+  the drive (§1). `void uploads` says `conflict: the drive changed (now version …); this Mac keeps
+  its copy`, its totals and `void status` count files in conflict apart from failures (one save
+  can leave several entries), the status API's uploads have `conflicts` (no longer in `failed`),
+  and `void daemon run` logs each file that goes into conflict to daemon.log, once, within 5 s
+  (6522123). Resolving one is later work (item 8's menu-bar UI).
+- **xattrs over 64 KiB.** Protocol §4.8 allows 64 KiB of xattrs an object and calls larger ones a
+  future feature. A resource fork over that can't be stored: `cp` copies the data, says
+  "Argument list too long" and exits 1, and **Finder's copy succeeds and drops the fork
+  silently**. Storing them needs an RFC.
+- **Finished uploads accumulate.** Every save through the mount stays listed as done in `void
+  uploads --all` until `void uploads clear`. Fine for the CLI; item 8's transfer view will want
+  to fold them.
+- **Test setup.** A memory-store server on 127.0.0.1:9000 whose pool has `multi-object-versions`
+  (RFC 0004). On a pool without it, a folder restore lists restored files at a version their
+  history doesn't have (the step 4 finding RFC 0004 fixed), so the mount's read by version
+  answers `ESTALE` until the file changes again (`raw/textedit-legacy-pool.txt`). As in item 3, the
+  agent used a `defaults` override to reach a test daemon in a `mktemp` state directory.
+
+**Evidence** (`bench/results/mac-fskit-writable`, [final build](../bench/results/mac-fskit-writable/README.md#the-final-build)),
+on the volume at 8a11a2f and the daemon at d80e71a:
+
+- **Finder copies and edits** (`raw/finder.txt`): a 5 MiB file, a folder tree, and a file with a
+  resource fork, `com.apple.quarantine`, `com.apple.provenance` and an empty `user.note`; renames
+  and duplicates. Contents match by SHA-256 on the source, the mount and the server; every xattr
+  round-trips byte for byte and the server holds them; no `._` files.
+- **Atomic saves** (`raw/atomic-save.txt`, `raw/textedit.txt`): `atomic.c` and TextEdit, as above.
+- **mmap writes** (`raw/mmap-final.txt`): stores with the descriptor open or closed reach the
+  server, and Q3's sequences that lost a store keep it.
+- **xattr round trips**: Finder's, plus `semantics.c`; empty values; the 64 KiB limit
+  (`raw/resource-fork.txt`).
+- **Killing the extension** (`raw/kill-extension.txt`): a copied file, an appended file and
+  64 KiB still open, all acknowledged within a second of `kill -9`, are on the server, one put
+  and one `attrs` each.
+- **Killing the daemon** (`raw/kill-daemon.txt`): with publication paused, `void daemon info`
+  said "6 changes unpublished, 3.0 MiB to send, all of it on disk"; after `kill -9` and a start the
+  mount showed every byte, and resuming published each change once (a file written and appended
+  1.5 s later is one put, an edit of a published file one `write`).
+- `raw/names.txt`, `raw/misses.txt`, `raw/mounts.txt`, `raw/locks.txt`, `raw/sqlite.txt`,
+  `raw/conflict.txt`, `raw/trash-spotlight-size.txt` and `raw/semantics-final.txt`, as above.
+
+**Tests.** Rust, in CI:
+
+| Test | Shows |
+| --- | --- |
+| `staged_writes_reach_disk_soon_after_without_publishing` (`voidfs-client/tests/mount_writes.rs`) | A write's stage reaches a `FULL` commit within the disk flush and publishes nothing; a burst is one flush; a flushed or closed file needs none |
+| `the_feed_reports_other_computers_changes_and_not_this_macs_own` (`mount_publication.rs`) | Own publications (puts, renames, a moved folder) invalidate nothing; another computer's changes still do, one by one |
+| `local_mutations_notify_other_sessions_after_the_new_bytes_are_visible` (changed, `voidfs-daemon/tests/sessions.rs`) | Local events say so, and the publication's echoes carry no invalidations or inodes; `remote_watch_…` checks a remote event isn't local |
+| `a_new_files_bytes_mode_times_and_xattrs_go_up_with_its_creating_put` | A new file is one journal entry and one `FULL` commit at close, published as `put` and `attrs` |
+| `a_new_file_written_past_the_hold_publishes_its_create_first` | The hold is 1 s; a slow writer publishes `put`, `put` |
+| `an_edit_sets_its_mode_and_times_in_its_own_request` | An edit is one `write`, with its mode and mtime |
+| `a_rewrite_in_place_is_one_version` | `O_TRUNC` then the bytes is one `write`; a truncate that leaves a gap is kept |
+| `a_ds_store_stays_on_this_mac_across_a_restart_and_nearby_names_publish` | `.DS_Store` journals nothing and survives a restart; nearby names publish |
+| `a_local_ds_store_renames_only_as_one_and_shadows_the_drives_own` | `EXDEV` across the boundary; a local one over the drive's |
+| `a_folder_removed_elsewhere_goes_with_its_local_ds_store` | A folder deleted elsewhere isn't kept for its `.DS_Store` |
+| `fskit_mounts_with_the_system_mount_and_comes_back_or_is_adopted_when_the_daemon_starts` (changed, `voidfs-daemon/tests/fskit.rs`) | Writable without `-r`, read-only with it; a dead mount unmounted with `-f` and mounted anew |
+| `a_mounts_conflict_reads_as_one_not_as_failures` (`voidfs-cli`) | The conflict wording and totals |
+| `a_mounts_conflict_shows_in_uploads_status_and_the_log` (`voidfs-cli/tests/uploads.rs`) | A real 412 through the daemon: `void uploads`, `void status`, the API's `conflicts`, one daemon.log line |
+
+Existing tests changed with the new counts: lost replies to a save and an edit land as one
+version each (`mount_recovery.rs`), and a new file's failed xattr changes leave one entry
+(`mount_xattrs.rs`). The restart helpers of `mount_publication.rs` and `mount_writes.rs` now
+wait for the old store to be let go, as `mount_model.rs`'s does: a disk flush can hold it for a
+moment after a test drops its session (one full run failed so).
+
+Swift: the probes on the mount are the tests (`writeprobe.c`, `semantics.c`, and here
+`mmapseq.c`, `atomic.c`, `locks.c`), with `voidfs bridge-selftest` for the bridge.
+
+Each new test was seen to fail with its code broken, each break alone: 39 Rust breaks
+([`breaks-rust.log`](../bench/results/mac-fskit-writable/breaks-rust.log)) across the disk flush,
+the echo filter, the local flag, the fold and hold, the rewrite rule, every `.DS_Store` path,
+the writable adapter, the dead-mount check and the conflict presentation. Swift was checked
+before and after on the mount: Q3's lost store before the push at open, Q4's revokes and
+`ESTALE` before the local-event change, and a created name still missing before the miss fix.
+
+**A Feedback for Apple, for the user to file** (`RENAME_SWAP`):
+
+> **FSKit: renamex_np(RENAME_SWAP) on an FSKit volume replaces the destination instead of
+> swapping or failing.** File System (FSKit), incorrect behavior; macOS 27.0.1 (26A434),
+> Xcode 27 beta (27A5194q), Apple silicon.
+>
+> On a volume served by an FSKit module, `renamex_np(a, b, RENAME_SWAP)` returns 0 and replaces
+> `b` with `a`: afterwards `a` is gone and `b` holds `a`'s old contents, so `b`'s are lost, though
+> the volume doesn't report `VOL_CAP_INT_RENAME_SWAP`. The module can't prevent it:
+> `renameItem(_:inDirectory:named:to:inDirectory:overItem:)` has no flags, so it receives exactly
+> an ordinary rename over an existing name (an atomic save's last step). `RENAME_EXCL` is handled:
+> the kernel fails it with `EEXIST`.
+>
+> To reproduce with Apple's FAT module: `hdiutil create -size 64m -fs MS-DOS -volname VFATPROBE
+> ~/probe.dmg`, `hdiutil attach ~/probe.dmg`; write `AAAA` to `a.txt` and `BBBB` to `b.txt` on it;
+> call `renamex_np` with `RENAME_SWAP`; read both. Expected: a swap, or `ENOTSUP` as on other
+> volumes without the capability. Actual: 0, `a.txt` gone, `b.txt` = `AAAA`. The same on a
+> third-party module.
+>
+> Impact: an app that swaps with `RENAME_SWAP` (or a library that falls back to it) loses data
+> on any FSKit volume, with no error. Suggested fix: refuse `RENAME_SWAP` (and `exchangedata`)
+> with `ENOTSUP` on FSKit volumes that don't advertise swap, or pass the flags to `renameItem`.
+> Attach `semantics.c`'s output on the FAT image and on the voidfs module
+> (`raw/fat-check.txt`, `raw/semantics-final.txt`).
+
+**Item 4 against its bullets.**
+
+| Item 4 asks for | Where it is |
+| --- | --- |
+| Writable handlers mapped to the durable local operations, not remote mutations; write success after staging that survives a daemon or extension crash; cloud publish visible separately | Met: the volume calls the core through the agent; writeThrough (Q1, Q2); the kill checks; `void uploads` |
+| `fsync`, `F_FULLFSYNC` and close flush bytes and metadata to disk | Met as the user decided: FSKit passes no fsync, so a bounded flush within 1 s; close flushes (the durability table) |
+| Synchronize and eject: documented, tested durability | Met: the table; `synchronize` flushes but is never called; unmount releases the session, which flushes |
+| Create, write, truncate, sparse regions, directory mutations | Met: Finder, `semantics.c`, the probes; the core's item 1 tests |
+| Atomic save via rename-over, retaining the replaced object's history and the old object for open handles | Met: `atomic.c`, TextEdit, a folder restore. A safe save makes a new object each time, so history by name splits (a later question) |
+| Full xattr create, replace, remove and list, empty values, resource forks, `com.apple.provenance`; never AppleDouble | **Not met for resource forks over 64 KiB** (protocol §4.8; Finder drops them silently). The rest met, with no `._` files |
+| Create-following metadata folded where ordering permits; commits counted | Met: the fold and its table. `com.apple.provenance` still costs an `attrs` version until a put carries xattrs (item 9) |
+| `.DS_Store` local-only; every housekeeping name defined; nearby user names tested | Met: the names table; `names.txt` and the `.DS_Store` tests |
+| `semantics.c` rerun for `RENAME_EXCL`, `RENAME_SWAP`, open-unlink, mmap/msync, locks, Unicode; unsupported operations advertised accurately | Rerun: all pass but **`RENAME_SWAP`, which overwrites although no swap is advertised** (release blocker, FSKit's kernel side, on Apple's FAT module too). Symbolic links and hidden flags are no longer advertised |
+| Locks per-Mac; guarded-save conflicts presented; no implication that `flock` or `fcntl` coordinate between Macs | Met: `locks.c` and SQLite; conflicts in `void uploads`, `void status` and daemon.log |
+| Done when: Finder copies and edits, atomic-save probes, mmap writes and xattr round trips pass | Met, but for forks over 64 KiB |
+| Done when: killing the extension or daemon after acknowledged writes loses no local bytes | Met (`kill-extension.txt`, `kill-daemon.txt`) |
+| Done when: recovery publishes the same journal without an unintended duplicate revision | Met: one version per change after the kill (`kill-daemon.txt`) and the lost-reply tests |
+
+**Item 4 is not complete.** Two bullets aren't met: `RENAME_SWAP` overwrites on every FSKit
+volume (a release blocker until Apple changes FSKit; the Feedback above), and resource forks
+over 64 KiB need a protocol change (an RFC for larger xattrs). Everything else is met. Item 3's
+blocker also stays open.
+
+Validation: 731 workspace tests pass (9 ignored), and workspace clippy passes with warnings
+denied. The first full run failed one `.DS_Store` test with `Locked`: its restart reopened the
+store while a disk flush still held it, so the restart helpers now wait (ba6d08b), and both
+files then passed five runs in a row. On this Mac the runs used a fresh target folder: in
+`target/debug/deps`, which held 810,885 files, the crash tests' child processes were slow to
+read the system's root certificates and failed in parallel runs, while copies of the same
+binaries elsewhere passed. Spec validation passes 56 cases / 432 steps, and the five
+credential-script tests pass. Local memory, fs and versitygw interoperability passes; boto3 is
+unavailable locally, and CI supplies it and checks MinIO and Docker Compose. `xcodebuild` builds
+the app, the extension and the probe with no warnings in the Swift sources. The test daemon used
+a `mktemp` state directory, since removed, against a local memory-store server, since stopped;
+nothing was put in `~/Library/Application Support/voidfs`.

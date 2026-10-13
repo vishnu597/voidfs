@@ -1,0 +1,69 @@
+# a guarded save that conflicts (final build)
+$ void uploads pause --all
+paused all uploads (0 unfinished)
+  (exit 0)
+rw.txt edited on the mount
+$ PUT rw.txt on the server directly (another Mac's edit)
+  HTTP 200
+$ void uploads resume --all
+resumed all uploads (2 unfinished)
+  (exit 0)
+$ cat /private/tmp/vw/rw.txt
+edited on this Mac
+  (exit 0)
+$ void show wtest rw.txt
+edited on another Mac  (exit 0)
+$ void uploads --all
+ID   DRIVE                                   KEY                                                                          SIZE      SENT  STATE
+159  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  rw.txt                                                                       19 B      0%    failed: 412 PreconditionFailed: At least one of the preconditions you specified did not hold (request 3ac5f3e4540c41a48dca08bf91068d22)
+160  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  rw.txt                                                                       0 B       100%  failed: 412 PreconditionFailed: At least one of the preconditions you specified did not hold (request 3ac5f3e4540c41a48dca08bf91068d22)
+
+0 uploading, 0 queued, 2 failed · 19 B to send
+  (exit 0)
+$ void mounts
+DRIVE  MOUNTPOINT       ADAPTER  STATE    SINCE                 FEED
+wtest  /private/tmp/vw  fskit    mounted  2026-10-12T23:14:10Z  at 184
+  (exit 0)
+$ void status
+daemon    running · pid 31903 · up 1m 48s · socket $VOIDFS_STATE_DIR/daemon.sock
+server    http://127.0.0.1:9000 · online
+uploads   2 failed · 19 B to send
+cache     128.1 KiB of 20.0 GiB on disk · 10 B of 192.0 MiB in memory
+mounts    wtest at /private/tmp/vw · fskit · mounted · feed at 184, 19 changes
+  (exit 0)
+$ void history --all wtest rw.txt
+wtest:rw.txt
+VERSION  TIME                         SIZE  OPERATION
+1.0      2026-10-12T23:03:06.596315Z  6 B   put
+2.0      2026-10-12T23:03:06.601763Z  6 B   attrs
+167.0    2026-10-12T23:14:13.832304Z  4 B   write
+184.0    2026-10-12T23:15:54.344486Z  21 B  put        current
+  (exit 0)
+
+# the same conflict after the daemon restarts with the build that presents it (6522123)
+$ void daemon restart
+daemon restarted (pid 37092, socket $VOIDFS_STATE_DIR/daemon.sock)
+  (exit 0)
+$ void uploads
+ID   DRIVE                                   KEY     SIZE  SENT  STATE
+159  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  rw.txt  19 B  0%    conflict: the drive changed (now version 184.0); this Mac keeps its copy
+160  d-01a1325a-7f50-721a-96a1-7f3557cbfb0c  rw.txt  0 B   100%  conflict: the drive changed (now version 184.0); this Mac keeps its copy
+
+BATCH  LABEL         ITEMS  DONE  FAILED  SIZE  STATE
+1      cli-made.txt  1      1     0       9 B   done
+
+0 uploading, 0 queued, 1 in conflict · 19 B to send
+  (exit 0)
+$ void status
+daemon    running · pid 37092 · up 7s · socket $VOIDFS_STATE_DIR/daemon.sock
+server    http://127.0.0.1:9000 · online
+uploads   1 in conflict · 19 B to send
+cache     128.1 KiB of 20.0 GiB on disk · 0 B of 192.0 MiB in memory
+mounts    wtest at /private/tmp/vw · fskit · mounted · feed at 189, 0 changes
+  (exit 0)
+$ tail -2 $VOIDFS_STATE_DIR/daemon.log
+2026-10-12T23:34:27.217Z void 0.0.0 (0bb432d, 2026-10-12) daemon started: pid 37092, socket $VOIDFS_STATE_DIR/daemon.sock, server http://127.0.0.1:9000
+2026-10-12T23:34:27.218Z conflict: the drive changed (now version 184.0); this Mac keeps its copy (d-01a1325a-7f50-721a-96a1-7f3557cbfb0c:rw.txt, entry 159)
+$ cat /private/tmp/vw/rw.txt
+edited on this Mac
+  (exit 0)

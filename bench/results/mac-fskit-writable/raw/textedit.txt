@@ -1,0 +1,29 @@
+# TextEdit saves, then a folder restore, on a pool with multi-object-versions (final build)
+first draft written; instant before TextEdit: 2026-10-12T23:03:33Z
+osascript exit 0
+$ cat notes.txt
+third draft, saved again
+$ void history --all wtest ev/textedit/
+wtest:ev/textedit/, every version of every file in it
+TIME                         FILE       VERSION  SIZE  OPERATION
+2026-10-12T23:03:39.782720Z  notes.txt  19.0     25 B  put
+2026-10-12T23:03:39.792457Z  notes.txt  20.0     25 B  attrs
+2026-10-12T23:03:39.808535Z  notes.txt  21.0     25 B  rename     current
+$ void restore wtest ev/textedit/ --at 2026-10-12T23:03:33Z
+Restored wtest:ev/textedit/ to its state at 2026-10-12T23:03:33.000000Z, as version 23.0.
+$ cat notes.txt (mount)
+first draft
+$ ls -la
+total 8
+drwxr-xr-x@ 2 vishnu  staff   0 Oct 12 19:03 .
+drwxr-xr-x@ 2 vishnu  staff   0 Oct 12 19:03 ..
+-rw-r--r--@ 1 vishnu  staff  12 Oct 12 19:03 notes.txt
+$ void history --all wtest ev/textedit/notes.txt
+wtest:ev/textedit/notes.txt
+VERSION  TIME                         SIZE  OPERATION
+7.0      2026-10-12T23:03:31.346183Z  12 B  put
+8.0      2026-10-12T23:03:31.351632Z  12 B  attrs
+9.0      2026-10-12T23:03:35.803251Z  12 B  attrs
+11.0     2026-10-12T23:03:37.536331Z  12 B  rename
+12.0     2026-10-12T23:03:37.831463Z  12 B  delete
+23.0     2026-10-12T23:03:43.369241Z  12 B  restore (from 8.0)  current

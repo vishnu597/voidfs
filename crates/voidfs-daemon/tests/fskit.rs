@@ -25,8 +25,8 @@ impl Commands {
         let d = dir.display();
         let mount = format!("#!/bin/sh\nif [ $# -eq 0 ]; then cat '{d}/table' 2>/dev/null; exit 0; fi\necho \"mount $*\" >> '{d}/calls'\nif [ -e '{d}/refuse' ]; then cat '{d}/refuse' >&2; exit 1; fi\n\
             eval \"res=\\${{$(($# - 1))}}\"; eval \"mp=\\${{$#}}\"\necho \"$res on $mp (voidfs, nodev, nosuid, read-only, noowners, noatime, fskit, mounted by test)\" >> '{d}/table'\n");
-        let umount = format!("#!/bin/sh\necho \"umount $*\" >> '{d}/calls'\nif [ -e '{d}/busy' ]; then echo \"umount: unmount($1): Resource busy\" >&2; exit 1; fi\n\
-            grep -v -F \" on $1 (\" '{d}/table' > '{d}/table.new'; mv '{d}/table.new' '{d}/table'\n");
+        let umount = format!("#!/bin/sh\necho \"umount $*\" >> '{d}/calls'\neval \"mp=\\${{$#}}\"\nif [ -e '{d}/busy' ]; then echo \"umount: unmount($mp): Resource busy\" >&2; exit 1; fi\n\
+            grep -v -F \" on $mp (\" '{d}/table' > '{d}/table.new'; mv '{d}/table.new' '{d}/table'\n");
         for (name, body) in [("mount", mount), ("umount", umount)] {
             std::fs::write(dir.join(name), body).unwrap();
             std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -90,7 +90,7 @@ fn new_mount(drive: &str, mountpoint: &Path) -> NewMount {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fskit_mounts_with_the_system_mount_read_only_and_comes_back_or_is_adopted_when_the_daemon_starts() {
+async fn fskit_mounts_with_the_system_mount_and_comes_back_or_is_adopted_when_the_daemon_starts() {
     let server = TestServer::start().await.unwrap();
     voidfs_sdk::Client::new(sdk(&server)).unwrap().create_drive("footage", Default::default()).await.unwrap();
     let dir = tempfile::Builder::new().prefix("vdk").tempdir_in(std::env::temp_dir()).unwrap();
@@ -99,9 +99,9 @@ async fn fskit_mounts_with_the_system_mount_read_only_and_comes_back_or_is_adopt
     let (d, c) = start(&server, dir.path(), &commands).await;
 
     let m = c.mount(&new_mount("footage", &mp)).await.unwrap();
-    assert_eq!((m.adapter.as_str(), m.state.as_str(), m.read_only), ("fskit", "mounted", true), "read-only until the module can write");
+    assert_eq!((m.adapter.as_str(), m.state.as_str(), m.read_only), ("fskit", "mounted", false), "writable: the module writes");
     let real = std::fs::canonicalize(&mp).unwrap();
-    assert_eq!(commands.calls(), [format!("mount -F -t voidfs -r voidfs://footage {}", real.display())], "the resource names only the drive, at the real path");
+    assert_eq!(commands.calls(), [format!("mount -F -t voidfs voidfs://footage {}", real.display())], "the resource names only the drive, at the real path");
     assert!(commands.table().contains(&format!("voidfs://footage on {} (voidfs,", real.display())));
     let view = c.mounts().await.unwrap();
     assert_eq!((view.remembered.len(), view.remembered[0].adapter.as_str(), view.remembered[0].read_only), (1, "fskit", false), "remembered as asked");
@@ -122,6 +122,19 @@ async fn fskit_mounts_with_the_system_mount_read_only_and_comes_back_or_is_adopt
     until("the mount still there is adopted", async || c.mounts().await.unwrap().mounts.first().is_some_and(|m| m.state == "mounted")).await;
     assert_eq!(commands.calls().len(), before, "no second mount over it");
 
+    // One whose module died answers nothing (here: its top folder can't be listed): the next
+    // daemon unmounts it and mounts it anew.
+    d.stop().await;
+    commands.set_table(&format!("voidfs://footage on {} (voidfs, nodev, nosuid, noowners, noatime, fskit, mounted by test)\n", real.display()));
+    let before = commands.calls().len();
+    let mode = |m| std::fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(m)).unwrap();
+    mode(0o000);
+    let (d, c) = start(&server, dir.path(), &commands).await;
+    until("the dead mount is mounted anew", async || c.mounts().await.unwrap().mounts.first().is_some_and(|m| m.state == "mounted")).await;
+    mode(0o755);
+    assert_eq!(commands.calls()[before..], [format!("umount -f {}", real.display()), format!("mount -F -t voidfs voidfs://footage {}", real.display())]);
+    assert_eq!(commands.table().lines().count(), 1, "{}", commands.table());
+
     // Busy: it stays mounted, listed and remembered.
     commands.set("busy", Some(""));
     let message = refused(c.unmount("footage").await, 500, "UnmountFailed");
@@ -140,6 +153,11 @@ async fn fskit_mounts_with_the_system_mount_read_only_and_comes_back_or_is_adopt
     let before = commands.calls().len();
     assert_eq!(c.unmount(&mp.display().to_string()).await.unwrap().unmounted, [mp.display().to_string()]);
     assert_eq!(commands.calls().len(), before);
+
+    // Asked read-only, `mount -r`.
+    let m = c.mount(&NewMount { read_only: true, ..new_mount("footage", &mp) }).await.unwrap();
+    assert!(m.read_only);
+    assert_eq!(commands.calls().last().unwrap(), &format!("mount -F -t voidfs -r voidfs://footage {}", real.display()));
     d.stop().await;
 }
 

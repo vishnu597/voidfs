@@ -1,0 +1,59 @@
+$ void history --all wtest ev/finder/
+wtest:ev/finder/, every version of every file in it
+TIME                         FILE                  VERSION  SIZE     OPERATION
+2026-10-12T22:53:22.768410Z  big.bin               3415.0   5.0 MiB  put
+2026-10-12T22:53:22.779190Z  big.bin               3416.0   5.0 MiB  attrs      current
+2026-10-12T22:53:23.083238Z  renamed.txt           3423.0   11 B     put
+2026-10-12T22:53:23.094153Z  renamed.txt           3424.0   11 B     attrs
+2026-10-12T22:53:23.398626Z  tagged.txt            3428.0   7 B      put
+2026-10-12T22:53:23.410098Z  tagged.txt            3429.0   7 B      attrs      current
+2026-10-12T22:53:24.061680Z  renamed.txt           3430.0   11 B     rename     current
+2026-10-12T22:53:24.138702Z  project/f1.txt        3431.0   7 B      put
+2026-10-12T22:53:24.143308Z  project/f1.txt        3432.0   7 B      attrs      current
+2026-10-12T22:53:24.184811Z  project/f3.txt        3433.0   7 B      put
+2026-10-12T22:53:24.194217Z  project/f3.txt        3434.0   7 B      attrs      current
+2026-10-12T22:53:24.318131Z  project/f2.txt        3435.0   7 B      put
+2026-10-12T22:53:24.325896Z  project/f2.txt        3436.0   7 B      attrs      current
+2026-10-12T22:53:24.448005Z  project/sub/deep.txt  3437.0   5 B      put
+2026-10-12T22:53:24.460897Z  project/sub/deep.txt  3438.0   5 B      attrs      current
+2026-10-12T22:53:24.903176Z  plain copy.txt        3448.0   11 B     put
+2026-10-12T22:53:24.911184Z  plain copy.txt        3449.0   11 B     attrs      current
+
+$ shasum (source, mount, server)
+7a191a0ab97d6f16ec1c2c17f7a7cc99503d591fda71428a7a35f5d8d2038383
+7a191a0ab97d6f16ec1c2c17f7a7cc99503d591fda71428a7a35f5d8d2038383
+7a191a0ab97d6f16ec1c2c17f7a7cc99503d591fda71428a7a35f5d8d2038383
+
+$ xattr -lx tagged.txt (source, then mount)
+com.apple.ResourceFork:
+00000000  01 02 03 04 05                                   |.....|
+00000005
+com.apple.provenance:
+00000000  01 02 00 68 CF D3 57 AE C8 85 E9                 |...h..W....|
+0000000B
+com.apple.quarantine:
+00000000  30 30 38 31 3B 30 30 30 30 30 30 30 30 3B 53 61  |0081;00000000;Sa|
+00000010  66 61 72 69 3B                                   |fari;|
+00000015
+user.note:
+00000000
+---
+com.apple.ResourceFork:
+00000000  01 02 03 04 05                                   |.....|
+00000005
+com.apple.provenance:
+00000000  01 02 00 68 CF D3 57 AE C8 85 E9                 |...h..W....|
+0000000B
+com.apple.quarantine:
+00000000  30 30 38 31 3B 30 30 30 30 30 30 30 30 3B 53 61  |0081;00000000;Sa|
+00000010  66 61 72 69 3B                                   |fari;|
+00000015
+user.note:
+00000000
+
+$ AppleDouble files on the mount
+(none besides the user's own ._notes)
+$ void show wtest ev/finder/.DS_Store
+error: ev/finder/.DS_Store: 404 NoSuchKey: The specified key does not exist
+server xattrs: {'com.apple.ResourceFork': '0102030405', 'com.apple.provenance': '01020068cfd357aec885e9', 'com.apple.quarantine': '303038313b30303030303030303b5361666172693b', 'user.note': ''}
+mode 0644 mtime 2026-10-12T22:48:02.861191Z

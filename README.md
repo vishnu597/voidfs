@@ -105,9 +105,10 @@ void daemon info                      # its build, what its journal holds unpubl
   `--detach` starts one.
 - `void mount <drive> [mountpoint]`, `void unmount` and `void mounts` keep the daemon's mount
   table and the mounts it brings back when it starts. On macOS the daemon mounts with the FSKit
-  module in voidfs.app (the `fskit` adapter, read-only for now: `mount -F -t voidfs
-  voidfs://<drive> <mountpoint>`), which reads through the daemon ([step 5](docs/step-5-macos.md#read-only-fskit-on-the-daemon-10-october));
-  elsewhere `void mount` answers `NoAdapter`.
+  module in voidfs.app (the `fskit` adapter: `mount -F -t voidfs voidfs://<drive>
+  <mountpoint>`, with `-r` for `void mount --read-only`), which reads and writes through the
+  daemon ([step 5](docs/step-5-macos.md#writable-fskit-12-october)); elsewhere `void mount`
+  answers `NoAdapter`.
 - `void daemon install` (macOS) writes a launchd agent, so that the daemon and its remembered
   mounts come back at login; `void daemon uninstall` removes it.
 
@@ -147,11 +148,17 @@ mount call whose server has gone silent fails after 5 s instead of waiting out t
 extension now reads through the daemon and follows other machines' changes, which completes step 5,
 item 3 with a release blocker: FSKit keeps a name this Mac looked up and missed while anything
 below its folder is in use (and in the drive's top folder until remount), so the SMB decision is
-reopened before the writable mount ([step 5](docs/step-5-macos.md#the-blocker-a-name-missed-while-its-folder-is-in-use)). The accepted
-direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge; verified
-whole-shard reads remain the path until a later authenticated-pieces RFC. See the
-[step 5 plan](docs/step-5-macos.md#read-only-fskit-on-the-daemon-10-october) for the current scope
-and decisions.
+reopened ([step 5](docs/step-5-macos.md#the-blocker-a-name-missed-while-its-folder-is-in-use)); the
+user kept FSKit and waits for Apple. The volume now writes through the daemon's durable core
+(step 5, item 4): writes return once staged, reach the disk within a second (FSKit passes no
+fsync on) and publish on close or after two quiet seconds; `.DS_Store` stays on the Mac, a
+create's metadata folds into its put, and a refused save shows as a conflict in `void uploads`,
+`void status` and the daemon's log. Item 4 is not complete: `RENAME_SWAP` overwrites on every
+FSKit volume, a release blocker for Apple, and resource forks over 64 KiB need a protocol change.
+The accepted direction is FSKit first, using the Rust daemon through a thin Swift XPC bridge;
+verified whole-shard reads remain the path until a later authenticated-pieces RFC. See the
+[step 5 plan](docs/step-5-macos.md#writable-fskit-12-october) for the current scope and
+decisions.
 
 ### The Rust SDK
 

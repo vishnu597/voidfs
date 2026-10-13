@@ -2,8 +2,9 @@
 
 The macOS drive: `voidfs.app`, a SwiftUI menu-bar app that contains an FSKit module
 (`VoidfsFS.appex`) and runs as the launch agent that bridges the module to the `void` daemon. A
-mount is read-only for now ([step 5, item 3](../../docs/step-5-macos.md#read-only-fskit-on-the-daemon-10-october));
-the module reads every byte and name through the daemon, which holds the server and key. The
+mount is writable unless mounted read-only ([step 5, item 4](../../docs/step-5-macos.md#writable-fskit-12-october));
+the module reads and writes every byte and name through the daemon, which holds the server and
+key and stages writes on this Mac before it publishes them. The
 FSKit spike that started it is in [`docs/spikes/fskit.md`](../../docs/spikes/fskit.md).
 
 | Folder | What |
@@ -75,6 +76,15 @@ path lookups while anything below its folder is in use, and in the drive's top f
 drive is mounted again; listings show it at once
 ([the blocker](../../docs/step-5-macos.md#the-blocker-a-name-missed-while-its-folder-is-in-use)).
 
+Writes go to the daemon, which stages them on this Mac: `write(2)` returns once the bytes are
+staged (they survive the daemon, the agent or the module being killed), they reach the disk
+within a second, since FSKit passes no `fsync` to a module, and they publish on close or after
+two seconds without writes (`void uploads` shows them). `.DS_Store` stays on this Mac; locks are
+this Mac's only. Two limits: `renamex_np(RENAME_SWAP)` replaces the destination on any FSKit
+volume instead of swapping, and xattrs (resource forks included) are limited to 64 KiB a file
+([writable FSKit](../../docs/step-5-macos.md#writable-fskit-12-october)). `mount -o trace` logs
+every callback the module gets.
+
 ## Checking a mount
 
 The scripts take a drive filled by `cargo run --release -p voidfs-sdk --example mount_seed`
@@ -88,6 +98,8 @@ examples plays another machine:
 | `coherence.py <mountpoint> <peer…>` | Overwrites, renames, deletes and new files from another client, with a sibling and the file itself held open |
 | `offline.py <mountpoint> <relay pid> "<relay command>" <peer…>` | The server refusing and hanging behind a relay, and coming back |
 | `restarts.py <mountpoint> <label> <command…>` | A file held open across a restart of the daemon or the agent |
+| `semantics.c <folder>` | `RENAME_EXCL`, `RENAME_SWAP`, open-unlink, mmap and msync, locks, xattrs, Unicode names: build with `cc` and run on a mount |
+| `writeprobe.c <folder> <test>` | Timed writes, `fsync`, `F_FULLFSYNC`, closes, `sync` and mmap stores, to see which call waits for the module; `unflushed` and `dirty` wait for a kill |
 
 ## Release build: Developer ID, notarized
 

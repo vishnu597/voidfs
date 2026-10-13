@@ -1,0 +1,28 @@
+/tmp/vw (voidfs, voidfs://wtest)
+  advertised: CASE_SENSITIVE=yes PERSISTENTOBJECTIDS=yes SYMBOLICLINKS=yes HARDLINKS=no 2TB_FILESIZE=yes EXTENDED_ATTR=yes NAMEDSTREAMS=no EXCHANGEDATA=no RENAME_SWAP=no RENAME_EXCL=no CLONE=no FLOCK=yes ADVLOCK=yes ALLOCATE=no
+  setxattr user.test                                   ok
+    AppleDouble ._a.txt created?                       no
+  setxattr com.apple.FinderInfo (32 bytes)             ok
+  setxattr com.apple.ResourceFork                      ok
+    AppleDouble ._b.txt created?                       no
+  atomic save: rename(save.tmp, a.txt) over a.txt      ok
+    after                                              a=A2
+  renamex_np(a, b, RENAME_SWAP)                        ok
+    after (a swap leaves a=B b=A)                      a=No such file or directory b=A
+  renamex_np(a, b, RENAME_EXCL) onto existing b        File exists
+    after (EEXIST leaves a=A b=B)                      a=A b=B
+  exchangedata(a, b)                                   Operation not supported
+    after                                              a=A b=B
+  clonefile(a, clone)                                  Operation not supported
+  fcntl F_FULLFSYNC                                    ok
+  fcntl F_BARRIERFSYNC                                 ok
+  flock LOCK_EX|LOCK_NB                                ok
+  fcntl F_SETLK write lock                             Resource temporarily unavailable
+  mmap MAP_SHARED write + msync(MS_SYNC)               ok
+    a.txt after the mapped write                       mapped
+  unlink while open                                    ok
+    read from the open descriptor                      still readable
+  link (hard link)                                     Operation not supported
+  symlink                                              Operation not supported
+  chmod 0600                                           ok
+  open O_EXLOCK                                        ok

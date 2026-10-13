@@ -1,0 +1,31 @@
+# resource forks: 200 KiB and 40,000 bytes (the limit is 64 KiB of xattrs a file, protocol §4.8)
+$ cp big-fork.txt (APFS) to the mount
+cp: $S/rsrc/big-fork.txt: could not copy extended attributes to /private/tmp/vw/ev/rsrc/big-fork.txt: Argument list too long
+  (exit 1)
+  data: data fork
+  ResourceFork on the mount: 38.5 bytes; source 204800
+$ cp small-fork.txt (APFS) to the mount
+  (exit 0)
+  data: data fork
+  ResourceFork on the mount: 40000 bytes; source 40000
+$ xattr -w directly, 70,000 bytes
+xattr: [Errno 7] Argument list too long: '/private/tmp/vw/ev/rsrc/small-fork.txt'
+  (exit 1)
+$ ls -la (any ._ files?)
+total 16
+drwxr-xr-x@ 2 vishnu  staff   0 Oct 12 19:14 .
+drwxr-xr-x@ 2 vishnu  staff   0 Oct 12 19:03 ..
+-rw-r--r--@ 1 vishnu  staff  10 Oct 12 19:14 big-fork.txt
+-rw-r--r--@ 1 vishnu  staff  10 Oct 12 19:14 small-fork.txt
+
+$ Finder: duplicate big-fork.txt (200 KiB fork) to ev/rsrc (osascript)
+document file big-fork.txt of folder rsrc of folder ev of disk vw
+  (exit 0)
+total 32
+drwxr-xr-x@ 2 vishnu  staff     0 Oct 12 19:14 .
+drwxr-xr-x@ 2 vishnu  staff     0 Oct 12 19:03 ..
+-rw-r--r--@ 1 vishnu  staff  6148 Oct 12 19:14 .DS_Store
+-rw-r--r--@ 1 vishnu  staff    10 Oct 12 19:14 big-fork.txt
+-rw-r--r--@ 1 vishnu  staff    10 Oct 12 19:14 small-fork.txt
+  data: data fork
+  xattrs on the mount: com.apple.provenance 

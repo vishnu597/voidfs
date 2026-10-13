@@ -1,0 +1,45 @@
+# void mount through the fskit adapter (final build, pool with multi-object-versions)
+$ void mount wtest /private/tmp/vw   (run just before this script)
+mounted wtest at /private/tmp/vw (fskit); it comes back when the daemon starts
+voidfs://wtest on /private/tmp/vw (voidfs, nodev, nosuid, noowners, noatime, fskit, mounted by vishnu)
+$ sh -c echo hello > /private/tmp/vw/rw.txt && cat /private/tmp/vw/rw.txt
+hello
+  (exit 0)
+$ void show wtest rw.txt
+hello
+  (exit 0)
+$ void unmount /private/tmp/vw
+unmounted /private/tmp/vw, and forgot it
+  (exit 0)
+$ void mount --read-only wtest /private/tmp/vr
+mounted wtest at /private/tmp/vr (fskit, read-only); it comes back when the daemon starts
+  (exit 0)
+voidfs://wtest on /private/tmp/vr (voidfs, nodev, nosuid, read-only, noowners, noatime, fskit, mounted by vishnu)
+$ cat /private/tmp/vr/rw.txt
+hello
+  (exit 0)
+$ sh -c echo x > /private/tmp/vr/new.txt
+sh: /private/tmp/vr/new.txt: Read-only file system
+  (exit 1)
+$ sh -c echo x >> /private/tmp/vr/rw.txt
+sh: /private/tmp/vr/rw.txt: Read-only file system
+  (exit 1)
+$ mkdir /private/tmp/vr/d
+mkdir: /private/tmp/vr/d: Read-only file system
+  (exit 1)
+$ rm /private/tmp/vr/rw.txt
+rm: /private/tmp/vr/rw.txt: Read-only file system
+  (exit 1)
+$ xattr -w user.k v /private/tmp/vr/rw.txt
+xattr: [Errno 30] Read-only file system: '/private/tmp/vr/rw.txt'
+  (exit 1)
+$ void unmount /private/tmp/vr
+unmounted /private/tmp/vr, and forgot it
+  (exit 0)
+$ void mount wtest /private/tmp/vw
+mounted wtest at /private/tmp/vw (fskit); it comes back when the daemon starts
+  (exit 0)
+$ void mounts
+DRIVE  MOUNTPOINT       ADAPTER  STATE    SINCE                 FEED
+wtest  /private/tmp/vw  fskit    mounted  2026-10-12T23:03:08Z  at 2
+  (exit 0)
