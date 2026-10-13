@@ -94,7 +94,7 @@ test file in an isolated promoted-main source tree and run each test individuall
 SCOPE_OLD=$(mktemp -d /private/tmp/voidfs-upload-scope-old.XXXXXX)
 git archive 0fe8913ba3d2d6a94ab899762943accbff259cca | tar -x -C "$SCOPE_OLD"
 cp crates/voidfs-daemon/tests/uploads.rs "$SCOPE_OLD/crates/voidfs-daemon/tests/uploads.rs"
-SCOPE_TARGET="$PWD/target/upload-drive-scope-check"
+SCOPE_TARGET="$SCOPE_OLD/target"
 cd "$SCOPE_OLD"
 for SCOPE_TEST in \
   drive_controls_apply_to_cli_alias_and_mounted_id_entries \
