@@ -2153,8 +2153,8 @@ cleanup are recorded there separately.
 server bytes/metadata after publication. Partial means useful operations pass with a named
 measured limitation or missing workflow. Fail means a required operation, notification or
 strict comparison failed; a known limitation is still a failed requirement when it prevents
-the scenario. Untested means no run exists for the app or hardware. Pending means work is still
-in progress. Missing paid apps and a second Mac are not passes. Failed non-atomic copies retain
+the scenario. Untested means no run exists for the app or hardware. Missing paid apps and a
+second Mac are not passes. Failed non-atomic copies retain
 their partial destination and source as evidence; they are distinguished from acknowledged
 successful saves returning wrong bytes. Silent loss remains a failure.
 
@@ -2171,16 +2171,16 @@ successful saves returning wrong bytes. Silent loss remains a failure.
 | TextEdit 1.21 | Partial: Unicode save/reopen, Revert To Last Opened, Duplicate, about-60 s autosave and mode-0444 prompt/Cancel pass. Browse All Versions shows only the current document; earlier native version recovery is unproven. Hidden/immutable flags and exact expanded APFS GUI controls are untested. |
 | Preview 11.0 | Partial: native GUI PDF open, annotate, save/export and close pass; PDFKit reads back original text and the Unicode note in both files, and the native-Cocoa collector reconciles current files after the FinderInfo fix. Server-version recovery/GUI reopen controls remain untested. |
 | Numbers 15.1 | Partial: native package save/reopen retains `名前`, value 22 and `Saved on FSKit`; CSV UTF-8 readback/server collection pass. Formula entry failed in the initial fixture before it moved to the mount, so formula compatibility is untested. Native permanent Versions warns; it is not disabled by a preference. |
-| QuickTime Player 10.5 | Partial: native UI opens/plays a real 1.718 GB/100 s ProRes clip and seeks. A fresh read-only fork begins with zero client cache blocks before its GUI open workflow, then playback advances 47.469 s and seeks 90→10→90 s. Chooser/open may preload before Play; server caches remain warm. Duplicate size/header is observed; full byte/server equality is pending. GUI trim/save fails with the same pre-target compatibility alert on FSKit and a 10 s APFS control, so GUI export is unvalidated as an app/fixture constraint. |
+| QuickTime Player 10.5 | Partial: native UI opens/plays a real 1.718 GB/100 s ProRes clip and seeks. A fresh read-only fork begins with zero client cache blocks before its GUI open workflow, then playback advances 47.469 s and seeks 90→10→90 s. Chooser/open may preload before Play; server caches remain warm. Duplicate size/header is observed; full byte/server equality is untested. GUI trim/save fails with the same pre-target compatibility alert on FSKit and a 10 s APFS control, so GUI export is unvalidated as an app/fixture constraint. |
 | AVFoundation / avconvert, 50 GB dataset | Pass for this Mac's declared synthetic media scope: 30 distinct ProRes clips, 50,000,175,334 encoded bytes, 87,305 frames and 2,910.167 s. All 30 source/server SHA-256 values, metadata and history agree; native first/last scrubs and a decoded 2 s HEVC export pass. A second fresh read-only fork proves zero blocks for each ETag immediately before direct decoder URL opens; first/last cold and warm runs decode matching ranges. This does not certify the absent editing apps or the two-Mac project criterion. |
-| Zed 1.7.2 / Cursor 3.24.12 | Native UI folder-open, Unicode edit/save/server bytes and project search pass on FSKit. Open buffers retain the old peer revision until close/reopen. GUI reopen latency is unmeasured; APFS GUI controls are pending. |
+| Zed 1.7.2 / Cursor 3.24.12 | Native UI folder-open, Unicode edit/save/server bytes and project search pass on FSKit. Open buffers retain the old peer revision until close/reopen. GUI reopen latency is unmeasured; APFS GUI controls are untested. |
 | Premiere / Final Cut / Microsoft Office / Resolve / Photos | Untested. Free alternatives have separately named rows. |
 | Two independent Macs | Untested, as the user chose this Mac. |
 
 Zed 1.7.2 and Cursor 3.24.12 now have native UI FSKit open-folder/Unicode edit/save and
 server-byte checks, plus project searches with two matches in two files. Each kept its old
 open buffer more than 5 s after the peer commit, then showed the peer bytes after close/reopen.
-GUI reopen latency against 5 s is unmeasured; APFS GUI controls remain pending. These
+GUI reopen latency against 5 s is unmeasured; APFS GUI controls remain untested. These
 [GUI observations](../bench/results/mac-app-matrix/raw/editor-ui.jsonl) do not turn the faster
 fresh-path filesystem probes into a GUI notification pass.
 
@@ -2200,7 +2200,7 @@ no successful save acknowledgement on either surface. The same alert on APFS and
 not establish a new FSKit-specific defect. The source movie's original SHA remains unchanged;
 GUI access adds last-used/quarantine metadata versions only. The independently validated
 [AVFoundation HEVC export](../bench/results/mac-app-matrix/raw/media-small-fixed.jsonl.gz) does
-not prove QuickTime GUI export. The duplicate's full SHA/server comparison remains pending.
+not prove QuickTime GUI export. The duplicate's full SHA/server comparison remains untested.
 The [fresh-fork GUI evidence](../bench/results/mac-app-matrix/raw/quicktime-cold-ui.jsonl)
 records zero client cache blocks before the native open workflow, with playback and
 90→10→90 s seeking afterward. The dialog/open path can preload before Play, and local

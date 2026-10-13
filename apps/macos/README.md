@@ -85,8 +85,8 @@ volume instead of swapping, and xattrs (resource forks included) are limited to 
 ([writable FSKit](../../docs/step-5-macos.md#writable-fskit-12-october)). `mount -o trace` logs
 every callback the module gets.
 
-The [13 October application matrix](../../bench/results/mac-app-matrix/README.md) is in
-progress on this Mac. Local FSEvents/kqueue operations pass, but remote commits produce no
+The [13 October application matrix](../../bench/results/mac-app-matrix/README.md) records
+scoped results on this Mac. Local FSEvents/kqueue operations pass, but remote commits produce no
 watcher notifications within 5 seconds; an app may need a rescan to discover them. Native
 Versions rejects safely. Positional reads of even a 17-byte resource fork fail after the first
 chunk, so `copyfile` metadata copies can fail independently of the 64 KiB size limit. An
@@ -133,7 +133,7 @@ examples plays another machine:
 | `watch-events.swift peer <scratch-parent> <mode> <mount-root> <peer-binary> <drive> [case]` | Peer commits, notification/listing/byte latency and a separate held-descriptor cache experiment; an SDK peer on one Mac is not two-Mac testing |
 | `app-matrix.py` and `app-matrix-xcode.py` | Git/SQLite, headless real Xcode project and stable server bytes/metadata collector; each run owns a fresh dataset |
 | `app-matrix-free.py` | Native Blender and LibreOffice persistence/readback using available scratch app copies, private profiles and the bundled runtimes; no app installation or dependency added |
-| `app-matrix-native.py`, `app-matrix-cocoa.applescript`, media/PDF probes | Finder/TextEdit and native GUI/media fixtures; see the matrix for measured scope, commands and pending values |
+| `app-matrix-native.py`, `app-matrix-cocoa.applescript`, media/PDF probes | Finder/TextEdit and native GUI/media fixtures; see the matrix for measured scope, commands and untested operations |
 | `app-matrix-finderinfo.swift <scratch-parent> listing\|full` | All-zero FinderInfo listing/readback control; `full` also scores the separately documented CREATE/REPLACE policy differences |
 | `app-matrix-finder-recovery.py` | Finder Move to Trash of a new two-revision fixture, server-version restore with exact bytes/metadata, and APFS/FSKit controls of a 65,537-byte resource-fork copy; preserves the known silent fork-drop failure |
 
