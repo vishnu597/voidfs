@@ -17,7 +17,7 @@ controls use that memo. The public daemon scope schema and queue entry/journal f
 change. Unknown offline names retain the previous exact-name behavior.
 
 The production change is independent of the application's large-file guarded-publication fix.
-This evidence accompanies its focused PR; unrelated media and GUI work is recorded separately in the application matrix.
+This evidence accompanies [PR #64](https://github.com/vishnu597/voidfs/pull/64); unrelated media and GUI work is recorded separately in the application matrix.
 
 | Regression | Faithful old code | Fix alone on promoted main |
 | --- | --- | --- |
@@ -39,6 +39,34 @@ ownership/security and filesystem sessions pass: [31 tests, 1 measurement ignore
 Isolated daemon/client all-target clippy with warnings denied is in
 [isolated-clippy.txt](raw/isolated-clippy.txt). These targeted checks do not claim a full
 workspace or interoperability run for this PR.
+
+The first [PR #64 CI attempt](https://github.com/vishnu597/voidfs/actions/runs/38424885345)
+failed an existing CLI test whose expected pause list still contained only the alias. The
+[exact failure](raw/ci-38424885345-failure.txt) shows the correct new alias/ID pair. The CLI
+assertion now requires that sorted pair, matching the daemon integration expectation;
+[all seven CLI upload tests pass](raw/cli-upload-tests.txt), with
+[CLI all-target clippy](raw/cli-clippy.txt) also passing. This updates the expected stored
+pause keys while retaining the mixed-entry, future-entry and offline migration checks.
+
+The [next CI run](https://github.com/vishnu597/voidfs/actions/runs/38426544300) passed the
+upload/CLI checks and failed the existing server bounded-hold timing test instead
+([exact log](raw/ci-38426544300-failure.txt)). It required five scheduling gaps to total less
+than 3 ms; CI scheduling took about 8 ms even though the first hold was within its bound.
+A separate test-only commit retains the first hold's timing bound and completion timeout,
+then requires the existing hold histogram count to be exactly one. This measures that later
+entries do not invoke a hold, instead of treating scheduler time between writes as a hold.
+No server production behavior changes.
+
+The corrected sequential server-library rebuild passes
+[170 tests, 4 ignored](raw/pool-hold-fixed-server-lib.txt), and
+[server all-target clippy](raw/pool-hold-clippy.txt) passes. In a disposable source snapshot,
+removing the adaptive `pay` gate makes the revised test fail its intended count assertion
+in [run 1](raw/pool-hold-broken-1.txt), [run 2](raw/pool-hold-broken-2.txt) and
+[run 3](raw/pool-hold-broken-3.txt), each with 6 holds instead of 1. Those break runs each
+executed the exact test alone under a timeout. A validation attempt initially reused that
+snapshot's intentionally broken test binary through the shared target; the linked fixed
+suite explicitly recompiles the real workspace sequentially. Future snapshot runs must use
+their own `CARGO_TARGET_DIR` inside the disposable tree, never the matrix's shared target.
 
 ## Reproduce
 

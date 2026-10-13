@@ -3026,7 +3026,9 @@ mod tests {
         assert_eq!(done.len(), 7);
         let gaps: Vec<Duration> = done.windows(2).map(|w| w[1].0 - w[0].1).collect();
         assert!((HOLD_MAX - TIMER_TICK..HOLD_MAX + Duration::from_millis(10)).contains(&gaps[0]), "the first entry waits, at most the bound: {gaps:?}");
-        assert!(gaps[1..].iter().sum::<Duration>() < Duration::from_millis(3), "the next ones do not: {gaps:?}");
+        // Scheduling between log writes can exceed a hold even when no timer ran. Count the
+        // hold invocations instead: only the initial entry pays for clients that never return.
+        assert_eq!(pool.metrics.hold.get_sample_count(), 1, "the next entries do not hold: {gaps:?}");
     }
 
     // -----------------------------------------------------------------------------------------
