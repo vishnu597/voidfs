@@ -103,7 +103,14 @@ impl Fixture {
         drop(old_cache);
         drop(old_queue);
         drop(store);
-        let store = Arc::new(Store::open(state.path()).unwrap());
+        // As a restarted process waits for the old one to exit: a disk flush may still hold it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let store = loop {
+            match Store::open(state.path()) {
+                Err(voidfs_client::Error::Locked(_)) if std::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(5)).await,
+                store => break Arc::new(store.unwrap()),
+            }
+        };
         let cache = cache(store.clone(), client.clone(), connectivity.clone(), backend).await;
         let queue = Queue::open(store.clone(), client.clone(), queue_config(&connectivity)).await.unwrap();
         let reopened = Self { _server, proxy, remote, client, state, store, cache, queue, connectivity, backend };
