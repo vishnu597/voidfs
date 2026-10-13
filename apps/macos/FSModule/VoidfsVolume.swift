@@ -981,7 +981,17 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     func xattrs(of item: FSItem, context: FSContext) async throws -> FSListXattrsResult {
         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
         guard try await attr(item).hasXattrs else { return FSListXattrsResult(xattrNames: [])! }
-        let names = try await call { try await $0.listxattr(item.ino) }
+        var names = try await call { try await $0.listxattr(item.ino) }
+        // APFS treats the fixed-size, all-zero FinderInfo structure as absent. FSKit's
+        // kernel also returns ENOATTR for that value, but doesn't remove its name from
+        // the module's list. Match APFS's listing without changing stored bytes/history.
+        // Other empty or all-zero xattrs are ordinary values and must remain visible.
+        if names.contains("com.apple.FinderInfo") {
+            let value = try await call { try await $0.getxattr(item.ino, "com.apple.FinderInfo") }
+            if value.count == 32 && value.allSatisfy({ $0 == 0 }) {
+                names.removeAll { $0 == "com.apple.FinderInfo" }
+            }
+        }
         return FSListXattrsResult(xattrNames: names.map { FSFileName(string: $0) })!
     }
 
