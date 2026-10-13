@@ -151,10 +151,12 @@ fn uploads_pause_resume_cancel_limit_and_clear() {
     assert!(s.void(&["uploads"]).ok().out().trim_end().ends_with("· limit 1.0 MiB/s"));
     assert_eq!(s.void(&["uploads", "limit", "unlimited", "--json"]).ok().json()["bytesPerSecond"], Value::Null);
 
-    // A pause by drive, named by its id, finds the uploads queued by its alias.
+    // A pause by drive finds alias entries and persists both names for mounted ID entries.
     let drive_id = f.block(f.client.describe_drive("footage")).unwrap().drive_id;
     s.void(&["uploads", "pause", "--drive", &drive_id]).ok();
-    assert_eq!(s.void(&["uploads", "--json"]).ok().json()["pausedDrives"], serde_json::json!(["footage"]));
+    let mut paused_names = vec![drive_id, "footage".to_owned()];
+    paused_names.sort();
+    assert_eq!(s.void(&["uploads", "--json"]).ok().json()["pausedDrives"], serde_json::json!(paused_names));
     s.void(&["uploads", "resume", "--all"]).ok();
     std::thread::sleep(Duration::from_millis(300));
     assert!(!exists(&f, "footage", "p/b.txt"), "still paused on its drive");
