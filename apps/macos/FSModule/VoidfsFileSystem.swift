@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The FSKit entry point: recognizes `voidfs://<drive>` URL resources and loads each as one
-// read-only volume, served by the daemon through the app's launch agent. The resource names only
+// volume (read-only with `mount -r`), served by the daemon through the app's launch agent. The resource names only
 // the drive: the daemon holds the server and its key, so nothing secret reaches the extension, the
 // URL or `mount`'s output.
 
@@ -47,6 +47,8 @@ final class VoidfsFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
             log.error("load: not voidfs://<drive>: \(String(describing: resource), privacy: .public) (voidfs://host:port/drive named a server; the daemon now chooses it)")
             throw fs_errorForPOSIXError(EINVAL)
         }
+        var opts = VolumeOptions()
+        opts.apply(options.taskOptions)
         log.notice("load \(drive, privacy: .public) options \(options.taskOptions, privacy: .public)")
         // Fail the mount now, with a clear error, rather than on the first `ls`: the daemon must
         // be running, know the drive, and relay its invalidations.
@@ -61,13 +63,14 @@ final class VoidfsFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         }
         defer { timer.cancel() }
         do {
+            // Read-only until `activate`, which receives the mount's options.
             session = try await client.open(drive: drive, readOnly: true)
         } catch {
             let e = Bridge.errno(error)
             log.error("load \(drive, privacy: .public): \(error.localizedDescription, privacy: .public) (errno \(e)); is the daemon running (void daemon start) and the agent registered (voidfs agent-register)?")
             throw fs_errorForPOSIXError(e == ECONNREFUSED ? EIO : e)
         }
-        let volume = VoidfsVolume(client: client, session: session, drive: drive, volumeID: FSVolume.Identifier(uuid: Self.uuid(drive)))
+        let volume = VoidfsVolume(client: client, session: session, drive: drive, options: opts, volumeID: FSVolume.Identifier(uuid: Self.uuid(drive)))
         containerStatus = .ready
         log.notice("loaded \(drive, privacy: .public): root inode \(session.info.root), daemon generation \(session.info.generation)")
         return volume

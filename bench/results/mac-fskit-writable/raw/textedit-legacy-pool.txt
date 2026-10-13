@@ -1,0 +1,26 @@
+# folder restore on a pool without multi-object-versions (memory server, default features)
+$ void restore wtest ev/textedit/ --at 2026-10-12T22:54:00Z
+Restored wtest:ev/textedit/ to its state at 2026-10-12T22:54:00.000000Z, as version 3478.0.
+$ cat /tmp/vw/ev/textedit/notes.txt
+cat: /private/tmp/vw/ev/textedit/notes.txt: Stale NFS file handle
+$ void history --all wtest ev/textedit/notes.txt
+wtest:ev/textedit/notes.txt
+VERSION  TIME                         SIZE  OPERATION
+3452.0   2026-10-12T22:53:55.886515Z  12 B  put
+3453.0   2026-10-12T22:53:55.895099Z  12 B  attrs
+3454.0   2026-10-12T22:53:59.257383Z  12 B  attrs
+3456.0   2026-10-12T22:54:03.459302Z  12 B  rename
+3457.0   2026-10-12T22:54:03.579725Z  12 B  delete     current
+$ void show --version 3478.0 wtest ev/textedit/notes.txt
+error: ev/textedit/notes.txt: 404 NoSuchVersion: The specified version does not exist
+$ GET /wtest?x-voidfs-list&prefix=ev/textedit/
+{"entries":[{"etag":"\"fa2e7ccb44cab9a334a8b12704bb3f09d04794f66980cafd3e1b6dde1a3caaa8\"","hasXattrs":true,"kind":"file","mode":"0644","mtime":"2026-10-12T22:53:54.895347Z","name":"notes.txt","objectId":"o-01M4S555SEPXG78R1Z0KMJ96MV","size":12,"versionId":"3478.0"}],"nextContinuationToken":null,"prefix":"ev/textedit/","seq":3478}
+# extension log
+2026-10-12 18:57:34.225 E  VoidfsFS[23660:6a9078] [dev.voidfs:fs] read 7261 @0+12: stale inode
+2026-10-12 19:00:54.851 E  VoidfsFS[23660:6a9d38] [dev.voidfs:fs] read 7261 @0+12: stale inode
+
+# the mount's listing, before the read
+total 8
+drwxr-xr-x@ 2 vishnu  staff   0 Oct 12 18:53 .
+drwxr-xr-x@ 2 vishnu  staff   0 Oct 12 18:52 ..
+-rw-r--r--  1 vishnu  staff  12 Oct 12 18:53 notes.txt

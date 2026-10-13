@@ -3,7 +3,8 @@
 //! user, with `mount -F -t voidfs voidfs://<drive> <mountpoint>`. The resource names only the
 //! drive: this daemon holds the server and key. The module reaches the daemon through the app's
 //! launch agent, with a session and an invalidation watch of its own, so the feed has nothing to
-//! tell the adapter here. The module is read-only until item 4.
+//! tell the adapter here. Mounts are writable (item 4) unless asked read-only (`mount -r`), so a
+//! writable mount remembered while the module was read-only comes back writable.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -60,6 +61,11 @@ fn find(table: &str, at: &Path) -> Option<String> {
     })
 }
 
+/// Whether the mount at `at` lists its top folder within a few seconds.
+async fn answers(at: &Path) -> bool {
+    matches!(tokio::time::timeout(Duration::from_secs(5), tokio::fs::read_dir(at)).await, Ok(Ok(_)))
+}
+
 /// Runs `program` with `args` and returns what it printed, or, when it fails, what it said.
 async fn run(program: &Path, args: Vec<OsString>) -> Result<String, String> {
     let name = program.display().to_string();
@@ -78,10 +84,6 @@ impl Adapter for FsKit {
         "fskit"
     }
 
-    fn writable(&self) -> bool {
-        false
-    }
-
     fn mount<'a>(&'a self, spec: &'a MountSpec, _core: &'a Core) -> BoxFuture<'a, Result<Arc<dyn Mounted>, String>> {
         Box::pin(async move {
             // `mount` prints a mountpoint's real path (`/private/tmp`, not `/tmp`).
@@ -89,8 +91,15 @@ impl Adapter for FsKit {
             let url = resource(&spec.drive);
             match self.mounted(&at).await? {
                 // Still mounted from before this daemon started (it was killed): the module opens
-                // a new session on its next call.
-                Some(from) if from == url => return Ok(Arc::new(FsKitMount { umount: self.umount.clone(), mount: self.mount.clone(), at, url }) as Arc<dyn Mounted>),
+                // a new session on its next call. If the module died instead, FSKit keeps the mount
+                // and answers every call with EIO, without starting it again (step 5, item 4): such
+                // a mount is unmounted and mounted anew.
+                Some(from) if from == url => {
+                    if answers(&at).await {
+                        return Ok(Arc::new(FsKitMount { umount: self.umount.clone(), mount: self.mount.clone(), at, url }) as Arc<dyn Mounted>);
+                    }
+                    run(&self.umount, vec!["-f".into(), at.clone().into_os_string()]).await?;
+                }
                 Some(from) if from.is_empty() => return Err(format!("something else is mounted at {}", at.display())),
                 Some(from) => return Err(format!("{from} is mounted at {}", at.display())),
                 None => {}

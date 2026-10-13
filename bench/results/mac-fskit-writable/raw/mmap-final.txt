@@ -1,0 +1,39 @@
+# mmap writes (final build, writeThrough), checked on the mount and on the server
+$ writeprobe ev/mmap mmap
+19:04:08.077  open O_CREAT|O_RDWR              19.0 ms  ok
+19:04:08.081  ftruncate 64 KiB                  3.3 ms  ok
+19:04:08.081  mmap MAP_SHARED rw                0.0 ms  ok
+19:04:08.083  stored into two pages             0.0 ms  ok
+19:04:09.091  msync MS_SYNC                     7.9 ms  ok
+19:04:09.091  stored into a third page          0.0 ms  ok
+19:04:09.091  munmap                            0.0 ms  ok
+19:04:09.136  close                            45.3 ms  ok
+$ writeprobe ev/mmap mmapclose
+19:04:09.160  open O_CREAT|O_RDWR              16.2 ms  ok
+19:04:09.164  ftruncate 64 KiB                  3.2 ms  ok
+19:04:09.164  mmap MAP_SHARED rw                0.0 ms  ok
+19:04:09.174  close (mapping kept)             10.2 ms  ok
+19:04:09.177  stored into two pages             0.0 ms  ok
+19:04:10.199  msync MS_SYNC                    19.1 ms  ok
+19:04:10.199  stored into a third page          0.0 ms  ok
+19:04:10.199  munmap                            0.0 ms  ok
+-- probe-mmap: mount, then server (strings)
+mapped page one|mapped page three|mapped page ten|
+mapped page one|mapped page three|mapped page ten|
+sha256 mount  b99e07b0adca67de
+sha256 server b99e07b0adca67de
+-- probe-mmapclose: mount, then server (strings)
+mapped page one|mapped page three|mapped page ten|
+mapped page one|mapped page three|mapped page ten|
+sha256 mount  b99e07b0adca67de
+sha256 server b99e07b0adca67de
+probe-mmap
+probe-mmapclose
+
+$ mmapseq ev/mmap/seq <steps> (the sequences that lost a store before the push at open)
+read after "mc1S2u": 1 2
+  server after "mc1S2ur": 1 2
+read after "mc1Sw2u": 1 2
+  server after "mc1Sw2ur": 1 2
+read after "mc1S2uw": 1 2
+  server after "mc1S2uwr": 1 2

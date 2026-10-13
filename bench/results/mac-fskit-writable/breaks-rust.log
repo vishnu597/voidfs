@@ -1,0 +1,56 @@
+Step 5, item 4: each new or changed Rust test run with its code broken, one break at a time, restored after.
+Format: break: the test that failed, and where it panicked.
+
+Bounded flush (mount_data.rs)
+B1 no harden after a write: staged_writes_reach_disk_soon_after_without_publishing panicked at crates/voidfs-client/tests/mount_writes.rs:759:13 ("staged bytes never reached disk")
+B2 a burst schedules a flush per write (hardening.swap ignored): staged_writes_reach_disk_soon_after_without_publishing panicked at crates/voidfs-client/tests/mount_writes.rs:770:5
+B3 a flushed file flushed again: staged_writes_reach_disk_soon_after_without_publishing panicked at crates/voidfs-client/tests/mount_writes.rs:780:5
+
+The feed's echoes (mount.rs, queue.rs)
+B4 own versions ignored: the_feed_reports_other_computers_changes_and_not_this_macs_own panicked at crates/voidfs-client/tests/mount_publication.rs:813:5
+B5 the queue records no published version: the_feed_reports_other_computers_changes_and_not_this_macs_own panicked at crates/voidfs-client/tests/mount_publication.rs:813:5
+B6 shown() always false: the_feed_reports_other_computers_changes_and_not_this_macs_own panicked at crates/voidfs-client/tests/mount_publication.rs:843:9
+B7 no rename-source check: the_feed_reports_other_computers_changes_and_not_this_macs_own panicked at crates/voidfs-client/tests/mount_publication.rs:854:9
+   (a first try patched nothing, its pattern's indentation was wrong, and the unbroken test passed; rerun as above)
+B8 no moved-folder check: the_feed_reports_other_computers_changes_and_not_this_macs_own panicked at crates/voidfs-client/tests/mount_publication.rs:854:9
+
+The daemon's events (sessions.rs)
+B9 local always false: local_mutations_notify_other_sessions_after_the_new_bytes_are_visible panicked at crates/voidfs-daemon/tests/sessions.rs:440:5
+B10 feed events not filtered: local_mutations_notify_other_sessions_after_the_new_bytes_are_visible panicked at crates/voidfs-daemon/tests/sessions.rs:458:13
+
+Folding a create's metadata (queue.rs, publish.rs, journal.rs, mount_data.rs)
+B11 no create hold: a_new_files_bytes_mode_times_and_xattrs_go_up_with_its_creating_put panicked at crates/voidfs-client/tests/mount_publication.rs:882:5
+B12 no fold: a_new_files_bytes_mode_times_and_xattrs_go_up_with_its_creating_put panicked at crates/voidfs-client/tests/mount_publication.rs:882:5
+B13 a patch without mode and times: an_edit_sets_its_mode_and_times_in_its_own_request panicked at crates/voidfs-client/tests/mount_publication.rs:936:5
+B14 the fold not persisted (journal::update for amend): mount::crash_tests::killed_after_a_flush_commits_publishes_its_entries_once panicked at crates/voidfs-client/src/mount_crash_tests.rs:52:84
+B15 a rewrite never recognized: a_rewrite_in_place_is_one_version panicked at crates/voidfs-client/tests/mount_publication.rs:952:5
+B16 every truncate dropped: a_rewrite_in_place_is_one_version panicked at crates/voidfs-client/tests/mount_publication.rs:960:5
+
+.DS_Store local-only (mount.rs, mount_mutations.rs, mount_data.rs, mount_xattrs.rs, mount_stage.rs)
+B17 local_only() false: a_ds_store_stays_on_this_mac_across_a_restart_and_nearby_names_publish (984:5), a_folder_removed_elsewhere_goes_with_its_local_ds_store (1064:5), a_local_ds_store_renames_only_as_one_and_shadows_the_drives_own (1023:97), all in crates/voidfs-client/tests/mount_publication.rs
+B18 pending_under counts local files: a_folder_removed_elsewhere_goes_with_its_local_ds_store panicked at mount_publication.rs:1064:5
+B19 unshadow leaves a tombstone: a_local_ds_store_renames_only_as_one_and_shadows_the_drives_own panicked at mount_publication.rs:1039:58
+B20 a flush publishes a local file: all three .DS_Store tests (mount_publication.rs:973:24, 990:24)
+B21 pending forgets local: all three .DS_Store tests (mount_publication.rs:986:47, 973:24)
+B22 a rename crosses the boundary: a_local_ds_store_renames_only_as_one_and_shadows_the_drives_own panicked at mount_publication.rs:1023:97
+B23 prepare_mutation asks the server: all three .DS_Store tests (mount_publication.rs:985:86, 971:47)
+B24 setattr journals: a_ds_store_stays_on_this_mac_across_a_restart_and_nearby_names_publish panicked at mount_publication.rs:998:5
+B25 setxattr journals: a_ds_store_stays_on_this_mac_across_a_restart_and_nearby_names_publish panicked at mount_publication.rs:998:5
+B26 create journals: a_local_ds_store_renames_only_as_one_and_shadows_the_drives_own (1030:5), a_ds_store_stays_on_this_mac_across_a_restart_and_nearby_names_publish (998:5)
+B27 remove journals: a_local_ds_store_renames_only_as_one_and_shadows_the_drives_own panicked at mount_publication.rs:1038:45
+
+The fskit adapter (fskit.rs)
+B28 the adapter says it can't write: fskit_mounts_with_the_system_mount_and_comes_back_or_is_adopted_when_the_daemon_starts panicked at crates/voidfs-daemon/tests/fskit.rs:102:5
+B29 a dead mount adopted (`if true || answers(..)`): fskit_mounts_with_the_system_mount_and_comes_back_or_is_adopted_when_the_daemon_starts panicked at crates/voidfs-daemon/tests/fskit.rs:135:5
+
+Conflicts (voidfs-cli uploads.rs, daemon.rs; voidfs-daemon api.rs; voidfs-client queue.rs, journal.rs)
+B30 no conflict label: uploads::tests::a_mounts_conflict_reads_as_one_not_as_failures panicked at crates/voidfs-cli/src/uploads.rs:293:9
+B31 no conflict label (integration): a_mounts_conflict_shows_in_uploads_status_and_the_log panicked at crates/voidfs-cli/tests/uploads.rs:290:5
+B32 totals count conflicts as failed: uploads::tests::a_mounts_conflict_reads_as_one_not_as_failures panicked at crates/voidfs-cli/src/uploads.rs:297:9
+B33 the API's failed counts conflicts: a_mounts_conflict_shows_in_uploads_status_and_the_log panicked at crates/voidfs-cli/tests/uploads.rs:293:5
+B34 the API counts no conflicts: a_mounts_conflict_shows_in_uploads_status_and_the_log panicked at crates/voidfs-cli/tests/uploads.rs:293:5
+B35 the status line leaves conflicts out: daemon::tests::the_uploads_line_says_what_is_left panicked at crates/voidfs-cli/src/daemon.rs:438:9
+B36 the API counts entries, not files: a_mounts_conflict_shows_in_uploads_status_and_the_log panicked at crates/voidfs-cli/tests/uploads.rs:293:5
+B37 the daemon never looks (first try didn't compile; rerun with a type annotation): a_mounts_conflict_shows_in_uploads_status_and_the_log panicked at crates/voidfs-cli/tests/uploads.rs:297:9
+B38 a line at every look: a_mounts_conflict_shows_in_uploads_status_and_the_log panicked at crates/voidfs-cli/tests/uploads.rs:302:5
+B39 Queue::conflicts reads the entries not in conflict: a_mounts_conflict_shows_in_uploads_status_and_the_log panicked at crates/voidfs-cli/tests/uploads.rs:297:9
