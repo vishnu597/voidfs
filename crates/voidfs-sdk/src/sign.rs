@@ -78,6 +78,16 @@ impl Signer {
     /// (encoded, without `?`). `headers` are signed except those named in `unsigned`, which are
     /// added after signing; `host` and the payload hash are added.
     pub fn sign(&self, method: &str, path: &str, query: &str, headers: Vec<(String, String)>, unsigned: &[String], body: Bytes) -> Result<http::Request<Bytes>, Error> {
+        self.sign_body(method, path, query, headers, unsigned, (body.clone(), SignableBody::Bytes(&body)))
+    }
+
+    /// Signs the headers of a file streamed afterwards, with its already computed SHA-256.
+    pub fn sign_prehashed(&self, method: &str, path: &str, query: &str, headers: Vec<(String, String)>, content_sha256: &str) -> Result<http::Request<Bytes>, Error> {
+        self.sign_body(method, path, query, headers, &[], (Bytes::new(), SignableBody::Precomputed(content_sha256.to_owned())))
+    }
+
+    fn sign_body(&self, method: &str, path: &str, query: &str, headers: Vec<(String, String)>, unsigned: &[String], content: (Bytes, SignableBody<'_>)) -> Result<http::Request<Bytes>, Error> {
+        let (body, payload) = content;
         let (host, path) = self.address(path);
         let uri = if query.is_empty() { format!("{}{}", self.endpoint, path) } else { format!("{}{}?{}", self.endpoint, path, query) };
         let mut headers = headers;
@@ -98,7 +108,7 @@ impl Signer {
             .build()
             .map_err(|e| Error::Invalid(format!("cannot sign: {e}")))?
             .into();
-        let signable = SignableRequest::new(method, &uri, signed.iter().map(|(k, v)| (k.as_str(), v.as_str())), SignableBody::Bytes(&body))
+        let signable = SignableRequest::new(method, &uri, signed.iter().map(|(k, v)| (k.as_str(), v.as_str())), payload)
             .map_err(|e| Error::Invalid(format!("cannot sign: {e}")))?;
         let (instructions, _) = sign(signable, &params).map_err(|e| Error::Invalid(format!("cannot sign: {e}")))?.into_parts();
 

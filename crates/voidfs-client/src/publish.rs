@@ -407,6 +407,9 @@ async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
         return Ok(o);
     }
     if run.len() == 1 && size > 0 && size >= ctx.multipart_from {
+        if e.mount && guard == Guard::Absent {
+            return guarded_file_put(ctx, e, size, &guard).await;
+        }
         return multipart(ctx, e, size, guard).await;
     }
     // Small enough to hold: the put, with the writes after it applied.
@@ -440,6 +443,41 @@ async fn put(ctx: &Ctx, run: &[Entry], guard: Guard) -> Step<Outcome> {
     };
     ctx.sent.store(sent, Ordering::Relaxed);
     done(Some(xattrs_after(ctx, e, attrs, version).await?), clash)
+}
+
+async fn guarded_file_put(ctx: &Ctx, e: &Entry, size: u64, guard: &Guard) -> Step<Outcome> {
+    let _mem = ctx.hold(2 * voidfs_sdk::bandwidth::PIECE as u64).await?;
+    let path = e.source.clone().ok_or_else(|| Outcome::Failed { error: "a streamed put without bytes".into(), transient: false })?;
+    let source = path.clone();
+    let stop = ctx.stop.clone();
+    let sha = blocking(move || {
+        hash_source(std::fs::File::open(source)?, &stop)
+    }).await??;
+    let result = ctx.stop.or(ctx.client.put_object_file(&e.drive, &e.key, &path, &sha, put_opts(ctx, e, &e.attrs, guard), Some(ctx.sent.clone()))).await?;
+    crate::kill::point("publish.sent");
+    let version = match result {
+        Ok(w) => w.version_id,
+        Err(error) if is_412(&error) => match landed(ctx, e, guard).await? {
+            Some(version) => version,
+            None => return Err(error.into()),
+        },
+        Err(error) => return Err(error.into()),
+    };
+    ctx.sent.store(size, Ordering::Relaxed);
+    done(Some(xattrs_after(ctx, e, &e.attrs, version).await?), None)
+}
+
+fn hash_source(mut source: impl std::io::Read, stop: &Stop) -> Result<Result<String, Why>> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut block = vec![0u8; voidfs_sdk::bandwidth::PIECE];
+    loop {
+        if let Some(why) = stop.why() { return Ok(Err(why)); }
+        let n = source.read(&mut block)?;
+        if n == 0 { break; }
+        hash.update(&block[..n]);
+    }
+    Ok(Ok(hex::encode(hash.finalize())))
 }
 
 impl Ctx {
@@ -833,4 +871,30 @@ async fn multipart(ctx: &Ctx, e: &Entry, size: u64, guard: Guard) -> Step<Outcom
         Err(err) => return Err(err.into()),
     };
     done(Some(xattrs_after(ctx, e, &e.attrs, version).await?), clash)
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn a_large_file_hash_stops_between_pieces_for_pause_and_cancel() {
+        struct StopAfterPiece { stop: Stop, why: Why, reads: usize }
+        impl std::io::Read for StopAfterPiece {
+            fn read(&mut self, block: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                assert_eq!(self.reads, 1, "stopping a prepass must not request another piece");
+                assert_eq!(block.len(), voidfs_sdk::bandwidth::PIECE);
+                block.fill(0x5a);
+                self.stop.signal(self.why);
+                Ok(block.len())
+            }
+        }
+        for why in [Why::Pause, Why::Cancel] {
+            let stop = Stop::default();
+            let mut source = StopAfterPiece { stop: stop.clone(), why, reads: 0 };
+            assert_eq!(hash_source(&mut source, &stop).unwrap(), Err(why));
+            assert_eq!(source.reads, 1, "stopping a prepass must not consume another 64 KiB piece");
+        }
+    }
 }

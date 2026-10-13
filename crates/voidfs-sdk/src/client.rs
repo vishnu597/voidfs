@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
@@ -261,6 +262,25 @@ pub(crate) fn paced(body: Bytes, bw: Arc<Bandwidth>) -> impl futures::Stream<Ite
         bw.take(piece.len()).await;
         Some((Ok(piece), (rest, bw)))
     })
+}
+
+/// Bounds a stalled upload and the wait for response headers. Deliberate pacing is not a
+/// stalled peer; each yielded piece starts a fresh silence interval, including the last one.
+async fn upload_silence(mut activity: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>, timeout: Duration) {
+    loop {
+        let deadline = (*activity.borrow_and_update()).map(|at| at + timeout);
+        match deadline {
+            Some(deadline) => tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    // A scheduler delay can make the old timer and a new activity update
+                    // ready together. Never expire a deadline which pacing/progress replaced.
+                    if (*activity.borrow()).is_some_and(|at| at + timeout <= tokio::time::Instant::now()) { return; }
+                },
+                changed = activity.changed() => if changed.is_err() { return },
+            },
+            None => if activity.changed().await.is_err() { return },
+        }
+    }
 }
 
 /// The text of the first element called `name`.
@@ -523,6 +543,91 @@ impl Client {
             req = req.header(&format!("x-amz-meta-{k}"), v.clone());
         }
         self.execute(req).await?.write_result()
+    }
+
+    /// Streams an immutable file as one ordinary PutObject, including its absence or version
+    /// guard. The caller computes `content_sha256` before calling; the server checks it against
+    /// the streamed body. Retries reopen the same file, and the shared bandwidth limit applies
+    /// to each 64 KiB piece. `progress`, when provided, counts yielded bytes in the current
+    /// attempt and resets on retry. The server timeout excludes deliberate pacing, but bounds
+    /// upload stalls and the wait after the last piece. This path never changes to multipart
+    /// or direct uploads.
+    pub async fn put_object_file(&self, drive: &str, key: &str, path: &std::path::Path, content_sha256: &str, opts: PutOptions, progress: Option<Arc<AtomicU64>>) -> Result<WriteResult> {
+        use aws_sdk_s3::primitives::{ByteStream, Length};
+        require("key", key)?;
+        content_sha256.parse::<voidfs_core::ids::ShardHash>().map_err(|e| Error::Invalid(e.to_string()))?;
+        let size = std::fs::metadata(path).map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?.len();
+        let mut req = Req::new(Method::PUT, object_path(drive, key))
+            .header("content-length", size.to_string())
+            .header_opt("content-type", opts.content_type)
+            .guard(opts.if_version.as_ref(), opts.if_match.as_ref())
+            .header_opt("if-none-match", opts.if_none_match_any.then_some("*"))
+            .attrs(opts.mtime.as_ref(), opts.mode);
+        for (k, v) in &opts.metadata {
+            req = req.header(&format!("x-amz-meta-{k}"), v.clone());
+        }
+        let mut attempt = 1;
+        loop {
+            if let Some(progress) = &progress { progress.store(0, Ordering::Relaxed); }
+            let body = ByteStream::read_from().path(path).buffer_size(crate::bandwidth::PIECE).length(Length::Exact(size)).build().await
+                .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
+            let bandwidth = self.0.config.upload_bandwidth.clone();
+            let (activity, updates) = tokio::sync::watch::channel(Some(tokio::time::Instant::now()));
+            // The HTTP layer may drop its exact-length body without polling EOF. Keep the
+            // channel alive while response headers are still outstanding.
+            let _activity = activity.clone();
+            let pieces = futures::stream::unfold((body, bandwidth, activity, progress.clone()), |(mut body, bandwidth, activity, progress)| async move {
+                let piece = match body.next().await {
+                    Some(piece) => piece,
+                    None => { activity.send_replace(Some(tokio::time::Instant::now())); return None; }
+                };
+                if let Ok(bytes) = &piece {
+                    if let Some(limit) = &bandwidth {
+                        activity.send_replace(None);
+                        limit.take(bytes.len()).await;
+                    }
+                    if let Some(progress) = &progress { progress.fetch_add(bytes.len() as u64, Ordering::Relaxed); }
+                }
+                activity.send_replace(Some(tokio::time::Instant::now()));
+                Some((piece, (body, bandwidth, activity, progress)))
+            });
+            let signed = self.0.signer.sign_prehashed(req.method.as_str(), &req.path, "", req.headers.clone(), content_sha256)?;
+            let mut request = reqwest::Request::try_from(signed).map_err(|e| Error::Invalid(e.to_string()))?;
+            *request.body_mut() = Some(reqwest::Body::wrap_stream(pieces));
+            let started = std::time::Instant::now();
+            let response = tokio::select! {
+                response = self.0.http_wait.execute(request) => response.map_err(Error::from),
+                _ = upload_silence(updates, self.0.config.timeout) => Err(Error::Transport { message: "streamed upload or response headers timed out".into(), sent: true }),
+            };
+            if let Some(observer) = &self.0.config.observer {
+                let (status, sent) = match &response {
+                    Ok(r) => (Some(r.status().as_u16()), true),
+                    Err(Error::Transport { sent, .. }) => (None, *sent),
+                    Err(_) => (None, false),
+                };
+                observer.observe(&Observation { status, sent, elapsed: started.elapsed() });
+            }
+            let result = match response {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let headers = response.headers().clone();
+                    match tokio::time::timeout(self.0.config.timeout, response.bytes()).await {
+                        Ok(Ok(body)) if status >= 300 => Err(Error::Service(service_error(status, &headers, &body))),
+                        Ok(Ok(body)) => Reply { status, headers, body }.write_result(),
+                        Ok(Err(e)) => Err(e.into()),
+                        Err(_) => Err(Error::Transport { message: "streamed upload response body timed out".into(), sent: true }),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            match result {
+                Err(e) if attempt < self.0.config.max_attempts.max(1) && retry::may_retry(&e, req.replay) => {
+                    tokio::time::sleep(retry::delay(attempt, &e)).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     // -----------------------------------------------------------------------------------------
