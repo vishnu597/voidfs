@@ -9,12 +9,12 @@ and then for the Mac apps head to head; provider follow-ups and the step 5 plan 
 2026-10-04, with step 5 decisions, namespace and snapshot-read slices on 2026-10-05, and bounded
 moved-snapshot resolution, local namespace changes and staged file writes on 2026-10-06,
 Rust daemon sessions/shared feeds and guarded publication on 2026-10-07, and mount recovery on
-2026-10-08. The first was taken
+2026-10-08, writable FSKit on 2026-10-12, and the application matrix on 2026-10-13. The first was taken
 on 2026-09-27.*
 
 Sources:
-- the voidfs code on `origin/main` at `4b4d62d` (Rust daemon sessions merged),
-  plus this change's stable remembered identities, local notifications and socket ownership fixes;
+- the writable FSKit commits promoted to `main` as `0fe8913` by
+  [vishnu597/voidfs#61](https://github.com/vishnu597/voidfs/pull/61), and the dated slices below;
 - the parity checklist in [§3 of the plan](RESEARCH_AND_PLAN.md#3-parity-checklist-everything-to-build);
 - the benchmark results in [`bench/results/`](../bench/results/);
 - SpaceFS's benchmark pages (runs of 20 and 23 September 2026) and changelog, read again on 28
@@ -149,6 +149,16 @@ billing or plans), this page says so.
     through the daemon's durable core, and killing the extension or the daemon loses no
     acknowledged byte. Item 4 is not complete: `RENAME_SWAP` overwrites on every FSKit volume (a
     release blocker, for Apple), and resource forks over 64 KiB need a protocol change.
+    **The application matrix is in progress** (13 October,
+    [evidence](../bench/results/mac-app-matrix/README.md)): native save, Git, headless Xcode,
+    SQLite database and free-app persistence scopes have measured results. Peer file watchers
+    receive no notifications, tiny resource forks fail positional `copyfile` reads, and native
+    Versions is unsupported. All-zero FinderInfo listing is fixed; drive-scoped upload controls
+    have a separately tested fix in [PR #64](https://github.com/vishnu597/voidfs/pull/64), while
+    guarded large-file publication is in [PR #65](https://github.com/vishnu597/voidfs/pull/65).
+    The declared 50 GB synthetic-media workload and native Xcode edit/build/run scope pass on
+    this Mac. QuickTime GUI trim/export remains unvalidated, and two independent Macs remain
+    untested; those scoped passes do not complete the application matrix.
     Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -209,6 +219,9 @@ verification does not change the scorecard counts.
 - D3 writes since step 5's item 4, but for `RENAME_SWAP` (FSKit overwrites) and resource forks
   over 64 KiB; D6's cache and read-ahead reach the mount through the daemon since item 3, and D11
   is the spike's shell, which now asks the daemon to mount.
+  Item 6's measured application scopes do not complete D3 or D5: remote watcher notifications,
+  small resource-fork offset reads, native Versions and the two-Mac application gate remain open
+  ([matrix](../bench/results/mac-app-matrix/README.md)).
 - D9 has the commands that need no account (`void`, step 4, item 2), and since 3 October `void
   daemon run|start|stop|restart|status|info|install|uninstall`, `void status`, `void upload
   --detach`, `void uploads` with pause, resume, cancel and a limit, and `void
@@ -888,7 +901,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      need its own SMB server ([spike](spikes/smb.md)). The user kept FSKit as the default and
      waits for Apple to fix the miss. The volume writes through the core (item 4), with a flush
      within a second standing in for the fsync FSKit doesn't pass on; `RENAME_SWAP` overwrites on
-     every FSKit volume, a second release blocker.
+     every FSKit volume, a second release blocker. Item 6's application matrix now runs on this
+     Mac; free alternatives have separate rows and do not certify the absent target apps.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
@@ -905,7 +919,51 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
-   - **Status (2026-10-12, later):** items 1–3 of 10 done, item 3 with a release blocker; item 4
+   - **Status (2026-10-13):** items 1–3 of 10 done, item 3 with a release blocker; item 4 built
+     and not complete; item 6 in progress, not complete
+     ([measured slice](step-5-macos.md#application-matrix-13-october),
+     [matrix](../bench/results/mac-app-matrix/README.md)). Foundation safe-save operations,
+     Git, headless/native GUI Xcode, durable SQLite `.db` semantics, Blender and LibreOffice persistence
+     have scoped passes. Remote FSEvents/kqueue notifications fail, native Versions rejects
+     safely, positional reads of even tiny resource forks fail, and SQLite's strict SHM byte
+     equality fails. The all-zero FinderInfo listing defect is fixed
+     ([PR #63](https://github.com/vishnu597/voidfs/pull/63),
+     [evidence](../bench/results/mac-finderinfo/README.md)); drive-scoped upload controls have
+     a separately tested fix in [PR #64](https://github.com/vishnu597/voidfs/pull/64)
+     ([evidence](../bench/results/mac-upload-drive-scope/README.md)), and guarded large-file
+     publication is in [PR #65](https://github.com/vishnu597/voidfs/pull/65). The declared 50 GB
+     media and native Xcode scopes now pass. Two independent Macs are untested at the
+     user's choice; a peer SDK client on this Mac is not that hardware/application scenario.
+     Finder Trash/server-version recovery passes exact bytes and metadata, but a fresh
+     65,537-byte resource fork is silently dropped by successful Finder copies on FSKit while
+     APFS preserves it. The known fork-drop requirement remains a failure.
+     QuickTime's native UI plays/seeks a 1.718 GB/100 s ProRes clip; its trim/save fails before
+     target creation with the same compatibility alert on APFS, so GUI export is unvalidated
+     as an app/fixture constraint rather than a new FSKit-specific defect. Small AVFoundation
+     ProRes scrub and 2 s HEVC export/decode/server checks pass. Whole-movie Duplicate has
+     size/header evidence only until its full byte/server checks complete. The
+     [media summary](../bench/results/mac-app-matrix/raw/media-50gb-summary.json) and
+     [manifest](../bench/results/mac-app-matrix/raw/media-50gb-manifest.json) record 30 unique
+     clips, 50,000,175,334 encoded bytes, 87,305 frames and 2,910.167 s, with all 30
+     source/server hashes, metadata/history and native first/last scrubs/export checks passing.
+     A [fresh read-only fork](../bench/results/mac-app-matrix/raw/quicktime-cold-ui.jsonl)
+     starts with zero client cache blocks before GUI open, then plays 47.469 s and seeks
+     90→10→90 s; chooser/open preload before Play is possible and object-store caches stay warm.
+     A [second fresh read-only fork](../bench/results/mac-app-matrix/raw/native-cold-media-inspect.jsonl)
+     has zero cached blocks for each ETag immediately before direct AVFoundation URL opens,
+     without GUI/chooser reads. First/last clips at 1920×1080 decode six matching ranges per
+     cold/warm run (24 total); wall times are 0.629/0.401 s and 0.464/0.410 s. The sampled
+     combined allocated client-cache peak is 4,706,942,976 bytes, below 8 GB. Server caches
+     may be warm; QuickTime's cache at Play is not claimed to be empty.
+     [Native Xcode](../bench/results/mac-app-matrix/raw/xcode-ui.jsonl) source edit/save/Build/Run
+     prints the expected 16 and exits 0; its four-file collector has zero failures. Its native
+     Versions warning on close was acknowledged. Exact expanded APFS GUI controls, native
+     prior-version recovery and the cross-Mac application criteria remain untested/unmet.
+     Microsoft Office, Premiere, Final Cut and Resolve remain untested; LibreOffice and native
+     media tools are separately named substitutes. No step 5 exit criterion is waived.
+     [#64's final CI run](https://github.com/vishnu597/voidfs/actions/runs/38430184924) passes
+     all six required jobs; #63 and #65 also have green required CI.
+     Before that, on **2026-10-12, later:** items 1–3 of 10 done, item 3 with a release blocker; item 4
      built and not complete ([step 5](step-5-macos.md#writable-fskit-12-october)): the mount
      writes, and `RENAME_SWAP` overwriting on every FSKit volume is a release blocker the user
      accepted (a Feedback for Apple drafted), with resource forks over 64 KiB waiting on an RFC.

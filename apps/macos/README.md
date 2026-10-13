@@ -80,10 +80,38 @@ Writes go to the daemon, which stages them on this Mac: `write(2)` returns once 
 staged (they survive the daemon, the agent or the module being killed), they reach the disk
 within a second, since FSKit passes no `fsync` to a module, and they publish on close or after
 two seconds without writes (`void uploads` shows them). `.DS_Store` stays on this Mac; locks are
-this Mac's only. Two limits: `renamex_np(RENAME_SWAP)` replaces the destination on any FSKit
+this Mac's only. `renamex_np(RENAME_SWAP)` replaces the destination on any FSKit
 volume instead of swapping, and xattrs (resource forks included) are limited to 64 KiB a file
 ([writable FSKit](../../docs/step-5-macos.md#writable-fskit-12-october)). `mount -o trace` logs
 every callback the module gets.
+
+The [13 October application matrix](../../bench/results/mac-app-matrix/README.md) records
+scoped results on this Mac. Local FSEvents/kqueue operations pass, but remote commits produce no
+watcher notifications within 5 seconds; an app may need a rescan to discover them. Native
+Versions rejects safely. Positional reads of even a 17-byte resource fork fail after the first
+chunk, so `copyfile` metadata copies can fail independently of the 64 KiB size limit. An
+all-zero 32-byte FinderInfo listing mismatch is fixed in
+[PR #63](https://github.com/vishnu597/voidfs/pull/63)
+([evidence](../../bench/results/mac-finderinfo/README.md)); the stored value/history remains
+intact and two CREATE/REPLACE policy differences stay documented. Drive-scoped upload controls
+have a separately tested alias/ID fix in [PR #64](https://github.com/vishnu597/voidfs/pull/64)
+([evidence](../../bench/results/mac-upload-drive-scope/README.md)); guarded large-file publication
+is in [PR #65](https://github.com/vishnu597/voidfs/pull/65). The declared synthetic-media scope
+passes on this Mac: 30 unique ProRes clips total 50,000,175,334 bytes, with all source/server
+hashes and metadata/history checked, native first/last scrubs and a 2 s HEVC export decoded.
+Native Xcode open/source-edit/save/Build/Run also passes, printing the expected 16 and exiting 0.
+A second fresh read-only fork has zero cached blocks for each ETag immediately before direct
+AVFoundation URL opens; first/last cold and warm frame-range counts match. Process wall times
+are 0.629/0.401 s and 0.464/0.410 s, with server caches possibly warm. The sampled combined
+allocated client-cache peak is 4,706,942,976 bytes, below 8 GB.
+QuickTime's fresh-fork GUI open workflow starts with zero client cache blocks, then plays
+47.469 s and seeks 90→10→90 s; the chooser/open path can preload before Play and server caches
+remain warm. GUI trim/save remains unvalidated because the same pre-target compatibility alert
+occurs on APFS and FSKit. Native Versions and exact expanded APFS GUI controls remain limited
+or untested. Two independent Macs and the absent paid target apps are explicitly untested;
+LibreOffice and native media tools have separate rows. The
+[step 5 status](../../docs/step-5-macos.md#application-matrix-13-october) keeps these passes
+separate from the uncompleted matrix and release criteria.
 
 ## Checking a mount
 
@@ -100,6 +128,21 @@ examples plays another machine:
 | `restarts.py <mountpoint> <label> <command…>` | A file held open across a restart of the daemon or the agent |
 | `semantics.c <folder>` | `RENAME_EXCL`, `RENAME_SWAP`, open-unlink, mmap and msync, locks, xattrs, Unicode names: build with `cc` and run on a mount |
 | `writeprobe.c <folder> <test>` | Timed writes, `fsync`, `F_FULLFSYNC`, closes, `sync` and mmap stores, to see which call waits for the module; `unflushed` and `dirty` wait for a kill |
+| `foundation-save.swift <scratch-parent> [case]` | Compile with Swift 5: actual NSDocument saves/autosaves, atomic replacements/backups, coordinator, native Versions, copyfile/clone fallback and positional resource-fork reads; preserves failed-case bytes |
+| `watch-events.swift local <scratch-parent> <mode> [case]` | Local FSEvents/kqueue checks with operation-specific flags and bytes/readback timing; `mode` is `fsevents`, `kqueue` or `both` |
+| `watch-events.swift peer <scratch-parent> <mode> <mount-root> <peer-binary> <drive> [case]` | Peer commits, notification/listing/byte latency and a separate held-descriptor cache experiment; an SDK peer on one Mac is not two-Mac testing |
+| `app-matrix.py` and `app-matrix-xcode.py` | Git/SQLite, headless real Xcode project and stable server bytes/metadata collector; each run owns a fresh dataset |
+| `app-matrix-free.py` | Native Blender and LibreOffice persistence/readback using available scratch app copies, private profiles and the bundled runtimes; no app installation or dependency added |
+| `app-matrix-native.py`, `app-matrix-cocoa.applescript`, media/PDF probes | Finder/TextEdit and native GUI/media fixtures; see the matrix for measured scope, commands and untested operations |
+| `app-matrix-finderinfo.swift <scratch-parent> listing\|full` | All-zero FinderInfo listing/readback control; `full` also scores the separately documented CREATE/REPLACE policy differences |
+| `app-matrix-finder-recovery.py` | Finder Move to Trash of a new two-revision fixture, server-version restore with exact bytes/metadata, and APFS/FSKit controls of a 65,537-byte resource-fork copy; preserves the known silent fork-drop failure |
+
+The application runners use `/usr/bin/python3`, system Git/SQLite, Xcode's Swift tools and
+native frameworks; the free-app row additionally needs Blender's Python and LibreOffice's
+Python/UNO bridge. Their [replay instructions](../../bench/results/mac-app-matrix/README.md#running-a-row)
+use a local test-only environment and isolated daemon state, with APFS controls, scoped
+publication draining and server reconciliation. Keep app profiles/build products outside the
+mounted dataset and restore test overrides/registrations after the run as described there.
 
 ## Release build: Developer ID, notarized
 

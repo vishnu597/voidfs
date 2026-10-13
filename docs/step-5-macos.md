@@ -6,7 +6,8 @@ and shared feeds, guarded publication and retained conflicts added 7 October; re
 advertised capabilities, setting mode and mtime, and recognizing lost replies to edits, renames
 and attribute changes added 8 October; the signed-bundle probe, the rest of the session calls,
 the Swift bridge and one daemon for the CLI and the app added 9 October; read-only FSKit on the
-daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October. **Item 1 is complete**
+daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October; the
+application matrix and its first fixes added 13 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -24,6 +25,17 @@ fix the miss. **Item 4 is built and not complete** ([12 October](#writable-fskit
 volume writes through the daemon's durable core, with a bounded flush in place of the fsync FSKit
 doesn't pass on, but `RENAME_SWAP` overwrites on every FSKit volume (a release blocker the user
 accepted, to be raised with Apple) and resource forks over 64 KiB need a protocol change.
+**Item 6 is in progress, not complete** ([13 October](#application-matrix-13-october)): the
+matrix runs on this Mac, with free alternatives in separate rows. Remote file watchers receive
+no notifications, even tiny resource forks fail positional reads used by `copyfile`, and native
+Versions is unsupported. All-zero FinderInfo listing is fixed; drive-scoped upload controls have
+a separately tested fix in [PR #64](https://github.com/vishnu597/voidfs/pull/64), and guarded
+large-file publication is in [PR #65](https://github.com/vishnu597/voidfs/pull/65). The 50 GB
+synthetic ProRes workload now passes source/server hashes, metadata/history and native
+decode/export checks on this Mac, including direct cold/warm decoder opens on a separate
+fresh fork; native Xcode open/edit/save/build/run also passes.
+QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and two
+independent Macs and the absent paid target apps remain explicitly untested.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -273,17 +285,23 @@ both were deferred in step 4 and are not implied by this plan.
 
 ### Item 6. App compatibility and the SMB gate
 
-**SMB feasibility spike done, 12 October; the application matrix is not started.** The spike ran
+**SMB feasibility spike done, 12 October; application matrix in progress, 13 October.** The spike ran
 item 3's coherence cases over the Mac's SMB client, through the daemon's mount core, and checked
 the servers and the checklist below ([SMB feasibility spike](#smb-feasibility-spike-12-october),
 [the spike](spikes/smb.md)). On 12 October the user kept FSKit as the default adapter, so the matrix
-runs on writable FSKit after item 4.
+runs on writable FSKit after item 4. Its [first measured slice](#application-matrix-13-october)
+and [replayable evidence](../bench/results/mac-app-matrix/README.md) keep the failed, partial,
+pending and untested rows visible. The user chose this Mac; the two-Mac exit criterion remains
+untested, and a local SDK peer does not complete it.
 
 Start this rig alongside item 3, and run it again after item 4. Use Finder, a code repo and
 Premiere, Resolve, Final Cut, Blender and Office on the target macOS. Record app/OS versions,
 operation, resulting bytes/metadata, recoverability and known limitations. Missing paid apps or
 a second Mac are untested rows, not passes. A second independent SDK client can cover server/feed
 logic locally but cannot prove the two-Mac application exit criterion.
+The user permits free alternatives: Blender and LibreOffice have their own tested rows;
+LibreOffice does not establish Microsoft Office compatibility, and native media tools do not
+establish Premiere, Resolve or Final Cut compatibility.
 
 If FSKit fails a required save or coherence case, make a contained SMB feasibility spike before
 choosing it as default: select a maintained reusable server and check its license, bounded reads,
@@ -2103,3 +2121,162 @@ unavailable locally, and CI supplies it and checks MinIO and Docker Compose. `xc
 the app, the extension and the probe with no warnings in the Swift sources. The test daemon used
 a `mktemp` state directory, since removed, against a local memory-store server, since stopped;
 nothing was put in `~/Library/Application Support/voidfs`.
+
+### Application matrix, 13 October
+
+**Item 6 is in progress, not complete.** The writable commits from
+[vishnu597/voidfs#60](https://github.com/vishnu597/voidfs/pull/60) were promoted to `main` by
+[#61](https://github.com/vishnu597/voidfs/pull/61), merge `0fe8913`. Its exact promoted head
+passed all eight jobs in the
+[workflow-dispatch CI run](https://github.com/vishnu597/voidfs/actions/runs/38411218456).
+The later [PR-triggered run](https://github.com/vishnu597/voidfs/actions/runs/38411424007)
+initially failed; its second attempt passed, as did the
+[main-branch rerun](https://github.com/vishnu597/voidfs/actions/runs/38412574302).
+The matrix README records the current conclusions and links the completed job metadata.
+
+The user chose to test this Mac and permits free alternatives. The matrix records the actual
+app or framework, version and operation separately. Blender and LibreOffice are tested as
+themselves; LibreOffice does not certify Microsoft Office, and QuickTime/AVFoundation do not
+certify Premiere, Resolve or Final Cut. **Two independent Macs are untested.** A peer SDK client
+on this Mac exercises commits and the feed, but cannot prove cross-Mac app notifications,
+locks or the 50 GB project exit criterion. The default remains FSKit as decided on 12 October.
+
+The rig uses an isolated daemon state directory, a loopback filesystem-store server with
+`multi-object-versions`, new synthetic datasets and a traced writable FSKit mount. The test Mac
+is Apple M5 Pro, macOS 27.0.1 (26A434), Xcode 27 beta (27A5194q). APFS controls use the same
+frameworks and app versions. The [matrix README](../bench/results/mac-app-matrix/README.md)
+contains exact replay commands, runtime dependencies, raw results and registration restoration
+steps. The completed media and GUI scopes are below; remaining untested controls and final
+cleanup are recorded there separately.
+
+**Scoring.** A pass covers every declared operation, semantic readback and applicable stable
+server bytes/metadata after publication. Partial means useful operations pass with a named
+measured limitation or missing workflow. Fail means a required operation, notification or
+strict comparison failed; a known limitation is still a failed requirement when it prevents
+the scenario. Untested means no run exists for the app or hardware. Missing paid apps and a
+second Mac are not passes. Failed non-atomic copies retain
+their partial destination and source as evidence; they are distinguished from acknowledged
+successful saves returning wrong bytes. Silent loss remains a failure.
+
+| Surface | Measured scope and current result |
+| --- | --- |
+| Foundation / AppKit | APFS: 21 cases pass. FSKit general run: 13 pass, 6 fail/unsupported; positional fork reads and the diagnostic copyfile case are separate failures. Atomic Data writes, backup variants, coordinator, actual NSDocument save/autosave and old-descriptor consistency pass. Native Versions rejects safely; resource-fork copying fails below. |
+| FSEvents / kqueue | Nine local operations pass on each surface. All seven peer operations have no notifications within 5 s. Without held descriptors, fresh bytes/listings appear in 14–31 ms; explicit kqueue holds keep bytes old/missing until release. That held-cache behavior is measured separately from the missing notifications. |
+| Git 2.54.0 | Clone, status, edit/add/commit, rebase, stash/pop, checkout, gc/repack, worktrees, index.lock handling and fsck pass. Final 872 regular files reconcile with server bytes, mode, mtime and xattrs. `core.symlinks=false` materializes symlink targets as regular files; no full symlink pass is claimed. |
+| Xcode 27 beta | Pass for headless and native GUI open/edit/save/build/run scope. Four headless builds across APFS/FSKit pass. Native source edit/save and Build/Run print `Xcode GUI revision — 名前: 16`, exit 0; the GUI collector reconciles four files with zero failures. Build products remain outside the mount. Exact APFS GUI controls and peer watcher behavior remain untested. |
+| SQLite 3.54.0 | Durable `.db` rollback/WAL transactions, writer crash, checkpoint/integrity and restore/reopen pass. Strict byte equality fails for the 32,768-byte SHM file: 43 bytes differ after drain. Local locks do not establish cross-Mac writer coordination. |
+| Blender 5.2.2 LTS | Twenty native background persistence checks per surface pass, including fresh-process reopen, edit, external texture, animation, backup and render. GUI and large-project coverage are separate. |
+| LibreOffice Writer / Calc 26.8.1.1 | Thirty native background persistence checks per surface pass, including Unicode, formulas, edit/reopen and lock files. Blender plus LibreOffice provide 50 checks on each surface; six artifacts reconcile with server metadata. Microsoft Office is untested. |
+| Finder | Small native copy/rename/metadata operations pass. Move to Trash and server restore recover the first version with exact SHA/mode/mtime/all xattrs in a fresh open after 78 ms. A fresh 65,537-byte resource fork is silently dropped by Finder copy/duplicate/copy-out on FSKit; APFS preserves it. That copy requirement fails. |
+| TextEdit 1.21 | Partial: Unicode save/reopen, Revert To Last Opened, Duplicate, about-60 s autosave and mode-0444 prompt/Cancel pass. Browse All Versions shows only the current document; earlier native version recovery is unproven. Hidden/immutable flags and exact expanded APFS GUI controls are untested. |
+| Preview 11.0 | Partial: native GUI PDF open, annotate, save/export and close pass; PDFKit reads back original text and the Unicode note in both files, and the native-Cocoa collector reconciles current files after the FinderInfo fix. Server-version recovery/GUI reopen controls remain untested. |
+| Numbers 15.1 | Partial: native package save/reopen retains `名前`, value 22 and `Saved on FSKit`; CSV UTF-8 readback/server collection pass. Formula entry failed in the initial fixture before it moved to the mount, so formula compatibility is untested. Native permanent Versions warns; it is not disabled by a preference. |
+| QuickTime Player 10.5 | Partial: native UI opens/plays a real 1.718 GB/100 s ProRes clip and seeks. A fresh read-only fork begins with zero client cache blocks before its GUI open workflow, then playback advances 47.469 s and seeks 90→10→90 s. Chooser/open may preload before Play; server caches remain warm. Duplicate size/header is observed; full byte/server equality is untested. GUI trim/save fails with the same pre-target compatibility alert on FSKit and a 10 s APFS control, so GUI export is unvalidated as an app/fixture constraint. |
+| AVFoundation / avconvert, 50 GB dataset | Pass for this Mac's declared synthetic media scope: 30 distinct ProRes clips, 50,000,175,334 encoded bytes, 87,305 frames and 2,910.167 s. All 30 source/server SHA-256 values, metadata and history agree; native first/last scrubs and a decoded 2 s HEVC export pass. A second fresh read-only fork proves zero blocks for each ETag immediately before direct decoder URL opens; first/last cold and warm runs decode matching ranges. This does not certify the absent editing apps or the two-Mac project criterion. |
+| Zed 1.7.2 / Cursor 3.24.12 | Native UI folder-open, Unicode edit/save/server bytes and project search pass on FSKit. Open buffers retain the old peer revision until close/reopen. GUI reopen latency is unmeasured; APFS GUI controls are untested. |
+| Premiere / Final Cut / Microsoft Office / Resolve / Photos | Untested. Free alternatives have separately named rows. |
+| Two independent Macs | Untested, as the user chose this Mac. |
+
+Zed 1.7.2 and Cursor 3.24.12 now have native UI FSKit open-folder/Unicode edit/save and
+server-byte checks, plus project searches with two matches in two files. Each kept its old
+open buffer more than 5 s after the peer commit, then showed the peer bytes after close/reopen.
+GUI reopen latency against 5 s is unmeasured; APFS GUI controls remain untested. These
+[GUI observations](../bench/results/mac-app-matrix/raw/editor-ui.jsonl) do not turn the faster
+fresh-path filesystem probes into a GUI notification pass.
+
+TextEdit 1.21 also passes native Revert To Last Opened (previous Unicode bytes), Duplicate
+to a separate fixture, and autosave of a duplicate edit without Command-S after about 60 s.
+Browse All Versions opens the current-document view, but no earlier document appeared;
+earlier native-version recovery remains unproven, consistent with the separate headless
+NSFileVersion error 512. The [sourced UI observations](../bench/results/mac-app-matrix/raw/textedit-ui-parent-observations.jsonl)
+are separate from the basic APFS save control and from server-version restore/reopen work.
+The [mode-0444 fixture](../bench/results/mac-app-matrix/raw/textedit-locked-ui.jsonl) also prompts
+to Unlock/Duplicate when edited; Cancel preserves the Unicode bytes and mode. Hidden/immutable
+flags are untested.
+
+QuickTime's [native UI/control evidence](../bench/results/mac-app-matrix/raw/quicktime-ui.jsonl)
+shows playback and Show Clips seeking, but the 0–2 s trim/save produces no export target and
+no successful save acknowledgement on either surface. The same alert on APFS and FSKit does
+not establish a new FSKit-specific defect. The source movie's original SHA remains unchanged;
+GUI access adds last-used/quarantine metadata versions only. The independently validated
+[AVFoundation HEVC export](../bench/results/mac-app-matrix/raw/media-small-fixed.jsonl.gz) does
+not prove QuickTime GUI export. The duplicate's full SHA/server comparison remains untested.
+The [fresh-fork GUI evidence](../bench/results/mac-app-matrix/raw/quicktime-cold-ui.jsonl)
+records zero client cache blocks before the native open workflow, with playback and
+90→10→90 s seeking afterward. The dialog/open path can preload before Play, and local
+object-store caches remain warm: this is not zero-cache-at-Play or cold-server evidence.
+
+A second fresh read-only fork closes the separate decoder-cache gap. Its
+[baseline](../bench/results/mac-app-matrix/raw/native-cold-media-baseline.jsonl) and
+[direct inspections](../bench/results/mac-app-matrix/raw/native-cold-media-inspect.jsonl)
+show zero indexed blocks/bytes for each clip's ETag immediately before the first AVFoundation
+URL open, without an earlier Finder/chooser/GUI body read. First and last clips report
+100 s and 10.1667 s at 1920×1080; six ranges in each of four cold/warm runs decode matching
+frame counts (24 ranges). Process wall times are 0.629/0.401 s for first cold/warm and
+0.464/0.410 s for last cold/warm. Server/object-store caches may be warm. The sampled combined
+allocated client-cache peak is 4,706,942,976 bytes, below 8 GB; this is a sampled maximum,
+not an atomic instantaneous peak. This direct decoder proof is separate from QuickTime's
+chooser workflow and does not claim zero cache at its Play button.
+
+The [50 GB summary](../bench/results/mac-app-matrix/raw/media-50gb-summary.json) and
+[manifest](../bench/results/mac-app-matrix/raw/media-50gb-manifest.json) record 30 unique clips
+and all 30 source/server hashes, metadata/history, first/last native scrubs and 2 s HEVC
+export/decode. The GUI duplicate is excluded from the project count. Disk peaks are sampled
+maxima, not atomic instantaneous peaks; the source view is virtual and no APFS source copy
+of the whole project was made. The original disappearing-server-temporary-file disk sample
+and QuickTime metadata-version preflight remain preserved; the continued run has zero
+failures. These scoped media passes do not complete the two-Mac or target-editor requirements.
+
+Xcode's [native GUI observation](../bench/results/mac-app-matrix/raw/xcode-ui.jsonl) and
+[four-file collector](../bench/results/mac-app-matrix/raw/xcode-ui-collector.jsonl.gz) pass
+open/source-edit/save/Build/Run and server equality. GUI products used Xcode's default
+DerivedData outside the mounted dataset. The fixture's traditional header-search warning
+was corrected in a separate headless fixture; its builds/server check also pass. The native
+Versions warning on close was acknowledged with Don't Ask Again left unchecked. Exact
+APFS GUI controls and Xcode peer-watch refresh remain untested.
+
+**Small resource forks add a separate API limitation.** A 17-byte resource fork reads at
+position 0 on FSKit but returns `EINVAL` at 1, 17 (EOF) and 18; APFS returns 16, 0 and 0 bytes.
+Apple's [copyfile source](https://github.com/apple-oss-distributions/copyfile/blob/main/copyfile.c)
+advances the fork-read position until EOF. Here its first chunk succeeds and the EOF read
+fails, so `COPYFILE_XATTR`, `COPYFILE_ALL` and clone fallback fail even far below 64 KiB.
+Data-only/stat copies and `COPYFILE_ALL` with only the forks removed pass. Overwriting with
+`COPYFILE_ALL` can leave an empty destination after the error; the intact source and partial
+destination are preserved. It is a failed non-atomic copy, not an acknowledged successful save.
+The SDK's XattrHandler exposes no position to the module, so there is no contained suffix/EOF
+fix for an offset the handler is not given. Increasing the protocol's xattr size does not fix
+this. Apple's FAT module has **not** been tested for this positional behavior. The resource-fork
+evidence and primary API references are in the matrix README.
+
+**All-zero FinderInfo listing is fixed.** Preview PDF and Numbers CSV exports store exactly
+32 zero bytes as `com.apple.FinderInfo`; the FSKit kernel returns `ENOATTR` for that value while
+the module used to list its name, causing generic xattr collectors to fail. The module now
+omits only that exact value from listings, matching APFS absence. Stored values/history remain
+intact; ordinary empty/all-zero xattrs and nonzero FinderInfo remain visible. The focused probe
+had two failed required checks before rebuilding and none of its 12 required checks failed
+after normal remount. Two CREATE/REPLACE storage-policy differences remain explicitly recorded.
+The native export collector then reconciled 10 files, with zero failures, using a named
+normalization of only raw remote zero32 FinderInfo to macOS absence. This does not prove
+Numbers formula/GUI coverage.
+[Fix PR #63](https://github.com/vishnu597/voidfs/pull/63) and
+[raw evidence](../bench/results/mac-finderinfo/README.md).
+
+**Two publication/control defects have separate work.** Drive-scoped pause resolved to the
+alias, while mounted queue entries use the stable ID; mounted saves therefore escaped both
+alias and ID CLI pauses. The contained fix preserves both stored spellings, applies
+pause/resume/cancel to both, uses the validated offline identity memo, and migrates old
+alias-only pauses before the worker starts. All three new regressions fail on promoted old
+code; all five upload tests pass with this fix alone. [PR #64](https://github.com/vishnu597/voidfs/pull/64) is open, with
+[focused proof](../bench/results/mac-upload-drive-scope/README.md). Separately, a 171,808,569-byte
+new mounted video initially failed publication because multipart completion cannot carry its absence
+guard. A guarded, bounded stream fix is in [PR #65](https://github.com/vishnu597/voidfs/pull/65)
+and the full media rerun now passes the declared 50 GB scope above. The first media workaround
+used global pause with its state guarded/restored; final generation uses corrected
+drive-scoped alias/ID pause controls and verifies them before writing.
+The final [#64 CI run](https://github.com/vishnu597/voidfs/actions/runs/38430184924) passes all
+six required jobs; #63 and #65 also have green required CI. This records validation, not a
+claim that the incomplete application/two-Mac release gate has passed.
+
+These results do not close item 3's cached-miss blocker, item 4's `RENAME_SWAP`/large-xattr
+requirements, or item 6's failed/untested scenarios. Later `/Volumes`, transfer UI, protocol
+RFCs and distribution work remain separate deliverables.

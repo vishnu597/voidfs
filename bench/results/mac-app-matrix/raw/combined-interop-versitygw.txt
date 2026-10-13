@@ -1,0 +1,244 @@
+== direct uploads (versitygw): presigned PUTs: a wrong x-amz-checksum-sha256 was refused (HTTP 400); a PUT without the signed checksum was refused (HTTP 400 or 403); If-None-Match on an existing object was refused (HTTP 412). Direct uploads are offered, binding both
+== storage credentials (versitygw): storage credentials: none could be minted: STS AssumeRole answered HTTP 405: MethodNotAllowed The specified method is not allowed against this resource. Storage credentials are NOT offered
+== admin listener (versitygw)
+ok    /healthz answers
+ok    /readyz: ready
+ok    /healthz on the S3 port is a drive's path, not the health check
+ok    the admin port does not serve S3
+ok    /metrics answers in the text format
+ok    /metrics has voidfs_s3_requests_total
+ok    /metrics has voidfs_s3_request_duration_seconds_bucket
+ok    /metrics has voidfs_bucket_requests_total
+ok    /metrics has voidfs_bucket_request_errors_total
+ok    /metrics has voidfs_bucket_request_duration_seconds_bucket
+ok    /metrics has voidfs_cache_hits_total
+ok    /metrics has voidfs_cache_misses_total
+ok    /metrics has voidfs_cache_evictions_total
+ok    /metrics has voidfs_cache_bytes
+ok    /metrics has voidfs_commit_transactions_bucket
+ok    /metrics has voidfs_commit_log_write_seconds_bucket
+ok    /metrics has voidfs_commits_total
+ok    /metrics has voidfs_gc_phase
+ok    /metrics has voidfs_drives
+ok    /metrics has voidfs_uptime_seconds
+ok    /metrics has voidfs_build_info
+ok    every series is voidfs_
+ok    create a drive
+ok    put an object
+ok    get it (1)
+ok    get it (2)
+ok    the put is counted
+ok    the gets are counted
+ok    both gets hit the shard cache
+ok    neither went to the bucket
+ok    the put wrote a log entry
+ok    a drive is open
+ok    remove the drive
+33 checks passed
+== conformance (versitygw)
+PASS  drive-lifecycle                       7 ms
+PASS  versioning-always-enabled             3 ms
+PASS  put-get-roundtrip                     4 ms
+PASS  get-range                             3 ms
+PASS  conditional-put                       5 ms
+PASS  write-at-offset                       8 ms
+PASS  write-at-extends-with-zeros           5 ms
+PASS  write-at-preconditions                5 ms
+PASS  truncate-and-extend                   7 ms
+PASS  batched-patch                         6 ms
+PASS  malformed-patch-rejected              4 ms
+PASS  splice-insert-remove                  6 ms
+PASS  user-metadata-on-edits                9 ms
+PASS  version-history-and-restore           6 ms
+PASS  read-by-version-id                    5 ms
+PASS  read-as-of                            5 ms
+PASS  history-is-immutable                  3 ms
+PASS  folders-and-path-conflicts            7 ms
+PASS  delete-and-folders                    7 ms
+PASS  listing-pagination                    5 ms
+PASS  special-character-keys                3 ms
+PASS  rename-file                           6 ms
+PASS  rename-replace-atomic-save            6 ms
+PASS  rename-folder-subtree                 6 ms
+PASS  copy-by-reference                     4 ms
+PASS  fork-copy-on-write                   12 ms
+PASS  fork-missing-source                   1 ms
+PASS  multipart-one-version               287 ms
+PASS  unsupported-operation                 2 ms
+PASS  unsigned-extension-header-rejected      4 ms
+PASS  read-key-scope                        4 ms
+PASS  attributes                            7 ms
+PASS  listing-with-attributes               6 ms
+PASS  recently-deleted                      7 ms
+PASS  subtree-restore-as-of                15 ms
+PASS  change-feed                           7 ms
+PASS  small-files-roundtrip                15 ms
+PASS  small-file-edits                     16 ms
+PASS  small-file-history                   12 ms
+PASS  folder-restore-versions-each-object     17 ms
+PASS  writes-version-the-folders-they-make      7 ms
+PASS  folder-restore-in-the-feed           12 ms
+PASS  replaced-file-comes-back-by-its-last-version      8 ms
+PASS  version-of-another-object            13 ms
+SKIP  direct-upload-not-offered        the server offers direct uploads, which the other direct-upload cases test
+PASS  direct-upload-roundtrip             732 ms
+PASS  direct-upload-held-counts          2065 ms
+PASS  direct-upload-missing-shard         573 ms
+PASS  direct-upload-token                1540 ms
+PASS  direct-upload-preconditions        1220 ms
+PASS  direct-upload-store-refuses-wrong-bytes    549 ms
+PASS  storage-credentials-not-offered       3 ms
+SKIP  storage-credentials-describe-the-drives-storage the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones
+SKIP  storage-credentials-read-the-drive the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones
+SKIP  storage-credentials-reach-no-further the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones
+SKIP  storage-credentials-for-read-keys the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones
+
+51 passed, 0 failed, 5 skipped
+== conformance, virtual-host style (versitygw)
+PASS  drive-lifecycle                       7 ms
+PASS  versioning-always-enabled             3 ms
+PASS  put-get-roundtrip                     4 ms
+PASS  get-range                             3 ms
+PASS  conditional-put                       5 ms
+PASS  write-at-offset                       5 ms
+PASS  write-at-extends-with-zeros           6 ms
+PASS  write-at-preconditions                5 ms
+PASS  truncate-and-extend                   6 ms
+PASS  batched-patch                         6 ms
+PASS  malformed-patch-rejected              5 ms
+PASS  splice-insert-remove                  6 ms
+PASS  user-metadata-on-edits               10 ms
+PASS  version-history-and-restore           7 ms
+PASS  read-by-version-id                    4 ms
+PASS  read-as-of                            5 ms
+PASS  history-is-immutable                  4 ms
+PASS  folders-and-path-conflicts            6 ms
+PASS  delete-and-folders                    7 ms
+PASS  listing-pagination                    6 ms
+PASS  special-character-keys                4 ms
+PASS  rename-file                           6 ms
+PASS  rename-replace-atomic-save            5 ms
+PASS  rename-folder-subtree                 6 ms
+PASS  copy-by-reference                     4 ms
+PASS  fork-copy-on-write                   13 ms
+PASS  fork-missing-source                   1 ms
+PASS  multipart-one-version               266 ms
+PASS  unsupported-operation                 2 ms
+PASS  unsigned-extension-header-rejected      4 ms
+PASS  read-key-scope                        5 ms
+PASS  attributes                            6 ms
+PASS  listing-with-attributes               4 ms
+PASS  recently-deleted                      6 ms
+PASS  subtree-restore-as-of                11 ms
+PASS  change-feed                           7 ms
+PASS  small-files-roundtrip                14 ms
+PASS  small-file-edits                     14 ms
+PASS  small-file-history                   11 ms
+PASS  folder-restore-versions-each-object     14 ms
+PASS  writes-version-the-folders-they-make      7 ms
+PASS  folder-restore-in-the-feed           11 ms
+PASS  replaced-file-comes-back-by-its-last-version      7 ms
+PASS  version-of-another-object            10 ms
+SKIP  direct-upload-not-offered        the server offers direct uploads, which the other direct-upload cases test
+PASS  direct-upload-roundtrip             701 ms
+PASS  direct-upload-held-counts          1942 ms
+PASS  direct-upload-missing-shard         550 ms
+PASS  direct-upload-token                1483 ms
+PASS  direct-upload-preconditions        1220 ms
+PASS  direct-upload-store-refuses-wrong-bytes    552 ms
+PASS  storage-credentials-not-offered       3 ms
+SKIP  storage-credentials-describe-the-drives-storage the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones
+SKIP  storage-credentials-read-the-drive the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones
+SKIP  storage-credentials-reach-no-further the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones
+SKIP  storage-credentials-for-read-keys the server does not issue storage credentials (protocol §5.5): its store can't mint scoped ones
+
+51 passed, 0 failed, 5 skipped
+== aws-chunked, both styles (versitygw)
+ok    create drive
+ok    put STREAMING-UNSIGNED-PAYLOAD-TRAILER
+ok    read back STREAMING-UNSIGNED-PAYLOAD-TRAILER
+ok    put STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+ok    read back STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+ok    put STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
+ok    read back STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
+ok    a bad chunk signature is refused
+ok    a wrong trailing checksum is refused
+ok    and nothing was written
+ok    a signature that leaves out host is refused, as S3 refuses it
+ok    and nothing was written
+ok    header auth without x-amz-content-sha256 is refused, as S3 refuses it
+ok    and nothing was written
+ok    hard-delete drive
+
+15 checks passed
+ok    create drive
+ok    put STREAMING-UNSIGNED-PAYLOAD-TRAILER
+ok    read back STREAMING-UNSIGNED-PAYLOAD-TRAILER
+ok    put STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+ok    read back STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+ok    put STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
+ok    read back STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
+ok    a bad chunk signature is refused
+ok    a wrong trailing checksum is refused
+ok    and nothing was written
+ok    a signature that leaves out host is refused, as S3 refuses it
+ok    and nothing was written
+ok    header auth without x-amz-content-sha256 is refused, as S3 refuses it
+ok    and nothing was written
+ok    hard-delete drive
+
+15 checks passed
+== virtual-host with curl (versitygw)
+ok    create a drive at its host
+ok    head the drive
+ok    put an object
+ok    get it at its host
+ok    get it path-style at the bare domain
+ok    get it path-style at another host
+ok    host case and a trailing dot
+ok    get it at the drive id's host
+ok    list objects
+ok    list drives at the bare domain
+ok    write at an offset (§4.1)
+ok    history (§4.4)
+ok    rename (§4.7)
+ok    read the renamed object
+ok    list with attributes (§4.9)
+ok    describe (§5.4)
+ok    change feed (§5.6)
+ok    fork (§5.2)
+ok    copy from another drive
+ok    read the copy
+ok    create a multipart upload
+ok    complete it: Location is on the drive's host
+ok    create a drive whose name has dots
+ok    it is the drive named with dots
+ok    delete the drive (§5.3)
+ok    undelete it
+ok    hard-delete vh-4b9e495503
+ok    hard-delete vh-4b9e495503-fork
+ok    hard-delete vh-4b9e495503.dotted
+
+29 checks passed
+== rclone (versitygw)
+ok    mkdir and lsd
+ok    copy (with a multipart upload)
+2026/10/13 12:38:11 NOTICE: S3 bucket interop-rclone-aq9dc7i6xn path tree: 0 differences found
+2026/10/13 12:38:11 NOTICE: S3 bucket interop-rclone-aq9dc7i6xn path tree: 4 matching files
+ok    check --download
+ok    size
+2026/10/13 12:38:11 NOTICE: S3 bucket interop-rclone-aq9dc7i6xn path tree: 0 differences found
+2026/10/13 12:38:11 NOTICE: S3 bucket interop-rclone-aq9dc7i6xn path tree: 4 matching files
+ok    sync and check
+ok    server-side copyto
+ok    moveto
+ok    rcat and cat
+ok    deletefile
+ok    delete and rmdir remove the bucket
+10 passed
+== boto3 (versitygw)
+skipped: boto3 is not installed (pip install boto3)
+== SIGTERM stops the server gracefully (versitygw)
+stopped, with status 0
+== the pool lists inline-data (versitygw)
+The pool already lists inline-data.
