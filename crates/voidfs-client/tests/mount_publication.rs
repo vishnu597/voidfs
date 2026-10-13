@@ -1026,6 +1026,8 @@ async fn a_local_ds_store_renames_only_as_one_and_shadows_the_drives_own() {
     write_new(&ns, ns.root(), ".DS_Store", b"local").await;
     write_new(&ns, ns.root(), "plain", b"plain").await;
     let empty = ns.mkdir(ns.root(), "empty", 0o755).await.unwrap().ino;
+    // These local-only renames do not test racing the parent's initial publication.
+    f.publish().await;
     // Crossing between a local-only file and a published name is EXDEV: `mv` copies instead.
     assert_eq!(ns.rename(ns.root(), ".DS_Store", ns.root(), "named", RenameMode::Replace).await.unwrap_err(), FsError::CrossDevice);
     assert_eq!(ns.rename(ns.root(), "plain", empty, ".DS_Store", RenameMode::Replace).await.unwrap_err(), FsError::CrossDevice);
