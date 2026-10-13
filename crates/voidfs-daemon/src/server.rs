@@ -292,7 +292,9 @@ impl Daemon {
         // through the API elsewhere.
         let fetcher = Arc::new(BucketFetcher::new(client.clone(), BucketConfig::default()).with_connectivity(conn.clone()));
         let cache = Cache::open(store.clone(), fetcher, cfg.cache.clone()).await?;
-        let queue = Queue::open(store.clone(), client.clone(), QueueConfig { connectivity: Some(conn.clone()), ..cfg.queue.clone() }).await?;
+        let dir = store.dir().to_owned();
+        let aliases = tokio::task::spawn_blocking(move || crate::sessions::queue_aliases(&dir)).await.map_err(voidfs_client::Error::from)??;
+        let queue = Queue::open_with_drive_aliases(store.clone(), client.clone(), QueueConfig { connectivity: Some(conn.clone()), ..cfg.queue.clone() }, aliases).await?;
         Ok((queue, cache, conn, client))
     }
 
