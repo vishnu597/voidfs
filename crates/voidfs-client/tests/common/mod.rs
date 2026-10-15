@@ -55,6 +55,7 @@ struct ProxyState {
     http: reqwest::Client,
     faults: Mutex<VecDeque<Fault>>,
     seen: Mutex<Vec<String>>,
+    abandoned: Mutex<Vec<String>>,
     /// Held before every request is forwarded.
     delay: Mutex<Duration>,
     inflight: std::sync::atomic::AtomicUsize,
@@ -82,6 +83,7 @@ impl Proxy {
             http: reqwest::Client::new(),
             faults: Mutex::new(VecDeque::new()),
             seen: Mutex::new(Vec::new()),
+            abandoned: Mutex::new(Vec::new()),
             delay: Mutex::new(Duration::ZERO),
             inflight: Default::default(),
             most: Default::default(),
@@ -104,8 +106,15 @@ impl Proxy {
         self.state.seen.lock().unwrap().clone()
     }
 
+    /// Those of [`Proxy::seen`] whose client gave up part way through the body: they went no
+    /// further.
+    pub fn abandoned(&self) -> Vec<String> {
+        self.state.abandoned.lock().unwrap().clone()
+    }
+
     pub fn clear(&self) {
         self.state.seen.lock().unwrap().clear();
+        self.state.abandoned.lock().unwrap().clear();
     }
 
     /// Holds every request this long before forwarding it.
@@ -123,7 +132,8 @@ async fn handle(State(st): State<Arc<ProxyState>>, req: axum::extract::Request) 
     let (parts, body) = req.into_parts();
     let pq = parts.uri.path_and_query().map_or("/".to_owned(), |p| p.as_str().to_owned());
     let resume = parts.headers.get("last-event-id").and_then(|v| v.to_str().ok()).map(|v| format!(" last-event-id={v}")).unwrap_or_default();
-    st.seen.lock().unwrap().push(format!("{} {}{resume}", parts.method, pq));
+    let line = format!("{} {}{resume}", parts.method, pq);
+    st.seen.lock().unwrap().push(line.clone());
     let fault = st.faults.lock().unwrap().pop_front().unwrap_or(Fault::Pass);
     let n = st.inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     st.most.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
@@ -144,6 +154,7 @@ async fn handle(State(st): State<Arc<ProxyState>>, req: axum::extract::Request) 
     }
     // A client that gave up part way through its body gets an answer it won't read.
     let Ok(body) = axum::body::to_bytes(body, usize::MAX).await else {
+        st.abandoned.lock().unwrap().push(line);
         return Response::builder().status(400).body(Body::empty()).unwrap();
     };
     let mut rb = st.http.request(parts.method.clone(), format!("{}{}", st.upstream, pq));
