@@ -220,7 +220,8 @@ verification does not change the scorecard counts.
   October). It mounts with FSKit since step 5's item 3 (10 October), writable since item 4
   (12 October).
 - D3 writes since step 5's item 4, but for `RENAME_SWAP` (FSKit overwrites) and resource forks
-  over 64 KiB; D6's cache and read-ahead reach the mount through the daemon since item 3, and D11
+  over 64 KiB ([RFC 0006](../rfcs/0006-extended-attributes-over-64-kib.md), proposed 15
+  October); D6's cache and read-ahead reach the mount through the daemon since item 3, and D11
   is the spike's shell, which now asks the daemon to mount.
   Item 6's measured application scopes do not complete D3 or D5: remote watcher notifications,
   small resource-fork offset reads, native Versions and the two-Mac application gate remain open
