@@ -1069,9 +1069,20 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     // MARK: - Extended attributes
 
+    /// Whether `item` has extended attributes, so that a file without any is answered here. They
+    /// are the inode's, as the daemon's `listxattr` and `getxattr` read them, not the open
+    /// version's: a handle's attributes keep `hasXattrs` from its open, and while the file has
+    /// unpublished staged bytes every open binds it from the stage's first write. So a reader of a
+    /// file Finder has just copied (create, write, then setxattr) saw none until the bytes
+    /// published (the 15 October trace). A retired incarnation keeps its handle's answer.
+    private func hasXattrs(_ item: VoidfsItem) async throws -> Bool {
+        if lock.withLock({ item.retired }) { return try await attr(item).hasXattrs }
+        return try await call { try await $0.getattr(item.ino) }.hasXattrs
+    }
+
     func xattrs(of item: FSItem, context: FSContext) async throws -> FSListXattrsResult {
         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
-        guard try await attr(item).hasXattrs else { return FSListXattrsResult(xattrNames: [])! }
+        guard try await hasXattrs(item) else { return FSListXattrsResult(xattrNames: [])! }
         var names = try await call { try await $0.listxattr(item.ino) }
         // APFS treats the fixed-size, all-zero FinderInfo structure as absent. FSKit's
         // kernel also returns ENOATTR for that value, but doesn't remove its name from
@@ -1088,7 +1099,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     func xattr(named name: FSFileName, of item: FSItem, context: FSContext) async throws -> FSGetXattrResult {
         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
-        guard let n = name.string, try await attr(item).hasXattrs else { throw posix(ENOATTR) }
+        guard let n = name.string, try await hasXattrs(item) else { throw posix(ENOATTR) }
         return FSGetXattrResult(xattrValue: try await call { try await $0.getxattr(item.ino, n) })!
     }
 
