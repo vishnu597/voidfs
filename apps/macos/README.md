@@ -90,13 +90,18 @@ scoped results on this Mac. Local FSEvents/kqueue operations pass, but remote co
 watcher notifications within 5 seconds; an app may need a rescan to discover them. Native
 Versions rejects safely. Positional reads of even a 17-byte resource fork fail after the first
 chunk, so `copyfile` metadata copies can fail independently of the 64 KiB size limit. An
-all-zero 32-byte FinderInfo listing mismatch is fixed in
-[PR #63](https://github.com/vishnu597/voidfs/pull/63)
+all-zero 32-byte FinderInfo listing mismatch is fixed in merged
+[PR #63](https://github.com/vishnu597/voidfs/pull/63) (`fa3ab3e`)
 ([evidence](../../bench/results/mac-finderinfo/README.md)); the stored value/history remains
 intact and two CREATE/REPLACE policy differences stay documented. Drive-scoped upload controls
-have a separately tested alias/ID fix in [PR #64](https://github.com/vishnu597/voidfs/pull/64)
+have an alias/ID fix merged in [PR #64](https://github.com/vishnu597/voidfs/pull/64) (`7734d9d`)
 ([evidence](../../bench/results/mac-upload-drive-scope/README.md)); guarded large-file publication
-is in [PR #65](https://github.com/vishnu597/voidfs/pull/65). The declared synthetic-media scope
+is fixed in merged [PR #65](https://github.com/vishnu597/voidfs/pull/65) (`ceedeee`). These fixes,
+the fixture stabilization (#62, `baa8369`) and the matrix rig/evidence (#66, `21b2249`) merged
+on 13 October. All eight jobs passed in the final
+[main CI run](https://github.com/vishnu597/voidfs/actions/runs/38441497023) on `21b2249`
+([merge record](../../bench/results/mac-app-matrix/README.md#final-verification-and-cleanup)).
+The declared synthetic-media scope
 passes on this Mac: 30 unique ProRes clips total 50,000,175,334 bytes, with all source/server
 hashes and metadata/history checked, native first/last scrubs and a 2 s HEVC export decoded.
 Native Xcode open/source-edit/save/Build/Run also passes, printing the expected 16 and exiting 0.
