@@ -28,3 +28,4 @@ RFCs are never deleted. A later RFC that replaces one says so, and the old one i
 | [0003](0003-small-content-in-descriptors.md) | Small content inside the content descriptor | Implemented |
 | [0004](0004-a-version-for-every-object-it-changes.md) | A version for every object a transaction changes | Implemented |
 | [0005](0005-user-metadata-on-edits.md) | User metadata on edits | Implemented |
+| [0006](0006-extended-attributes-over-64-kib.md) | Extended attributes over 64 KiB | Proposed |

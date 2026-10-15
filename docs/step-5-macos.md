@@ -231,7 +231,10 @@ decision is reopened before adding more app surface.
 destination on every FSKit volume, Apple's FAT module included (a release blocker; the user keeps
 building and files a Feedback), and resource forks over 64 KiB need a protocol change. FSKit
 passes no fsync, so the user accepted a flush within a second of the last write in its place.
-The evidence is in [writable FSKit](#writable-fskit-12-october).
+The evidence is in [writable FSKit](#writable-fskit-12-october). **15 October:**
+[RFC 0006](../rfcs/0006-extended-attributes-over-64-kib.md) proposes that change, values up to
+16 MiB stored as content, and is not accepted. Whether FSKit then passes Finder such values whole
+is its first open question, unmeasured.
 
 Map writable handlers to the durable local operations, not directly to remote SDK mutations.
 Return write success after staging that survives a daemon or extension crash; cloud publish is
@@ -2004,7 +2007,8 @@ trace.
 - **xattrs over 64 KiB.** Protocol §4.8 allows 64 KiB of xattrs an object and calls larger ones a
   future feature. A resource fork over that can't be stored: `cp` copies the data, says
   "Argument list too long" and exits 1, and **Finder's copy succeeds and drops the fork
-  silently**. Storing them needs an RFC.
+  silently**. Storing them needs an RFC: [RFC 0006](../rfcs/0006-extended-attributes-over-64-kib.md),
+  proposed 15 October.
 - **Finished uploads accumulate.** Every save through the mount stays listed as done in `void
   uploads --all` until `void uploads clear`. Fine for the CLI; item 8's transfer view will want
   to fold them.
