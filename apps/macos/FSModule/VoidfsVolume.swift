@@ -184,8 +184,8 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     #if VOIDFS_LARGE_XATTR_PROBE_BITS
     /// Test-only second probe build: FSKit uses this instead of `maximumXattrSize` when both exist.
     var maximumXattrSizeInBits: Int {
-        log.notice("probe: FSKit read maximumXattrSizeInBits 26")
-        return 26
+        log.notice("probe: FSKit read maximumXattrSizeInBits 17")
+        return 17
     }
     #endif
     var maximumFileSize: UInt64 { 5 << 40 }
