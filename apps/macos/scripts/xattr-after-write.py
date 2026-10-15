@@ -13,18 +13,20 @@ The attributes are a 26-byte user.voidfs.sentinel and a 4,096-byte com.apple.Res
   com.apple.provenance the kernel tags a tracked process's files with, open it for writing,
   write 43,008 bytes, set the attributes on that descriptor, and close it. A round whose file
   held an attribute before its write (the tag stayed, or came back) is inconclusive: the bug
-  needs a file with none when it's first written.
+  needs a file with none when it's first written. On 15 October, run from a tracked process,
+  the tag stayed on APFS, and on the FSKit mount the kernel set it again 7 ms after its removal,
+  so every such round was inconclusive.
 - --finder makes the source on APFS (in a temporary folder) and has Finder copy it into the
   child with `duplicate`, as bench/results/fskit-large-xattrs did. It needs osascript's
-  Automation access to Finder.
+  Automation access to Finder. This is the mode that reproduces the bug.
 
 With --settle, a round that misses some opens and lists again every half second, for at most that
 long, and records when they appeared.
 
 Before the fix, the FSKit volume's flistxattr on the reader's descriptor listed none until the
-file's staged bytes published: 21 of 22 Finder copies on 15 October, settled about a minute later.
-`cp` didn't show it, as the kernel tagged its files before their first open. One JSON line a
-round. Exit 0 when every round read every value back whole at once and at least one round was
+file's staged bytes published: 3 of 3 Finder rounds, which listed them 1.1 s after the copy
+(bench/results/fskit-xattrs-after-setxattr). `cp` didn't show it, as the kernel tagged its files
+before their first open. One JSON line a round. Exit 0 when every round read every value back whole at once and at least one round was
 conclusive, 1 when a round missed one, 2 on a setup failure or no conclusive round. It never
 mounts, registers or starts anything.
 """

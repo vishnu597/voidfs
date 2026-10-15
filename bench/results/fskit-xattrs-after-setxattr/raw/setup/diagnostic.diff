@@ -1,0 +1,36 @@
+diff --git a/apps/macos/FSModule/VoidfsVolume.swift b/apps/macos/FSModule/VoidfsVolume.swift
+index c4dbe63..8080359 100644
+--- a/apps/macos/FSModule/VoidfsVolume.swift
++++ b/apps/macos/FSModule/VoidfsVolume.swift
+@@ -24,6 +24,9 @@ struct VolumeOptions {
+     /// Push possible shared mappings on a serial sweep. Zero disables it for reproduction.
+     /// Unsynchronized stores are not acknowledged writes (step 5, 14 October).
+     var mmapPushMilliseconds = 500
++    /// DIAGNOSTIC, not committed: `-o xattr-gate=handle` gates xattr calls on an open handle's
++    /// hasXattrs, as before the fix, so one build shows both.
++    var handleXattrGate = false
+     /// What a write open is granted at most. Measured (step 5, item 4): with writeBack a write
+     /// returns before the module sees it, and killing the extension lost acknowledged bytes; with
+     /// writeThrough write(2) returns after the bytes are staged.
+@@ -46,6 +49,7 @@ struct VolumeOptions {
+                     case ("ro", nil), ("rdonly", nil): readOnly = true
+                     case ("rw", nil): readOnly = false
+                     case ("trace", _): trace = true
++                    case ("xattr-gate", let v?) where v == "handle": handleXattrGate = true
+                     case ("mmap-push-ms", let v?):
+                         if let ms = Int(v), (0...60_000).contains(ms) { mmapPushMilliseconds = ms }
+                     default: break
+@@ -1076,8 +1080,11 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
+     /// file Finder has just copied (create, write, then setxattr) saw none until the bytes
+     /// published (the 15 October trace). A retired incarnation keeps its handle's answer.
+     private func hasXattrs(_ item: VoidfsItem) async throws -> Bool {
+-        if lock.withLock({ item.retired }) { return try await attr(item).hasXattrs }
+-        return try await call { try await $0.getattr(item.ino) }.hasXattrs
++        let has: Bool
++        if options.handleXattrGate || lock.withLock({ item.retired }) { has = try await attr(item).hasXattrs }
++        else { has = try await call { try await $0.getattr(item.ino) }.hasXattrs }
++        if options.trace { log.notice("xattr gate \(item.ino) \(self.options.handleXattrGate ? "handle" : "inode", privacy: .public) handle \(self.lock.withLock { item.handle != nil }) hasXattrs \(has)") }
++        return has
+     }
+ 
+     func xattrs(of item: FSItem, context: FSContext) async throws -> FSListXattrsResult {
