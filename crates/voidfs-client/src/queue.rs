@@ -2412,12 +2412,16 @@ mod tests {
     async fn a_large_new_mount_file_publishes_through_a_guarded_bounded_stream() {
         let server = voidfs_server::test_server::TestServer::start().await.unwrap();
         let peer = client(&server.endpoint); peer.create_drive("drive", Default::default()).await.unwrap();
-        let (_dir, q, session) = large_new_file_session_with_timeout(&server.endpoint, peer.clone(), Duration::from_millis(300)).await;
+        // The paced upload, about 4.75 s, outlasts the timeout: a timeout that counted the silent
+        // upload would fail every attempt. The timeout also bounds the server's reply after the last
+        // piece, about 40 ms on a Mac but over 300 ms on CI runners, where a 300 ms timeout resent
+        // the stream.
+        let (_dir, q, session) = large_new_file_session_with_timeout(&server.endpoint, peer.clone(), Duration::from_secs(2)).await;
         let attr = session.create(session.root(), "file", 0o600).await.unwrap();
         let fh = session.open(attr.ino, true).await.unwrap();
         let bytes = Bytes::from(vec![0x5a; (5 * MIB + 37) as usize]);
         session.write(fh, 0, bytes.clone()).await.unwrap(); session.fsync(fh).await.unwrap();
-        q.set_bandwidth(Some(5 * MIB)).await.unwrap();
+        q.set_bandwidth(Some(MIB)).await.unwrap();
         let started = std::time::Instant::now();
         q.resume(Scope::All).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -2437,7 +2441,7 @@ mod tests {
         assert_eq!(item.sent, bytes.len() as u64);
         let remote = peer.get_object("drive", "file", Default::default()).await.unwrap();
         assert_eq!(remote.body, bytes);
-        assert!(started.elapsed() >= Duration::from_millis(800), "streaming must observe the shared upload limit");
+        assert!(started.elapsed() >= Duration::from_millis(4500), "streaming must observe the shared upload limit");
         assert_eq!(q.bytes_sent(), bytes.len() as u64, "every streamed content piece counts toward the queue's rate");
         assert_eq!(remote.meta.mode.as_deref(), Some("0600"));
         assert!(remote.meta.mtime.is_some());
