@@ -106,7 +106,7 @@ impl AttrsPatch {
         }
         let total: usize = a.xattrs.iter().map(|(k, v)| k.len() + base64_decoded_len(v)).sum();
         if total > MAX_XATTR_BYTES {
-            return Err(OpError::TooLarge("extended attributes exceed 64 KiB".into()));
+            return Err(OpError::TooLarge(format!("extended attributes exceed {MAX_XATTR_BYTES} bytes")));
         }
         if let Some(f) = &self.flags {
             a.flags = f.clone();

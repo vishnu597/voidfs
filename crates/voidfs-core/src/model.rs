@@ -323,7 +323,13 @@ pub struct Attrs {
 }
 
 /// Total decoded size of extended attributes allowed per object (protocol §7).
+#[cfg(not(feature = "large-xattr-probe"))]
 pub const MAX_XATTR_BYTES: usize = 64 * 1024;
+/// Test-only probe build: RFC 0006's 64 MiB an object, held inline.
+#[cfg(feature = "large-xattr-probe")]
+pub const MAX_XATTR_BYTES: usize = 64 << 20;
+/// Whether this is the test-only large-xattr probe build.
+pub const LARGE_XATTR_PROBE: bool = cfg!(feature = "large-xattr-probe");
 
 /// The current record of an object (format §7.7), plus the version that is its head.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

@@ -18,7 +18,12 @@ enum Bridge {
     /// crosses the socket.
     static let maxIo: UInt64 = 8 << 20
     static let maxEntries = 256
+    #if VOIDFS_LARGE_XATTR_PROBE
+    /// Test-only probe build (RFC 0006 open question 1): one value of 16 MiB.
+    static let maxXattr = 16 << 20
+    #else
     static let maxXattr = 64 << 10
+    #endif
     static let maxName = 255
     static let maxDrive = 1024
     /// Per extension connection.

@@ -876,7 +876,8 @@ struct AttrsBody {
 }
 
 async fn post_attrs(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
-    let body = BodyReader::new(body, ctx, MAX_SMALL_BODY)?.read_all().await?;
+    let limit = if voidfs_core::model::LARGE_XATTR_PROBE { MAX_EXTENSION_BODY } else { MAX_SMALL_BODY };
+    let body = BodyReader::new(body, ctx, limit)?.read_all().await?;
     let b: AttrsBody = serde_json::from_slice(&body).map_err(|e| S3Error::invalid(format!("attributes body: {e}")))?;
     let x = b.xattrs.unwrap_or_default();
     let patch = AttrsPatch {

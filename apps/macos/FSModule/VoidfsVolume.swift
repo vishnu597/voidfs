@@ -4,6 +4,7 @@
 // (Shared/BridgeClient.swift). The daemon's session answers every call; its invalidation relay says
 // what changed, here or on other machines, and the volume makes the kernel forget it with revokes.
 
+import CryptoKit
 import FSKit
 import Foundation
 import os
@@ -1083,13 +1084,31 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
                 names.removeAll { $0 == "com.apple.FinderInfo" }
             }
         }
+        if options.trace { log.notice("listxattr \(item.ino) \(names.count) names \(names.joined(separator: ","), privacy: .public)") }
         return FSListXattrsResult(xattrNames: names.map { FSFileName(string: $0) })!
+    }
+
+    /// Probe trace: a value's SHA-256, to show whether the module sees it whole.
+    private func digest(_ value: Data?) -> String {
+        guard let value else { return "-" }
+        return SHA256.hash(data: value).map { String(format: "%02x", $0) }.joined()
     }
 
     func xattr(named name: FSFileName, of item: FSItem, context: FSContext) async throws -> FSGetXattrResult {
         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
-        guard let n = name.string, try await attr(item).hasXattrs else { throw posix(ENOATTR) }
-        return FSGetXattrResult(xattrValue: try await call { try await $0.getxattr(item.ino, n) })!
+        guard let n = name.string, try await attr(item).hasXattrs else {
+            if options.trace { log.notice("getxattr \(item.ino) \(name.string ?? "?", privacy: .public) absent") }
+            throw posix(ENOATTR)
+        }
+        let start = ContinuousClock.now
+        do {
+            let value = try await call { try await $0.getxattr(item.ino, n) }
+            if options.trace { log.notice("getxattr \(item.ino) \(n, privacy: .public) \(value.count) bytes sha256 \(self.digest(value), privacy: .public) in \(ContinuousClock.now - start, privacy: .public)") }
+            return FSGetXattrResult(xattrValue: value)!
+        } catch {
+            if options.trace { log.notice("getxattr \(item.ino) \(n, privacy: .public) failed errno \(Bridge.errno(error))") }
+            throw error
+        }
     }
 
     /// Every name is stored, so the kernel never falls back to AppleDouble `._` files.
@@ -1097,14 +1116,21 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
         if options.readOnly { throw posix(EROFS) }
         guard let n = name.string else { throw posix(EINVAL) }
-        if options.trace { log.notice("setxattr \(item.ino) \(n, privacy: .public) policy \(policy.rawValue) \(value?.count ?? -1) bytes") }
-        if policy == .delete {
-            try await call { try await $0.removexattr(item.ino, n) }
-        } else {
-            guard let value else { throw posix(EINVAL) }
-            let how = policy == .mustCreate ? 1 : policy == .mustReplace ? 2 : 0
-            try await call { try await $0.setxattr(item.ino, n, value, how: how) }
+        if options.trace { log.notice("setxattr \(item.ino) \(n, privacy: .public) policy \(policy.rawValue) \(value?.count ?? -1) bytes sha256 \(self.digest(value), privacy: .public)") }
+        let start = ContinuousClock.now
+        do {
+            if policy == .delete {
+                try await call { try await $0.removexattr(item.ino, n) }
+            } else {
+                guard let value else { throw posix(EINVAL) }
+                let how = policy == .mustCreate ? 1 : policy == .mustReplace ? 2 : 0
+                try await call { try await $0.setxattr(item.ino, n, value, how: how) }
+            }
+        } catch {
+            if options.trace { log.notice("setxattr \(item.ino) \(n, privacy: .public) failed errno \(Bridge.errno(error))") }
+            throw error
         }
+        if options.trace { log.notice("setxattr \(item.ino) \(n, privacy: .public) stored in \(ContinuousClock.now - start, privacy: .public)") }
         lock.withLock { item.stale = item.handle != nil }
         return FSSetXattrResult(freeSpace: FSFreeSpace.noUpdate)!
     }

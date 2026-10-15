@@ -14,7 +14,8 @@ pub const MAX_WATCHES: usize = 64;
 pub const MAX_JSON: usize = 64 * 1024;
 pub const MAX_RESPONSE: usize = 1024 * 1024;
 /// An object's extended attribute names and values together, as `Capabilities::max_xattr_bytes` says.
-pub const MAX_XATTR: usize = 64 * 1024;
+/// The test-only probe build (feature `large-xattr-probe`, with voidfs-core's) carries one 16 MiB value.
+pub const MAX_XATTR: usize = if cfg!(feature = "large-xattr-probe") { 16 << 20 } else { 64 * 1024 };
 pub const EVENT_CAPACITY: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
