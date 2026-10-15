@@ -19,8 +19,8 @@ bytes, with ranges. Pools without the feature keep the 64 KiB limit.
 
 On the Mac, FSKit passes a module at most 262,143 bytes a value, and the module should accept at
 most 131,071 ([measured 15 October](#what-fskit-allows)). There this design fixes Finder's copies
-of forks up to that size, no more than a much smaller change would. [Open question 1](#open-questions)
-asks which to build.
+of forks up to that size, no more than a smaller inline raise would. It stays the proposal
+because it also serves clients that don't go through FSKit ([decided 15 October](#open-questions)).
 
 ## Motivation
 
@@ -361,24 +361,20 @@ Two cases.
 ## Open questions
 
 The first version of this RFC asked whether FSKit hands a module values over 64 KiB whole. It
-does, up to 262,143 bytes ([What FSKit allows](#what-fskit-allows)), which changes what the design
-buys the Mac:
+does, up to 262,143 bytes ([What FSKit allows](#what-fskit-allows)).
 
-1. **Which change.** On the Mac, this design and raising the inline limit to 256 KiB
-   ([Alternatives](#alternatives)) fix the same copies. This design also serves clients that don't
-   go through FSKit: the CLI, the SDK and a later Linux mount (PARITY step 9). It would serve the
-   Mac too if Apple raises FSKit's cap. The choices are:
-   - this design now;
-   - the inline raise now, and this design when a client needs more;
-   - neither until Apple raises the cap.
+That raised a choice: on the Mac, this design and raising the inline limit to 256 KiB
+([Alternatives](#alternatives)) fix the same copies. **Decided 15 October: this design stays the
+proposal.** It also serves clients that don't go through FSKit (the CLI, the SDK and a later
+Linux mount, PARITY step 9), and the Mac if Apple raises FSKit's cap. The inline raise remains an
+alternative.
 
-   *Recommended: the inline raise now.* It gives the Mac all FSKit allows, for a fraction of the
-   work and no format change. This RFC would then be revised to that change, keeping this design
-   as its alternative.
-2. **The module's limit.** 131,071 bytes refuses a cut-off fork, as today's module does. Up to
+Still open:
+
+1. **The module's limit.** 131,071 bytes refuses a cut-off fork, as today's module does. Up to
    262,143 bytes, Finder keeps larger forks, but a 131,072-byte piece of a cut-off fork would be
    stored as whole. The module could refuse values of exactly 131,072 bytes and accept the rest;
    that keeps forks up to 262,143 bytes and refuses a genuine fork of exactly that size.
-3. **The drive limits**, if this design goes ahead: 16 MiB a value and 64 MiB an object, or
-   larger? APFS accepts 1 GiB. Larger limits cost memory along the module, bridge and daemon
-   path, and longer single requests.
+2. **The drive limits:** 16 MiB a value and 64 MiB an object, or larger? APFS accepts 1 GiB.
+   Larger limits cost memory along the module, bridge and daemon path, and longer single
+   requests.

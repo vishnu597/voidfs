@@ -236,8 +236,9 @@ The evidence is in [writable FSKit](#writable-fskit-12-october). **15 October:**
 16 MiB stored as content, and is not accepted. FSKit itself passes a module at most 262,143 bytes
 a value, and a cut-off fork arrives as a 131,072-byte value that looks whole
 ([vishnu597/voidfs#71](https://github.com/vishnu597/voidfs/pull/71)). So on the Mac the module
-should stay under 131,072 bytes, and Finder's copies are fixed only up to that. The RFC asks
-whether a smaller inline raise to 256 KiB should come first.
+should stay under 131,072 bytes, and Finder's copies are fixed only up to that. The user kept the
+stored-value design over a smaller inline raise to 256 KiB; the module and drive limits are still
+open on the RFC.
 
 Map writable handlers to the durable local operations, not directly to remote SDK mutations.
 Return write success after staging that survives a daemon or extension crash; cloud publish is
