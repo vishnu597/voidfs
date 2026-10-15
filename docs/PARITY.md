@@ -929,14 +929,30 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      [main CI run](https://github.com/vishnu597/voidfs/actions/runs/38441497023) on `21b2249`;
      the [merge record](../bench/results/mac-app-matrix/README.md#final-verification-and-cleanup)
      preserves the earlier PR-head CI history. Item statuses and exit criteria are unchanged.
+   - **Status (2026-10-14, held mmap):** the [SQLite SHM investigation](../bench/results/mac-mmap-held/README.md)
+     reproduces the historical 43-byte kernel/server difference and localizes it before Rust
+     staging: the read-only daemon view and server agree. The old mapping flag was set only
+     after a write arrived without a writable daemon handle, missing mappings whose descriptor
+     stayed open. The user accepted a default 500 ms timer with serial page-push sweeps over
+     writable file incarnations retained until reclaim. An unsynchronized mapped store can
+     remain only in kernel memory and can be lost in a crash before its write callback; the
+     existing 1 s disk flush and 2 s quiet publication periods then apply from callback delivery.
+     This is not a hard 500 ms bound: a 1,000-dirty-candidate sweep measured 792.4 ms. The
+     default-option [probe](../bench/results/mac-mmap-held/raw/probe-default.jsonl.gz) and
+     [SQLite rerun](../bench/results/mac-mmap-held/raw/sqlite-default.jsonl.gz) pass, including strict
+     SHM equality. WriteThrough's
+     acknowledged `write(2)` promise and ordinary `-shm` names policy are unchanged. The
+     [durability table](step-5-macos.md#writable-fskit-12-october) distinguishes these states;
+     item 3/4/6 statuses and other release blockers remain unchanged.
      Before that, on **2026-10-13:** items 1–3 of 10 done, item 3 with a release blocker; item 4 built
      and not complete; item 6 in progress, not complete
      ([measured slice](step-5-macos.md#application-matrix-13-october),
      [matrix](../bench/results/mac-app-matrix/README.md)). Foundation safe-save operations,
      Git, headless/native GUI Xcode, durable SQLite `.db` semantics, Blender and LibreOffice persistence
      have scoped passes. Remote FSEvents/kqueue notifications fail, native Versions rejects
-     safely, positional reads of even tiny resource forks fail, and SQLite's strict SHM byte
-     equality fails. The all-zero FinderInfo listing defect is fixed
+     safely and positional reads of even tiny resource forks fail. The preserved 13 October
+     SQLite SHM byte-equality failure is historical; the 14 October delivery finding and passing
+     default-option rerun are recorded above. The all-zero FinderInfo listing defect is fixed
      ([PR #63](https://github.com/vishnu597/voidfs/pull/63), merged as `fa3ab3e`,
      [evidence](../bench/results/mac-finderinfo/README.md)); drive-scoped upload controls have
      a fix merged in [PR #64](https://github.com/vishnu597/voidfs/pull/64) as `7734d9d`

@@ -7,7 +7,8 @@ advertised capabilities, setting mode and mtime, and recognizing lost replies to
 and attribute changes added 8 October; the signed-bundle probe, the rest of the session calls,
 the Swift bridge and one daemon for the CLI and the app added 9 October; read-only FSKit on the
 daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October; the
-application matrix and its first fixes added 13 October. **Item 1 is complete**
+application matrix and its first fixes added 13 October; held mmap delivery and its durability
+policy clarified 14 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -85,6 +86,7 @@ writes through it since item 4 ([12 October](#writable-fskit-12-october)).
 | Cache and journal ownership | **One daemon owns mutable state; shared cache files are read through leases.** | An extension-owned core repeats state per drive and loses its process on eject. Neither a bridge nor an extension may independently open the writable state database. |
 | Partial-shard integrity | **Accepted 5 October: keep verified whole-shard reads; authenticated pieces require a later RFC.** | Length-only ranged reads fit today's format but weaken content-address verification. They require a separate policy decision and must not silently replace the verified path. |
 | `/Volumes` | **First prove a user-owned mountpoint; add a narrowly scoped privileged mount helper later.** | A release may use user-owned folders if the helper is not ready, but that does not complete the `/Volumes` deliverable in PARITY. Do not make all client I/O privileged. |
+| Unsynchronized mmap stores | **Accepted 14 October: enable serial kernel-page push sweeps on a 500 ms timer by default.** A store can remain only in the kernel until its write callback; it has no `write(2)` acknowledgement and a crash can lose it. The existing 1 s disk flush and 2 s quiet publication periods begin when bytes reach the module. [Finding and measurements](../bench/results/mac-mmap-held/README.md). | The timer interval is not a hard delivery bound: a sweep takes time and sweeps cannot overlap. The writeThrough acknowledgement and ordinary-file names policy remain unchanged. |
 
 The adapter, bridge and integrity choices are settled. The other recommendations preserve the
 existing plan or describe implementation requirements. The user also accepted these item 1
@@ -1875,11 +1877,13 @@ trace.
 2. Killing the extension: FSKit doesn't start it again. Under writeThrough every byte `write(2)`
    acknowledged was staged and published; under writeBack the kernel's pages were lost and
    `close` still returned 0. **writeThrough it is.**
-3. mmap: `msync` and the last close push a shared mapping's pages as write callbacks, also after
-   the descriptor closed. But once pages were pushed with no descriptor open, FSKit drops the
-   mapping's next stores at the file's next open, silently. The volume now pushes such a file's
-   pages itself at its next open (`setCacheState(…, action: .push)`, about 1 ms), and the stores
-   survive, a remount too.
+3. mmap: in the 12 October sequences, `msync` and the last close push a shared mapping's pages
+   as write callbacks, also after the descriptor closed. Once pages were pushed with no
+   descriptor open, FSKit drops the mapping's next stores at the file's next open, silently.
+   Pushing such a file before its next open (`setCacheState(…, action: .push)`, about 1 ms)
+   preserves those sequences. The [14 October finding](#held-mmap-stores-and-sqlite-shm-14-october)
+   identifies a separate gap while the descriptor stays open; these sequences do not establish
+   that every remaining mapped store is delivered by close.
 4. The volume's own writes came back as events (local ones, and each publication through the
    feed), and the volume revoked the file it was writing; a page-out after close then failed with
    `ESTALE` while `msync` returned 0. Fixed in the core and the volume (below).
@@ -1903,16 +1907,19 @@ trace.
 
 **Decisions.**
 
-- **Durability.** What each step leaves, on this Mac and in the drive:
+- **Durability.** What each step leaves, on this Mac and in the drive. The user accepted the
+  mmap distinction and default 500 ms push timer on 14 October:
 
   | When | On this Mac's disk | In the drive |
   | --- | --- | --- |
   | `write(2)` returns (writeThrough waits for the module) | Bytes in the stage file and their record committed `NORMAL`: they survive the daemon, the agent or the extension being killed | Nothing yet |
-  | Within 1 s of the last write (`StagingConfig::disk_flush`) | The stage file and its folders synchronized (`F_FULLFSYNC`) and a `FULL` commit: they survive a power loss | Nothing yet |
-  | `fsync`, `F_FULLFSYNC`, `sync(2)` | Nothing more: FSKit doesn't pass them on | |
-  | 2 s without writes, the file still open (§1, 6 October) | Flushed as at close | Queued |
-  | Last close | Flushed: synchronized, `FULL` commit | Queued |
-  | Unmount and eject | The volume releases its session, and the daemon flushes every file it still had open | Queued |
+  | Unsynchronized shared mmap store | May remain only in kernel pages until a push delivers a write callback. No `write(2)` acknowledgement has occurred; a crash can lose these stores | Nothing yet |
+  | Scheduled kernel-page push: 500 ms timer plus serial sweep cost | Bytes delivered by its write callbacks enter the same stage/`NORMAL` path as an ordinary write. This is not a hard 500 ms bound: the measured 1,000-dirty-candidate sweep took up to 792.4 ms | The same quiet-publication period starts from the delivered write callbacks |
+  | Within 1 s of the last module-delivered write (`StagingConfig::disk_flush`) | The stage file and its folders synchronized (`F_FULLFSYNC`) and a `FULL` commit: delivered bytes survive a power loss | Nothing yet |
+  | `fsync`, `F_FULLFSYNC`, `sync(2)` | No module synchronization callback: FSKit doesn't pass them on. Any page-write callbacks they induce follow the rows above | No additional publication guarantee from these calls alone |
+  | 2 s without module-delivered writes, the file still open (§1, 6 October) | Delivered staged bytes flushed as at close | Queued |
+  | Last close, for bytes already delivered to the module | Staged bytes flushed: synchronized, `FULL` commit. This does not promise that close forces every remaining mapped store out of the kernel | Queued |
+  | Unmount and eject | The volume releases its session, and the daemon flushes staged bytes for every file it still had open | Queued |
   | The volume's `synchronize` | Every writable handle flushed (macOS 27.0.1 never calls it) | Queued |
 
   Publication then runs from the journal (`void uploads`), paused or not, and recovery after a
@@ -2015,8 +2022,9 @@ on the volume at 8a11a2f and the daemon at d80e71a:
   and duplicates. Contents match by SHA-256 on the source, the mount and the server; every xattr
   round-trips byte for byte and the server holds them; no `._` files.
 - **Atomic saves** (`raw/atomic-save.txt`, `raw/textedit.txt`): `atomic.c` and TextEdit, as above.
-- **mmap writes** (`raw/mmap-final.txt`): stores with the descriptor open or closed reach the
-  server, and Q3's sequences that lost a store keep it.
+- **mmap writes** (`raw/mmap-final.txt`): the 12 October sequences with the descriptor open or
+  closed reach the server, and Q3's sequences that lost a store keep it. The distinct held-store
+  gap and its later fix are measured [on 14 October](../bench/results/mac-mmap-held/README.md).
 - **xattr round trips**: Finder's, plus `semantics.c`; empty values; the 64 KiB limit
   (`raw/resource-fork.txt`).
 - **Killing the extension** (`raw/kill-extension.txt`): a copied file, an appended file and
@@ -2166,7 +2174,7 @@ successful saves returning wrong bytes. Silent loss remains a failure.
 | FSEvents / kqueue | Nine local operations pass on each surface. All seven peer operations have no notifications within 5 s. Without held descriptors, fresh bytes/listings appear in 14–31 ms; explicit kqueue holds keep bytes old/missing until release. That held-cache behavior is measured separately from the missing notifications. |
 | Git 2.54.0 | Clone, status, edit/add/commit, rebase, stash/pop, checkout, gc/repack, worktrees, index.lock handling and fsck pass. Final 872 regular files reconcile with server bytes, mode, mtime and xattrs. `core.symlinks=false` materializes symlink targets as regular files; no full symlink pass is claimed. |
 | Xcode 27 beta | Pass for headless and native GUI open/edit/save/build/run scope. Four headless builds across APFS/FSKit pass. Native source edit/save and Build/Run print `Xcode GUI revision — 名前: 16`, exit 0; the GUI collector reconciles four files with zero failures. Build products remain outside the mount. Exact APFS GUI controls and peer watcher behavior remain untested. |
-| SQLite 3.54.0 | Durable `.db` rollback/WAL transactions, writer crash, checkpoint/integrity and restore/reopen pass. Strict byte equality fails for the 32,768-byte SHM file: 43 bytes differ after drain. Local locks do not establish cross-Mac writer coordination. |
+| SQLite 3.54.0 | Durable `.db` rollback/WAL transactions, writer crash, checkpoint/integrity and restore/reopen pass. The preserved 13 October run fails strict byte equality for the 32,768-byte SHM file: 43 bytes differ after drain. The [14 October 500 ms push rerun](../bench/results/mac-mmap-held/raw/sqlite-500ms.jsonl.gz) has zero failures, including strict SHM equality. Local locks do not establish cross-Mac writer coordination. |
 | Blender 5.2.2 LTS | Twenty native background persistence checks per surface pass, including fresh-process reopen, edit, external texture, animation, backup and render. GUI and large-project coverage are separate. |
 | LibreOffice Writer / Calc 26.8.1.1 | Thirty native background persistence checks per surface pass, including Unicode, formulas, edit/reopen and lock files. Blender plus LibreOffice provide 50 checks on each surface; six artifacts reconcile with server metadata. Microsoft Office is untested. |
 | Finder | Small native copy/rename/metadata operations pass. Move to Trash and server restore recover the first version with exact SHA/mode/mtime/all xattrs in a fresh open after 78 ms. A fresh 65,537-byte resource fork is silently dropped by Finder copy/duplicate/copy-out on FSKit; APFS preserves it. That copy requirement fails. |
@@ -2283,6 +2291,31 @@ All eight jobs passed in the final [main CI run](https://github.com/vishnu597/vo
 on `21b2249`; the [merge record](../bench/results/mac-app-matrix/README.md#final-verification-and-cleanup)
 distinguishes that result from the earlier PR-head evidence. This records validation, not a
 claim that the incomplete application/two-Mac release gate has passed.
+
+### Held mmap stores and SQLite SHM, 14 October
+
+The [independent three-view observation](../bench/results/mac-mmap-held/raw/sqlite-before-three-views.json)
+reproduces the historical 43-byte SHM divergence: kernel bytes differ, while the daemon's logical
+staged view and server agree. The changed pages have not reached the module, so draining the
+Rust publication queue cannot publish them. The old `mapped` flag was set only after a write
+arrived without a writable daemon handle; mappings written while that handle stayed open
+therefore escaped the existing push before a later open.
+
+**Accepted 14 October:** the user approved a 500 ms timer by default, with serial push sweeps
+over writable file incarnations retained until reclaim, including those already closed.
+Pushes run outside module locks, sweeps do not overlap, and unmount stops and drains the sweep
+before releasing the daemon session. This changes page delivery; writeThrough and the policy
+treating SQLite `-journal`, `-wal` and `-shm` as ordinary files remain unchanged. Unsynchronized
+mapped stores can remain in kernel memory and can be lost in a crash before delivery. Once a
+write callback delivers them, the same 1 s disk-flush and 2 s quiet-publication rules apply.
+
+The [500 ms experiment](../bench/results/mac-mmap-held/README.md) passes all nine held-mapping
+checks and the full SQLite row, including SHM equality. The final ordinary mount also passes
+[all nine probe checks](../bench/results/mac-mmap-held/raw/probe-default.jsonl.gz) and the
+[full SQLite row](../bench/results/mac-mmap-held/raw/sqlite-default.jsonl.gz), without an interval override. The timer is not a hard 500 ms delivery
+bound: [measured sweeps](../bench/results/mac-mmap-held/raw/cost-summary.json) over 1,000 retained
+candidates had a clean median of 18.3 ms (maximum 19.6 ms), and a dirty maximum of 792.4 ms. The earlier failed evidence is
+preserved. No SQLite-name exception or cross-Mac writer-coordination claim is introduced.
 
 These results do not close item 3's cached-miss blocker, item 4's `RENAME_SWAP`/large-xattr
 requirements, or item 6's failed/untested scenarios. Later `/Volumes`, transfer UI, protocol
