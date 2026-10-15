@@ -39,6 +39,16 @@ fn count(p: &Proxy, method: &str, needle: &str) -> usize {
     p.seen().iter().filter(|r| r.starts_with(&format!("{method} ")) && r.contains(needle)).count()
 }
 
+/// Part uploads the proxy saw that went on to the server, or are on their way: not one whose body
+/// the queue gave up. One the queue began just before a pause took effect is given up then, but
+/// it can reach the proxy after `settle` returns.
+fn parts_sent(p: &Proxy) -> usize {
+    let part = |r: &&String| r.starts_with("PUT ") && r.contains("partNumber=");
+    // The abandoned first: each is in `seen` by then.
+    let abandoned = p.abandoned().iter().filter(part).count();
+    p.seen().iter().filter(part).count() - abandoned
+}
+
 async fn setup() -> (voidfs_server::test_server::TestServer, Proxy, Client, Client) {
     let s = server().await;
     let proxy = Proxy::start(&s.endpoint).await;
@@ -174,13 +184,15 @@ async fn a_pause_stops_an_upload_and_a_resume_goes_on_from_its_parts() {
     assert!(b.paused && b.done == 0 && b.sent >= 5 * MIB && b.sent < 30 * MIB, "{b:?}");
     // Progress counts finished parts, of 5 MiB each.
     let finished = b.sent / (5 * MIB);
-    let before = count(&p, "PUT", "partNumber=");
+    let before = parts_sent(&p);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(count(&p, "PUT", "partNumber="), before, "nothing goes while paused");
+    // Fewer if one counted before turned out to be given up.
+    let paused = parts_sent(&p);
+    assert!(paused <= before, "nothing goes while paused: {before} part uploads, then {paused}: {:?}", p.seen());
     q.set_bandwidth(None).await.unwrap();
     q.resume(Scope::Batch(batch)).await.unwrap();
     q.settle().await;
-    let parts = count(&p, "PUT", "partNumber=") - before;
+    let parts = parts_sent(&p) - paused;
     assert!(parts <= 6 - finished as usize, "the {finished} parts it had were not sent again: {parts} part requests after the resume, for 6 parts");
     assert!(direct.get_object("drv", "big.bin", ReadOptions::default()).await.unwrap().body == body);
     assert_eq!(q.status().await.unwrap().batches[0].done, 1);
