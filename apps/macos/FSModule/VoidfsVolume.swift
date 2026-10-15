@@ -172,10 +172,21 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     var maximumNameLength: Int { Bridge.maxName }
     var restrictsOwnershipChanges: Bool { true }
     var truncatesLongNames: Bool { false }
+    #if VOIDFS_LARGE_XATTR_PROBE
+    /// Test-only probe build: logs each time FSKit reads the limit.
+    var maximumXattrSize: Int {
+        log.notice("probe: FSKit read maximumXattrSize \(Bridge.maxXattr)")
+        return Bridge.maxXattr
+    }
+    #else
     var maximumXattrSize: Int { Bridge.maxXattr }
+    #endif
     #if VOIDFS_LARGE_XATTR_PROBE_BITS
     /// Test-only second probe build: FSKit uses this instead of `maximumXattrSize` when both exist.
-    var maximumXattrSizeInBits: Int { 26 }
+    var maximumXattrSizeInBits: Int {
+        log.notice("probe: FSKit read maximumXattrSizeInBits 26")
+        return 26
+    }
     #endif
     var maximumFileSize: UInt64 { 5 << 40 }
     var requestedMountOptions: FSVolume.MountOptions { options.readOnly ? .readOnly : [] }
