@@ -173,6 +173,10 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     var restrictsOwnershipChanges: Bool { true }
     var truncatesLongNames: Bool { false }
     var maximumXattrSize: Int { Bridge.maxXattr }
+    #if VOIDFS_LARGE_XATTR_PROBE_BITS
+    /// Test-only second probe build: FSKit uses this instead of `maximumXattrSize` when both exist.
+    var maximumXattrSizeInBits: Int { 26 }
+    #endif
     var maximumFileSize: UInt64 { 5 << 40 }
     var requestedMountOptions: FSVolume.MountOptions { options.readOnly ? .readOnly : [] }
 
