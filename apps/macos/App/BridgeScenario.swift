@@ -212,6 +212,28 @@ final class BridgeScenario: @unchecked Sendable {
             await expect("an xattr over 64 KiB", E2BIG) { try await s.setxattr(file.ino, "big", Data(count: Bridge.maxXattr + 1)) }
             try await s.removexattr(file.ino, "empty")
             await expect("getxattr after remove", ENOATTR) { _ = try await s.getxattr(file.ino, "empty") }
+            // Finder's copy order: create, write, then setxattr, and a reader opening the file
+            // before its bytes publish. The volume answers listxattr from the inode's attributes,
+            // as the memo has them: a handle's keep hasXattrs from its open, and while a stage
+            // lasts every open binds it from the first write.
+            let copy = try await s.create(dir.ino, "copied", mode: 0o644)
+            let (ch, _) = try await s.open(copy.ino, write: true)
+            _ = try await s.write(ch, offset: 0, data: Self.pattern(43008, seed: 4))
+            client.holdEvents()
+            let plain = s.memoHits
+            for _ in 0..<50 where s.memoHits == plain { _ = try await s.getattr(copy.ino) }
+            try await s.setxattr(copy.ino, "user.voidfs.sentinel", Data("copied".utf8))
+            let flagged = try await s.getattr(copy.ino).hasXattrs
+            client.releaseEvents()
+            check("the memo follows this client's setxattr after a new file's write, before any event", flagged)
+            try await s.close(ch)
+            let (rh, bound) = try await s.open(copy.ino, write: false)
+            let reading = try await s.getattr(copy.ino).hasXattrs
+            let names = try await s.listxattr(copy.ino)
+            check("with a reader open, getattr has xattrs and listxattr lists them", reading && names == ["user.voidfs.sentinel"], "hasXattrs \(reading), \(names)")
+            say("note: the reader's open bound hasXattrs \(bound.hasXattrs)")
+            try await s.close(rh)
+            try await s.remove(dir.ino, "copied")
             let page = try await s.readdir(dir.ino, after: nil, limit: 16)
             check("readdir", page.names == ["moved", "other"], "\(page.names)")
             await expect("a page of 0", EINVAL) { _ = try await s.readdir(dir.ino, after: nil, limit: 0) }

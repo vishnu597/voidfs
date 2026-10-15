@@ -671,6 +671,26 @@ async fn full_writes_preserve_remote_and_local_extended_attributes() {
     f.queue.close().await;
 }
 
+/// Finder's copy order: create, write, then setxattr, and a reader opening the file before its
+/// bytes publish. The FSKit volume answers listxattr from the inode's attributes: a handle's keep
+/// `has_xattrs` from its open, and while a stage lasts every open binds it from the first write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn xattrs_set_after_a_new_files_first_write_show_in_its_attributes_while_a_reader_is_open() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    let file = ns.create(ns.root(), "copied", 0o644).await.unwrap();
+    let fh = ns.open(file.ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"copied bytes")).await.unwrap();
+    ns.setxattr(file.ino, "user.voidfs.sentinel", b"copied", XattrMode::Set).await.unwrap();
+    assert!(ns.getattr(file.ino).await.unwrap().has_xattrs, "with the writer open");
+    ns.close(fh).await.unwrap();
+    let reader = ns.open(file.ino, false).await.unwrap();
+    assert!(ns.getattr(file.ino).await.unwrap().has_xattrs, "with a reader open and the bytes unpublished");
+    assert_eq!(ns.listxattr(file.ino).await.unwrap(), ["user.voidfs.sentinel"]);
+    ns.close(reader).await.unwrap();
+    f.queue.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sparse_edits_larger_than_one_patch_publish_in_guarded_bounded_runs() {
     const MIB: usize = 1 << 20;
