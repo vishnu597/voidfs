@@ -17,6 +17,11 @@ base64 in every commit and history row. The attributes response keeps listing ev
 lists today and names the others with their sizes. A new call reads or writes one value as raw
 bytes, with ranges. Pools without the feature keep the 64 KiB limit.
 
+On the Mac, FSKit passes a module at most 262,143 bytes a value, and the module should accept at
+most 131,071 ([measured 15 October](#what-fskit-allows)). There this design fixes Finder's copies
+of forks up to that size, no more than a much smaller change would. [Open question 1](#open-questions)
+asks which to build.
+
 ## Motivation
 
 Protocol §4.8 and §7 allow 64 KiB of extended attributes per object, names and values together,
@@ -50,13 +55,34 @@ SpaceFS can't write a resource fork at all through its SMB mount ("Operation not
 [step 4 §1.8](../docs/step-4-client.md#18-the-mount-observed-3-october-02343)). voidfs already
 keeps forks up to 64 KiB; this keeps larger ones.
 
+### What FSKit allows
+
+Measured on 15 October with a test-only build whose module advertised 16 MiB and whose daemon and
+server accepted that much ([vishnu597/voidfs#71](https://github.com/vishnu597/voidfs/pull/71),
+`bench/results/fskit-large-xattrs/`):
+
+- **Up to 262,143 bytes (2^18 − 1), values arrive whole.** Each reaches the module in one
+  `setXattr` of its full size. Finder's copy onto the mount, duplicate within it and copy back out
+  keep forks and `user.*` values of 65,537 and 262,143 bytes byte for byte, and so does `cp`.
+- **From 262,144 bytes, the kernel refuses them** with `EFBIG` before it calls the module,
+  whatever the module advertises. It also refuses any `getxattr` buffer over 262,144 bytes.
+  Finder then drops the value; five of six such copies reported success.
+- **A cut-off fork looks whole.** `copyfile` writes forks over 1 MiB through `..namedfork/rsrc`.
+  The module receives one `setXattr` of the first 131,072 bytes, which it can't tell from a whole
+  value, and `close` then fails. With the probe's limit, `cp` of a 16 MiB fork exited 0 and left a
+  131,072-byte fork. Today's 64 KiB module refuses that piece.
+- **Advertising a limit doesn't enforce it.** With `maximumXattrSizeInBits` 17, `pathconf` said
+  17, and the kernel still passed 131,072- and 262,143-byte values to the module.
+
+So on the Mac the module has to enforce its own limit, below 131,072 bytes unless a cut-off fork
+is to be stored as if it were whole ([the Mac](#the-client-and-the-mac-informative)). Finder's
+copies are fixed up to that limit. Above 262,143 bytes only Apple can help.
+
 **What this does not fix.** FSKit's `XattrHandler` gives a module no position, so positional
 reads of a fork fail after the first chunk, and `copyfile` copies *from* the mount fail for forks
 of any size ([the resource-fork failure](../bench/results/mac-app-matrix/README.md#the-resource-fork-failure)).
-That needs Apple. A value over the new limit is still refused. The module advertises the limit,
-but Finder may drop such a value just as silently as it drops one over 64 KiB today. Whether
-raising the limit is enough for Finder's copies onto the mount is not yet measured
-([open question 1](#open-questions)).
+That needs Apple too. A value over the module's limit is still refused, and Finder may still drop
+it without saying so.
 
 ## Design
 
@@ -234,8 +260,15 @@ The change feed (§5.6) carries no attribute values and is unchanged.
 - It reads stored values with §4.12 and caches them by object version and name. FSKit asks a
   module for the whole value even when the caller only wants its size, so the cache matters for
   repeated `getxattr`.
-- The core's advertised `maxXattrBytes`, the daemon session's frame limits, the bridge's XPC
-  replies and the module's `maximumXattrSize` follow the drive's `valueBytes`.
+- The core's advertised `maxXattrBytes`, the daemon session's frame limits and the bridge's XPC
+  replies follow the drive's `valueBytes`.
+- **The FSKit module keeps its own, lower limit.** It accepts at most 131,071 bytes a value
+  (`maximumXattrSizeInBits` 17) and refuses anything larger with `E2BIG` itself, since the kernel
+  passes larger values whatever `pathconf` reports. A limit of 131,072 or more would store the
+  piece the kernel passes for a `..namedfork/rsrc` write as the whole fork, a silent truncation
+  worse than today's refusal ([What FSKit allows](#what-fskit-allows)). What `cp` reports when the
+  module refuses that piece is unmeasured. A value another client stored over the module's limit
+  is listed but answers `E2BIG` when read; FSKit refuses read buffers over 262,144 bytes anyway.
 - On a drive without the feature, everything stays at 64 KiB and answers `E2BIG` as today.
 
 ## Compatibility
@@ -296,8 +329,21 @@ Two cases.
 
 ## Alternatives
 
-- **Raise the inline limit.** The smallest change, but every version carries every value in its
-  commit and history row, as base64, without deduplication (above).
+- **Raise the inline limit to 16 MiB.** The smallest change, but every version carries every
+  value in its commit and history row, as base64, without deduplication (above).
+- **Raise the inline limit to 256 KiB, with no stored values.** FSKit passes at most 262,143
+  bytes, and the module should accept at most 131,071, so on the Mac this does exactly what the
+  design does. It needs no format feature, no new call and no garbage-collection change: values
+  stay base64 strings, and a drive advertises the larger total (§5.4). Its costs:
+  - each `attrs` version of such an object carries up to about 341 KiB of base64 in its commit
+    and in its checkpoint history row, undeduplicated;
+  - clients that don't go through FSKit stay at 256 KiB;
+  - voidfs's mount before the change rejects an attribute set over 64 KiB that it reads
+    ("invalid remote extended attributes", `crates/voidfs-client/src/mount_xattrs.rs`), so
+    clients must be updated before any drive uses the larger limit. Nothing is lost, but such
+    files answer `EIO` to an old mount.
+
+  It doesn't rule out this design later.
 - **A sidecar object**, such as an AppleDouble `._` file or a hidden `.voidfs/` tree, written
   by the client. No format change, but other clients see stray objects, renames and deletes must
   move them, and item 4 requires that no `._` files appear.
@@ -314,15 +360,25 @@ Two cases.
 
 ## Open questions
 
-1. **Does FSKit hand a module values over 64 KiB whole, and does Finder then keep them?** The
-   matrix shows only that Finder drops a fork the module refuses. Before this is accepted, a test
-   build should check it. Its module would advertise 16 MiB, and its daemon would accept that
-   much in memory, without a protocol change. With module tracing on, it would copy files with
-   65,537-byte, 1 MiB and 16 MiB forks onto and within the FSKit mount, with Finder and with `cp`,
-   and record the size of each `setXattr` and `getXattr`. If the kernel splits or refuses such
-   values, this RFC still helps other clients, but the Finder failure stays. The check needs the
-   development module and agent registered on the test Mac, and restored afterwards, as the matrix
-   did.
-2. **The limits.** Is 16 MiB a value and 64 MiB an object right, or should they be larger? APFS
-   accepts 1 GiB. Larger limits cost memory along the module, bridge and daemon path, and
-   longer single requests.
+The first version of this RFC asked whether FSKit hands a module values over 64 KiB whole. It
+does, up to 262,143 bytes ([What FSKit allows](#what-fskit-allows)), which changes what the design
+buys the Mac:
+
+1. **Which change.** On the Mac, this design and raising the inline limit to 256 KiB
+   ([Alternatives](#alternatives)) fix the same copies. This design also serves clients that don't
+   go through FSKit: the CLI, the SDK and a later Linux mount (PARITY step 9). It would serve the
+   Mac too if Apple raises FSKit's cap. The choices are:
+   - this design now;
+   - the inline raise now, and this design when a client needs more;
+   - neither until Apple raises the cap.
+
+   *Recommended: the inline raise now.* It gives the Mac all FSKit allows, for a fraction of the
+   work and no format change. This RFC would then be revised to that change, keeping this design
+   as its alternative.
+2. **The module's limit.** 131,071 bytes refuses a cut-off fork, as today's module does. Up to
+   262,143 bytes, Finder keeps larger forks, but a 131,072-byte piece of a cut-off fork would be
+   stored as whole. The module could refuse values of exactly 131,072 bytes and accept the rest;
+   that keeps forks up to 262,143 bytes and refuses a genuine fork of exactly that size.
+3. **The drive limits**, if this design goes ahead: 16 MiB a value and 64 MiB an object, or
+   larger? APFS accepts 1 GiB. Larger limits cost memory along the module, bridge and daemon
+   path, and longer single requests.

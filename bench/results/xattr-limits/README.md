@@ -11,9 +11,9 @@ therefore a choice, not something the Mac imposes. A value over voidfs's limit f
 would accept it.
 
 The probe uses positionless `fsetxattr` and `fgetxattr`, one value at a time. It does not show how
-Finder or `copyfile` move values of these sizes, and it does not touch FSKit. The FSKit behavior
-these limits depend on, whether the kernel hands a module values over 64 KiB whole, is RFC 0006's
-first open question and is unmeasured.
+Finder or `copyfile` move values of these sizes, and it does not touch FSKit. FSKit was measured
+separately the same day ([vishnu597/voidfs#71](https://github.com/vishnu597/voidfs/pull/71)): it
+passes a module values up to 262,143 bytes whole and refuses larger ones with `EFBIG`, unlike APFS.
 
 ```sh
 cc -std=c11 -Wall -Wextra -Werror -O2 -o /tmp/apfs-xattr-sizes bench/results/xattr-limits/apfs-xattr-sizes.c

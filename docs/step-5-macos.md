@@ -233,8 +233,11 @@ building and files a Feedback), and resource forks over 64 KiB need a protocol c
 passes no fsync, so the user accepted a flush within a second of the last write in its place.
 The evidence is in [writable FSKit](#writable-fskit-12-october). **15 October:**
 [RFC 0006](../rfcs/0006-extended-attributes-over-64-kib.md) proposes that change, values up to
-16 MiB stored as content, and is not accepted. Whether FSKit then passes Finder such values whole
-is its first open question, unmeasured.
+16 MiB stored as content, and is not accepted. FSKit itself passes a module at most 262,143 bytes
+a value, and a cut-off fork arrives as a 131,072-byte value that looks whole
+([vishnu597/voidfs#71](https://github.com/vishnu597/voidfs/pull/71)). So on the Mac the module
+should stay under 131,072 bytes, and Finder's copies are fixed only up to that. The RFC asks
+whether a smaller inline raise to 256 KiB should come first.
 
 Map writable handlers to the durable local operations, not directly to remote SDK mutations.
 Return write success after staging that survives a daemon or extension crash; cloud publish is
