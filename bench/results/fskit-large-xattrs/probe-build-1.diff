@@ -1,0 +1,182 @@
+diff --git a/apps/macos/FSModule/VoidfsVolume.swift b/apps/macos/FSModule/VoidfsVolume.swift
+index b996797..389f41e 100644
+--- a/apps/macos/FSModule/VoidfsVolume.swift
++++ b/apps/macos/FSModule/VoidfsVolume.swift
+@@ -4,6 +4,7 @@
+ // (Shared/BridgeClient.swift). The daemon's session answers every call; its invalidation relay says
+ // what changed, here or on other machines, and the volume makes the kernel forget it with revokes.
+ 
++import CryptoKit
+ import FSKit
+ import Foundation
+ import os
+@@ -1083,13 +1084,31 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
+                 names.removeAll { $0 == "com.apple.FinderInfo" }
+             }
+         }
++        if options.trace { log.notice("listxattr \(item.ino) \(names.count) names \(names.joined(separator: ","), privacy: .public)") }
+         return FSListXattrsResult(xattrNames: names.map { FSFileName(string: $0) })!
+     }
+ 
++    /// Probe trace: a value's SHA-256, to show whether the module sees it whole.
++    private func digest(_ value: Data?) -> String {
++        guard let value else { return "-" }
++        return SHA256.hash(data: value).map { String(format: "%02x", $0) }.joined()
++    }
++
+     func xattr(named name: FSFileName, of item: FSItem, context: FSContext) async throws -> FSGetXattrResult {
+         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
+-        guard let n = name.string, try await attr(item).hasXattrs else { throw posix(ENOATTR) }
+-        return FSGetXattrResult(xattrValue: try await call { try await $0.getxattr(item.ino, n) })!
++        guard let n = name.string, try await attr(item).hasXattrs else {
++            if options.trace { log.notice("getxattr \(item.ino) \(name.string ?? "?", privacy: .public) absent") }
++            throw posix(ENOATTR)
++        }
++        let start = ContinuousClock.now
++        do {
++            let value = try await call { try await $0.getxattr(item.ino, n) }
++            if options.trace { log.notice("getxattr \(item.ino) \(n, privacy: .public) \(value.count) bytes sha256 \(self.digest(value), privacy: .public) in \(ContinuousClock.now - start, privacy: .public)") }
++            return FSGetXattrResult(xattrValue: value)!
++        } catch {
++            if options.trace { log.notice("getxattr \(item.ino) \(n, privacy: .public) failed errno \(Bridge.errno(error))") }
++            throw error
++        }
+     }
+ 
+     /// Every name is stored, so the kernel never falls back to AppleDouble `._` files.
+@@ -1097,14 +1116,21 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
+         guard let item = item as? VoidfsItem else { throw posix(EINVAL) }
+         if options.readOnly { throw posix(EROFS) }
+         guard let n = name.string else { throw posix(EINVAL) }
+-        if options.trace { log.notice("setxattr \(item.ino) \(n, privacy: .public) policy \(policy.rawValue) \(value?.count ?? -1) bytes") }
+-        if policy == .delete {
+-            try await call { try await $0.removexattr(item.ino, n) }
+-        } else {
+-            guard let value else { throw posix(EINVAL) }
+-            let how = policy == .mustCreate ? 1 : policy == .mustReplace ? 2 : 0
+-            try await call { try await $0.setxattr(item.ino, n, value, how: how) }
++        if options.trace { log.notice("setxattr \(item.ino) \(n, privacy: .public) policy \(policy.rawValue) \(value?.count ?? -1) bytes sha256 \(self.digest(value), privacy: .public)") }
++        let start = ContinuousClock.now
++        do {
++            if policy == .delete {
++                try await call { try await $0.removexattr(item.ino, n) }
++            } else {
++                guard let value else { throw posix(EINVAL) }
++                let how = policy == .mustCreate ? 1 : policy == .mustReplace ? 2 : 0
++                try await call { try await $0.setxattr(item.ino, n, value, how: how) }
++            }
++        } catch {
++            if options.trace { log.notice("setxattr \(item.ino) \(n, privacy: .public) failed errno \(Bridge.errno(error))") }
++            throw error
+         }
++        if options.trace { log.notice("setxattr \(item.ino) \(n, privacy: .public) stored in \(ContinuousClock.now - start, privacy: .public)") }
+         lock.withLock { item.stale = item.handle != nil }
+         return FSSetXattrResult(freeSpace: FSFreeSpace.noUpdate)!
+     }
+diff --git a/apps/macos/Shared/Bridge.swift b/apps/macos/Shared/Bridge.swift
+index 5cbff39..0dbcb80 100644
+--- a/apps/macos/Shared/Bridge.swift
++++ b/apps/macos/Shared/Bridge.swift
+@@ -18,7 +18,12 @@ enum Bridge {
+     /// crosses the socket.
+     static let maxIo: UInt64 = 8 << 20
+     static let maxEntries = 256
++    #if VOIDFS_LARGE_XATTR_PROBE
++    /// Test-only probe build (RFC 0006 open question 1): one value of 16 MiB.
++    static let maxXattr = 16 << 20
++    #else
+     static let maxXattr = 64 << 10
++    #endif
+     static let maxName = 255
+     static let maxDrive = 1024
+     /// Per extension connection.
+diff --git a/crates/voidfs-core/Cargo.toml b/crates/voidfs-core/Cargo.toml
+index ea53301..5fca6e1 100644
+--- a/crates/voidfs-core/Cargo.toml
++++ b/crates/voidfs-core/Cargo.toml
+@@ -20,6 +20,11 @@ thiserror = "2.0.21"
+ ulid = "3.0.0"
+ uuid = { version = "1.26.1", features = ["v4", "v7"] }
+ 
++[features]
++# Test-only (fskit-large-xattrs probe, RFC 0006 open question 1): raises the extended attribute
++# limits so a mount can carry 16 MiB values. Never enabled in a release or CI build.
++large-xattr-probe = []
++
+ [lints]
+ workspace = true
+ 
+diff --git a/crates/voidfs-core/src/model.rs b/crates/voidfs-core/src/model.rs
+index a1ebd63..e0885c2 100644
+--- a/crates/voidfs-core/src/model.rs
++++ b/crates/voidfs-core/src/model.rs
+@@ -323,7 +323,13 @@ pub struct Attrs {
+ }
+ 
+ /// Total decoded size of extended attributes allowed per object (protocol §7).
++#[cfg(not(feature = "large-xattr-probe"))]
+ pub const MAX_XATTR_BYTES: usize = 64 * 1024;
++/// Test-only probe build: RFC 0006's 64 MiB an object, held inline.
++#[cfg(feature = "large-xattr-probe")]
++pub const MAX_XATTR_BYTES: usize = 64 << 20;
++/// Whether this is the test-only large-xattr probe build.
++pub const LARGE_XATTR_PROBE: bool = cfg!(feature = "large-xattr-probe");
+ 
+ /// The current record of an object (format §7.7), plus the version that is its head.
+ #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+diff --git a/crates/voidfs-core/src/ops.rs b/crates/voidfs-core/src/ops.rs
+index 2012c52..bd3f46e 100644
+--- a/crates/voidfs-core/src/ops.rs
++++ b/crates/voidfs-core/src/ops.rs
+@@ -106,7 +106,7 @@ impl AttrsPatch {
+         }
+         let total: usize = a.xattrs.iter().map(|(k, v)| k.len() + base64_decoded_len(v)).sum();
+         if total > MAX_XATTR_BYTES {
+-            return Err(OpError::TooLarge("extended attributes exceed 64 KiB".into()));
++            return Err(OpError::TooLarge(format!("extended attributes exceed {MAX_XATTR_BYTES} bytes")));
+         }
+         if let Some(f) = &self.flags {
+             a.flags = f.clone();
+diff --git a/crates/voidfs-daemon/Cargo.toml b/crates/voidfs-daemon/Cargo.toml
+index d44c828..b4cade9 100644
+--- a/crates/voidfs-daemon/Cargo.toml
++++ b/crates/voidfs-daemon/Cargo.toml
+@@ -19,6 +19,10 @@ tokio = { version = "1.53.1", features = ["rt", "net", "sync", "time", "fs", "ma
+ voidfs-client = { version = "0.0.0", path = "../voidfs-client" }
+ voidfs-sdk = { version = "0.0.0", path = "../voidfs-sdk" }
+ 
++[features]
++# Test-only (fskit-large-xattrs probe): build together with voidfs-core/large-xattr-probe.
++large-xattr-probe = []
++
+ [dev-dependencies]
+ tempfile = "3.27.0"
+ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+diff --git a/crates/voidfs-daemon/src/fs_api.rs b/crates/voidfs-daemon/src/fs_api.rs
+index 8620d21..1029eaa 100644
+--- a/crates/voidfs-daemon/src/fs_api.rs
++++ b/crates/voidfs-daemon/src/fs_api.rs
+@@ -14,7 +14,8 @@ pub const MAX_WATCHES: usize = 64;
+ pub const MAX_JSON: usize = 64 * 1024;
+ pub const MAX_RESPONSE: usize = 1024 * 1024;
+ /// An object's extended attribute names and values together, as `Capabilities::max_xattr_bytes` says.
+-pub const MAX_XATTR: usize = 64 * 1024;
++/// The test-only probe build (feature `large-xattr-probe`, with voidfs-core's) carries one 16 MiB value.
++pub const MAX_XATTR: usize = if cfg!(feature = "large-xattr-probe") { 16 << 20 } else { 64 * 1024 };
+ pub const EVENT_CAPACITY: usize = 64;
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+diff --git a/crates/voidfs-server/src/s3/object.rs b/crates/voidfs-server/src/s3/object.rs
+index d3d4eaf..4c186e1 100644
+--- a/crates/voidfs-server/src/s3/object.rs
++++ b/crates/voidfs-server/src/s3/object.rs
+@@ -876,7 +876,8 @@ struct AttrsBody {
+ }
+ 
+ async fn post_attrs(app: &Arc<App>, ctx: &Ctx, d: &Arc<Drive>, body: Body) -> Result<Response, S3Error> {
+-    let body = BodyReader::new(body, ctx, MAX_SMALL_BODY)?.read_all().await?;
++    let limit = if voidfs_core::model::LARGE_XATTR_PROBE { MAX_EXTENSION_BODY } else { MAX_SMALL_BODY };
++    let body = BodyReader::new(body, ctx, limit)?.read_all().await?;
+     let b: AttrsBody = serde_json::from_slice(&body).map_err(|e| S3Error::invalid(format!("attributes body: {e}")))?;
+     let x = b.xattrs.unwrap_or_default();
+     let patch = AttrsPatch {
