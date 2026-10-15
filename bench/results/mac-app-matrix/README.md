@@ -183,7 +183,7 @@ Apple M5 Pro, macOS **27.0.1 (26A434)**, Xcode **27.0 beta (27A5194q)**, Apple G
 **2.54.0 (Git-156)**, SQLite **3.54.0**, system Python **3.9.6**. The initial app/tool inventory
 and disk sample are in [inventory.jsonl](raw/inventory.jsonl); that sample had 637 GiB free on
 the Data volume. The loopback server uses a filesystem store and `multi-object-versions`, not
-the memory store. FSKit callbacks are in [fskit-trace.txt](raw/fskit-trace.txt.gz). The initial daemon reported `f2f711e`, the promoted head. After the fixes were reviewed it was rebuilt from merged `main` (`0fe8913`) plus the recorded working changes in PRs #63–#65; the real-media reruns used that rebuilt daemon/module.
+the memory store. FSKit callbacks are in [fskit-trace.txt](raw/fskit-trace.txt.gz). The initial daemon reported `f2f711e`, the promoted head. After the fixes were reviewed it was rebuilt from merged `main` (`0fe8913`) plus the then-unmerged changes in PRs #63–#65; the real-media reruns used that rebuilt daemon/module. Those PRs later merged as `fa3ab3e`, `7734d9d` and `ceedeee`, respectively; the [final merge record](#final-verification-and-cleanup) does not change this test-build provenance.
 
 | App / surface | Scope and result | Evidence and limits |
 | --- | --- | --- |
@@ -246,7 +246,7 @@ exact zero32 value from listings, matching APFS absence. Stored values/history a
 and nonzero FinderInfo plus ordinary empty/all-zero xattrs stay visible. The focused probe
 passes all 12 required listing checks after rebuilding and normally remounting, compared with
 two failures before. Two CREATE/REPLACE storage-policy differences remain stated separately.
-[FinderInfo fix PR #63](https://github.com/vishnu597/voidfs/pull/63) and
+[FinderInfo fix PR #63](https://github.com/vishnu597/voidfs/pull/63), merged as `fa3ab3e`, and
 [FinderInfo evidence and replay](../mac-finderinfo/README.md) include current PDF/CSV
 framework readback and a 10-file native-Cocoa subtree collector with no failures. The collector
 normalizes only raw remote zero32 FinderInfo to macOS absence and records the raw values plus
@@ -258,12 +258,12 @@ so mounted entries could continue publishing. Its contained fix preserves both e
 spellings, applies pause/resume/cancel to both, uses the validated offline identity memo and
 migrates old alias-only pauses before the queue worker starts. All three new regressions fail
 the promoted old code; all five upload tests pass with only this fix on promoted main.
-[Focused upload-control evidence](../mac-upload-drive-scope/README.md) is packaged for separate
-[PR #64](https://github.com/vishnu597/voidfs/pull/64). The fixed media runner pauses by alias, checks that the mounted stable ID is paused, and restores that scoped pause after source hashing.
+[Focused upload-control evidence](../mac-upload-drive-scope/README.md) accompanies
+[PR #64](https://github.com/vishnu597/voidfs/pull/64), merged as `7734d9d`. The fixed media runner pauses by alias, checks that the mounted stable ID is paused, and restores that scoped pause after source hashing.
 
 Separately, the new 171,808,569-byte video in
 [media preflight](raw/media-small-fskit.jsonl.gz) fails publication because multipart completion
-cannot carry the required absence guard. The guarded, bounded stream fix in [PR #65](https://github.com/vishnu597/voidfs/pull/65) publishes the original retained movie with its original SHA and metadata; a fresh save/export and the full 50 GB dataset then pass. [Focused evidence](../mac-guarded-large-put/README.md) preserves failing old/weakened-code regressions and successful native reruns. The original preflight remains a failure with staged bytes retained.
+cannot carry the required absence guard. The guarded, bounded stream fix in [PR #65](https://github.com/vishnu597/voidfs/pull/65), merged as `ceedeee`, publishes the original retained movie with its original SHA and metadata; a fresh save/export and the full 50 GB dataset then pass. [Focused evidence](../mac-guarded-large-put/README.md) preserves failing old/weakened-code regressions and successful native reruns. The original preflight remains a failure with staged bytes retained.
 
 ## Other rows and final server verification
 
@@ -514,8 +514,23 @@ and registration restoration are recorded below.
 
 ## Final verification and cleanup
 
-The combined client/daemon/module fixes pass the [local workspace tests](raw/combined-workspace-tests.txt.gz) and [all-target clippy](raw/combined-workspace-clippy.txt); protocol validation (56 cases/432 steps) and five credential-script checks pass. Local memory, filesystem and Versity interoperability runs pass; local system Python lacks boto3, so that client is explicitly skipped locally and covered by each PR's required CI jobs. See `raw/combined-workspace-tests.txt.gz`, `raw/combined-workspace-clippy.txt` and `raw/combined-interop-*.txt`. [Recorded required CI](raw/fix-pr-ci.json) captures the passing #62–#65 heads before the final fixture/documentation updates; #63–#65 were retargeted to main before their shared fixture-fix base is merged. These follow-up PRs remain open for review.
+The combined client/daemon/module fixes pass the [local workspace tests](raw/combined-workspace-tests.txt.gz) and [all-target clippy](raw/combined-workspace-clippy.txt); protocol validation (56 cases/432 steps) and five credential-script checks pass. Local memory, filesystem and Versity interoperability runs pass; local system Python lacks boto3, so that client is explicitly skipped locally and covered by each PR's required CI jobs. See `raw/combined-workspace-tests.txt.gz`, `raw/combined-workspace-clippy.txt` and `raw/combined-interop-*.txt`. [Recorded required CI](raw/fix-pr-ci.json) captures the passing #62–#65 heads before the final fixture/documentation updates; #63–#65 were retargeted to main before their shared fixture-fix base merged. That snapshot remains historical evidence.
 
-The first rig PR run exposed another setup race in the local `.DS_Store` fixtures. Both now keep publication paused through setup, retaining every assertion. The [focused fixture evidence](../mac-ds-store-fixtures/README.md) records the original CI failure, 40/40 repeated runs, the 24-test suite and scoped clippy. The rig also includes the scheduler-independent hold-count assertion from #64, whose timing-flake evidence remains preserved in the upload-control corpus. Exact-head PR CI validates these final test changes separately from the recorded combined run.
+The first rig PR run exposed another setup race in the local `.DS_Store` fixtures. Both now keep publication paused through setup, retaining every assertion. The [focused fixture evidence](../mac-ds-store-fixtures/README.md) records the original CI failure, 40/40 repeated runs, the 24-test suite and scoped clippy. The rig also includes the scheduler-independent hold-count assertion from #64, whose timing-flake evidence remains preserved in the upload-control corpus. Exact-head PR CI validated these final test changes separately from the recorded combined run.
+
+**Merge status, 14 October 2026:** all five PRs merged on 13 October, in order:
+
+| PR | Merge commit | Change |
+| --- | --- | --- |
+| [#62](https://github.com/vishnu597/voidfs/pull/62) | `baa8369` | Keep local `.DS_Store` fixture publication paused through setup |
+| [#63](https://github.com/vishnu597/voidfs/pull/63) | `fa3ab3e` | Omit absent all-zero FinderInfo from xattr listings |
+| [#64](https://github.com/vishnu597/voidfs/pull/64) | `7734d9d` | Apply drive-scoped upload controls to aliases and stable IDs |
+| [#65](https://github.com/vishnu597/voidfs/pull/65) | `ceedeee` | Stream guarded large mount creations through signed PUT |
+| [#66](https://github.com/vishnu597/voidfs/pull/66) | `21b2249` | Application matrix rig and evidence, including the 50 GB run |
+
+All eight jobs passed in the final [main CI run](https://github.com/vishnu597/voidfs/actions/runs/38441497023)
+on `21b2249`. The push runs for the merges of #63–#65 were cancelled while waiting behind
+#62's run by CI's concurrency group; they did not fail. The final run covers the combined
+merged tree. These merge and CI results do not change any matrix score or step 5 item status.
 
 All three test mounts were normally unmounted, and only the test daemon/server/logger PIDs were stopped. The installed `/Applications/voidfs.app` and its enabled agent registration were restored; the temporary state-directory preference was deleted. Shared daemon state remained absent. All synthetic datasets, temporary free-app copies and newly created Rust/Swift build scratch were removed; [cleanup evidence](raw/cleanup.json) records each owned path and the recovered disk space. No production drive, real credentials, library, specification or security setting was changed.

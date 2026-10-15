@@ -153,9 +153,12 @@ billing or plans), this page says so.
     [evidence](../bench/results/mac-app-matrix/README.md)): native save, Git, headless Xcode,
     SQLite database and free-app persistence scopes have measured results. Peer file watchers
     receive no notifications, tiny resource forks fail positional `copyfile` reads, and native
-    Versions is unsupported. All-zero FinderInfo listing is fixed; drive-scoped upload controls
-    have a separately tested fix in [PR #64](https://github.com/vishnu597/voidfs/pull/64), while
-    guarded large-file publication is in [PR #65](https://github.com/vishnu597/voidfs/pull/65).
+    Versions is unsupported. All-zero FinderInfo listing is fixed in merged
+    [PR #63](https://github.com/vishnu597/voidfs/pull/63) (`fa3ab3e`); drive-scoped upload controls
+    are fixed in merged [PR #64](https://github.com/vishnu597/voidfs/pull/64) (`7734d9d`), while
+    guarded large-file publication is fixed in merged [PR #65](https://github.com/vishnu597/voidfs/pull/65)
+    (`ceedeee`). PRs #62–#66 merged on 13 October; all eight jobs passed in the final
+    [main CI run](https://github.com/vishnu597/voidfs/actions/runs/38441497023) on `21b2249`.
     The declared 50 GB synthetic-media workload and native Xcode edit/build/run scope pass on
     this Mac. QuickTime GUI trim/export remains unvalidated, and two independent Macs remain
     untested; those scoped passes do not complete the application matrix.
@@ -919,7 +922,14 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
-   - **Status (2026-10-13):** items 1–3 of 10 done, item 3 with a release blocker; item 4 built
+   - **Status (2026-10-14):** PRs #62–#66 merged on 13 October: fixture stabilization
+     (#62, `baa8369`), FinderInfo listing (#63, `fa3ab3e`), drive-scoped uploads (#64, `7734d9d`),
+     guarded large-file publication (#65, `ceedeee`) and the application matrix rig/evidence
+     (#66, `21b2249`). All eight jobs passed in the final
+     [main CI run](https://github.com/vishnu597/voidfs/actions/runs/38441497023) on `21b2249`;
+     the [merge record](../bench/results/mac-app-matrix/README.md#final-verification-and-cleanup)
+     preserves the earlier PR-head CI history. Item statuses and exit criteria are unchanged.
+     Before that, on **2026-10-13:** items 1–3 of 10 done, item 3 with a release blocker; item 4 built
      and not complete; item 6 in progress, not complete
      ([measured slice](step-5-macos.md#application-matrix-13-october),
      [matrix](../bench/results/mac-app-matrix/README.md)). Foundation safe-save operations,
@@ -927,11 +937,11 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      have scoped passes. Remote FSEvents/kqueue notifications fail, native Versions rejects
      safely, positional reads of even tiny resource forks fail, and SQLite's strict SHM byte
      equality fails. The all-zero FinderInfo listing defect is fixed
-     ([PR #63](https://github.com/vishnu597/voidfs/pull/63),
+     ([PR #63](https://github.com/vishnu597/voidfs/pull/63), merged as `fa3ab3e`,
      [evidence](../bench/results/mac-finderinfo/README.md)); drive-scoped upload controls have
-     a separately tested fix in [PR #64](https://github.com/vishnu597/voidfs/pull/64)
+     a fix merged in [PR #64](https://github.com/vishnu597/voidfs/pull/64) as `7734d9d`
      ([evidence](../bench/results/mac-upload-drive-scope/README.md)), and guarded large-file
-     publication is in [PR #65](https://github.com/vishnu597/voidfs/pull/65). The declared 50 GB
+     publication is fixed in merged [PR #65](https://github.com/vishnu597/voidfs/pull/65) (`ceedeee`). The declared 50 GB
      media and native Xcode scopes now pass. Two independent Macs are untested at the
      user's choice; a peer SDK client on this Mac is not that hardware/application scenario.
      Finder Trash/server-version recovery passes exact bytes and metadata, but a fresh
@@ -961,8 +971,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      prior-version recovery and the cross-Mac application criteria remain untested/unmet.
      Microsoft Office, Premiere, Final Cut and Resolve remain untested; LibreOffice and native
      media tools are separately named substitutes. No step 5 exit criterion is waived.
-     [#64's final CI run](https://github.com/vishnu597/voidfs/actions/runs/38430184924) passes
-     all six required jobs; #63 and #65 also have green required CI.
+     [#64's final CI run](https://github.com/vishnu597/voidfs/actions/runs/38430184924) passed
+     all six required jobs; #63 and #65 also passed required CI.
      Before that, on **2026-10-12, later:** items 1–3 of 10 done, item 3 with a release blocker; item 4
      built and not complete ([step 5](step-5-macos.md#writable-fskit-12-october)): the mount
      writes, and `RENAME_SWAP` overwriting on every FSKit volume is a release blocker the user

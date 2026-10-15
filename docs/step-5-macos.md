@@ -28,9 +28,11 @@ accepted, to be raised with Apple) and resource forks over 64 KiB need a protoco
 **Item 6 is in progress, not complete** ([13 October](#application-matrix-13-october)): the
 matrix runs on this Mac, with free alternatives in separate rows. Remote file watchers receive
 no notifications, even tiny resource forks fail positional reads used by `copyfile`, and native
-Versions is unsupported. All-zero FinderInfo listing is fixed; drive-scoped upload controls have
-a separately tested fix in [PR #64](https://github.com/vishnu597/voidfs/pull/64), and guarded
-large-file publication is in [PR #65](https://github.com/vishnu597/voidfs/pull/65). The 50 GB
+Versions is unsupported. All-zero FinderInfo listing is fixed in merged
+[PR #63](https://github.com/vishnu597/voidfs/pull/63) (`fa3ab3e`); drive-scoped upload controls are
+fixed in merged [PR #64](https://github.com/vishnu597/voidfs/pull/64) (`7734d9d`), and guarded
+large-file publication is fixed in merged [PR #65](https://github.com/vishnu597/voidfs/pull/65)
+(`ceedeee`). The 50 GB
 synthetic ProRes workload now passes source/server hashes, metadata/history and native
 decode/export checks on this Mac, including direct cold/warm decoder opens on a separate
 fresh fork; native Xcode open/edit/save/build/run also passes.
@@ -2258,23 +2260,28 @@ after normal remount. Two CREATE/REPLACE storage-policy differences remain expli
 The native export collector then reconciled 10 files, with zero failures, using a named
 normalization of only raw remote zero32 FinderInfo to macOS absence. This does not prove
 Numbers formula/GUI coverage.
-[Fix PR #63](https://github.com/vishnu597/voidfs/pull/63) and
+[Fix PR #63](https://github.com/vishnu597/voidfs/pull/63), merged as `fa3ab3e`, and
 [raw evidence](../bench/results/mac-finderinfo/README.md).
 
-**Two publication/control defects have separate work.** Drive-scoped pause resolved to the
+**Two publication/control defects are fixed in merged PRs.** Drive-scoped pause resolved to the
 alias, while mounted queue entries use the stable ID; mounted saves therefore escaped both
 alias and ID CLI pauses. The contained fix preserves both stored spellings, applies
 pause/resume/cancel to both, uses the validated offline identity memo, and migrates old
 alias-only pauses before the worker starts. All three new regressions fail on promoted old
-code; all five upload tests pass with this fix alone. [PR #64](https://github.com/vishnu597/voidfs/pull/64) is open, with
+code; all five upload tests pass with this fix alone. [PR #64](https://github.com/vishnu597/voidfs/pull/64) merged as `7734d9d`, with
 [focused proof](../bench/results/mac-upload-drive-scope/README.md). Separately, a 171,808,569-byte
 new mounted video initially failed publication because multipart completion cannot carry its absence
-guard. A guarded, bounded stream fix is in [PR #65](https://github.com/vishnu597/voidfs/pull/65)
+guard. The guarded, bounded stream fix merged in [PR #65](https://github.com/vishnu597/voidfs/pull/65) as `ceedeee`,
 and the full media rerun now passes the declared 50 GB scope above. The first media workaround
 used global pause with its state guarded/restored; final generation uses corrected
 drive-scoped alias/ID pause controls and verifies them before writing.
-The final [#64 CI run](https://github.com/vishnu597/voidfs/actions/runs/38430184924) passes all
-six required jobs; #63 and #65 also have green required CI. This records validation, not a
+The final [#64 CI run](https://github.com/vishnu597/voidfs/actions/runs/38430184924) passed all
+six required jobs; #63 and #65 also passed required CI. The fixture stabilization
+([#62](https://github.com/vishnu597/voidfs/pull/62), `baa8369`), these three fixes and the matrix
+rig/evidence ([#66](https://github.com/vishnu597/voidfs/pull/66), `21b2249`) merged on 13 October.
+All eight jobs passed in the final [main CI run](https://github.com/vishnu597/voidfs/actions/runs/38441497023)
+on `21b2249`; the [merge record](../bench/results/mac-app-matrix/README.md#final-verification-and-cleanup)
+distinguishes that result from the earlier PR-head evidence. This records validation, not a
 claim that the incomplete application/two-Mac release gate has passed.
 
 These results do not close item 3's cached-miss blocker, item 4's `RENAME_SWAP`/large-xattr
