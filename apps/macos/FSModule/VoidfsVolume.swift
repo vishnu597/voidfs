@@ -21,6 +21,9 @@ struct VolumeOptions {
     var readOnly = false
     /// A log line for every data and namespace callback (`-o trace`).
     var trace = false
+    /// Push possible shared mappings on a serial sweep. Zero disables it for reproduction.
+    /// Unsynchronized stores are not acknowledged writes (step 5, 14 October).
+    var mmapPushMilliseconds = 500
     /// What a write open is granted at most. Measured (step 5, item 4): with writeBack a write
     /// returns before the module sees it, and killing the extension lost acknowledged bytes; with
     /// writeThrough write(2) returns after the bytes are staged.
@@ -43,6 +46,8 @@ struct VolumeOptions {
                     case ("ro", nil), ("rdonly", nil): readOnly = true
                     case ("rw", nil): readOnly = false
                     case ("trace", _): trace = true
+                    case ("mmap-push-ms", let v?):
+                        if let ms = Int(v), (0...60_000).contains(ms) { mmapPushMilliseconds = ms }
                     default: break
                     }
                 }
@@ -115,6 +120,10 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     private var items: [UInt64: VoidfsItem] = [:]
     /// Incarnations, current or retired, with a daemon handle open.
     private var open: [ObjectIdentifier: VoidfsItem] = [:]
+    /// FSKit supplies no mapping lifecycle callback. Every writable file open may leave dirty
+    /// mapped pages, even after close; keep its incarnation until reclaim so a later sweep can push them.
+    private var mmapPushCandidates: [ObjectIdentifier: VoidfsItem] = [:]
+    private var mmapPushTimer: DispatchSourceTimer?
     private var listings: [UInt64: Listing] = [:]
     private var listed = 0
     /// Counts invalidations; a listing fetched across one isn't kept.
@@ -133,6 +142,8 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     /// Revokes run in order, here and nowhere else.
     private let revokes = DispatchQueue(label: "dev.voidfs.fs.revoke")
     private let pushes = DispatchQueue(label: "dev.voidfs.fs.push", attributes: .concurrent)
+    /// Timer handlers run synchronously and serially here, so slow pushes cannot pile up sweeps.
+    private let mmapPushes = DispatchQueue(label: "dev.voidfs.fs.mmap-push")
     private static let listingLimit = 200_000
     private static let missesLimit = 200_000
 
@@ -151,6 +162,8 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
             self.relay(event, from: session)
         }
     }
+
+    deinit { mmapPushTimer?.cancel() }
 
     // MARK: - Properties FSKit reads
 
@@ -220,11 +233,13 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
             let old: BridgeSession = lock.withLock { defer { session = s }; return session }
             try? await old.release()
         }
+        startMmapPushes()
         log.notice("activate \(taskOptions.taskOptions, privacy: .public): drive \(self.drive, privacy: .public), root inode \(self.root); wanted attributes: lookup \(String(FSLookupItemResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public), getattr \(String(FSGetAttributesResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public), read \(String(FSReadFileResult.requestedAttributes.wantedAttributes.rawValue, radix: 16), privacy: .public)")
         return FSActivateResult(rootItem: rootItem)!
     }
 
     func deactivate(options: FSDeactivateOptions = []) async throws {
+        await stopMmapPushes()
         log.notice("deactivate")
     }
 
@@ -253,6 +268,9 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     }
 
     func unmount() async {
+        // A cache push can reenter `write` and need the live session. Drain it before marking
+        // the volume unmounted or releasing that session.
+        await stopMmapPushes()
         let s: BridgeSession = lock.withLock {
             unmounted = true
             connecting?.cancel()
@@ -281,6 +299,74 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
             do { try await h.session.fsync(h.fh) } catch { failed = failed ?? error }
         }
         if let failed { throw failure(failed) }
+    }
+
+    /// The kernel's writeThrough grant does not make
+    /// unsynchronized mmap stores arrive as write callbacks on the daemon's quiet-period clock.
+    private func startMmapPushes() {
+        guard !options.readOnly, options.mmapPushMilliseconds > 0 else { return }
+        let ms = options.mmapPushMilliseconds
+        lock.withLock {
+            guard !unmounted, mmapPushTimer == nil else { return }
+            let timer = DispatchSource.makeTimerSource(queue: mmapPushes)
+            timer.schedule(deadline: .now() + .milliseconds(ms), repeating: .milliseconds(ms), leeway: .milliseconds(min(ms / 10, 100)))
+            timer.setEventHandler { [weak self] in self?.pushMmapCandidates() }
+            mmapPushTimer = timer
+            timer.resume()
+        }
+        log.notice("mmap page push enabled, interval \(ms) ms; writeThrough unchanged")
+    }
+
+    private func stopMmapPushes() async {
+        let timer = lock.withLock {
+            let timer = mmapPushTimer
+            mmapPushTimer = nil
+            mmapPushCandidates.removeAll()
+            return timer
+        }
+        timer?.cancel()
+        // Dispatch cancellation does not interrupt a handler already in setCacheState. The
+        // serial queue's barrier lets its callbacks finish before the session is released.
+        await withCheckedContinuation { done in mmapPushes.async { done.resume() } }
+    }
+
+    private func rememberMmapPushCandidate(_ item: VoidfsItem) {
+        lock.withLock {
+            guard mmapPushTimer != nil, !unmounted, item.kind == .file else { return }
+            mmapPushCandidates[ObjectIdentifier(item)] = item
+        }
+    }
+
+    /// Runs only on `mmapPushes`. Never hold `lock` through setCacheState: it may call write,
+    /// close or reclaim back into the volume. Recheck each incarnation after taking the snapshot.
+    private func pushMmapCandidates() {
+        let start = ContinuousClock.now
+        let candidates = lock.withLock { Array(mmapPushCandidates.values) }
+        var pushed = 0, skipped = 0, errors = 0
+        var totalLatency = Duration.zero, maximumLatency = Duration.zero
+        for item in candidates {
+            let eligible = lock.withLock {
+                mmapPushTimer != nil && !unmounted && mmapPushCandidates[ObjectIdentifier(item)] === item
+                    // A retired incarnation may still have a bound writable handle. Without
+                    // one, handle(_:write:) refuses its page-out rather than opening a new version.
+                    && (!item.retired || item.handle?.write == true)
+            }
+            guard eligible else { skipped += 1; continue }
+            let before = ContinuousClock.now
+            let error = setCacheState(for: item, cacheMode: .readWriteWithCache, coherencyType: VolumeOptions.writeCoherency, action: .push)
+            let latency = ContinuousClock.now - before
+            pushed += 1
+            totalLatency += latency
+            maximumLatency = max(maximumLatency, latency)
+            if let error {
+                errors += 1
+                let e = error as NSError
+                log.error("mmap page push \(item.ino) failed in \(latency, privacy: .public): \(e.domain, privacy: .public) \(e.code)")
+            }
+        }
+        if options.trace {
+            log.notice("mmap page push sweep: \(candidates.count) candidates, \(pushed) pushed, \(skipped) skipped, \(errors) errors, elapsed \(ContinuousClock.now - start, privacy: .public), push total \(totalLatency, privacy: .public), push max \(maximumLatency, privacy: .public)")
+        }
     }
 
     // MARK: - The session
@@ -702,6 +788,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         let handle: OpenFile? = lock.withLock {
             if items[item.ino] === item { items[item.ino] = nil }
             open[ObjectIdentifier(item)] = nil
+            mmapPushCandidates[ObjectIdentifier(item)] = nil
             defer { item.handle = nil }
             return item.handle
         }
@@ -834,7 +921,10 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         let write = modes.contains(.write)
         if write && options.readOnly { throw posix(EROFS) }
         if item.kind == .file, lock.withLock({ item.mapped }) { await push(item) }
-        if item.kind == .file { _ = try await handle(item, write: write) }
+        if item.kind == .file {
+            _ = try await handle(item, write: write)
+            if write { rememberMmapPushCandidate(item) }
+        }
         // A folder's listing is the extension's to cache (`listings`, kept by the relay): the
         // kernel's, once granted, outlives every revoke of the top folder (see `revoke`).
         let granted: FSVolume.KernelCacheCoherencyType
@@ -923,6 +1013,7 @@ final class VoidfsVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         var f = try await handle(item, write: true)
         if !opened {
             lock.withLock { item.mapped = true }
+            rememberMmapPushCandidate(item)
             log.notice("write \(item.ino) @\(offset)+\(contents.count) without a write open: a writable handle opened for it")
         }
         var a: BridgeAttr

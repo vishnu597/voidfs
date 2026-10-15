@@ -79,7 +79,12 @@ drive is mounted again; listings show it at once
 Writes go to the daemon, which stages them on this Mac: `write(2)` returns once the bytes are
 staged (they survive the daemon, the agent or the module being killed), they reach the disk
 within a second, since FSKit passes no `fsync` to a module, and they publish on close or after
-two seconds without writes (`void uploads` shows them). `.DS_Store` stays on this Mac; locks are
+two seconds without writes (`void uploads` shows them). Unsynchronized shared-mapping stores
+can remain in kernel pages until the module receives a page write. A serial sweep scheduled
+every 500 ms pushes possible writable mappings; its duration adds to that interval, then the
+same staging/flush/publication path applies. These stores have no `write(2)` acknowledgement
+before delivery ([finding and accepted durability policy](../../bench/results/mac-mmap-held/README.md)).
+`.DS_Store` stays on this Mac; locks are
 this Mac's only. `renamex_np(RENAME_SWAP)` replaces the destination on any FSKit
 volume instead of swapping, and xattrs (resource forks included) are limited to 64 KiB a file
 ([writable FSKit](../../docs/step-5-macos.md#writable-fskit-12-october)). `mount -o trace` logs
@@ -136,6 +141,7 @@ examples plays another machine:
 | `foundation-save.swift <scratch-parent> [case]` | Compile with Swift 5: actual NSDocument saves/autosaves, atomic replacements/backups, coordinator, native Versions, copyfile/clone fallback and positional resource-fork reads; preserves failed-case bytes |
 | `watch-events.swift local <scratch-parent> <mode> [case]` | Local FSEvents/kqueue checks with operation-specific flags and bytes/readback timing; `mode` is `fsevents`, `kqueue` or `both` |
 | `watch-events.swift peer <scratch-parent> <mode> <mount-root> <peer-binary> <drive> [case]` | Peer commits, notification/listing/byte latency and a separate held-descriptor cache experiment; an SDK peer on one Mac is not two-Mac testing |
+| `mmap-held.py` | Held shared-mapping stores, close/unmap orders and later stores after msync, compared with independent daemon/server bytes; compile `bench/results/mac-fskit-writable/mmapheld.c` first |
 | `app-matrix.py` and `app-matrix-xcode.py` | Git/SQLite, headless real Xcode project and stable server bytes/metadata collector; each run owns a fresh dataset |
 | `app-matrix-free.py` | Native Blender and LibreOffice persistence/readback using available scratch app copies, private profiles and the bundled runtimes; no app installation or dependency added |
 | `app-matrix-native.py`, `app-matrix-cocoa.applescript`, media/PDF probes | Finder/TextEdit and native GUI/media fixtures; see the matrix for measured scope, commands and untested operations |

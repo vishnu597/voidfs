@@ -1,0 +1,22 @@
+Each mutation affects only an in-memory copy of mmap-held.py. Repository source remains unchanged.
+The matching fixture must fail its assertion when that detector is individually disabled.
+
+CASE malformed-json
+DISABLED errors.append("malformed JSON in probe cleanup")
+EXPECTED FIXTURE FAILURE: AssertionError: cleanup detector silently accepted invalid trailing output
+DETECTOR BREAK CONFIRMED
+
+CASE non-object-json
+DISABLED errors.append("malformed JSON in probe cleanup")
+EXPECTED FIXTURE FAILURE: AssertionError: cleanup detector silently accepted invalid trailing output
+DETECTOR BREAK CONFIRMED
+
+CASE failed-cleanup
+DISABLED errors.append("probe cleanup syscall failed: " + json.dumps(record))
+EXPECTED FIXTURE FAILURE: AssertionError: cleanup detector silently accepted invalid trailing output
+DETECTOR BREAK CONFIRMED
+
+CASE late-sample
+DISABLED timely = observed_seconds <= target + FINAL_SAMPLE_TOLERANCE
+EXPECTED FIXTURE FAILURE: AssertionError: timing detector accepted a late matching observation
+DETECTOR BREAK CONFIRMED
