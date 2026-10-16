@@ -1,0 +1,34 @@
+{
+ "bandwidth": null,
+ "conflicts": 1,
+ "failed": 0,
+ "paused": false,
+ "pausedDrives": [],
+ "pausedItems": 0,
+ "queued": 0,
+ "rate": 0,
+ "unpublished": 2,
+ "unpublishedBytes": 5,
+ "uploading": 0
+}
+ID  DRIVE                                   KEY                    SIZE  SENT  STATE
+1   d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/                  0 B   100%  done
+2   d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/                  0 B   100%  done
+3   d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/saved.txt         6 B   100%  done
+4   d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/conflict.txt      5 B   100%  done
+5   d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/conflict.txt      5 B   0%    conflict: the drive changed (now version 7.0); this Mac keeps its copy
+6   d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/conflict.txt      0 B   100%  conflict: the drive changed (now version 7.0); this Mac keeps its copy
+7   d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/saving.txt        7 B   100%  done
+8   d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/pending.txt       0 B   100%  done
+9   d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/error.txt         6 B   0%    cancelled
+10  d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/nested/           0 B   100%  done
+11  d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/nested/           0 B   100%  done
+12  d-01a145a6-fe1e-710f-aa2a-03978e839c96  live/nested/inner.txt  0 B   100%  done
+
+0 uploading, 0 queued, 1 in conflict · 5 B to send
+$ POST /v1/mounts/states {drive, folder: "live"}
+{"drive":"badges-live-1792169905","folder":"live","version":"19fe9e0f6a1fe6e0.1.63.31","unchanged":false,"state":"Conflict","entries":[["conflict.txt","Conflict"],["error.txt","Error"]],"next":null}
+$ POST /v1/mounts/states {drive, folder: "live/nested"}
+{"drive":"badges-live-1792169905","folder":"live/nested","version":"19fe9e0f6a1fe6e0.1.63.7","unchanged":false,"state":"Saved","entries":[],"next":null}
+$ POST /v1/mounts/states {drive, folder: ""}
+{"drive":"badges-live-1792169905","folder":"","version":"19fe9e0f6a1fe6e0.1.63.24","unchanged":false,"state":"Conflict","entries":[[".DS_Store","Local"],["live","Conflict"]],"next":null}

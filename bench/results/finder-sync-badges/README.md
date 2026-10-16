@@ -98,12 +98,10 @@ saves the same file on the drive while this Mac's edit waits.
 
 ## Not shown
 
-- **A live Finder.** The extension wasn't enabled and no FSKit volume was mounted. Both change this
-  Mac's registrations, and the brief asks for the user's approval first. So Finder drawing the
-  badges, Finder's own `beginObservingDirectory` and `requestBadgeIdentifier` calls, the context
-  menu and its pause and resume on a live mount, and the `badges-check` refusal by the installed
-  agent were not exercised. Computer use can't reach a development app run from a build folder
-  either.
+- **A live Finder, in this run.** The extension wasn't enabled and no FSKit volume was mounted
+  here. A later run on the same day did both, with the user's approval:
+  [finder-sync-badges-live](../finder-sync-badges-live/README.md) shows each badge in Finder, the
+  context menu's pause and resume, and the installed agent refusing `badges-check`.
 - **Finder and the menu bar side by side.** The menu's transfers view is in open
   [PR #74](https://github.com/vishnu597/voidfs/pull/74), not on `main`.
 - **Offline.** While the server can't be reached, the call still answers from local state (it

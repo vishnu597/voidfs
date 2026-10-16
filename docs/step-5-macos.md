@@ -41,7 +41,8 @@ QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and
 independent Macs and the absent paid target apps remain explicitly untested.
 **Item 8's Finder Sync slice is built, not complete** ([16 October](#finder-sync-badges-16-october)):
 a Finder Sync extension badges mounted drives' items from one new daemon call that reads only
-local state; a live Finder and FSKit volume were not exercised.
+local state. Every state and the menu's pause and resume were shown in a live Finder on an FSKit
+mount the same day ([live run](../bench/results/finder-sync-badges-live/README.md)).
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -352,9 +353,9 @@ actions, not actions performed by writing this plan.
 
 **Finder Sync slice built, 16 October, not complete:** badges for saved, pending, saving, error and
 conflict, a drive's pause and resume in the context menu, and the daemon call behind them, checked
-against a test daemon without Finder ([Finder Sync badges](#finder-sync-badges-16-october)). Badge
-reads cost no server request. Badges in a live Finder on an FSKit mount, and Finder beside the menu
-bar, remain; cancel isn't offered for a mount's changes.
+against a test daemon without Finder ([Finder Sync badges](#finder-sync-badges-16-october)), then
+in a live Finder on an FSKit mount. Badge reads cost no server request. Finder beside the menu bar
+remains; cancel isn't offered for a mount's changes.
 
 Use the existing daemon status/upload stream for mounts, connectivity, queue progress, per-item
 and global pause/resume, cancel and immediate bandwidth caps. Distinguish local durable saves
@@ -2383,8 +2384,14 @@ renames and equivalent spellings, pages, a folder no longer listed) and the daem
 proxy sees no request for any badge call over a 1,000-file folder, and states come back from the
 journal after a restart.
 
-Not shown: badges and the context menu in a live Finder on an FSKit mount. Enabling the extension
-and mounting change this Mac's registrations, and were left for the user's approval. Also not
-shown: Finder beside the menu bar's transfers view (open
+A [live run](../bench/results/finder-sync-badges-live/README.md), with the user's approval, enabled
+the extension and mounted a new test drive through FSKit. Finder showed each state on files and
+folders: saved, pending, saving, error from a cancelled entry, and conflict from `mount_peer`.
+The context menu's Pause Uploads and Resume Uploads paused and released the drive, and Finder
+redrew the open folders after the resume. The installed agent refused `badges-check` by its
+signature requirement. The drive's own icon on the desktop showed no badge. Every registration and
+default was restored afterwards.
+
+Not shown: Finder beside the menu bar's transfers view (open
 [PR #74](https://github.com/vishnu597/voidfs/pull/74)), an offline link, and two Macs. A pending
 deletion leaves no name to badge, so it doesn't mark its folder. Item 8's done-when is not met.
