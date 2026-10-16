@@ -157,11 +157,11 @@ async fn badges_follow_the_queue_from_local_state_without_a_remote_request() {
 
     // Nothing unpublished yet: every listed name is saved, so no entry is named.
     let top = client.folder_states(&folder("drive", "")).await.unwrap();
-    assert!(top.known && !top.unchanged && top.state == Sync::Saved && top.entries.is_empty(), "{top:?}");
+    assert!(!top.unchanged && top.state == Sync::Saved && top.entries.is_empty(), "{top:?}");
     let all_big = client.folder_states(&folder("drive", "big")).await.unwrap();
-    assert!(all_big.known && all_big.entries.is_empty() && all_big.next.is_none());
+    assert!(all_big.entries.is_empty() && all_big.next.is_none());
     let never = client.folder_states(&folder("drive", "never")).await.unwrap();
-    assert!(!never.known && never.entries.is_empty(), "a folder never listed here is unknown, and isn't listed for a badge: {never:?}");
+    assert!(never.entries.is_empty() && never.state == Sync::Saved, "a folder never listed here isn't listed for a badge: {never:?}");
     refused(client.folder_states(&folder("drive", "missing")).await, 404, "NotFound");
     refused(client.folder_states(&folder("drive", "a.txt")).await, 400, "NotDir");
     refused(client.folder_states(&Folder { limit: Some(0), ..folder("drive", "") }).await, 400, "InvalidArgument");
@@ -271,7 +271,6 @@ async fn badges_come_back_from_the_journal_after_the_daemon_restarts() {
     until("the remembered mount comes back", async || client.mounts().await.unwrap().mounts.first().is_some_and(|m| m.state == "mounted")).await;
     let after = client.folder_states(&folder("drive", "folder")).await.unwrap();
     assert_eq!(entries(&after), [("file", Sync::Saving)], "the unpublished change is still this Mac's");
-    assert!(after.known, "a listing from before the restart still counts");
     assert_ne!(after.version, before.version, "another daemon's versions never match");
     let top = client.folder_states(&folder("drive", "")).await.unwrap();
     assert_eq!((entries(&top), top.state), (vec![("folder", Sync::Saving)], Sync::Saving));

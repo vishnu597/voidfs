@@ -9,15 +9,13 @@ use super::*;
 pub const MAX_STATES: usize = 1024;
 
 /// A folder's entries that are not [`Sync::Saved`], from [`Session::folder_states`]. Every other
-/// name the folder has on this Mac is saved. A folder's state, its own and its entries', counts
-/// everything below it: the most pressing of its unsaved descendants ([`Sync::Conflict`], then
-/// [`Sync::Error`], [`Sync::Saving`] and [`Sync::Pending`]). [`Sync::Local`] files count for
-/// nothing above them.
+/// name in the folder is saved: whatever isn't is a change made on this Mac, and those are in the
+/// local view whether or not the folder is listed now. A folder's state, its own and its
+/// entries', counts everything below it: the most pressing of its unsaved descendants
+/// ([`Sync::Conflict`], then [`Sync::Error`], [`Sync::Saving`] and [`Sync::Pending`]).
+/// [`Sync::Local`] files count for nothing above them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderStates {
-    /// The folder's names are on this Mac: listed once at least, or made here. Until then its
-    /// entries are unknown rather than saved.
-    pub known: bool,
     pub state: Sync,
     /// In UTF-8 byte order, after the request's cursor.
     pub entries: Vec<(String, Sync)>,
@@ -71,9 +69,8 @@ fn child(c: &Connection, parent: Ino, name: &str) -> rusqlite::Result<Option<Ino
 
 impl Session {
     /// The states of `folder`'s entries, `folder` being its path below the drive's top (`""`
-    /// for the top itself, `/` between names). It reads this Mac's state only: a folder not yet
-    /// listed is not listed for it, and its entries are unknown ([`FolderStates::known`]).
-    /// `after` is an exclusive name cursor; a page holds `limit` entries at most
+    /// for the top itself, `/` between names). It reads this Mac's state only: a folder not
+    /// listed now is not listed for it. `after` is an exclusive name cursor; a page holds `limit` entries at most
     /// ([`MAX_STATES`]) and stops before its names exceed `max_bytes`. With `unless`, a folder
     /// whose listing generation is still that answers [`FolderStates::unchanged`] at once; the
     /// caller compares what else may have changed (the drive's own generation).
@@ -97,12 +94,10 @@ impl Session {
                 }
                 let Some(n) = node(&tx, d, at)? else { return Ok(Err(FsError::Stale)); };
                 if n.entry.kind != Kind::Folder { return Ok(Err(FsError::NotDir)); }
-                let (generation, listed, seq): (u64, bool, Option<u64>) = tx.query_row("SELECT generation, listed, seq FROM mount_dirs WHERE ino=?1", [at],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?.unwrap_or((0, false, None));
+                let generation: u64 = tx.query_row("SELECT generation FROM mount_dirs WHERE ino=?1", [at], |r| r.get(0)).optional()?.unwrap_or(0);
                 if unless == Some(generation) {
-                    return Ok(Ok(FolderStates { known: false, state: Sync::Saved, entries: Vec::new(), next: None, generation, unchanged: true }));
+                    return Ok(Ok(FolderStates { state: Sync::Saved, entries: Vec::new(), next: None, generation, unchanged: true }));
                 }
-                let known = listed || seq.is_some() || (at != root && n.entry.object_id.is_empty());
                 let mut entries = std::collections::BTreeMap::<String, Sync>::new();
                 for row in tx.prepare_cached(UNSAVED_CHILDREN)?.query_map([at], |r| Ok((r.get::<_, String>(0)?, parse(&r.get::<_, String>(1)?)?)))? {
                     let (name, sync) = row?;
@@ -149,7 +144,7 @@ impl Session {
                     bytes = bytes.saturating_add(size);
                     page.push((name.clone(), *sync));
                 }
-                Ok(Ok(FolderStates { known, state, entries: page, next, generation, unchanged: false }))
+                Ok(Ok(FolderStates { state, entries: page, next, generation, unchanged: false }))
             })();
             drop(tx);
             found
@@ -200,7 +195,7 @@ mod tests {
         set(&store, &[failed], "error");
         set(&store, &[saving], "saving");
         let top = core.folder_states("", None, MAX_STATES, usize::MAX, None).await.unwrap();
-        assert!(top.known && !top.unchanged && top.next.is_none());
+        assert!(!top.unchanged && top.next.is_none());
         assert_eq!(top.entries, states(&[(".DS_Store", Sync::Local), ("folder", Sync::Error), ("pending", Sync::Pending)]),
             "saved names are left out; a folder takes the most pressing state below it; a local file stays local");
         assert_eq!(top.state, Sync::Error);
@@ -210,7 +205,7 @@ mod tests {
         let leaf = core.folder_states("folder/deep", None, MAX_STATES, usize::MAX, None).await.unwrap();
         assert_eq!((leaf.entries, leaf.state), (states(&[("failed", Sync::Error)]), Sync::Error));
         let calm = core.folder_states("quiet", None, MAX_STATES, usize::MAX, None).await.unwrap();
-        assert!(calm.known && calm.entries.is_empty() && calm.state == Sync::Saved, "a folder whose names are all saved lists nothing");
+        assert!(calm.entries.is_empty() && calm.state == Sync::Saved, "a folder whose names are all saved lists nothing");
         set(&store, &[pending], "conflict");
         let top = core.folder_states("", None, MAX_STATES, usize::MAX, None).await.unwrap();
         assert_eq!((top.entries[2].1, top.state), (Sync::Conflict, Sync::Conflict), "a conflict outranks an error");
@@ -271,18 +266,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_unlisted_folder_is_unknown_until_listed_and_a_new_one_is_known() {
+    async fn a_folder_no_longer_listed_still_answers_its_local_changes() {
         let (_dir, store, core, queue) = fixture().await;
         let root = core.root();
         let made = core.mkdir(root, "made", 0o755).await.unwrap().ino;
-        assert!(core.folder_states("made", None, 8, usize::MAX, None).await.unwrap().known, "a folder made here has only local names");
+        let inner = core.create(made, "inner", 0o644).await.unwrap().ino;
+        set(&store, &[made], "saved");
+        // Published, then unlisted, as the feed's echo of its own publication leaves it.
         store.with(|c| {
             c.execute("UPDATE mount_inodes SET object_id='remote-id', attrs=json_set(attrs, '$.objectId', 'remote-id') WHERE ino=?1", [made])?;
-            c.execute("UPDATE mount_dirs SET listed=0, seq=NULL WHERE ino=?1", [made])
+            c.execute("UPDATE mount_dirs SET listed=0, seq=NULL, generation=generation+1 WHERE ino=?1", [made])
         }).unwrap();
-        assert!(!core.folder_states("made", None, 8, usize::MAX, None).await.unwrap().known, "a remote folder never listed is unknown");
-        store.with(|c| c.execute("UPDATE mount_dirs SET seq=7 WHERE ino=?1", [made])).unwrap();
-        assert!(core.folder_states("made", None, 8, usize::MAX, None).await.unwrap().known, "a listing from before a restart still counts");
+        let unlisted = core.folder_states("made", None, 8, usize::MAX, None).await.unwrap();
+        assert_eq!((unlisted.entries, unlisted.state), (states(&[("inner", Sync::Pending)]), Sync::Pending), "its unsaved names are still on this Mac");
+        set(&store, &[inner], "saved");
+        let calm = core.folder_states("made", None, 8, usize::MAX, None).await.unwrap();
+        assert_eq!((calm.entries, calm.state), (Vec::new(), Sync::Saved), "and everything else is saved");
         queue.close().await;
     }
 

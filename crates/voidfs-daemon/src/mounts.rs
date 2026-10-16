@@ -324,7 +324,6 @@ pub(crate) async fn states(State(s): State<Arc<Shared>>, Json(f): Json<api::Fold
         folder: f.folder,
         version: format!("{version}.{}", states.generation),
         unchanged: states.unchanged,
-        known: states.known,
         state: states.state,
         entries: states.entries,
         next: states.next,

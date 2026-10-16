@@ -251,7 +251,7 @@ pub struct Folder {
     pub since: Option<String>,
 }
 
-/// A folder's entries that aren't saved; every other name it has on this Mac is. A folder's
+/// A folder's entries that aren't saved; every other name in it is. A folder's
 /// state counts what is below it: conflict, then error, saving and pending. Read from the
 /// daemon's state only, never from the server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,8 +265,6 @@ pub struct FolderStates {
     /// `since` still holds: nothing else is set.
     #[serde(default)]
     pub unchanged: bool,
-    /// The folder's names are on this Mac. Until it is listed once, its entries are unknown.
-    pub known: bool,
     /// The folder's own, with everything below it.
     pub state: voidfs_client::mount::Sync,
     /// In UTF-8 name order.
