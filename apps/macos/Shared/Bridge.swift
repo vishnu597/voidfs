@@ -97,8 +97,10 @@ enum Bridge {
 /// The daemon's `Attr`, with its RFC 3339 time as seconds and nanoseconds.
 @objc(VoidfsBridgeAttr) final class BridgeAttr: NSObject, NSSecureCoding {
     @objc enum Kind: Int { case file, folder, symlink, unknown }
-    /// `local`: a file kept on this Mac (`.DS_Store`), never published.
-    @objc enum SyncState: Int { case saved, pending, saving, conflict, error, local }
+    /// `local`: a file kept on this Mac (`.DS_Store`), never published. `kept`: a change whose
+    /// upload was cancelled, kept on this Mac and not uploaded until a later save (step 5, item 8).
+    /// New states go last: the raw values cross the bridge.
+    @objc enum SyncState: Int { case saved, pending, saving, conflict, error, local, kept }
 
     let ino: UInt64
     let kind: Kind

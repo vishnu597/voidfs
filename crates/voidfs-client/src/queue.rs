@@ -171,6 +171,13 @@ pub struct Status {
     pub unpublished_bytes: u64,
 }
 
+/// What a cancel did: the entries it cancelled for good, and a mount's changes it kept on this Mac.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cancelled {
+    pub cancelled: u64,
+    pub kept: u64,
+}
+
 struct Running {
     stop: Stop,
     sent: Arc<AtomicU64>,
@@ -234,11 +241,23 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
     tokio::task::spawn_blocking(f).await?
 }
 
+/// The mount inodes a conflict holds: their own, or a folder's they wait for.
+fn conflicted(c: &rusqlite::Connection) -> rusqlite::Result<HashSet<u64>> {
+    c.prepare("SELECT ino FROM mount_conflict_blockers UNION SELECT ino FROM mount_conflicts")?.query_map([], |r| r.get::<_, u64>(0))?.collect()
+}
+
 /// What the journal in `store` holds unpublished, and the bytes it has left to send, without
-/// opening the queue: for a status while no daemon runs.
+/// opening the queue: for a status while no daemon runs. Kept changes aren't counted.
 pub fn unpublished(store: &Store) -> Result<(u64, u64)> {
     let entries = store.with(|c| journal::unfinished(c))?;
-    Ok((entries.len() as u64, entries.iter().map(|e| e.size.saturating_sub(e.sent)).sum()))
+    let entries = entries.iter().filter(|e| e.state.to_send());
+    Ok(entries.fold((0, 0), |(n, bytes), e| (n + 1, bytes + e.size.saturating_sub(e.sent))))
+}
+
+/// Files with a mount change kept on this Mac ([`State::Kept`]), without opening the queue.
+pub fn kept(store: &Store) -> Result<u64> {
+    let entries = store.with(|c| journal::unfinished(c))?;
+    Ok(entries.iter().filter(|e| e.state == State::Kept).map(|e| (&e.drive, &e.key)).collect::<BTreeSet<_>>().len() as u64)
 }
 
 /// Is `key` the folder `prefix` (ending in `/`) or inside it?
@@ -413,17 +432,40 @@ impl Queue {
 
     /// The new file's creating put that `e` folds into: not started, its inode's latest entry
     /// at the same key, and `e` the inode's next edit of its mode, times, xattrs or whole bytes.
-    fn fold_target(tx: &rusqlite::Transaction<'_>, st: &QState, e: &Entry) -> rusqlite::Result<Option<Entry>> {
+    fn fold_target(tx: &rusqlite::Transaction<'_>, st: &QState, e: &Entry, requeued: &BTreeSet<EntryId>) -> rusqlite::Result<Option<Entry>> {
         use rusqlite::OptionalExtension;
         let (Some(ino), StoredBase::Entry(base)) = (e.mount_ino, &e.base) else { return Ok(None); };
         let foldable = match e.op { Op::Attrs => e.attrs.content_type.is_none(), Op::Put => true, _ => false };
         if !foldable || e.batch.is_some() { return Ok(None); }
         let Some(p) = st.pending.get(base) else { return Ok(None); };
+        let queued = p.state == State::Queued || p.state == State::Kept && requeued.contains(&p.id);
         if !(p.mount && p.op == Op::Put && p.base == StoredBase::Absent && p.mount_ino == Some(ino) && p.drive == e.drive && p.key == e.key
-            && p.state == State::Queued && p.batch.is_none() && p.published_version.is_none() && p.upload_id.is_none()
+            && queued && p.batch.is_none() && p.published_version.is_none() && p.upload_id.is_none()
             && !st.running.contains_key(&p.id) && !st.may_have_landed.contains(&p.id)) { return Ok(None); }
         let latest = tx.query_row("SELECT entry_id FROM mount_inodes WHERE ino=?1 AND drive=?2", rusqlite::params![ino, e.drive], |r| r.get::<_, Option<EntryId>>(0)).optional()?.flatten();
-        Ok((latest == Some(p.id)).then(|| p.clone()))
+        Ok((latest == Some(p.id)).then(|| { let mut p = p.clone(); p.state = State::Queued; p }))
+    }
+
+    /// The kept changes that new mount `entries` need published first, with the kept changes
+    /// those need in turn: the same inode's, the ones their bases name, and earlier ones they
+    /// depend on by name ([`State::Kept`]).
+    fn needed_kept(st: &QState, entries: &[Entry]) -> BTreeSet<EntryId> {
+        let kept: Vec<&Entry> = st.pending.values().filter(|p| p.state == State::Kept).collect();
+        let mut needed = BTreeSet::new();
+        if kept.is_empty() { return needed; }
+        let mut look: Vec<Entry> = entries.iter().map(|e| Entry { mount: true, ..e.clone() }).collect();
+        while let Some(e) = look.pop() {
+            for k in &kept {
+                // A new entry has no id yet: it comes after every kept one.
+                let before = e.id == 0 || k.id < e.id;
+                if needed.contains(&k.id) || !before { continue; }
+                if k.drive == e.drive && k.mount_ino.is_some() && k.mount_ino == e.mount_ino || matches!(e.base, StoredBase::Entry(b) if b == k.id) || depends(k, &e) {
+                    needed.insert(k.id);
+                    look.push((*k).clone());
+                }
+            }
+        }
+        needed
     }
 
     /// How much longer a mount's new file holds its creating put back, if it does ([`QueueConfig::create_hold`]).
@@ -521,12 +563,22 @@ impl Queue {
                     Ok(result) => result,
                     Err(err) => return Ok(Err(err)),
                 };
+                // Kept changes these need are queued again, to publish first.
+                let requeued = Self::needed_kept(&st, &entries);
+                for id in &requeued {
+                    let Some(k) = st.pending.get(id) else { continue };
+                    let k = Entry { state: State::Queued, ..k.clone() };
+                    journal::update(&tx, &k)?;
+                    if let Some(ino) = k.mount_ino {
+                        tx.execute("UPDATE mount_inodes SET sync='saving', generation=generation+1 WHERE ino=?1 AND drive=?2 AND sync='kept'", rusqlite::params![ino, k.drive])?;
+                    }
+                }
                 let mut folded = Vec::new();
                 for i in 0..entries.len() {
                     let (earlier, rest) = entries.split_at_mut(i);
                     let e = &mut rest[0];
                     e.mount = true;
-                    if let Some(mut into) = Self::fold_target(&tx, &st, e)? {
+                    if let Some(mut into) = Self::fold_target(&tx, &st, e, &requeued)? {
                         let replaced = fold(&mut into, e);
                         journal::amend(&tx, &into)?;
                         crate::mount::publication::stamp(&tx, &into)?;
@@ -559,9 +611,12 @@ impl Queue {
                     entries[i] = into;
                     replaced.extend(old);
                 }
-                Ok(Ok((value, entries, replaced)))
+                Ok(Ok((value, entries, replaced, requeued)))
             }).map_err(crate::mount::FsError::from)??;
-            let (value, entries, replaced) = committed;
+            let (value, entries, replaced, requeued) = committed;
+            for id in requeued {
+                if let Some(k) = st.pending.get_mut(&id) { k.state = State::Queued; }
+            }
             for e in entries {
                 st.pending.insert(e.id, e);
             }
@@ -776,7 +831,7 @@ impl Queue {
             }
             if !paused {
                 // A resume tries the scope's failed entries again, at once.
-                let blocked = s.with(|c| c.prepare("SELECT ino FROM mount_conflict_blockers UNION SELECT ino FROM mount_conflicts")?.query_map([], |r| r.get::<_, u64>(0))?.collect::<rusqlite::Result<HashSet<_>>>())?;
+                let blocked = s.with(|c| conflicted(c))?;
                 let ids: Vec<EntryId> = st.pending.values().filter(|e| e.state == State::Failed && !(e.mount && (e.conflict.is_some() || e.mount_ino.is_some_and(|ino| blocked.contains(&ino)))) && in_scope(e, &scope)).map(|e| e.id).collect();
                 for id in ids {
                     st.retry_at.remove(&id);
@@ -805,12 +860,24 @@ impl Queue {
 
     /// Cancels: nothing in the scope is published from now on, and what was uploading stops. A
     /// change made on top of a cancelled one is cancelled with it.
-    pub async fn cancel(&self, scope: Scope) -> Result<()> {
+    ///
+    /// A mount's change is kept rather than dropped ([`State::Kept`]): the copy on this Mac keeps
+    /// it, not uploaded, and so does every later mount change that would have waited for it. The
+    /// next change that needs it (a save of the same file, its rename or deletion, or a change it
+    /// must come before) queues it again, so the drive then gets the file as it is on this Mac,
+    /// guarded on the version the kept change was made on (step 5, item 8). A mount's conflict,
+    /// and what waits for one, stay as they are: both versions are already on this Mac, and
+    /// nothing of them is sent until the conflict is resolved.
+    pub async fn cancel(&self, scope: Scope) -> Result<Cancelled> {
+        let store = self.0.store.clone();
+        let blocked = blocking(move || store.with(|c| conflicted(c))).await?;
         let entries = {
             let st = self.st();
-            let mut gone: BTreeSet<EntryId> = st.pending.values().filter(|e| in_scope(e, &scope)).map(|e| e.id).collect();
+            let left = |e: &Entry| e.state == State::Kept || e.mount && (e.conflict.is_some() || e.mount_ino.is_some_and(|ino| blocked.contains(&ino)));
+            let mut gone: BTreeSet<EntryId> = st.pending.values().filter(|e| in_scope(e, &scope) && !left(e)).map(|e| e.id).collect();
             loop {
-                let more: Vec<EntryId> = st.pending.values().filter(|e| !gone.contains(&e.id) && matches!(e.base, StoredBase::Entry(b) if gone.contains(&b))).map(|e| e.id).collect();
+                let more: Vec<EntryId> = st.pending.values().filter(|e| !gone.contains(&e.id) && !left(e) && (matches!(e.base, StoredBase::Entry(b) if gone.contains(&b))
+                    || e.mount && gone.iter().any(|g| *g < e.id && st.pending.get(g).is_some_and(|g| g.mount && depends(g, e))))).map(|e| e.id).collect();
                 if more.is_empty() { break; }
                 gone.extend(more);
             }
@@ -829,36 +896,44 @@ impl Queue {
         let this = self.clone();
         let reports = blocking(move || {
             let mut st = this.st();
-            let mut cancelled = Vec::new();
+            let mut stopped = Vec::new();
+            let mut done = Cancelled::default();
             for entry in entries {
                 if let Some(r) = st.running.get(&entry.id).cloned() {
                     st.cancelled.insert(entry.id);
                     r.stop.signal(Why::Cancel);
+                    if entry.mount { done.kept += 1 } else { done.cancelled += 1 }
                 } else if let Some(e) = st.pending.get(&entry.id) {
                     if e.published_version.is_some() { continue; }
-                    let mut e = e.clone(); e.state = State::Cancelled;
-                    cancelled.push(e);
+                    let mut e = e.clone();
+                    e.state = if e.mount { State::Kept } else { State::Cancelled };
+                    if e.mount { done.kept += 1 } else { done.cancelled += 1 }
+                    stopped.push(e);
                 }
             }
             let reports = this.0.store.with(|c| {
                 let tx = c.transaction()?;
-                for e in &cancelled { journal::update(&tx, e)?; }
+                for e in &stopped { journal::update(&tx, e)?; }
                 let mut drives = BTreeMap::<String, Vec<Entry>>::new();
-                for e in cancelled.iter().filter(|e| e.mount) { drives.entry(e.drive.clone()).or_default().push(e.clone()); }
+                for e in stopped.iter().filter(|e| e.mount) { drives.entry(e.drive.clone()).or_default().push(e.clone()); }
                 let mut reports = Vec::new();
                 for run in drives.into_values() {
-                    reports.extend(crate::mount::publication::reconcile(&tx, &run, &crate::mount::publication::Completion::Cancelled).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?);
+                    reports.extend(crate::mount::publication::reconcile(&tx, &run, &crate::mount::publication::Completion::Kept).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?);
                 }
                 tx.commit()?;
                 Ok(reports)
             })?;
-            for e in cancelled {
-                st.pending.remove(&e.id); st.attempts.remove(&e.id); st.retry_at.remove(&e.id);
+            for e in stopped {
+                st.attempts.remove(&e.id); st.retry_at.remove(&e.id);
+                // A kept entry that may have landed is still recognized by its marker once queued again.
+                if e.state == State::Kept { st.pending.insert(e.id, e); continue; }
+                st.pending.remove(&e.id);
                 if e.staged && let Some(p) = &e.source { let _ = std::fs::remove_file(p); }
             }
             st.idle = false;
-            Ok(reports)
+            Ok((reports, done))
         }).await?;
+        let (reports, done) = reports;
         for (inodes, prepared) in prepared {
             let selected = reports.iter().filter(|r| inodes.contains(&r.ino)).cloned().collect();
             prepared.apply(selected);
@@ -866,7 +941,7 @@ impl Queue {
         drop(registrations);
         self.0.wake.notify_one();
         self.0.changed.notify_waiters();
-        Ok(())
+        Ok(done)
     }
 
     /// The upload bandwidth limit, in bytes a second (`None` for unlimited). It applies to the
@@ -916,7 +991,7 @@ impl Queue {
                 let state = if st.running.contains_key(&e.id) { State::Uploading } else { e.state };
                 items.push(Item {
                     id: e.id,
-                    paused: st.paused(&e) && !state.finished(),
+                    paused: st.paused(&e) && state.to_send(),
                     drive: e.drive,
                     key: e.key,
                     to_key: e.to_key,
@@ -945,7 +1020,8 @@ impl Queue {
                     _ => {}
                 }
             }
-            let unpublished: Vec<&Item> = items.iter().filter(|i| !i.state.finished()).collect();
+            // Kept changes aren't to send until a later change queues them again.
+            let unpublished: Vec<&Item> = items.iter().filter(|i| i.state.to_send()).collect();
             Ok(Status {
                 unpublished: unpublished.len() as u64,
                 unpublished_bytes: unpublished.iter().map(|i| i.size.saturating_sub(i.sent)).sum(),
@@ -1058,7 +1134,7 @@ impl Queue {
 
     /// The runs that may start now, and how long until a failed one may be tried again.
     fn select(&self, st: &mut QState) -> (Vec<Vec<Entry>>, Option<Duration>) {
-        let blocked = match self.0.store.with(|c| c.prepare("SELECT ino FROM mount_conflict_blockers UNION SELECT ino FROM mount_conflicts")?.query_map([], |r| r.get::<_, u64>(0))?.collect::<rusqlite::Result<HashSet<_>>>()) {
+        let blocked = match self.0.store.with(|c| conflicted(c)) {
             Ok(blocked) => blocked,
             Err(_) => return (Vec::new(), Some(Duration::from_secs(1))),
         };
@@ -1074,7 +1150,8 @@ impl Queue {
                 break;
             }
             let e = &st.pending[id];
-            if taken.contains(id) || st.running.contains_key(id) || st.paused(e) || e.mount && e.mount_ino.is_some_and(|ino| blocked.contains(&ino)) {
+            // A kept change waits for a later one to queue it again; what depends on it waits too.
+            if e.state == State::Kept || taken.contains(id) || st.running.contains_key(id) || st.paused(e) || e.mount && e.mount_ino.is_some_and(|ino| blocked.contains(&ino)) {
                 continue;
             }
             if e.state == State::Failed {
@@ -1088,8 +1165,9 @@ impl Queue {
                     None => continue,
                 }
             }
-            // Anything earlier it depends on must be finished first.
-            if ids[..i].iter().any(|p| depends(&st.pending[p], e)) {
+            // Anything earlier it depends on must be finished first. A kept mount change holds
+            // back only the mount's own later changes, which queue it again when they're made.
+            if ids[..i].iter().any(|p| (e.mount || st.pending[p].state != State::Kept) && depends(&st.pending[p], e)) {
                 continue;
             }
             if !st.may_have_landed.contains(id) && let Some(d) = self.held(e, now_ms) {
@@ -1326,7 +1404,7 @@ impl Queue {
             if completion.is_none() {
                 completion = match &outcome {
                     Outcome::Failed { error, .. } | Outcome::Rejected { error, .. } => Some(crate::mount::publication::Completion::Error { error: error.clone() }),
-                    Outcome::Stopped(Why::Cancel) => Some(crate::mount::publication::Completion::Cancelled),
+                    Outcome::Stopped(Why::Cancel) => Some(crate::mount::publication::Completion::Kept),
                     _ => None,
                 };
             }
@@ -1433,7 +1511,7 @@ impl Queue {
                 Outcome::Failed { error, .. } | Outcome::Rejected { error, .. } if i == 0 => {
                     p.state = State::Failed; p.sent = sent.min(p.size); p.error = Some(error.clone());
                 }
-                Outcome::Stopped(Why::Cancel) if cancelled => p.state = State::Cancelled,
+                Outcome::Stopped(Why::Cancel) if cancelled => p.state = if p.mount { State::Kept } else { State::Cancelled },
                 _ => {
                     p.state = if closed { State::Uploading } else { State::Queued };
                     p.sent = if i == 0 { sent.min(p.size) } else { 0 };
@@ -1445,7 +1523,7 @@ impl Queue {
             let tx = c.transaction()?;
             for e in &entries { journal::update(&tx, e)?; }
             let reports = if let Some(completion) = &completion {
-                let reconciled: Vec<Entry> = entries.iter().filter(|e| !matches!(completion, crate::mount::publication::Completion::Cancelled) || e.state == State::Cancelled).cloned().collect();
+                let reconciled: Vec<Entry> = entries.iter().filter(|e| !matches!(completion, crate::mount::publication::Completion::Kept) || e.state == State::Kept).cloned().collect();
                 crate::mount::publication::reconcile(&tx, &reconciled, completion).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
             } else { Vec::new() };
             tx.commit()?;
@@ -1467,7 +1545,7 @@ impl Queue {
             for e in &run { st.retry_at.remove(&e.id); }
         }
         for e in entries {
-            if e.state == State::Queued && matches!(outcome, Outcome::Stopped(_)) { st.may_have_landed.insert(e.id); }
+            if matches!(e.state, State::Queued | State::Kept) && matches!(outcome, Outcome::Stopped(_)) { st.may_have_landed.insert(e.id); }
             if !e.state.finished() { st.pending.insert(e.id, e); continue; }
             st.pending.remove(&e.id); st.attempts.remove(&e.id); st.retry_at.remove(&e.id); st.may_have_landed.remove(&e.id);
             if e.staged && let Some(p) = &e.source { let _ = std::fs::remove_file(p); }
@@ -1647,7 +1725,13 @@ mod tests {
         assert!(entry.staged);
         assert_eq!(std::fs::read(&frozen).unwrap(), b"snapshot", "queue startup keeps adopted source bytes");
         q.cancel(Scope::All).await.unwrap();
-        assert!(!frozen.exists(), "the journal cleans up its frozen source after cancellation");
+        assert_eq!(q.status().await.unwrap().items[0].state, State::Kept);
+        assert!(frozen.exists(), "a kept change keeps its frozen source for the save that queues it again");
+        q.clear_finished().await.unwrap();
+        q.close().await;
+        drop(q);
+        let q = paused(dir.path()).await;
+        assert!(frozen.exists(), "and keeps it through clearing and a restart");
         assert!(source.exists(), "the mount still owns its mutable staging file");
         q.close().await;
     }
@@ -2448,6 +2532,38 @@ mod tests {
         assert!(remote.meta.metadata.contains_key(publish::MARKER));
         assert_eq!(peer.list_versions("drive", "file", true).await.unwrap().len(), 1);
         assert_eq!(session.read(fh, 0, bytes.len() as u64).await.unwrap(), bytes);
+        session.close(fh).await.unwrap(); q.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_mount_upload_in_flight_keeps_it_and_the_next_save_sends_the_file() {
+        let server = voidfs_server::test_server::TestServer::start().await.unwrap();
+        let peer = client(&server.endpoint); peer.create_drive("drive", Default::default()).await.unwrap();
+        let (_dir, q, session) = large_new_file_session(&server.endpoint, peer.clone()).await;
+        let attr = session.create(session.root(), "file", 0o600).await.unwrap();
+        let fh = session.open(attr.ino, true).await.unwrap();
+        let bytes = Bytes::from(vec![0x5a; (5 * MIB + 37) as usize]);
+        session.write(fh, 0, bytes.clone()).await.unwrap(); session.fsync(fh).await.unwrap();
+        q.set_bandwidth(Some(MIB)).await.unwrap();
+        q.resume(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !q.status().await.unwrap().items.iter().any(|i| i.state == State::Uploading && i.sent > 0) { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await.expect("the streamed upload starts");
+        q.cancel(Scope::All).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), q.settle()).await.unwrap();
+        let items = q.status().await.unwrap().items;
+        assert!(items.iter().all(|i| i.state == State::Kept && i.sent < bytes.len() as u64), "{items:?}");
+        assert_eq!(peer.head_object("drive", "file", Default::default()).await.unwrap_err().status(), Some(404), "the stopped stream published nothing");
+        assert_eq!(session.getattr(attr.ino).await.unwrap().sync, crate::mount::Sync::Kept);
+        q.set_bandwidth(None).await.unwrap();
+        session.write(fh, bytes.len() as u64, Bytes::from_static(b"end")).await.unwrap(); session.fsync(fh).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), q.settle()).await.unwrap();
+        let remote = peer.get_object("drive", "file", Default::default()).await.unwrap();
+        assert_eq!(remote.body.len(), bytes.len() + 3);
+        assert_eq!(&remote.body[bytes.len()..], b"end");
+        // The stopped attempt may have landed, so the kept creation goes alone, then the save.
+        assert_eq!(peer.list_versions("drive", "file", true).await.unwrap().len(), 2);
+        assert_eq!(session.getattr(attr.ino).await.unwrap().sync, crate::mount::Sync::Saved);
         session.close(fh).await.unwrap(); q.close().await;
     }
 

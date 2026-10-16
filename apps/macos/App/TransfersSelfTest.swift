@@ -3,8 +3,9 @@
 // `voidfs transfers-selftest <drive> [--cancel] [--png <path>]`: the menu's transfers controls
 // against a running daemon, through the same model calls as the menu's buttons, each checked in the
 // daemon's status or queue afterwards. It restores the limit and the pauses it changes. `--cancel`
-// also cancels the newest unfinished import and clears finished uploads, which can't be undone; a
-// mount's changes are never cancelled. `--png` draws the menu's view, offscreen, to a file.
+// also cancels the newest unfinished import and clears finished uploads, which can't be undone,
+// and cancels the oldest mount change waiting, which then stays on this Mac, not uploaded, until
+// its file is saved again. A mount's conflict, if there is one, is cancelled too, and stays a conflict. `--png` draws the menu's view, offscreen, to a file.
 //
 // Run it against a test daemon: `-VoidfsStateDirectory <dir>` points the app at one.
 
@@ -62,7 +63,9 @@ enum TransfersSelfTest {
         if !before.paused {
             await t.pause(.all)
             check("pause all pauses", await eventually { t.status?.uploads.paused == true && t.queue?.paused == true })
-            check("the symbol says paused", t.status?.uploads.unpublished == 0 || t.symbol == "pause.circle", t.symbol)
+            // A failure or a conflict outranks the pause.
+            let problem = (t.status?.uploads.failed ?? 0) + (t.status?.uploads.conflicts ?? 0) > 0
+            check("the symbol says paused", t.status?.uploads.unpublished == 0 || t.symbol == (problem ? "exclamationmark.triangle" : "pause.circle"), t.symbol)
             await t.resume(.all)
             check("resume all resumes", await eventually { t.status?.uploads.paused == false })
         }
@@ -82,7 +85,7 @@ enum TransfersSelfTest {
         } else {
             print("skip no unpaused, unfinished import")
         }
-        if let i = queue.items.first(where: { !$0.finished && !$0.paused }) {
+        if let i = queue.items.first(where: { $0.toSend && !$0.paused }) {
             await t.pause(.entry(i.id))
             check("pause change \(i.id) pauses it", await eventually { t.queue?.items.first { $0.id == i.id }.map { $0.paused || $0.finished } ?? true })
             await t.resume(.entry(i.id))
@@ -99,6 +102,23 @@ enum TransfersSelfTest {
                 check("clear finished forgets import \(b.id)", await eventually { t.queue?.batches.contains { $0.id == b.id } == false })
             } else {
                 print("skip no unfinished import to cancel")
+            }
+            if let c = t.queue?.items.first(where: { $0.batch == nil && $0.conflict != nil && $0.toSend }) {
+                check("a mount's conflict has no Cancel", !c.cancellable)
+                await t.cancel(.entry(c.id))
+                check("cancelling conflict \(c.id) leaves it a conflict", await eventually { t.queue?.items.first { $0.id == c.id }.map { $0.conflict != nil && $0.toSend } ?? false })
+                check("the menu says nothing was cancelled", t.notice == Words.nothingCancelled, t.notice ?? "no notice")
+            }
+            if let i = t.queue?.items.first(where: { $0.batch == nil && $0.conflict == nil && $0.toSend }) {
+                let keptBefore = t.status?.uploads.kept ?? 0
+                await t.cancel(.entry(i.id))
+                check("cancel change \(i.id) keeps it on this Mac", await eventually { t.queue?.items.first { $0.id == i.id }?.kept == true }, "\(String(describing: t.queue?.items.first { $0.id == i.id }?.state))")
+                check("the menu says what the cancel did", t.notice?.contains("on this Mac, not uploaded") == true, t.notice ?? "no notice")
+                check("the uploads line counts the kept file", await eventually { (t.status?.uploads.kept ?? 0) > keptBefore && Words.uploads(t.status!.uploads).contains("kept on this Mac, not uploaded") },
+                      t.status.map { Words.uploads($0.uploads) } ?? "")
+                check("the kept change says so", t.queue?.items.first { $0.id == i.id }.map(Words.state) == "kept on this Mac, not uploaded")
+            } else {
+                print("skip no mount change waiting to cancel")
             }
         }
         check("no control failed", t.controlError == nil, t.controlError ?? "")

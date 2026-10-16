@@ -138,10 +138,15 @@ async fn drive_controls_apply_to_cli_alias_and_mounted_id_entries() {
     assert!(paused.contains(&"footage".to_owned()) && paused.contains(&id), "both queue spellings stay paused for future entries: {paused:?}");
     assert_eq!(client.resume(&Scope::Drive(id.clone())).await.unwrap().items, selected, "ID resume includes CLI aliases too");
     assert!(client.uploads(false, None).await.unwrap().queue.paused_drives.is_empty());
-    assert_eq!(client.cancel(&Scope::Drive(id.clone())).await.unwrap().items, selected, "ID cancel includes both queue spellings");
+    let mounted = before.items.iter().filter(|item| item.drive == id).count() as u64;
+    let cancelled = client.cancel(&Scope::Drive(id.clone())).await.unwrap();
+    assert_eq!(cancelled.items, selected, "ID cancel includes both queue spellings");
+    assert_eq!(cancelled.kept, mounted, "the mount's changes are kept on this Mac");
     let remaining = client.uploads(false, None).await.unwrap().queue.items;
-    assert_eq!(remaining.len(), 1);
-    assert_eq!((remaining[0].drive.as_str(), remaining[0].key.as_str()), ("other", "unrelated.txt"), "drive control cannot affect another drive");
+    let (to_send, kept): (Vec<_>, Vec<_>) = remaining.iter().partition(|item| item.state.to_send());
+    assert_eq!(to_send.len(), 1);
+    assert_eq!((to_send[0].drive.as_str(), to_send[0].key.as_str()), ("other", "unrelated.txt"), "drive control cannot affect another drive");
+    assert!(kept.len() as u64 == mounted && kept.iter().all(|item| item.state == voidfs_client::State::Kept && item.key == "mount.txt"), "{kept:?}");
     daemon.stop().await;
 }
 

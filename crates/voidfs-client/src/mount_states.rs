@@ -12,7 +12,7 @@ pub const MAX_STATES: usize = 1024;
 /// name in the folder is saved: whatever isn't is a change made on this Mac, and those are in the
 /// local view whether or not the folder is listed now. A folder's state, its own and its
 /// entries', counts everything below it: the most pressing of its unsaved descendants
-/// ([`Sync::Conflict`], then [`Sync::Error`], [`Sync::Saving`] and [`Sync::Pending`]).
+/// ([`Sync::Conflict`], then [`Sync::Error`], [`Sync::Kept`], [`Sync::Saving`] and [`Sync::Pending`]).
 /// [`Sync::Local`] files count for nothing above them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FolderStates {
@@ -47,7 +47,7 @@ const MAX_DEPTH: usize = 4096;
 
 /// How pressing a state is, for a folder's.
 fn rank(sync: Sync) -> u8 {
-    match sync { Sync::Saved | Sync::Local => 0, Sync::Pending => 1, Sync::Saving => 2, Sync::Error => 3, Sync::Conflict => 4 }
+    match sync { Sync::Saved | Sync::Local => 0, Sync::Pending => 1, Sync::Saving => 2, Sync::Kept => 3, Sync::Error => 4, Sync::Conflict => 5 }
 }
 
 fn worse(a: Sync, b: Sync) -> Sync { if rank(b) > rank(a) { b } else { a } }
@@ -55,7 +55,7 @@ fn worse(a: Sync, b: Sync) -> Sync { if rank(b) > rank(a) { b } else { a } }
 fn parse(sync: &str) -> rusqlite::Result<Sync> {
     Ok(match sync {
         "saved" => Sync::Saved, "pending" => Sync::Pending, "saving" => Sync::Saving, "conflict" => Sync::Conflict, "error" => Sync::Error,
-        "local" => Sync::Local,
+        "local" => Sync::Local, "kept" => Sync::Kept,
         _ => return Err(rusqlite::Error::InvalidQuery),
     })
 }
