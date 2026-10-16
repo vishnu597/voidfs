@@ -301,6 +301,36 @@ pub(crate) async fn unmount(State(s): State<Arc<Shared>>, Json(u): Json<api::Unm
     Ok(Json(api::Unmounted { unmounted }))
 }
 
+/// Names in one folder-states answer at most, with their quoting: half the socket's response bound.
+const STATES_BYTES: usize = crate::api::fs::MAX_RESPONSE / 2;
+
+/// A folder's sync states for status badges, from a drive a mount or a session has open. It
+/// never opens one: that would ask the server, and a badge may cost nothing remote.
+pub(crate) async fn states(State(s): State<Arc<Shared>>, Json(f): Json<api::Folder>) -> Answer<api::FolderStates> {
+    let bad = |m: &str| Failure::new(StatusCode::BAD_REQUEST, "InvalidArgument", m);
+    if f.drive.is_empty() || f.drive.len() > 1024 { return Err(bad("invalid drive name")); }
+    let limit = f.limit.unwrap_or(voidfs_client::mount::MAX_STATES);
+    if limit == 0 || limit > voidfs_client::mount::MAX_STATES { return Err(bad("the page limit is out of bounds")); }
+    if f.since.as_ref().is_some_and(|v| v.len() > 256) { return Err(bad("invalid version")); }
+    let drive = s.sessions.open_drive(&f.drive)
+        .ok_or_else(|| Failure::new(StatusCode::NOT_FOUND, "NotOpen", format!("{} isn't mounted or open here", f.drive)))?;
+    // Read before the states: a change that lands meanwhile then shows in the next version.
+    let version = format!("{:x}.{}.{}", s.nonce, drive.serial, drive.metadata_generation());
+    let unless = f.since.as_deref().filter(|_| f.after.is_none())
+        .and_then(|since| since.rsplit_once('.')).filter(|(prefix, _)| *prefix == version).and_then(|(_, generation)| generation.parse().ok());
+    let states = drive.core.folder_states(&f.folder, f.after.as_deref(), limit, STATES_BYTES, unless).await?;
+    Ok(Json(api::FolderStates {
+        drive: drive.drive(),
+        folder: f.folder,
+        version: format!("{version}.{}", states.generation),
+        unchanged: states.unchanged,
+        known: states.known,
+        state: states.state,
+        entries: states.entries,
+        next: states.next,
+    }))
+}
+
 /// The remembered mounts in `store`, for the daemon to restore.
 pub(crate) fn stored(store: &Store) -> voidfs_client::Result<Vec<Remembered>> {
     voidfs_client::mounts::remembered(store)

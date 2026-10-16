@@ -166,6 +166,11 @@ impl DaemonClient {
         self.post("/v1/mounts", m).await
     }
 
+    /// The sync states of a folder of an open drive, for status badges.
+    pub async fn folder_states(&self, folder: &api::Folder) -> Result<api::FolderStates, ClientError> {
+        self.post("/v1/mounts/states", folder).await
+    }
+
     /// Unmounts and forgets a mountpoint, or every mount of a drive.
     pub async fn unmount(&self, target: &str) -> Result<api::Unmounted, ClientError> {
         self.post("/v1/mounts/unmount", &api::Unmount { target: target.into() }).await

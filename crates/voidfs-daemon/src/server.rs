@@ -108,6 +108,8 @@ pub(crate) struct Shared {
     pub(crate) closing: watch::Sender<bool>,
     /// The queue's bytes sent, sampled each second, for a rate.
     samples: Mutex<VecDeque<(Instant, u64)>>,
+    /// This daemon's own, in each folder-states version, so that another daemon's never match.
+    pub(crate) nonce: u64,
 }
 
 /// A running daemon. Stop it with [`Daemon::stop`]: dropped, its tasks go on.
@@ -239,6 +241,7 @@ impl Daemon {
             stop_asked: watch::Sender::new(false),
             closing: watch::Sender::new(false),
             samples: Mutex::new(VecDeque::new()),
+            nonce: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64) ^ (u64::from(std::process::id()) << 40),
         });
         let sampler = tokio::spawn({
             let shared = shared.clone();
@@ -267,6 +270,7 @@ impl Daemon {
             .route("/v1/uploads/clear", post(crate::uploads::clear))
             .route("/v1/mounts", get(crate::mounts::list).post(crate::mounts::mount))
             .route("/v1/mounts/unmount", post(crate::mounts::unmount))
+            .route("/v1/mounts/states", post(crate::mounts::states))
             .nest("/v1/fs", crate::rpc::routes(shared.clone()))
             .fallback(not_found)
             .layer(middleware::from_fn_with_state(shared.clone(), authenticate))
