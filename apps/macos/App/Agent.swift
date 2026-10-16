@@ -3,8 +3,9 @@
 // The launch agent: the app's own binary, which launchd runs from the bundle's
 // `Contents/Library/LaunchAgents` plist once `SMAppService` registers it. It answers the bridge
 // (`Shared/Bridge.swift`) on the App-Group-prefixed Mach service, accepts only the extension's code
-// signature, and forwards each call to the Rust daemon's user-only socket. It owns no journal,
-// publisher or cache: the daemon does.
+// signature, and forwards each call to the Rust daemon's user-only socket. Finder's badges have a
+// service of their own (`BadgeAgent.swift`). It owns no journal, publisher or cache: the daemon
+// does.
 
 import Foundation
 import ServiceManagement
@@ -43,6 +44,11 @@ enum Agent {
         let listener = NSXPCListener(machServiceName: Bridge.service)
         listener.delegate = delegate
         listener.resume()
+        // Finder's badges, on a service of their own for the Finder extension's signature.
+        let badgeDelegate = BadgeListener(socket: DaemonSocket(path: socket))
+        let badges = NSXPCListener(machServiceName: Badges.service)
+        badges.delegate = badgeDelegate
+        badges.resume()
         // launchd stops an agent with SIGTERM: release the daemon sessions first, as an
         // invalidated connection does. A kill leaves them to the daemon's next restart.
         signal(SIGTERM, SIG_IGN)
@@ -55,8 +61,8 @@ enum Agent {
             }
         }
         term.resume()
-        log.notice("bridge serving \(Bridge.service, privacy: .public), daemon socket \(socket, privacy: .public)")
-        withExtendedLifetime((listener, delegate, term)) { RunLoop.main.run() }
+        log.notice("bridge serving \(Bridge.service, privacy: .public) and \(Badges.service, privacy: .public), daemon socket \(socket, privacy: .public)")
+        withExtendedLifetime((listener, delegate, badges, badgeDelegate, term)) { RunLoop.main.run() }
         exit(0)
     }
 }

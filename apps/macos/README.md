@@ -1,7 +1,8 @@
 # voidfs for macOS
 
 The macOS drive: `voidfs.app`, a SwiftUI menu-bar app that contains an FSKit module
-(`VoidfsFS.appex`) and runs as the launch agent that bridges the module to the `void` daemon. A
+(`VoidfsFS.appex`) and a Finder Sync extension for sync badges (`VoidfsFinder.appex`), and runs as
+the launch agent that bridges both to the `void` daemon. A
 mount is writable unless mounted read-only ([step 5, item 4](../../docs/step-5-macos.md#writable-fskit-12-october));
 the module reads and writes every byte and name through the daemon, which holds the server and
 key and stages writes on this Mac before it publishes them. The
@@ -9,11 +10,13 @@ FSKit spike that started it is in [`docs/spikes/fskit.md`](../../docs/spikes/fsk
 
 | Folder | What |
 |---|---|
-| `App/` | The host app and its menu of transfers, the launch agent that bridges the extension to the daemon, and the bridge's and the transfers' in-process checks. Run from a terminal it also takes `status`, `transfers`, `mount`, `settings` and the agent and bridge commands |
+| `App/` | The host app and its menu of transfers, the launch agent that bridges the extensions to the daemon, and the in-process checks of the bridge, the transfers and the badges. Run from a terminal it also takes `status`, `transfers`, `mount`, `settings` and the agent, bridge and badge commands |
 | `FSModule/` | The FSKit module: a `FSUnaryFileSystem` that serves `voidfs://<drive>` resources from daemon sessions |
+| `FinderSync/` | The Finder Sync extension: badges and the context menu |
+| `Badges/` | The badges' XPC interface, client, model and pictures, shared by the extension and the app |
 | `Shared/` | The bridge's XPC interface and the extension's client of it, with its metadata memo |
 | `Probe/` | `voidfs-probe`, the spike's HTTP calls without FSKit or the daemon, for baselines |
-| `Config/` | The extension's `Info.plist` and the entitlements |
+| `Config/` | The extensions' `Info.plist`s and the entitlements |
 | `scripts/` | Measurements and checks of a mounted drive, the semantics probes, and the release script |
 
 ## Requirements
@@ -24,8 +27,9 @@ FSKit spike that started it is in [`docs/spikes/fskit.md`](../../docs/spikes/fsk
   signed in to your team, automatic signing creates the profile. The project uses team
   `HAUTK68F56`; set `DEVELOPMENT_TEAM` to your own, and change the App Group
   (`HAUTK68F56.dev.voidfs` in `Config/*.entitlements`, `Shared/Bridge.swift` and
-  `LaunchAgents/dev.voidfs.agent.plist`) and the team in the bridge's code-signing requirements
-  (`Shared/Bridge.swift`, `App/SelfTest.swift`) to match.
+  `LaunchAgents/dev.voidfs.agent.plist`, whose two Mach services carry it) and the team in the
+  code-signing requirements (`Shared/Bridge.swift`, `Badges/Badges.swift`, `App/SelfTest.swift`)
+  to match.
 
 ## Build, enable, mount
 
@@ -233,3 +237,24 @@ defaults write dev.voidfs.app VoidfsStateDirectory /tmp/vfsd.test
 ```bash
 launchctl kickstart -k gui/$(id -u)/dev.voidfs.agent
 ```
+
+## Finder badges
+
+`VoidfsFinder.appex` badges the items of mounted drives as saved, pending, saving, error or
+conflict, and its context menu pauses or resumes the drive's uploads (step 5, item 8;
+[Finder Sync badges](../../docs/step-5-macos.md#finder-sync-badges-16-october)). It has no cancel
+for a mount's changes. The daemon is the only source: the extension asks the app's launch agent on
+`HAUTK68F56.dev.voidfs.badges`, which accepts only the Finder extension's signature and asks the
+daemon's `POST /v1/mounts/states`, read from the daemon's own state, never the server. A folder
+costs one call however many files it has, and a folder that hasn't changed answers `unchanged`.
+The extension badges the folders under the daemon's mounted mountpoints, so it needs the agent
+registered (above) and a drive mounted. Enable it in System Settings → General → Login Items &
+Extensions → Finder Extensions (or with `pluginkit -e use -i dev.voidfs.app.findersync`).
+Building registers the build folder's copy with LaunchServices, disabled.
+
+`badges-check` shows that the installed agent turns the app itself away. `badges-selftest <drive>`
+runs the extension's model against the agent's badge listener in process, without Finder, FSKit or
+launchd. It makes each state on a fresh folder through bridge sessions, with `--peer <mount_peer>`
+for a conflict and `--metrics <url>` to count the server's requests while badges are read. Its
+modes `daemon-restart` and `refused` cover a restart and peer refusal
+([evidence and replay](../../bench/results/finder-sync-badges/README.md)).

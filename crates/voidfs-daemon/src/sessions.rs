@@ -97,6 +97,14 @@ impl Sessions {
         }
     }
 
+    /// A drive a mount or a session has open, by its id or alias, without opening one or asking
+    /// the server: an open drive with a stable identity first.
+    pub(crate) fn open_drive(&self, name: &str) -> Option<Arc<DriveSession>> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let open = state.drives.values().filter_map(Weak::upgrade).filter(|d| d.id == name || d.drive() == name).collect::<Vec<_>>();
+        open.iter().find(|d| d.id == name && d.pinned).or_else(|| open.iter().find(|d| d.pinned)).or_else(|| open.first()).cloned()
+    }
+
     pub(crate) async fn drive(&self, s: &Shared, name: &str) -> Result<Arc<DriveSession>, Failure> {
         self.open(s, name, true, None).await
     }
@@ -200,6 +208,7 @@ impl Sessions {
         let (events, _) = broadcast::channel(64);
         let drive = Arc::new(DriveSession {
             core, drive: Mutex::new(identity.alias), id: identity.id.clone(), pinned,
+            serial: NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             state: Mutex::new(FeedState { seq, events: 0, last: None, generation: 1, namespace_generation: 1 }),
             publish: Mutex::new(()), observers: Mutex::new(Vec::new()), events, task: Mutex::new(None),
         });
@@ -270,12 +279,16 @@ async fn bootstrap<T>(closing: &mut watch::Receiver<bool>, pending: impl Future<
 
 struct FeedState { seq: u64, events: u64, last: Option<String>, generation: u64, namespace_generation: u64 }
 
+/// Tells one drive's session from another this daemon opened before, whose generations restart.
+static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct DriveSession {
     pub(crate) core: Arc<Session>,
     drive: Mutex<String>,
     pub(crate) id: String,
     /// The drive was resolved to an ID online or from the durable alias memo.
     pub(crate) pinned: bool,
+    pub(crate) serial: u64,
     state: Mutex<FeedState>,
     publish: Mutex<()>,
     observers: Mutex<Vec<Weak<dyn Mounted>>>,

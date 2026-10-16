@@ -8,7 +8,7 @@ and attribute changes added 8 October; the signed-bundle probe, the rest of the 
 the Swift bridge and one daemon for the CLI and the app added 9 October; read-only FSKit on the
 daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October; the
 application matrix and its first fixes added 13 October; held mmap delivery and its durability
-policy clarified 14 October; menu-bar transfers added 16 October. **Item 1 is complete**
+policy clarified 14 October; menu-bar transfers and Finder Sync badges added 16 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -39,9 +39,14 @@ decode/export checks on this Mac, including direct cold/warm decoder opens on a 
 fresh fork; native Xcode open/edit/save/build/run also passes.
 QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and two
 independent Macs and the absent paid target apps remain explicitly untested.
-**Item 8's first slice is built, not complete** ([16 October](#menu-bar-transfers-16-october)):
-the menu shows the daemon's connection, queue and mounts in the CLI's words and controls the
-queue; cancelling a mount's changes and Finder Sync are not built.
+**Item 8's first two slices are built, not complete** (16 October): the menu shows the daemon's
+connection, queue and mounts in the CLI's words and controls the queue
+([menu-bar transfers](#menu-bar-transfers-16-october)), and a Finder Sync extension badges mounted
+drives' items from one new daemon call that reads only local state
+([Finder Sync badges](#finder-sync-badges-16-october)). Every badge state and the context menu's
+pause and resume were shown in a live Finder on an FSKit mount the same day
+([live run](../bench/results/finder-sync-badges-live/README.md)). Neither offers cancel for a
+mount's changes.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -350,10 +355,14 @@ actions, not actions performed by writing this plan.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
-**First slice built, 16 October, not complete:** the menu's transfers view and its queue controls,
-checked against a test daemon ([menu-bar transfers](#menu-bar-transfers-16-october)). A mount's
-changes can be paused but not cancelled until the menu can say what happens to the copy on this
-Mac. Finder Sync, a live mount's rows, offline states and the bridge restarting remain.
+**Two slices built, 16 October, not complete.** The menu's transfers view and its queue controls,
+checked against a test daemon ([menu-bar transfers](#menu-bar-transfers-16-october)). Finder Sync
+badges for saved, pending, saving, error and conflict, a drive's pause and resume in the context
+menu, and the daemon call behind them, checked against a test daemon without Finder and then in a
+live Finder on an FSKit mount ([Finder Sync badges](#finder-sync-badges-16-october)); badge reads
+cost no server request. A mount's changes can be paused but not cancelled until the app can say
+what happens to the copy on this Mac. A live mount's rows in the menu, offline states, the bridge
+restarting and Finder beside the menu bar remain.
 
 Use the existing daemon status/upload stream for mounts, connectivity, queue progress, per-item
 and global pause/resume, cancel and immediate bandwidth caps. Distinguish local durable saves
@@ -2365,5 +2374,64 @@ mount's changes. Stopping and starting the daemon brings back the same queue.
 Not shown: clicks in the real menu (computer use can't reach a development app run from a build
 folder), a live FSKit mount's rows, offline and degraded links, the bridge restarting, a
 10,000-file import in the watch, and what waits in the journal while no daemon runs, which
-`void status` reads and the menu doesn't. Finder Sync badges and the cancelled-save fate are the
-next slices of item 8. Its done-when is not met.
+`void status` reads and the menu doesn't. The cancelled-save fate is still to be defined; Finder
+Sync badges followed the same day ([Finder Sync badges](#finder-sync-badges-16-october)). Item 8's
+done-when is not met.
+
+### Finder Sync badges, 16 October
+
+**Item 8's Finder Sync slice.** A Finder Sync extension (`apps/macos/FinderSync`, embedded as
+`Contents/PlugIns/VoidfsFinder.appex`) badges the items of mounted drives as saved, pending,
+saving, error or conflict. Its context menu has the drive's Pause Uploads or Resume Uploads, as the
+menu bar does, and no cancel: cancelling a mount's change marks its local copy as an error and
+deletes its staged bytes, and that fate isn't defined yet. The daemon is the only source of state;
+the extension keeps none and shows no badge when the daemon doesn't answer.
+
+The daemon gained one call, `POST /v1/mounts/states` (`voidfs_client::mount::FolderStates`). It
+answers a folder's entries that aren't saved, with each one's state, and the folder's own. A
+folder's state counts everything below it, most pressing first: conflict, error, saving, pending.
+It reads only the daemon's SQLite state, in one read transaction: the folder's unsaved children by
+name, then a walk up from each unsaved inode of the drive, which an index holding only those finds.
+So its cost follows the unsaved inodes, not the folder's files, and no listing or other request
+reaches the server. Every other name in the folder is saved: whatever isn't is a change made on
+this Mac, and those stay in the local view whether or not the folder is listed now. Pages hold
+1,024 entries, or half the daemon's response bound. A first page's `version` (the daemon run, the
+drive session, the drive's metadata generation and the folder's listing generation) makes a
+repeated read answer `unchanged` while it holds. The call answers for a drive a mount or a daemon
+session has open, and never opens one.
+
+The sandboxed extension reaches it through the app's launch agent, on a second Mach service,
+`HAUTK68F56.dev.voidfs.badges`, which accepts only the Finder extension's code signature, as the
+FSKit bridge accepts only the module's (`App/BadgeAgent.swift`). The agent is not a proxy for it:
+four calls with typed arguments, checked before a daemon request is built. They are the mount
+table (`/v1/mounts`, with each drive's pause from `/v1/status`), one folder's states, and a drive's
+pause and resume, which apply only to a drive mounted now. The extension's model
+(`Badges/Badges.swift`) takes its folder scope from the mounted mountpoints, polled every
+3 seconds. It reads an item's folder once for all its items. It reads the folders Finder shows,
+or asked about in the last 30 seconds, again each second with `since`, and tells Finder only the
+badges that change.
+
+The [evidence](../bench/results/finder-sync-badges/README.md) uses an isolated test daemon and
+server, with nothing mounted and nothing registered. `voidfs badges-selftest` runs the extension's
+model against the agent's badge listener in process, with bridge sessions making the edits and the
+SDK's `mount_peer` making a conflict. Each state is badged correctly, folders included: 35 checks.
+Over 10 seconds of polling three folders and badging 200 saved files, the server saw no request,
+as in the same time idle. The model made 34 calls, all answered `unchanged`. A daemon restart
+clears the badges while it is down and brings them back from its state (39 checks). A peer
+without the Finder extension's signature is refused. Rust tests cover the core's call (aggregation,
+renames and equivalent spellings, pages, a folder no longer listed) and the daemon's: a counting
+proxy sees no request for any badge call over a 1,000-file folder, and states come back from the
+journal after a restart.
+
+A [live run](../bench/results/finder-sync-badges-live/README.md), with the user's approval, enabled
+the extension and mounted a new test drive through FSKit. Finder showed each state on files and
+folders: saved, pending, saving, error from a cancelled entry, and conflict from `mount_peer`.
+The context menu's Pause Uploads and Resume Uploads paused and released the drive, and Finder
+redrew the open folders after the resume. The installed agent refused `badges-check` by its
+signature requirement. The drive's own icon on the desktop showed no badge. Every registration and
+default was restored afterwards.
+
+Not shown: Finder beside the menu bar's transfers view
+([menu-bar transfers](#menu-bar-transfers-16-october), merged in
+[PR #74](https://github.com/vishnu597/voidfs/pull/74)), an offline link, and two Macs. A pending
+deletion leaves no name to badge, so it doesn't mark its folder. Item 8's done-when is not met.

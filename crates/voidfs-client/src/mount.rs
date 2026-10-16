@@ -26,6 +26,8 @@ pub(crate) mod data;
 mod notify;
 #[path = "mount_publish.rs"]
 pub(crate) mod publication;
+#[path = "mount_states.rs"]
+mod states;
 #[cfg(test)]
 #[path = "mount_crash_tests.rs"]
 mod crash_tests;
@@ -34,6 +36,7 @@ pub use xattrs::XattrMode;
 pub use stage::StagingConfig;
 pub use notify::LocalChange;
 pub use publication::{Conflict, ConflictSide};
+pub use states::{FolderStates, MAX_STATES};
 
 pub type Ino = u64;
 pub type Fh = u64;

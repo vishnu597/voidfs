@@ -15,8 +15,10 @@
 //     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status
 //     voidfs.app/Contents/MacOS/voidfs bridge-check
 //     voidfs.app/Contents/MacOS/voidfs bridge-selftest <drive> [main|daemon-restart|agent-restart|remote <key>|refused|wire] [--socket <path>]
+//     voidfs.app/Contents/MacOS/voidfs badges-selftest <drive> [main|daemon-restart|refused] [--socket <path>] [--peer <path>] [--metrics <url>] [--files <n>] [--png <path>]
+//     voidfs.app/Contents/MacOS/voidfs badges-check
 //
-// `agent` is how launchd runs it as the extension's bridge to the daemon (Agent.swift).
+// `agent` is how launchd runs it as the extensions' bridge to the daemon (Agent.swift, BadgeAgent.swift).
 
 import FSKit
 import ServiceManagement
@@ -35,7 +37,7 @@ enum Launcher {
             NSApplication.shared.setActivationPolicy(.prohibited)
             NSApplication.shared.run()
         }
-        if let command = args.first, ["status", "transfers", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "bridge-check", "bridge-selftest"].contains(command) {
+        if let command = args.first, ["status", "transfers", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "bridge-check", "bridge-selftest", "badges-selftest", "badges-check"].contains(command) {
             Task {
                 let code = await HostCommands.run(args)
                 exit(code)
@@ -96,6 +98,20 @@ enum HostCommands {
                 }
             case "bridge-selftest":
                 return await SelfTest.run(Array(args.dropFirst()))
+            case "badges-selftest":
+                return await BadgesSelfTest.run(Array(args.dropFirst()))
+            case "badges-check":
+                // The installed agent's badge service must refuse anything but the Finder extension.
+                let client = BadgeClient()
+                do {
+                    _ = try await client.mounts()
+                    withExtendedLifetime(client) {}
+                    print("badges-check: the agent accepted the app: FAIL")
+                    return 1
+                } catch {
+                    let e = error as NSError
+                    print("badges-check: refused (\(e.domain) \(e.code)): ok")
+                }
             default:
                 return 2
             }

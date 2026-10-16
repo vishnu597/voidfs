@@ -21,6 +21,9 @@
 //!   [`Mount`].
 //! - `/v1/fs`: bounded filesystem sessions, binary I/O and invalidations; see [`fs`].
 //! - `POST /v1/mounts/unmount`: [`Unmount`]; unmounts and forgets; answers [`Unmounted`].
+//! - `POST /v1/mounts/states`: [`Folder`], one folder of a drive that a mount or a filesystem
+//!   session has open; answers [`FolderStates`], its entries' sync states for status badges,
+//!   from this Mac's state alone.
 //!
 //! A control error is `{"error": {"code", "message"}}`, with a 4xx or 5xx status.
 //! Filesystem errors also carry native `errno`.
@@ -226,6 +229,48 @@ pub struct Unmount {
 #[serde(rename_all = "camelCase")]
 pub struct Unmounted {
     pub unmounted: Vec<String>,
+}
+
+/// `POST /v1/mounts/states`: a folder of an open drive, by its path below the drive's top.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Folder {
+    /// By alias or id, as the mount table names it.
+    pub drive: String,
+    /// Names joined by `/`; `""` is the top.
+    pub folder: String,
+    /// An exclusive name cursor: a page's [`FolderStates::next`].
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Entries a page holds at most; `None` is [`voidfs_client::mount::MAX_STATES`].
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// A first page's [`FolderStates::version`]: while it holds, the answer is only
+    /// [`FolderStates::unchanged`].
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+/// A folder's entries that aren't saved; every other name in it is. A folder's
+/// state counts what is below it: conflict, then error, saving and pending. Read from the
+/// daemon's state only, never from the server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderStates {
+    /// The drive's alias.
+    pub drive: String,
+    pub folder: String,
+    /// Opaque; it changes whenever any of these states may have.
+    pub version: String,
+    /// `since` still holds: nothing else is set.
+    #[serde(default)]
+    pub unchanged: bool,
+    /// The folder's own, with everything below it.
+    pub state: voidfs_client::mount::Sync,
+    /// In UTF-8 name order.
+    pub entries: Vec<(String, voidfs_client::mount::Sync)>,
+    /// Where the next page starts, when this one stopped short.
+    pub next: Option<String>,
 }
 
 /// The journal, for a restart.
