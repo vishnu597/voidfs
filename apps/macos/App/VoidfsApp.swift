@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// voidfs.app: the menu-bar host FSKit requires. It shows whether the extension is enabled and asks
-// the daemon to mount drives, which it does with the extension (the `fskit` adapter) and remembers.
-// The daemon holds the server and key (`void daemon start`); the extension and the app hold none.
+// voidfs.app: the menu-bar host FSKit requires. It shows whether the extension is enabled, the
+// daemon's transfers with their controls (Transfers.swift), and asks the daemon to mount drives,
+// which it does with the extension (the `fskit` adapter) and remembers. The daemon holds the server
+// and key (`void daemon start`); the extension and the app hold none.
 //
 // It also runs headless, for scripts:
 //
 //     voidfs.app/Contents/MacOS/voidfs status
+//     voidfs.app/Contents/MacOS/voidfs transfers
+//     voidfs.app/Contents/MacOS/voidfs transfers-selftest <drive> [--cancel] [--png <path>]
 //     voidfs.app/Contents/MacOS/voidfs mount <drive> [mount-point]
 //     voidfs.app/Contents/MacOS/voidfs settings
 //     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status
@@ -26,7 +29,13 @@ enum Launcher {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
         if args.first == "agent" { Agent.serve() }
-        if let command = args.first, ["status", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "bridge-check", "bridge-selftest"].contains(command) {
+        if args.first == "transfers-selftest" {
+            // It draws with AppKit, which needs the main thread that dispatchMain() gives up.
+            Task { @MainActor in exit(await TransfersSelfTest.run(Array(args.dropFirst()))) }
+            NSApplication.shared.setActivationPolicy(.prohibited)
+            NSApplication.shared.run()
+        }
+        if let command = args.first, ["status", "transfers", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "bridge-check", "bridge-selftest"].contains(command) {
             Task {
                 let code = await HostCommands.run(args)
                 exit(code)
@@ -50,6 +59,11 @@ enum HostCommands {
                     print("\(extensionBundleID) is not installed")
                     return 1
                 }
+            case "transfers":
+                // The menu's transfers as text, laid out like `void status`.
+                let (text, code) = await Transfers.report()
+                print(text)
+                return code
             case "mount":
                 guard args.count == 2 || args.count == 3 else {
                     print("usage: mount <drive> [mount-point]")
@@ -120,10 +134,19 @@ enum Mounter {
 
 struct VoidfsApp: App {
     @State private var model = HostModel()
+    @State private var transfers: Transfers
+
+    init() {
+        let transfers = Transfers()
+        transfers.start()
+        _transfers = State(initialValue: transfers)
+    }
 
     var body: some Scene {
-        MenuBarExtra("voidfs", systemImage: "externaldrive.connected.to.line.below") {
-            HostView(model: model)
+        MenuBarExtra {
+            HostView(model: model, transfers: transfers)
+        } label: {
+            Image(systemName: transfers.symbol)
         }
         .menuBarExtraStyle(.window)
     }
@@ -162,6 +185,7 @@ final class HostModel {
 
 struct HostView: View {
     @Bindable var model: HostModel
+    let transfers: Transfers
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -173,6 +197,8 @@ struct HostView: View {
                 Button("Open File System Extensions settings") { _ = FSClient.shared.openFileSystemExtensionsSettings() }
             case nil: EmptyView()
             }
+            TransfersView(transfers: transfers)
+            Divider()
             TextField("Drive", text: $model.drive)
             HStack {
                 Button("Mount") { Task { await model.mount() } }
@@ -182,7 +208,7 @@ struct HostView: View {
             if !model.status.isEmpty { Text(model.status).font(.caption).textSelection(.enabled) }
         }
         .padding()
-        .frame(width: 340)
+        .frame(width: 400)
         .task { await model.refresh() }
     }
 }
