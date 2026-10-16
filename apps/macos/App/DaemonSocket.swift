@@ -125,7 +125,7 @@ final class DaemonSocket: @unchecked Sendable {
 
     /// Streams a long-lived NDJSON answer line by line until it ends, `line` returns false or
     /// `cancel` is called. Lines over `limit` end it with `tooLarge`.
-    func stream(_ target: String, generation: UInt32, limit: Int, opened: (Int32) -> Void, line: (Data) -> Bool) throws {
+    func stream(_ target: String, generation: UInt32?, limit: Int, opened: (Int32) -> Void, line: (Data) -> Bool) throws {
         let fd = try connect(timeout: nil)
         defer { Darwin.close(fd) }
         opened(fd)

@@ -10,7 +10,7 @@ FSKit spike that started it is in [`docs/spikes/fskit.md`](../../docs/spikes/fsk
 
 | Folder | What |
 |---|---|
-| `App/` | The host app, the launch agent that bridges the extensions to the daemon, and the in-process checks of the bridge and the badges. Run from a terminal it also takes `status`, `mount`, `settings` and the agent, bridge and badge commands |
+| `App/` | The host app and its menu of transfers, the launch agent that bridges the extensions to the daemon, and the in-process checks of the bridge, the transfers and the badges. Run from a terminal it also takes `status`, `transfers`, `mount`, `settings` and the agent, bridge and badge commands |
 | `FSModule/` | The FSKit module: a `FSUnaryFileSystem` that serves `voidfs://<drive>` resources from daemon sessions |
 | `FinderSync/` | The Finder Sync extension: badges and the context menu |
 | `Badges/` | The badges' XPC interface, client, model and pictures, shared by the extension and the app |
@@ -70,7 +70,17 @@ mkdir -p /tmp/voidfs-mnt && mount -F -t voidfs voidfs://footage /tmp/voidfs-mnt
 ```
 
 Unmount with `void unmount footage` or `umount /tmp/voidfs-mnt`. The app's `mount <drive>
-[mountpoint]` command and its menu ask the daemon as `void mount` does. Logs:
+[mountpoint]` command and its menu ask the daemon as `void mount` does.
+
+The menu also shows the daemon's transfers, in the words `void status` and `void uploads` use:
+the server and its link, the uploads line, the mounts, and the unfinished changes and imports. It
+can pause and resume everything, a drive, an import or one change, set a bandwidth limit, clear
+finished uploads and unmount. Imports can be cancelled there; a mount's changes can't, since
+cancelling one marks the file's copy on this Mac as an error and deletes its staged bytes
+(`void uploads cancel` still does it). `voidfs transfers` prints the menu's lines, and
+`voidfs transfers-selftest <drive> [--cancel] [--png <path>]` calls each control and checks the
+daemon afterwards; run it against a test daemon with `-VoidfsStateDirectory <dir>`
+([evidence](../../bench/results/menu-transfers/README.md)). Logs:
 `log stream --predicate 'subsystem == "dev.voidfs"'` (the module logs as category `fs`, the agent
 as `agent`).
 

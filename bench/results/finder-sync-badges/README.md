@@ -102,8 +102,9 @@ saves the same file on the drive while this Mac's edit waits.
   here. A later run on the same day did both, with the user's approval:
   [finder-sync-badges-live](../finder-sync-badges-live/README.md) shows each badge in Finder, the
   context menu's pause and resume, and the installed agent refusing `badges-check`.
-- **Finder and the menu bar side by side.** The menu's transfers view is in open
-  [PR #74](https://github.com/vishnu597/voidfs/pull/74), not on `main`.
+- **Finder and the menu bar side by side.** The menu's transfers view was in
+  [PR #74](https://github.com/vishnu597/voidfs/pull/74), merged after this run; the two weren't run
+  together.
 - **Offline.** While the server can't be reached, the call still answers from local state (it
   never asks the server), but no run took the link down.
 - **Deletions.** A pending deletion leaves no name in the folder, so it doesn't badge the folder.
