@@ -8,7 +8,7 @@ and attribute changes added 8 October; the signed-bundle probe, the rest of the 
 the Swift bridge and one daemon for the CLI and the app added 9 October; read-only FSKit on the
 daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October; the
 application matrix and its first fixes added 13 October; held mmap delivery and its durability
-policy clarified 14 October. **Item 1 is complete**
+policy clarified 14 October; menu-bar transfers added 16 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -39,6 +39,9 @@ decode/export checks on this Mac, including direct cold/warm decoder opens on a 
 fresh fork; native Xcode open/edit/save/build/run also passes.
 QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and two
 independent Macs and the absent paid target apps remain explicitly untested.
+**Item 8's first slice is built, not complete** ([16 October](#menu-bar-transfers-16-october)):
+the menu shows the daemon's connection, queue and mounts in the CLI's words and controls the
+queue; cancelling a mount's changes and Finder Sync are not built.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -346,6 +349,11 @@ the permitted voidfs volumes. Registration and credentials testing are implement
 actions, not actions performed by writing this plan.
 
 ### Item 8. Menu-bar transfers and Finder Sync
+
+**First slice built, 16 October, not complete:** the menu's transfers view and its queue controls,
+checked against a test daemon ([menu-bar transfers](#menu-bar-transfers-16-october)). A mount's
+changes can be paused but not cancelled until the menu can say what happens to the copy on this
+Mac. Finder Sync, a live mount's rows, offline states and the bridge restarting remain.
 
 Use the existing daemon status/upload stream for mounts, connectivity, queue progress, per-item
 and global pause/resume, cancel and immediate bandwidth caps. Distinguish local durable saves
@@ -2328,3 +2336,34 @@ preserved. No SQLite-name exception or cross-Mac writer-coordination claim is in
 These results do not close item 3's cached-miss blocker, item 4's `RENAME_SWAP`/large-xattr
 requirements, or item 6's failed/untested scenarios. Later `/Volumes`, transfer UI, protocol
 RFCs and distribution work remain separate deliverables.
+
+### Menu-bar transfers, 16 October
+
+**Item 8's first slice.** The app's menu (`apps/macos/App/Transfers.swift`) now shows the daemon's
+connection, uploads and mounts. Below them it lists the unfinished changes, uploading ones first,
+and the imports, newest first. It has the queue's controls: pause and resume for everything, a
+drive, an import or one change; a bandwidth limit (none, 1, 10 or 100 MiB/s); clear finished; and
+unmount. Its icon shows what most needs looking at: a problem (no daemon, offline, failed or in
+conflict), paused, or uploading. The view reads the daemon's existing `/v1/status` every
+2 seconds and follows `/v1/uploads/watch`, reconnecting every 2 seconds. Its wording is the CLI's,
+so the menu and `void status` agree. The app keeps no state of its own, so after the app or the
+daemon restarts it shows what the daemon's journal holds. No daemon API changed.
+
+A mount's changes can be paused and resumed in the menu, not cancelled. Cancelling one marks the
+file's copy on this Mac as an error and deletes the bytes staged for it, and item 8 asks for that
+fate to be defined and shown before cancellation is offered. The menu says how many changes are
+saved on this Mac and not yet on the drive. Imports, whose source files stay where they are, can be
+cancelled.
+
+The [evidence](../bench/results/menu-transfers/README.md) uses an isolated test daemon and server,
+with no FSKit registration. `voidfs transfers` prints the menu's lines, and its server and uploads
+lines match `void status`. `voidfs transfers-selftest` calls each control through the model the
+buttons use and checks the daemon afterwards: 15 checks pass, including a mount's change, which
+came from daemon sessions. Its offscreen drawings show Cancel on imports and only Pause on a
+mount's changes. Stopping and starting the daemon brings back the same queue.
+
+Not shown: clicks in the real menu (computer use can't reach a development app run from a build
+folder), a live FSKit mount's rows, offline and degraded links, the bridge restarting, a
+10,000-file import in the watch, and what waits in the journal while no daemon runs, which
+`void status` reads and the menu doesn't. Finder Sync badges and the cancelled-save fate are the
+next slices of item 8. Its done-when is not met.
