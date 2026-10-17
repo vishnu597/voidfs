@@ -366,6 +366,12 @@ pub struct UploadList {
     pub rate: u64,
     /// Seconds until what is unpublished is sent, at that rate.
     pub eta_secs: Option<u64>,
+    /// Items a `limit` left out.
+    #[serde(default)]
+    pub more: u64,
+    /// A mount's changes still to send, listed or not: saved on this Mac, not yet on the drive.
+    #[serde(default)]
+    pub mount_unsent: u64,
 }
 
 /// What a pause, a resume or a cancel applies to: `"all"`, `{"drive": …}`, `{"batch": …}` or

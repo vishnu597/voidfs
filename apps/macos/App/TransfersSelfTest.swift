@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// `voidfs transfers-selftest <drive> [--cancel] [--png <path>]`: the menu's transfers controls
+// `voidfs transfers-selftest <drive> [--cancel | --no-daemon | --look] [--png <path>]`: the menu's transfers controls
 // against a running daemon, through the same model calls as the menu's buttons, each checked in the
 // daemon's status or queue afterwards. It restores the limit and the pauses it changes. `--cancel`
 // also cancels the newest unfinished import and clears finished uploads, which can't be undone,
 // and cancels the oldest mount change waiting, which then stays on this Mac, not uploaded, until
-// its file is saved again. A mount's conflict, if there is one, is cancelled too, and stays a conflict. `--png` draws the menu's view, offscreen, to a file.
+// its file is saved again. A mount's conflict, if there is one, is cancelled too, and stays a conflict.
+// `--no-daemon` expects the daemon stopped, and checks that the menu reads what waits in its journal.
+// `--look` changes nothing: it prints the menu's uploads line, for drawing the menu as it is.
+// `--png` draws the menu's view, offscreen, to a file.
 //
 // Run it against a test daemon: `-VoidfsStateDirectory <dir>` points the app at one.
 
@@ -21,13 +24,14 @@ enum TransfersSelfTest {
             png = rest[i + 1]
             rest.removeSubrange(i...(i + 1))
         }
-        let cancel = rest.contains("--cancel")
-        rest.removeAll { $0 == "--cancel" }
+        let cancel = rest.contains("--cancel"), noDaemon = rest.contains("--no-daemon"), look = rest.contains("--look")
+        rest.removeAll { $0 == "--cancel" || $0 == "--no-daemon" || $0 == "--look" }
         guard let drive = rest.first else {
-            print("usage: transfers-selftest <drive> [--cancel] [--png <path>]")
+            print("usage: transfers-selftest <drive> [--cancel | --no-daemon | --look] [--png <path>]")
             return 2
         }
-        let t = Transfers()
+        // All of the queue, to find the changes it controls; the menu lists only what it shows.
+        let t = Transfers(limit: nil)
         var failed = 0
         func check(_ what: String, _ ok: Bool, _ detail: @autoclosure () -> String = "") {
             print("\(ok ? "ok  " : "FAIL") \(what)\(ok ? "" : ": \(detail())")")
@@ -47,11 +51,26 @@ enum TransfersSelfTest {
 
         await t.refresh()
         await t.refreshQueue()
+        if noDaemon {
+            // The daemon is stopped: the menu says so and reads what waits in its journal.
+            check("no daemon answers", t.status == nil && t.problem?.contains("isn't running") == true, t.problem ?? "")
+            let words = t.waiting.flatMap(Words.waiting)
+            check("the journal is read", words != nil, "nothing read")
+            print("journal: \(words ?? "")")
+            if let png { check("the view draws to \(png)", await draw(TransfersView(transfers: t), to: png)) }
+            print(failed == 0 ? "transfers self-test passed" : "transfers self-test: \(failed) failed")
+            return failed == 0 ? 0 : 1
+        }
         guard let before = t.status?.uploads, let queue = t.queue else {
             print("FAIL no daemon status: \(t.problem ?? "")")
             return 1
         }
         print("transfers self-test: drive \(drive), \(Words.uploads(before))")
+        if look {
+            if let png { check("the view draws to \(png)", await draw(TransfersView(transfers: t), to: png)) }
+            print(failed == 0 ? "transfers self-test passed" : "transfers self-test: \(failed) failed")
+            return failed == 0 ? 0 : 1
+        }
 
         await t.limit(123_456)
         check("a limit reaches the daemon", await eventually { t.status?.uploads.bandwidth == 123_456 }, "\(String(describing: t.status?.uploads.bandwidth))")

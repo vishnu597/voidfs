@@ -97,6 +97,30 @@ impl Sessions {
         }
     }
 
+    /// A drive's queue spellings for a pause, a resume or a cancel, from what this Mac knows: a
+    /// drive open here, or the memo. Its queue holds only names this Mac resolved, so only a name
+    /// it never saw asks the server, and a control doesn't wait on a link that hangs.
+    pub(crate) async fn control_names(&self, s: &Shared, name: &str) -> Result<Vec<String>, Failure> {
+        if name.is_empty() || name.len() > 1024 { return Err(Failure::new(StatusCode::BAD_REQUEST, "InvalidArgument", "invalid drive name")); }
+        let known = match self.open_drive(name) {
+            Some(d) => Some((d.drive(), d.id.clone())),
+            None => {
+                if !self.state.lock().unwrap_or_else(|p| p.into_inner()).loaded {
+                    let dir = s.store.dir().to_owned();
+                    let aliases = tokio::task::spawn_blocking(move || load_aliases(&dir)).await.map_err(voidfs_client::Error::from)??;
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    // A creation may have loaded and added to it meanwhile, holding its lock.
+                    if !state.loaded { state.aliases = aliases; state.loaded = true; }
+                }
+                self.state.lock().unwrap_or_else(|p| p.into_inner()).aliases.get(name).map(|i| (i.alias.clone(), i.id.clone()))
+            }
+        };
+        let Some((alias, id)) = known else { return Ok(self.upload_names(s, name).await?.1) };
+        if alias == id { return Ok(vec![id]); }
+        s.queue.inherit_drive_pause(&alias, &id).await?;
+        Ok(vec![alias, id])
+    }
+
     /// A drive a mount or a session has open, by its id or alias, without opening one or asking
     /// the server: an open drive with a stable identity first.
     pub(crate) fn open_drive(&self, name: &str) -> Option<Arc<DriveSession>> {

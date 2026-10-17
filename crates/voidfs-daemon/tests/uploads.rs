@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Uploads handed to the daemon in this process, through `DaemonClient`.
 
+use std::future::IntoFuture;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -214,4 +217,86 @@ async fn legacy_alias_pause_is_migrated_before_worker_start_and_offline_controls
     let paused = client.uploads(false, None).await.unwrap().queue.paused_drives;
     assert!(paused.contains(&id) && paused.contains(&"footage".to_owned()));
     daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_limited_list_keeps_what_most_needs_showing_and_counts_the_rest() {
+    let server = TestServer::start().await.unwrap();
+    let remote = voidfs_sdk::Client::new(sdk(&server)).unwrap();
+    remote.create_drive("footage", Default::default()).await.unwrap();
+    let dir = state_dir("limited");
+    let (daemon, client) = start(&server, dir.path()).await;
+    client.pause(&Scope::All).await.unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "imported bytes").unwrap();
+    client.enqueue(&batch("footage", &[(&source, "a.txt"), (&source, "b.txt"), (&source, "c.txt")])).await.unwrap();
+    mounted_file(&client, "footage", "mount.txt").await;
+    let full = client.uploads(false, None).await.unwrap();
+    let mounted = full.queue.items.iter().filter(|i| i.batch.is_none()).count() as u64;
+    assert!(mounted > 0 && full.queue.items.len() > 3, "{:?}", full.queue.items);
+    assert_eq!((full.more, full.mount_unsent), (0, mounted));
+    let limited: voidfs_daemon::api::UploadList = client.get("/v1/uploads?limit=2").await.unwrap();
+    assert_eq!(limited.queue.items, full.queue.items[..2], "all queued, so the oldest");
+    assert_eq!((limited.more, limited.mount_unsent), (full.queue.items.len() as u64 - 2, mounted), "the rest are counted, the mount's changes included");
+    assert_eq!((limited.queue.unpublished, &limited.queue.batches), (full.queue.unpublished, &full.queue.batches));
+    daemon.stop().await;
+}
+
+/// Forwards to the server until `hang` is set, then answers nothing, as a link that hangs.
+struct Hanging {
+    endpoint: String,
+    http: reqwest::Client,
+    hang: AtomicBool,
+}
+
+async fn hanging(axum::extract::State(link): axum::extract::State<Arc<Hanging>>, request: axum::extract::Request) -> axum::response::Response {
+    if link.hang.load(Ordering::SeqCst) { return std::future::pending().await; }
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+    let mut send = link.http.request(parts.method, format!("{}{}", link.endpoint, parts.uri));
+    for (name, value) in &parts.headers { send = send.header(name, value); }
+    let response = send.body(bytes).send().await.unwrap();
+    let mut output = axum::response::Response::builder().status(response.status());
+    for (name, value) in response.headers() {
+        if !matches!(name.as_str(), "content-length" | "transfer-encoding" | "connection") { output = output.header(name, value); }
+    }
+    output.body(axum::body::Body::from(response.bytes().await.unwrap())).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_controls_answer_while_the_link_hangs() {
+    let server = TestServer::start().await.unwrap();
+    let remote = voidfs_sdk::Client::new(sdk(&server)).unwrap();
+    let id = remote.create_drive("footage", Default::default()).await.unwrap().drive_id;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+    let link = Arc::new(Hanging { endpoint: server.endpoint.clone(), http: reqwest::Client::new(), hang: AtomicBool::new(false) });
+    let relay = tokio::spawn(axum::serve(listener, axum::Router::new().fallback(hanging).with_state(link.clone())).into_future());
+    let dir = state_dir("hang");
+    let sdk = voidfs_sdk::Config { endpoint, timeout: Duration::from_secs(20), max_attempts: 1, ..sdk(&server) };
+    let daemon = Daemon::start(DaemonConfig::new(dir.path(), sdk, Build::default())).await.unwrap();
+    let client = DaemonClient::new(daemon.socket());
+    client.pause(&Scope::All).await.unwrap();
+    let source = dir.path().join("source.txt");
+    std::fs::write(&source, "imported bytes").unwrap();
+    client.enqueue(&batch("footage", &[(&source, "cli.txt")])).await.unwrap();
+    mounted_file(&client, "footage", "mount.txt").await;
+    let queued = client.uploads(false, None).await.unwrap().queue.items;
+    let mounted = queued.iter().filter(|item| item.drive == id).count() as u64;
+    assert!(mounted > 0 && queued.iter().any(|item| item.drive == "footage"), "both queue spellings: {queued:?}");
+
+    // The server stops answering. Each drive control answers from what this Mac knows, well
+    // inside the SDK's 20 s timeout, and covers both spellings.
+    link.hang.store(true, Ordering::SeqCst);
+    let quick = Duration::from_secs(3);
+    let paused = tokio::time::timeout(quick, client.pause(&Scope::Drive("footage".into()))).await.expect("a drive pause doesn't wait on the link").unwrap();
+    assert_eq!(paused.items, queued.len() as u64);
+    let names = client.uploads(false, None).await.unwrap().queue.paused_drives;
+    assert!(names.contains(&id) && names.contains(&"footage".to_owned()), "{names:?}");
+    tokio::time::timeout(quick, client.resume(&Scope::Drive(id.clone()))).await.expect("a drive resume doesn't wait on the link").unwrap();
+    assert!(client.uploads(false, None).await.unwrap().queue.paused_drives.is_empty());
+    let cancelled = tokio::time::timeout(quick, client.cancel(&Scope::Drive("footage".into()))).await.expect("a drive cancel doesn't wait on the link").unwrap();
+    assert_eq!((cancelled.items, cancelled.kept), (queued.len() as u64, mounted), "the import is cancelled, the mount's changes kept");
+    daemon.stop().await;
+    relay.abort();
 }

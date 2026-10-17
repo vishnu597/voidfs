@@ -143,7 +143,7 @@ pub struct Item {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchStatus {
     pub id: BatchId,
@@ -244,6 +244,32 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 /// The mount inodes a conflict holds: their own, or a folder's they wait for.
 fn conflicted(c: &rusqlite::Connection) -> rusqlite::Result<HashSet<u64>> {
     c.prepare("SELECT ino FROM mount_conflict_blockers UNION SELECT ino FROM mount_conflicts")?.query_map([], |r| r.get::<_, u64>(0))?.collect()
+}
+
+/// Each import's label, and whether it is paused.
+fn labels(c: &rusqlite::Connection) -> rusqlite::Result<HashMap<BatchId, (String, bool)>> {
+    c.prepare("SELECT id, label, paused FROM batches")?.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?.collect()
+}
+
+/// An entry as `status` lists it, with what is uploading now.
+fn item(st: &QState, e: Entry) -> Item {
+    let sent = st.running.get(&e.id).map_or(e.sent, |r| r.sent.load(Ordering::Relaxed));
+    let state = if st.running.contains_key(&e.id) { State::Uploading } else { e.state };
+    Item {
+        id: e.id,
+        paused: st.paused(&e) && state.to_send(),
+        drive: e.drive,
+        key: e.key,
+        to_key: e.to_key,
+        op: e.op,
+        state,
+        batch: e.batch,
+        size: e.size,
+        sent,
+        version: e.version,
+        conflict: e.conflict,
+        error: e.error,
+    }
 }
 
 /// What the journal in `store` holds unpublished, and the bytes it has left to send, without
@@ -980,59 +1006,73 @@ impl Queue {
         let this = self.clone();
         blocking(move || {
             let entries = this.0.store.with(|c| journal::all(c))?;
-            let labels: HashMap<BatchId, (String, bool)> =
-                this.0.store.with(|c| c.prepare("SELECT id, label, paused FROM batches")?.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?.collect())?;
+            let labels = this.0.store.with(|c| labels(c))?;
             let st = this.st();
-            let mut items = Vec::with_capacity(entries.len());
-            for e in entries {
-                // The live view of what is pending, the stored one of what isn't.
-                let e = st.pending.get(&e.id).cloned().unwrap_or(e);
-                let sent = st.running.get(&e.id).map_or(e.sent, |r| r.sent.load(Ordering::Relaxed));
-                let state = if st.running.contains_key(&e.id) { State::Uploading } else { e.state };
-                items.push(Item {
-                    id: e.id,
-                    paused: st.paused(&e) && state.to_send(),
-                    drive: e.drive,
-                    key: e.key,
-                    to_key: e.to_key,
-                    op: e.op,
-                    state,
-                    batch: e.batch,
-                    size: e.size,
-                    sent,
-                    version: e.version,
-                    conflict: e.conflict,
-                    error: e.error,
-                });
-            }
-            let mut batches: BTreeMap<BatchId, BatchStatus> = BTreeMap::new();
-            for i in &items {
-                let Some(b) = i.batch else { continue };
-                let (label, paused) = labels.get(&b).cloned().unwrap_or_default();
-                let s = batches.entry(b).or_insert(BatchStatus { id: b, label, items: 0, done: 0, failed: 0, cancelled: 0, bytes: 0, sent: 0, paused });
-                s.items += 1;
-                s.bytes += i.size;
-                s.sent += if i.state == State::Done { i.size } else { i.sent };
-                match i.state {
-                    State::Done => s.done += 1,
-                    State::Failed => s.failed += 1,
-                    State::Cancelled => s.cancelled += 1,
-                    _ => {}
-                }
-            }
-            // Kept changes aren't to send until a later change queues them again.
-            let unpublished: Vec<&Item> = items.iter().filter(|i| i.state.to_send()).collect();
-            Ok(Status {
-                unpublished: unpublished.len() as u64,
-                unpublished_bytes: unpublished.iter().map(|i| i.size.saturating_sub(i.sent)).sum(),
-                batches: batches.into_values().collect(),
-                paused: st.paused_all,
-                paused_drives: st.paused_drives.iter().cloned().collect(),
-                bandwidth: this.0.bandwidth.get(),
-                items,
-            })
+            // The live view of what is pending, the stored one of what isn't.
+            let items = entries.into_iter().map(|e| item(&st, st.pending.get(&e.id).cloned().unwrap_or(e))).collect();
+            Ok(this.summary(&st, items, &labels, BTreeMap::new()))
         })
         .await
+    }
+
+    /// As [`status`](Self::status), without finished entries, and at the cost of what is
+    /// unfinished rather than of the journal's history: those come from memory, and each import's
+    /// finished entries from one count of the journal. For a status read each second.
+    pub async fn unfinished(&self) -> Result<Status> {
+        let this = self.clone();
+        blocking(move || {
+            // Under the queue's lock, so that nothing finishes between the count and the rest.
+            let st = this.st();
+            let (labels, finished) = this.0.store.with(|c| {
+                let mut q = c.prepare("SELECT batch, state='done', COUNT(*), SUM(size), SUM(sent) FROM entries
+                    WHERE batch IS NOT NULL AND state IN ('done', 'cancelled') GROUP BY batch, state")?;
+                let rows = q.query_map([], |r| Ok((r.get::<_, BatchId>(0)?, r.get::<_, bool>(1)?, r.get::<_, u64>(2)?, r.get::<_, u64>(3)?, r.get::<_, u64>(4)?)))?;
+                let mut finished = BTreeMap::new();
+                for row in rows {
+                    let (b, done, n, size, sent) = row?;
+                    let s: &mut BatchStatus = finished.entry(b).or_default();
+                    s.items += n;
+                    s.bytes += size;
+                    if done { s.done += n; s.sent += size } else { s.cancelled += n; s.sent += sent }
+                }
+                Ok((labels(c)?, finished))
+            })?;
+            let items = st.pending.values().map(|e| item(&st, e.clone())).collect();
+            Ok(this.summary(&st, items, &labels, finished))
+        })
+        .await
+    }
+
+    /// The status of `items`, with the imports' counts of them added to `batches`.
+    fn summary(&self, st: &QState, items: Vec<Item>, labels: &HashMap<BatchId, (String, bool)>, mut batches: BTreeMap<BatchId, BatchStatus>) -> Status {
+        for i in &items {
+            let Some(b) = i.batch else { continue };
+            let s = batches.entry(b).or_default();
+            s.items += 1;
+            s.bytes += i.size;
+            s.sent += if i.state == State::Done { i.size } else { i.sent };
+            match i.state {
+                State::Done => s.done += 1,
+                State::Failed => s.failed += 1,
+                State::Cancelled => s.cancelled += 1,
+                _ => {}
+            }
+        }
+        for (b, s) in batches.iter_mut() {
+            let (label, paused) = labels.get(b).cloned().unwrap_or_default();
+            (s.id, s.label, s.paused) = (*b, label, paused);
+        }
+        // Kept changes aren't to send until a later change queues them again.
+        let unpublished: Vec<&Item> = items.iter().filter(|i| i.state.to_send()).collect();
+        Status {
+            unpublished: unpublished.len() as u64,
+            unpublished_bytes: unpublished.iter().map(|i| i.size.saturating_sub(i.sent)).sum(),
+            batches: batches.into_values().collect(),
+            paused: st.paused_all,
+            paused_drives: st.paused_drives.iter().cloned().collect(),
+            bandwidth: self.0.bandwidth.get(),
+            items,
+        }
     }
 
     /// The entries the drive refused because it changed since their base (a mount's guarded
