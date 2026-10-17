@@ -16,9 +16,11 @@ The user chose, on 17 October:
 
 The first runs used a hand-signed test copy, because Xcode had no account to make a profile for
 `dev.voidfs.app`. The user then signed Xcode in to the team, and the signed Release build ran the
-same self-test and sign-ins.
+same self-test and sign-ins. The user then approved [the live run](#the-live-run), which
+registered the job from that build with a throwaway state directory, and was undone.
 
-Nothing here registered the job with SMAppService, wrote defaults, or touched
+Apart from the live run, nothing here registered the job with SMAppService or wrote defaults.
+Nothing touched
 `~/Library/Application Support/voidfs`, which was absent before and after
 ([snapshots](raw/registration.txt)). The drawings' first row read whether the Keychain has a key
 for that directory (it doesn't) and whether its `daemon.json` exists (it doesn't).
@@ -157,10 +159,91 @@ until you sign in, with "Sign in to your voidfs server first: the daemon starts 
   was left for the user.
 - The app's job was never loaded, and no defaults were written.
 
+## The live run
+
+Approved by the user, run on 17 October from 15:33 to 15:38 (local time), from the signed
+Release build of `68c5296`. Its outputs are in [raw/live](raw/live/), with the daemon's whole log
+in [daemon.log](raw/live/daemon.log).
+
+**The rig.**
+- Two `voidfs-server --store memory` on `127.0.0.1:9372` and `:9373`, each with its own throwaway
+  key from `void keys generate`.
+- A state directory under `/private/tmp/vli.…` (`$D`), set as the app's `VoidfsStateDirectory`
+  before anything was registered.
+- The bridge agent was registered and enabled, so Start at login left it alone.
+- Snapshots: [before](raw/live/before.txt) and [after](raw/live/after.txt).
+
+**What happened**, from the build's `voidfs` and bundled `void`:
+
+1. **Not signed in** ([output](raw/live/01-not-signed-in.txt)). `login-item on` said "Sign in to
+   your voidfs server first", registered nothing and exited 1.
+2. **A terminal daemon** ([output](raw/live/02-terminal-daemon.txt)). `void daemon start`, with
+   the first server and key in its environment, wrote `daemon.json` (mode 600) and started a
+   daemon. `server-key status` said the terminal had kept a key there.
+3. **Start at login, first try: refused by a launch constraint**
+   ([output](raw/live/03-login-item-on.txt), [launchd](raw/live/03-launchd-log.txt),
+   [requirement](raw/live/03-lwcr.txt)).
+   - `login-item on` registered the job, but launchd killed `voidfs` at once: "Launch Constraint
+     Violation … (Constraint not matched) … failure proc [vc: 3]". The daemon didn't answer within
+     20 s.
+   - The job's lightweight code requirement (LWCR) still named `signing-identifier
+     dev.voidfs.void`, the program of the first slice's job, registered in that slice's live run
+     and unregistered after it. Background Task Management had kept the item (`4C5730D7…`) and
+     its requirement, so the new job, which runs `voidfs` (`dev.voidfs.app`), was refused.
+   - launchd's own repair failed ("Unable to get updated LWCR … Invalid argument"). After that
+     each run said "Could not find and/or execute program", exit code 78 (EX_CONFIG), every 10 s.
+4. **Unregistered and registered again** ([output](raw/live/03b-reregister.txt)). `login-item off`
+   then `on` made a new item (`0104A10B…`) whose requirement names `dev.voidfs.app`. The daemon
+   answered at once.
+5. **The handover** ([output](raw/live/03c-handover.txt)).
+   - launchd runs `voidfs daemon-launch` (pid 80649). Its child is `void daemon run --app --logged
+     --endpoint http://127.0.0.1:9372 --key-file /dev/stdin` (pid 80650).
+   - The log has "moved the server key from daemon.json into the Keychain, and deleted the file",
+     then the terminal's daemon stopping, and the app's daemon starting on the first server.
+   - `daemon.json` is gone. `server-key status` and `daemon status` name the first server and
+     key, and `daemon status` names `dev.voidfs.app.daemon` as the login job.
+   - Neither process has the secret in its arguments or environment (`ps -E -ww`), nor does the
+     log.
+6. **Signing in again restarts the daemon** ([output](raw/live/04-sign-in-restarts.txt)).
+   `server-key sign-in` to the second server with the second key said "The daemon (pid 80822)
+   runs with it". The job ran again (run 2) within 0.3 s, on the second server, with the
+   second key.
+7. **The CLI while the app has it** ([output](raw/live/05-cli-stop-start-crash.txt)).
+   - `void daemon stop` stopped it, and 15 s later launchd hadn't run it again (last exit code 0).
+   - `void daemon start` from an empty environment kickstarted the job. `void daemon restart`,
+     with the first key in its environment, restarted it on the app's key, the second. Neither
+     wrote `daemon.json`.
+   - After `kill -9` of the daemon, the launcher logged "the daemon (pid 80983) was killed by
+     signal 9" and died by the same signal. launchd ran the job again, its last terminating
+     signal "Killed: 9".
+   - The restart and the crash each waited 10 s. A run shorter than the job's 10 s minimum
+     runtime makes launchd wait before the next one; the first slice's run saw 1.1 s because
+     its daemon had run longer.
+8. **Signing out stops it** ([output](raw/live/06-sign-out.txt)). `server-key sign-out` said
+   "Signed out: the daemon (pid 81502) stopped, and starts again once you sign in". launchd left
+   the job stopped (last exit code 0). Then `void daemon start`, with a key in its environment,
+   failed in 0.1 s with "voidfs.app has no server key for the daemon: sign in from its menu",
+   quoting the launcher's log line. No `daemon.json` was written.
+9. **Turning it off** ([output](raw/live/07-login-item-off.txt)). `login-item off` unregistered
+   the job, and `launchctl print` no longer finds it.
+
+**Restored** ([output](raw/live/08-restore.txt)). In order: the default deleted; the servers
+stopped; the state directory removed (its Keychain item had gone at the sign-out); the build's
+copy unregistered from LaunchServices (pluginkit had no plug-ins from it this time). The snapshot
+after matches the one before. No process from the run was left.
+
+**What it means.** BTM keeps a job's launch requirement across unregistering and registering
+the same label once. A version of the app whose job runs a program with another signing
+identifier is then refused until the job is registered a second time. The bridge agent did the
+same on 9 October when switching between Developer ID and development copies
+([the Swift bridge](../../docs/step-5-macos.md#the-swift-bridge-9-october), findings). The first
+slice's job never shipped, but an update that changes a job's program, or a switch between
+differently signed copies, would hit it.
+
 ## Not covered
 
 - **The Developer ID export**: it needs the "voidfs App Developer ID" profile, then notarizing.
-- **The live run**: the job registered with SMAppService, launchd running `voidfs daemon-launch`,
-  a sign-in that restarts the daemon, a sign-out that stops it, and a key read before the first
-  unlock after a reboot.
+- **Logout and login, and a reboot**: the key read by the job at login, and before the first
+  unlock.
+- **A fix for the kept launch requirement**: the app doesn't yet notice it, nor register again.
 - **The form in the running menu**, and its Import key file panel.

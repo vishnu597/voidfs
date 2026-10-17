@@ -89,8 +89,11 @@ Turning it off stops the daemon. `void daemon status` says who starts the daemon
 checked on a registered copy with a throwaway state directory: the takeover, the refusal, stop,
 start and a crash. Login Items' approval flow, logout and reboot are untested
 ([step 5, item 7](../../docs/step-5-macos.md#the-apps-login-daemon-17-october)). The Keychain
-handover passed its self-test on the signed development build, not yet on a registered one
-([the Keychain slice](../../docs/step-5-macos.md#the-server-key-in-the-keychain-17-october)).
+handover was checked on a registered development build: the adopted `daemon.json`, a restart on a
+new sign-in, and the stop on sign-out
+([the Keychain slice](../../docs/step-5-macos.md#the-server-key-in-the-keychain-17-october)). If
+launchd refuses the job after you switch between differently signed copies ("Launch Constraint
+Violation" in its log, exit code 78), turn Start at login off and on again.
 
 Then mount a drive by its alias or id. `void mount` asks the daemon, which mounts it with the
 module (the `fskit` adapter) and mounts it again when it starts:

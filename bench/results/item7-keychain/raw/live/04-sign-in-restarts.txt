@@ -1,0 +1,32 @@
+$ voidfs server-key sign-in --endpoint http://127.0.0.1:9373 --key-file key2.json
+15:37:01
+Signed in to http://127.0.0.1:9373 as VFJQRJTHF7T6X7YFQCZ2. The daemon (pid 80822) runs with it.
+exit 0
+15:37:01
+$ launchctl print gui/$UID/dev.voidfs.app.daemon (excerpt)
+	state = running
+	runs = 2
+	pid = 80821
+	last exit code = 0
+		state = active
+		state = active
+$ ps -o pid,ppid,command (the job's process and its child)
+80821     1 voidfs daemon-launch
+80822 80821 void daemon run --app --logged --endpoint http://127.0.0.1:9373 --key-file /dev/stdin
+$ voidfs server-key status
+signed in to http://127.0.0.1:9373 (region us-east-1) as VFJQRJTHF7T6X7YFQCZ2, for $D
+login item: on: the daemon starts at login (dev.voidfs.app.daemon)
+exit 0
+$ VOIDFS_STATE_DIR=$D void daemon status --json (endpoint, key id, pid)
+  "accessKeyId": "VFJQRJTHF7T6X7YFQCZ2",
+  "endpoint": "http://127.0.0.1:9373",
+  "pid": 80822,
+  "started": "2026-10-17T19:37:01Z",
+$ ls -A $D | grep daemon
+daemon.log
+daemon.sock
+$ the log's new lines
+2026-10-17T19:36:36.493Z void 0.0.0 (68c5296, 2026-10-17) daemon started: pid 80650, socket $D/daemon.sock, server http://127.0.0.1:9372
+2026-10-17T19:37:01.352Z stopping (asked to stop)
+2026-10-17T19:37:01.353Z stopped
+2026-10-17T19:37:01.623Z void 0.0.0 (68c5296, 2026-10-17) daemon started: pid 80822, socket $D/daemon.sock, server http://127.0.0.1:9373
