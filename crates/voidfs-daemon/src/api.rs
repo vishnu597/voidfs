@@ -108,6 +108,10 @@ pub struct Uploads {
     pub conflicts: u64,
     /// Not finished and held by a pause, of the queue, a drive, a batch or the entry.
     pub paused_items: u64,
+    /// Files with a mount change whose upload was cancelled: this Mac keeps it, not uploaded,
+    /// until a later change queues it again (step 5, item 8). Not in `unpublished`.
+    #[serde(default)]
+    pub kept: u64,
     /// Entries not yet published, and the bytes they have left to send.
     pub unpublished: u64,
     pub unpublished_bytes: u64,
@@ -132,6 +136,7 @@ impl Uploads {
             failed: open().filter(|i| i.state == State::Failed && i.conflict.is_none()).count() as u64,
             conflicts: open().filter(|i| i.state == State::Failed && i.conflict.is_some()).map(|i| (&i.drive, &i.key)).collect::<std::collections::BTreeSet<_>>().len() as u64,
             paused_items: open().filter(|i| i.paused).count() as u64,
+            kept: open().filter(|i| i.state == State::Kept).map(|i| (&i.drive, &i.key)).collect::<std::collections::BTreeSet<_>>().len() as u64,
             unpublished: s.unpublished,
             unpublished_bytes: s.unpublished_bytes,
             paused: s.paused,
@@ -361,6 +366,12 @@ pub struct UploadList {
     pub rate: u64,
     /// Seconds until what is unpublished is sent, at that rate.
     pub eta_secs: Option<u64>,
+    /// Items a `limit` left out.
+    #[serde(default)]
+    pub more: u64,
+    /// A mount's changes still to send, listed or not: saved on this Mac, not yet on the drive.
+    #[serde(default)]
+    pub mount_unsent: u64,
 }
 
 /// What a pause, a resume or a cancel applies to: `"all"`, `{"drive": …}`, `{"batch": …}` or
@@ -374,11 +385,16 @@ pub enum Scope {
     Entry(i64),
 }
 
-/// How many unfinished uploads a pause, a resume or a cancel applied to.
+/// How many unfinished uploads a pause, a resume or a cancel applied to. A cancel counts what it
+/// cancelled, which includes changes made on top of those in its scope and leaves out a mount's
+/// conflicts, which it doesn't touch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Affected {
     pub items: u64,
+    /// Of those, a cancel's mount changes, which this Mac keeps, not uploaded.
+    #[serde(default)]
+    pub kept: u64,
 }
 
 /// `PUT /v1/uploads/limit`, and its answer: bytes a second, `None` (or 0) for unlimited.

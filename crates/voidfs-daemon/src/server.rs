@@ -338,6 +338,13 @@ impl Daemon {
         let _ = probe.await;
         let socket = shared.socket.clone();
         drop(shared);
+        // The server returns once each connection has let go of its shutdown signal, which its
+        // task does just before it drops the router, and the daemon's state with it: wait for
+        // those, so that the state directory is free once this returns.
+        let deadline = Instant::now() + DRAIN_WAIT;
+        while Arc::strong_count(&store) > 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // The socket first: once the state directory is free, a new daemon may have made its own.
         let _ = std::fs::remove_file(&socket);
         drop(store);
@@ -422,7 +429,7 @@ impl Shared {
 }
 
 async fn status(State(s): State<Arc<Shared>>) -> Answer<api::Status> {
-    let q = s.queue.status().await?;
+    let q = s.queue.unfinished().await?;
     let usage = s.cache.usage();
     let cfg = s.cache.config();
     Ok(Json(api::Status {
@@ -435,7 +442,7 @@ async fn status(State(s): State<Arc<Shared>>) -> Answer<api::Status> {
 }
 
 async fn info(State(s): State<Arc<Shared>>) -> Answer<api::Info> {
-    let q = s.queue.status().await?;
+    let q = s.queue.unfinished().await?;
     // Every change the journal took is on disk; nothing here holds one only in memory yet.
     let memory_only_bytes = 0;
     Ok(Json(api::Info {

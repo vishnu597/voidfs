@@ -3,14 +3,18 @@
 // The menu's transfers (step 5, item 8): the daemon's connection, mounts and upload queue, in the
 // words `void status` and `void uploads` use, with the queue's pause, resume, cancel, bandwidth
 // limit and clear. The daemon is the only source: the app keeps no state of its own, so what the
-// menu shows comes back after the app, the bridge or the daemon restarts.
+// menu shows comes back after the app, the bridge or the daemon restarts. While no daemon runs, the
+// menu reads what waits in its journal, writing nothing, as `void status` does.
 //
-// A mount's unpublished saves can be paused and resumed here, not cancelled. Cancelling one marks
-// the file's copy on this Mac as an error and deletes the bytes staged for it, and the menu doesn't
-// yet say so. Imports, whose source files stay where they are, can be cancelled.
+// Cancel stops an upload. For an import, its unsent files aren't uploaded; their sources stay where
+// they are. For a mount's change, the user chose the fate (16 October): the copy on this Mac keeps
+// the change, not uploaded ("kept"), and the next save of the file uploads it as it is then,
+// guarded on the drive's version, so another computer's save meanwhile becomes a conflict. The
+// menu says so beside the button, and again after a cancel. Finder's context menu has no cancel.
 
 import Foundation
 import Observation
+import SQLite3
 import SwiftUI
 
 /// `GET /v1/status`: the fields the menu shows (crates/voidfs-daemon/src/api.rs).
@@ -22,6 +26,8 @@ struct DaemonStatus: Decodable {
 
     struct Uploads: Decodable {
         let uploading, queued, failed, conflicts, pausedItems, unpublished, unpublishedBytes, rate: UInt64
+        /// Files with a cancelled mount change, kept on this Mac; older daemons don't send it.
+        let kept: UInt64?
         let paused: Bool
         let pausedDrives: [String]
         let bandwidth: UInt64?
@@ -51,6 +57,11 @@ struct UploadList: Decodable {
         let size, sent: UInt64
         let conflict, error: String?
         var finished: Bool { state == "done" || state == "cancelled" }
+        /// A mount's change whose upload was cancelled: on this Mac, not uploaded.
+        var kept: Bool { state == "kept" }
+        var toSend: Bool { !finished && !kept }
+        /// A mount's conflict isn't cancelled: both versions stay on this Mac until it's resolved.
+        var cancellable: Bool { toSend && !(batch == nil && conflict != nil) }
     }
 
     struct Batch: Decodable, Identifiable {
@@ -68,6 +79,8 @@ struct UploadList: Decodable {
     let bandwidth: UInt64?
     let unpublished, unpublishedBytes, rate: UInt64
     let etaSecs: UInt64?
+    /// Items a `limit` left out, and a mount's changes still to send, listed or not.
+    let more, mountUnsent: UInt64?
 }
 
 /// What a pause, a resume or a cancel applies to, as the daemon reads it.
@@ -119,9 +132,31 @@ enum Words {
         }
     }
 
+    /// `void status`'s words for files with a kept change.
+    static func kept(_ files: UInt64) -> String {
+        "\(files) \(files == 1 ? "file" : "files") kept on this Mac, not uploaded"
+    }
+
+    /// What a cancel says it did to a mount's changes.
+    static func keptByCancel(_ changes: UInt64) -> String {
+        "\(changes) \(changes == 1 ? "change stays" : "changes stay") on this Mac, not uploaded: saving the file again uploads it as it is then."
+    }
+
+    /// What a cancel that changed nothing says.
+    static let nothingCancelled = "Nothing was cancelled: it was sent already, or it waits for a conflict, which stays on this Mac until it's resolved."
+
+    /// What `void status` says waits in the journal while no daemon runs, or `nil` for nothing.
+    static func waiting(_ w: Journal.Waiting) -> String? {
+        let kept = w.kept > 0 ? Self.kept(w.kept) : nil
+        guard w.changes > 0 else { return kept }
+        let line = "\(w.changes) \(w.changes == 1 ? "change" : "changes") (\(size(w.bytes))) wait in the journal, for the daemon to start"
+        return kept.map { "\(line) · \($0)" } ?? line
+    }
+
     /// `void status`'s uploads line.
     static func uploads(_ u: DaemonStatus.Uploads) -> String {
-        if u.unpublished == 0 { return u.paused ? "idle · paused" : "idle" }
+        let kept = (u.kept ?? 0) > 0 ? " · \(Self.kept(u.kept ?? 0))" : ""
+        if u.unpublished == 0 { return (u.paused ? "idle · paused" : "idle") + kept }
         let parts = [(u.uploading, "uploading"), (u.queued, "queued"), (u.failed, "failed"), (u.conflicts, "in conflict")].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
         var line = "\(parts.joined(separator: ", ")) · \(size(u.unpublishedBytes)) to send"
         if u.rate > 0 { line += " · \(size(u.rate))/s" }
@@ -132,7 +167,7 @@ enum Words {
         }
         if !u.pausedDrives.isEmpty { line += " · paused on \(u.pausedDrives.joined(separator: ", "))" }
         if let b = u.bandwidth { line += " · limit \(size(b))/s" }
-        return line
+        return line + kept
     }
 
     /// An item's state, as `void uploads` says it.
@@ -144,6 +179,7 @@ enum Words {
         case "failed": return "failed: \(i.error ?? "")"
         case _ where i.paused && !i.finished: return "paused"
         case "done" where i.conflict != nil: return "done, over a newer version"
+        case "kept": return "kept on this Mac, not uploaded"
         default: return i.state
         }
     }
@@ -183,11 +219,20 @@ final class Transfers {
     private(set) var problem: String?
     /// The last control's failure, until the next control.
     private(set) var controlError: String?
+    /// What the last control did that its button doesn't show: a cancel keeping a mount's changes.
+    private(set) var notice: String?
+    /// While no daemon runs, what its journal holds for it.
+    private(set) var waiting: Journal.Waiting?
     @ObservationIgnored let socket: DaemonSocket?
     @ObservationIgnored private var started = false
+    /// The query that lists the queue: the rows the menu shows, which most need showing, unless
+    /// all are asked for. With 10,000 changes queued, a whole list is about 1.4 MB a second.
+    @ObservationIgnored let listing: String
 
-    init() {
+    /// `limit`: how many changes to list; `nil` lists them all.
+    init(limit: Int? = TransfersView.shownItems) {
         socket = Agent.stateDirectory.map { DaemonSocket(path: $0.appending(path: "daemon.sock").path) }
+        listing = limit.map { "?limit=\($0)" } ?? ""
         if socket == nil { problem = "No home directory for the daemon's state." }
     }
 
@@ -196,8 +241,9 @@ final class Transfers {
     func start() {
         guard !started, let socket else { return }
         started = true
+        let target = "/v1/uploads/watch" + listing
         Thread.detachNewThread { [weak self] in
-            Self.watch(socket) { list in Task { @MainActor in self?.queue = list } }
+            Self.watch(socket, target) { list in Task { @MainActor in self?.queue = list } }
         }
         Task {
             while true {
@@ -207,11 +253,11 @@ final class Transfers {
         }
     }
 
-    nonisolated private static func watch(_ socket: DaemonSocket, _ deliver: @escaping (UploadList?) -> Void) -> Never {
+    nonisolated private static func watch(_ socket: DaemonSocket, _ target: String, _ deliver: @escaping (UploadList?) -> Void) -> Never {
         let decoder = JSONDecoder()
         while true {
-            // A large import lists every item each second, so a line can run to megabytes.
-            try? socket.stream("/v1/uploads/watch", generation: nil, limit: 64 << 20, opened: { _ in }) { line in
+            // Unlimited, a large import lists every item each second, so a line can run to megabytes.
+            try? socket.stream(target, generation: nil, limit: 64 << 20, opened: { _ in }) { line in
                 deliver(try? decoder.decode(UploadList.self, from: line))
                 return true
             }
@@ -226,10 +272,11 @@ final class Transfers {
             let r = try await socket.request("GET", "/v1/status", generation: nil, limit: 4 << 20)
             guard r.status == 200 else { throw DaemonSocketError.malformed(Self.message(r)) }
             status = try JSONDecoder().decode(DaemonStatus.self, from: r.body)
-            problem = nil
+            (problem, waiting) = (nil, nil)
         } catch DaemonSocketError.notRunning {
             (status, queue) = (nil, nil)
             problem = "The voidfs daemon isn't running: start it with `void daemon start`."
+            waiting = Agent.stateDirectory.flatMap(Journal.waiting)
         } catch {
             status = nil
             problem = "The daemon's status failed: \(error)"
@@ -238,25 +285,38 @@ final class Transfers {
 
     /// The queue now, rather than at the watch's next line: after a control, say.
     func refreshQueue() async {
-        guard let socket, let r = try? await socket.request("GET", "/v1/uploads", generation: nil, limit: 64 << 20), r.status == 200 else { return }
+        guard let socket, let r = try? await socket.request("GET", "/v1/uploads" + listing, generation: nil, limit: 64 << 20), r.status == 200 else { return }
         if let q = try? JSONDecoder().decode(UploadList.self, from: r.body) { queue = q }
     }
 
     func pause(_ scope: UploadScope) async { await call("POST", "/v1/uploads/pause", scope.json) }
     func resume(_ scope: UploadScope) async { await call("POST", "/v1/uploads/resume", scope.json) }
-    /// Offered for imports only; see the top of this file.
-    func cancel(_ scope: UploadScope) async { await call("POST", "/v1/uploads/cancel", scope.json) }
+    /// For an import and for a mount's change, which stays on this Mac; see the top of this file.
+    func cancel(_ scope: UploadScope) async {
+        let answer = await call("POST", "/v1/uploads/cancel", scope.json)
+        let kept = (answer?["kept"] as? NSNumber)?.uint64Value ?? 0
+        if kept > 0 {
+            notice = Words.keptByCancel(kept)
+        } else if (answer?["items"] as? NSNumber)?.uint64Value == 0 {
+            notice = Words.nothingCancelled
+        }
+    }
     func limit(_ bytesPerSecond: UInt64?) async { await call("PUT", "/v1/uploads/limit", ["bytesPerSecond": bytesPerSecond.map { $0 as Any } ?? NSNull()]) }
     func clearFinished() async { await call("POST", "/v1/uploads/clear", nil) }
     /// As `void unmount`: the daemon unmounts it and forgets it; its unpublished changes still go.
     func unmount(_ m: DaemonStatus.Mount) async { await call("POST", "/v1/mounts/unmount", ["target": m.mountpoint]) }
 
-    private func call(_ method: String, _ target: String, _ body: Any?) async {
-        guard let socket else { return }
+    /// The daemon's answer to a control, when it succeeded.
+    @discardableResult
+    private func call(_ method: String, _ target: String, _ body: Any?) async -> [String: Any]? {
+        guard let socket else { return nil }
+        notice = nil
+        var answer: [String: Any]?
         do {
             let data = try body.map { try JSONSerialization.data(withJSONObject: $0, options: .fragmentsAllowed) } ?? Data()
             let r = try await socket.request(method, target, generation: nil, contentType: body == nil ? nil : "application/json", body: data, limit: 1 << 20)
             controlError = (200..<300).contains(r.status) ? nil : Self.message(r)
+            if controlError == nil { answer = (try? JSONSerialization.jsonObject(with: r.body)) as? [String: Any] }
         } catch DaemonSocketError.notRunning {
             controlError = "The voidfs daemon isn't running."
         } catch {
@@ -264,6 +324,7 @@ final class Transfers {
         }
         await refresh()
         await refreshQueue()
+        return answer
     }
 
     /// The daemon's error message, or its status code.
@@ -282,9 +343,12 @@ final class Transfers {
 
     /// What `transfers` prints: the menu's lines, laid out as `void status` lays out its rows.
     static func report() async -> (String, Int32) {
-        let t = Transfers()
+        let t = Transfers(limit: nil)
         await t.refresh()
-        guard let s = t.status else { return (t.problem ?? "no status", 1) }
+        guard let s = t.status else {
+            let waiting = t.waiting.flatMap(Words.waiting).map { "\nuploads   \($0)" } ?? ""
+            return ((t.problem ?? "no status") + waiting, 1)
+        }
         var rows = [("server", "\(s.connection.endpoint) · \(Words.link(s.connection.link))"), ("uploads", Words.uploads(s.uploads))]
         rows += s.mounts.isEmpty ? [("mounts", "none")] : s.mounts.enumerated().map { ($0.offset == 0 ? "mounts" : "", Words.mount($0.element)) }
         await t.refreshQueue()
@@ -301,17 +365,55 @@ final class Transfers {
     }
 }
 
+/// The daemon's journal, read while no daemon runs, as `void status` reads it.
+enum Journal {
+    /// What waits: changes to send and their bytes (`voidfs_client::queue::unpublished`), and the
+    /// files with a change kept on this Mac (`queue::kept`).
+    struct Waiting: Equatable {
+        let changes, bytes, kept: UInt64
+    }
+
+    /// The newest schema this build reads (crates/voidfs-client/src/store.rs's migrations).
+    static let schema: Int64 = 10
+
+    /// Reads `state.sqlite`, writing nothing. `nil` when there is none, or a newer voidfs wrote it.
+    /// The connection may write, though: a read-only one can't open the WAL database once a
+    /// stopped daemon has removed its shared-memory file.
+    static func waiting(in dir: URL) -> Waiting? {
+        let path = dir.appending(path: "state.sqlite").path
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else { return nil }
+        sqlite3_busy_timeout(db, 500)
+        func row(_ sql: String) -> [Int64]? {
+            var q: OpaquePointer?
+            defer { sqlite3_finalize(q) }
+            guard sqlite3_prepare_v2(db, sql, -1, &q, nil) == SQLITE_OK, sqlite3_step(q) == SQLITE_ROW else { return nil }
+            return (0..<sqlite3_column_count(q)).map { sqlite3_column_int64(q, $0) }
+        }
+        guard let version = row("PRAGMA user_version")?.first, version <= schema,
+              let send = row("SELECT COUNT(*), COALESCE(SUM(MAX(size - sent, 0)), 0) FROM entries WHERE state NOT IN ('done', 'cancelled', 'kept')"),
+              let kept = row("SELECT COUNT(*) FROM (SELECT DISTINCT drive, key FROM entries WHERE state = 'kept')")
+        else { return nil }
+        return Waiting(changes: UInt64(send[0]), bytes: UInt64(send[1]), kept: UInt64(kept[0]))
+    }
+}
+
 /// The menu's transfers: the server, the queue and its controls, the mounts, and the changes and
 /// imports still to send.
 struct TransfersView: View {
     let transfers: Transfers
     /// Rows past these are left to `void uploads`, which lists them all.
-    private static let shownItems = 6, shownBatches = 4
+    static let shownItems = 6, shownBatches = 4
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let problem = transfers.problem {
                 Label(problem, systemImage: "exclamationmark.triangle").font(.caption).textSelection(.enabled)
+            }
+            if let w = transfers.waiting.flatMap(Words.waiting) {
+                row("Uploads", w)
             }
             if let s = transfers.status {
                 row("Server", "\(s.connection.endpoint) · \(Words.link(s.connection.link))")
@@ -324,6 +426,7 @@ struct TransfersView: View {
                 changes(q)
                 imports(q)
             }
+            if let n = transfers.notice { Text(n).font(.caption).textSelection(.enabled) }
             if let e = transfers.controlError { Text(e).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
         }
     }
@@ -382,16 +485,26 @@ struct TransfersView: View {
         }
     }
 
-    /// Unfinished changes: the uploading ones first, then those that need looking at.
+    /// What Cancel does to a mount's change, beside the button.
+    static let keepsHere = "Cancel keeps a change on this Mac, not uploaded. Saving the file again uploads it as it is then."
+
+    /// Unfinished changes: the uploading ones first, then those that need looking at, then those
+    /// kept on this Mac.
     @ViewBuilder
     private func changes(_ q: UploadList) -> some View {
-        let order = ["uploading": 0, "failed": 1, "queued": 2]
+        let order = ["uploading": 0, "failed": 1, "queued": 2, "kept": 4]
         let open = q.items.filter { !$0.finished }.sorted { (order[$0.state] ?? 3, $0.id) < (order[$1.state] ?? 3, $1.id) }
-        let saved = open.filter { $0.batch == nil }.count
-        if !open.isEmpty {
+        // A limited list counts what it leaves out; an older daemon lists everything.
+        let total = open.count + Int(q.more ?? 0)
+        let saved = q.mountUnsent.map(Int.init) ?? open.filter { $0.batch == nil && $0.toSend }.count
+        let kept = transfers.status?.uploads.kept.map(Int.init) ?? Set(open.filter(\.kept).map { "\($0.drive)/\($0.key)" }).count
+        if total > 0 {
             Divider()
             if saved > 0 {
-                Text("\(saved) \(saved == 1 ? "change is" : "changes are") saved on this Mac and not yet on the drive.").font(.caption).foregroundStyle(.secondary)
+                Text("\(saved) \(saved == 1 ? "change is" : "changes are") saved on this Mac and not yet on the drive. \(Self.keepsHere)").font(.caption).foregroundStyle(.secondary)
+            }
+            if kept > 0 {
+                Text("\(Words.kept(UInt64(kept))): saving one again uploads it.").font(.caption).foregroundStyle(.secondary)
             }
             ForEach(open.prefix(Self.shownItems)) { i in
                 HStack(alignment: .firstTextBaseline) {
@@ -402,19 +515,22 @@ struct TransfersView: View {
                     .font(.caption)
                     .textSelection(.enabled)
                     Spacer()
-                    if i.paused {
-                        Button("Resume", action: act { await $0.resume(.entry(i.id)) })
-                    } else {
-                        Button("Pause", action: act { await $0.pause(.entry(i.id)) })
-                    }
-                    if i.batch != nil {
-                        Button("Cancel", action: act { await $0.cancel(.entry(i.id)) })
+                    if i.toSend {
+                        if i.paused {
+                            Button("Resume", action: act { await $0.resume(.entry(i.id)) })
+                        } else {
+                            Button("Pause", action: act { await $0.pause(.entry(i.id)) })
+                        }
+                        if i.cancellable {
+                            Button("Cancel", action: act { await $0.cancel(.entry(i.id)) })
+                                .help(i.batch == nil ? Self.keepsHere : "Cancel this file's upload. Its source stays where it is.")
+                        }
                     }
                 }
                 .controlSize(.small)
             }
-            if open.count > Self.shownItems {
-                Text("and \(open.count - Self.shownItems) more: `void uploads` lists them all").font(.caption).foregroundStyle(.secondary)
+            if total > Self.shownItems {
+                Text("and \(total - Self.shownItems) more: `void uploads` lists them all").font(.caption).foregroundStyle(.secondary)
             }
         }
     }

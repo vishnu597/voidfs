@@ -200,6 +200,7 @@ impl Fixture {
 
 async fn existing(f: &Fixture, ns: &Session) -> (u64, u64) {
     f.put("file", b"0123456789ab").await;
+    ns.invalidate(&[Invalidation::All]).await.unwrap();
     let ino = ns.lookup(ns.root(), "file").await.unwrap().ino;
     (ino, ns.open(ino, true).await.unwrap())
 }
@@ -1070,5 +1071,153 @@ async fn a_folder_removed_elsewhere_goes_with_its_local_ds_store() {
     f.remote.delete_object("drv", "dir/", Default::default()).await.unwrap();
     ns.invalidate(&[Invalidation::All]).await.unwrap();
     assert_eq!(names(&ns, ns.root()).await, Vec::<String>::new(), "only local-only names were left in it");
+    f.queue.close().await;
+}
+
+
+fn stage_paths(f: &Fixture) -> Vec<String> {
+    f.db().prepare("SELECT path FROM mount_staged").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+}
+
+fn sources(f: &Fixture) -> Vec<String> {
+    f.db().prepare("SELECT source FROM entries WHERE source IS NOT NULL").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+}
+
+async fn read_all(ns: &Session, ino: u64) -> Bytes {
+    let fh = ns.open(ino, false).await.unwrap();
+    let bytes = ns.read(fh, 0, 1024).await.unwrap();
+    ns.close(fh).await.unwrap();
+    bytes
+}
+
+async fn kept(f: &Fixture) -> Vec<voidfs_client::Item> {
+    f.queue.status().await.unwrap().items.into_iter().filter(|i| i.state == State::Kept).collect()
+}
+
+/// Cancelling a mounted file's unpublished change keeps it on this Mac, not uploaded, and the
+/// next save of the file uploads the file as it is then, guarded on the version the change was
+/// made on (step 5, item 8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_mount_change_stays_here_not_uploaded_until_the_next_save() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    let (ino, fh) = existing(&f, &ns).await;
+    ns.write(fh, 0, Bytes::from_static(b"LOCAL")).await.unwrap();
+    ns.fsync(fh).await.unwrap();
+    let queued = f.queue.status().await.unwrap().items;
+    let (frozen, stage) = (sources(&f), stage_paths(&f));
+    f.queue.cancel(Scope::Entry(queued[0].id)).await.unwrap();
+    let status = f.queue.status().await.unwrap();
+    assert!(status.items.iter().all(|i| i.state == State::Kept && !i.paused), "the change's truncate is kept with it: {:?}", status.items);
+    assert_eq!((status.unpublished, status.unpublished_bytes), (0, 0), "a kept change isn't waiting to be sent");
+    assert!(Path::new(&frozen[0]).exists(), "the queue keeps its copy of the change");
+    assert_eq!(stage_paths(&f), stage);
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Kept);
+    assert_eq!(ns.read(fh, 0, 1024).await.unwrap(), Bytes::from_static(b"LOCAL56789ab"));
+    ns.close(fh).await.unwrap();
+    assert_eq!(read_all(&ns, ino).await, Bytes::from_static(b"LOCAL56789ab"), "the copy here keeps the change");
+    f.publish().await;
+    assert_eq!(f.body("file").await, Some(Bytes::from_static(b"0123456789ab")), "a resume doesn't upload it");
+    assert_eq!(kept(&f).await.len(), 2);
+
+    // It stays so through a restart.
+    let (f, ns) = f.restart(ns).await;
+    f.publish().await;
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Kept);
+    assert_eq!(read_all(&ns, ino).await, Bytes::from_static(b"LOCAL56789ab"));
+    assert_eq!(f.body("file").await, Some(Bytes::from_static(b"0123456789ab")));
+    assert_eq!(kept(&f).await.len(), 2);
+
+    // The next save uploads the file as it is here: the kept change and the new one.
+    let fh = ns.open(ino, true).await.unwrap();
+    ns.write(fh, 12, Bytes::from_static(b"!")).await.unwrap();
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Pending);
+    ns.fsync(fh).await.unwrap();
+    ns.close(fh).await.unwrap();
+    assert!(kept(&f).await.is_empty(), "the save queued the kept change again");
+    f.publish().await;
+    assert_eq!(f.body("file").await, Some(Bytes::from_static(b"LOCAL56789ab!")));
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Saved);
+    assert!(f.queue.status().await.unwrap().items.iter().all(|i| i.state == State::Done));
+    // The kept change's truncate ends a run, so the new save is a version of its own after it.
+    assert_eq!(f.remote.list_versions("drv", "file", true).await.unwrap().len(), 3, "both made on the version the kept change was made on");
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_change_and_another_computers_save_become_a_conflict_at_the_next_save() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    let (ino, fh) = existing(&f, &ns).await;
+    ns.write(fh, 0, Bytes::from_static(b"LOCAL")).await.unwrap();
+    ns.fsync(fh).await.unwrap();
+    let done = f.queue.cancel(Scope::All).await.unwrap();
+    assert_eq!((done.cancelled, done.kept), (0, f.queue.status().await.unwrap().items.len() as u64), "a cancel says what it kept");
+    f.put("file", b"from another mac").await;
+    ns.invalidate(&[Invalidation::All]).await.unwrap();
+    assert_eq!(ns.read(fh, 0, 1024).await.unwrap(), Bytes::from_static(b"LOCAL56789ab"), "this Mac keeps its copy");
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Kept);
+    ns.write(fh, 0, Bytes::from_static(b"AGAIN")).await.unwrap();
+    ns.fsync(fh).await.unwrap();
+    f.publish().await;
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Conflict);
+    assert_eq!(f.body("file").await, Some(Bytes::from_static(b"from another mac")));
+    assert_eq!(ns.read_conflict(ino, ConflictSide::Local, 0, 1024).await.unwrap(), Bytes::from_static(b"AGAIN56789ab"));
+    assert_eq!(ns.read_conflict(ino, ConflictSide::Remote, 0, 1024).await.unwrap(), Bytes::from_static(b"from another mac"));
+    // A cancel leaves the conflict as it is: it is no upload, and both versions stay here.
+    let before = f.queue.status().await.unwrap().items;
+    assert!(before.iter().any(|i| i.state == State::Failed && i.conflict.is_some()), "{before:?}");
+    let done = f.queue.cancel(Scope::All).await.unwrap();
+    assert_eq!((done.cancelled, done.kept), (0, 0));
+    assert_eq!(f.queue.status().await.unwrap().items, before);
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Conflict);
+    ns.close(fh).await.unwrap();
+    let (f, ns) = f.restart(ns).await;
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Conflict);
+    assert_eq!(f.body("file").await, Some(Bytes::from_static(b"from another mac")));
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_new_file_uploads_whole_at_its_next_save_and_a_kept_edit_goes_before_its_deletion() {
+    let f = Fixture::new(Backend::Api).await;
+    let ns = f.session().await;
+    let new = ns.create(ns.root(), "new", 0o600).await.unwrap();
+    let fh = ns.open(new.ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"fresh")).await.unwrap();
+    ns.fsync(fh).await.unwrap();
+    f.queue.cancel(Scope::All).await.unwrap();
+    f.publish().await;
+    assert_eq!(f.body("new").await, None, "a kept creation leaves the drive as it was");
+    assert_eq!(ns.getattr(new.ino).await.unwrap().sync, Sync::Kept);
+    assert_eq!(ns.lookup(ns.root(), "new").await.unwrap().sync, Sync::Kept);
+    assert_eq!(ns.readdir(ns.root(), None, 10).await.unwrap().into_iter().map(|(n, a)| (n, a.sync)).collect::<Vec<_>>(), [("new".to_owned(), Sync::Kept)]);
+    ns.write(fh, 5, Bytes::from_static(b"er")).await.unwrap();
+    ns.fsync(fh).await.unwrap();
+    ns.close(fh).await.unwrap();
+    f.publish().await;
+    assert_eq!(f.body("new").await, Some(Bytes::from_static(b"fresher")));
+    assert_eq!(f.remote.list_versions("drv", "new", true).await.unwrap().len(), 1, "the new save folded into the kept creation: one put");
+    assert_eq!(ns.getattr(new.ino).await.unwrap().sync, Sync::Saved);
+
+    // A kept edit, then the file's deletion here: the edit goes first, so the drive's history has it.
+    f.queue.pause(Scope::All).await.unwrap();
+    f.put("file", b"0123456789ab").await;
+    ns.invalidate(&[Invalidation::All]).await.unwrap();
+    let ino = ns.lookup(ns.root(), "file").await.unwrap().ino;
+    let fh = ns.open(ino, true).await.unwrap();
+    ns.write(fh, 0, Bytes::from_static(b"LOCAL")).await.unwrap();
+    ns.fsync(fh).await.unwrap();
+    ns.close(fh).await.unwrap();
+    f.queue.cancel(Scope::All).await.unwrap();
+    assert_eq!(ns.getattr(ino).await.unwrap().sync, Sync::Kept);
+    ns.unlink(ns.root(), "file").await.unwrap();
+    assert!(kept(&f).await.is_empty());
+    f.publish().await;
+    assert_eq!(f.body("file").await, None);
+    let items = f.queue.status().await.unwrap().items.into_iter().filter(|i| i.key == "file").collect::<Vec<_>>();
+    assert_eq!(items.iter().map(|i| (i.op, i.state)).collect::<Vec<_>>(),
+        [(voidfs_client::Op::Write, State::Done), (voidfs_client::Op::Truncate, State::Done), (voidfs_client::Op::Delete, State::Done)]);
+    assert!(items[0].version.is_some(), "the kept edit became a version before the deletion: {items:?}");
     f.queue.close().await;
 }

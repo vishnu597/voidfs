@@ -39,6 +39,7 @@ enum Badges {
         case .saving?: "saving"
         case .error?: "error"
         case .conflict?: "conflict"
+        case .kept?: "kept"
         case .local?, nil: ""
         }
     }
@@ -51,6 +52,7 @@ enum Badges {
         case "Conflict": .conflict
         case "Error": .error
         case "Local": .local
+        case "Kept": .kept
         default: nil
         }
     }
@@ -71,8 +73,8 @@ enum Badges {
     /// One page of a folder's sync states. `since`, a first page's version, answers only
     /// `unchanged` while it holds.
     func states(drive: String, folder: String, after: String?, since: String?, reply: @escaping (BadgeFolder?, NSError?) -> Void)
-    /// Pauses or resumes a mounted drive's uploads, as the menu does. There is no cancel: it
-    /// would mark a mount's local copy as an error and delete its staged bytes.
+    /// Pauses or resumes a mounted drive's uploads, as the menu does. Cancel is the menu bar's
+    /// only, where it says what happens: the change stays on this Mac, not uploaded.
     func pause(drive: String, reply: @escaping (NSError?) -> Void)
     func resume(drive: String, reply: @escaping (NSError?) -> Void)
 }

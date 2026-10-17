@@ -8,7 +8,8 @@ and attribute changes added 8 October; the signed-bundle probe, the rest of the 
 the Swift bridge and one daemon for the CLI and the app added 9 October; read-only FSKit on the
 daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October; the
 application matrix and its first fixes added 13 October; held mmap delivery and its durability
-policy clarified 14 October; menu-bar transfers and Finder Sync badges added 16 October. **Item 1 is complete**
+policy clarified 14 October; menu-bar transfers, Finder Sync badges and the fate of a mount's
+cancelled change added 16 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -39,14 +40,19 @@ decode/export checks on this Mac, including direct cold/warm decoder opens on a 
 fresh fork; native Xcode open/edit/save/build/run also passes.
 QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and two
 independent Macs and the absent paid target apps remain explicitly untested.
-**Item 8's first two slices are built, not complete** (16 October): the menu shows the daemon's
-connection, queue and mounts in the CLI's words and controls the queue
-([menu-bar transfers](#menu-bar-transfers-16-october)), and a Finder Sync extension badges mounted
-drives' items from one new daemon call that reads only local state
-([Finder Sync badges](#finder-sync-badges-16-october)). Every badge state and the context menu's
-pause and resume were shown in a live Finder on an FSKit mount the same day
-([live run](../bench/results/finder-sync-badges-live/README.md)). Neither offers cancel for a
-mount's changes.
+**Item 8 is built, and each clause of its done-when is shown on a live FSKit mount, with one
+finding open** (16 October). The menu shows the daemon's connection, queue and mounts in the CLI's
+words and controls the queue ([menu-bar transfers](#menu-bar-transfers-16-october)). A Finder Sync
+extension badges mounted drives' items from one daemon call that reads only local state
+([Finder Sync badges](#finder-sync-badges-16-october)). Cancelling a mount's change keeps it on
+this Mac, not uploaded, until the file is saved again, as the user chose; the menu offers it and
+Finder doesn't ([cancelling](#cancelling-a-mounts-change-16-october)). On a live mount, Finder,
+the menu and `void status` agreed through each state, daemon and agent restarts, and offline, hung
+and degraded links, and a drive's controls no longer wait on a hung server; the menu reads the
+journal while no daemon runs and lists only what it shows during a 10,000-file import
+([live mount](#item-8-on-a-live-mount-16-october)). Open: once, Finder showed no badges two minutes
+after a degraded link recovered, and that isn't explained yet. The drive's own icon carries no
+reliable badge, a Finder limit.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -355,14 +361,43 @@ actions, not actions performed by writing this plan.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
-**Two slices built, 16 October, not complete.** The menu's transfers view and its queue controls,
-checked against a test daemon ([menu-bar transfers](#menu-bar-transfers-16-october)). Finder Sync
-badges for saved, pending, saving, error and conflict, a drive's pause and resume in the context
-menu, and the daemon call behind them, checked against a test daemon without Finder and then in a
-live Finder on an FSKit mount ([Finder Sync badges](#finder-sync-badges-16-october)); badge reads
-cost no server request. A mount's changes can be paused but not cancelled until the app can say
-what happens to the copy on this Mac. A live mount's rows in the menu, offline states, the bridge
-restarting and Finder beside the menu bar remain.
+**Built, 16 October; each clause shown, one finding open.** The slices: the menu's transfers
+([menu-bar transfers](#menu-bar-transfers-16-october)), Finder Sync badges and context menu
+([Finder Sync badges](#finder-sync-badges-16-october)), the fate of a mount's cancelled change
+([cancelling](#cancelling-a-mounts-change-16-october)), and a live mount with the menu bounded and
+a drive's controls freed from the server ([live mount](#item-8-on-a-live-mount-16-october)). The
+done-when, clause by clause:
+
+- **Finder and the menu bar agree with CLI status: shown.** At every capture on a live FSKit mount
+  (saved, saving, kept, paused, conflict, both restarts, offline, hung, degraded), the menu's lines
+  and its drawn view, `void status`, `void uploads` and the daemon's badge call said the same, and
+  Finder's badges matched. Open: once, two minutes after a degraded link recovered, Finder showed
+  `live/` with no badges at all; not investigated. Limit: the drive's own icon carries no reliable
+  badge, because Finder doesn't ask the extension about a mounted volume's icon.
+- **Queue controls affect live mounts: shown.** The menu's model set and cleared a limit, paused
+  and resumed everything, the drive and one change, and cancelled a change mid-upload, which
+  became kept; each was checked in the daemon. The CLI's controls and Finder's Pause Uploads and
+  Resume Uploads worked on live mounts too. A drive's pause waited on a hung server (30 s and
+  more); it now answers from this Mac. Not shown: clicks in the real menu-bar menu.
+- **States survive app, bridge and daemon restart: shown for the daemon and the bridge.** With the
+  daemon stopped, the menu and `void status` read the same line from its journal. Started again,
+  it brought back the mount, the queue, the kept file and the conflict in the CLI, the menu and
+  Finder. The agent (the bridge), killed, came back in about 2 s, and the mount and badges carried
+  on. The app keeps no state and each check ran as a new app process, but the running menu app
+  wasn't restarted by hand.
+- **Badge requests for a folder don't issue one remote request per file: shown** without Finder
+  (no server request over a 1,000-file folder, none in 10 s of polling three folders) and live.
+- **The app stays usable while offline: shown.** Offline, the mount wrote in 0.06 s and the
+  menu's checks ran in 1.25 s. Hung, after the fix, they ran in 0.68 s. Degraded, they ran in
+  0.66 s, while reads of what wasn't cached failed, by design. The status says offline and
+  degraded, but says online while the server hangs with only a long upload asking.
+- **The app stays usable while a large upload runs: shown.** With 10,000 changes queued, a status
+  takes 17 ms rather than 79, and the menu's watch line is 1.6 KB rather than 1.4 MB. The menu app
+  uses 0.1% CPU and 16 MB. The live run's controls ran while uploads were in flight.
+- **The fate of unpublished mounted-file writes before cancelling them: defined and shown.** Kept
+  on this Mac, not uploaded, until the next save.
+
+Item 8 isn't marked complete until the missing badges are explained.
 
 Use the existing daemon status/upload stream for mounts, connectivity, queue progress, per-item
 and global pause/resume, cancel and immediate bandwidth caps. Distinguish local durable saves
@@ -2435,3 +2470,125 @@ Not shown: Finder beside the menu bar's transfers view
 ([menu-bar transfers](#menu-bar-transfers-16-october), merged in
 [PR #74](https://github.com/vishnu597/voidfs/pull/74)), an offline link, and two Macs. A pending
 deletion leaves no name to badge, so it doesn't mark its folder. Item 8's done-when is not met.
+
+### Cancelling a mount's change, 16 October
+
+**Item 8's cancel.** Until now, cancelling a mount's change marked the file's copy on this Mac as
+an error and deleted the bytes the queue had frozen for it. A Rust test at `main` showed what
+followed ([before](../bench/results/mount-cancel-kept/raw/cancel-before.txt)): the copy here kept
+the cancelled bytes, every later save of the file failed for good ("the mount edit's predecessor
+was not published"), another computer's save didn't show and wasn't a conflict, and deleting the
+file here never reached the drive. The user chose the fate on 16 October: **cancel keeps the
+change on this Mac, not uploaded, and the next save uploads the whole file as it is then.**
+Nothing is lost, no open app sees its file change under it, and the file no longer gets stuck.
+The user also kept cancel in the menu bar only; Finder's context menu keeps the drive's Pause
+Uploads and Resume Uploads.
+
+The journal has a new state, `kept` (store migration 10, whose index finds a mount's kept
+changes; a binary from before it refuses to open the state, "written by a newer voidfs", rather
+than publish them). A cancel
+turns a mount's change in its scope into `kept`, with every later mount change that would have
+waited for it. Kept changes stay in the journal with their frozen bytes and are never scheduled.
+What was uploading stops at its next request, and an attempt that may have landed still goes
+alone later and is recognized by its marker. The file's state on this Mac becomes `kept`: Finder
+badges it "Not uploaded: kept on this Mac", ranked below error and conflict and above saving and
+pending in a folder's state; `void uploads` says "kept on this Mac, not uploaded"; `void status`
+and the menu add "N files kept on this Mac, not uploaded", and `void status` says so from the
+journal while no daemon runs.
+
+The next mount change that needs a kept one queues it again in the same transaction: a save of
+the same file, its rename or deletion, or a change that must come after it. The drive then gets
+the file as it is on this Mac, guarded on the version the kept change was made on, so another
+computer's save in the meantime becomes a conflict, with both versions kept here. A new file's
+kept creation folds into one put at its next save. A deletion after a kept edit publishes the edit
+first, so it stays in the file's history. Cancel leaves a mount's conflict, and what waits for one,
+as they are: both versions are already on this Mac and nothing of them is sent until the conflict
+is resolved, so the menu offers no Cancel for a conflict. Imports are unchanged: a cancelled
+import's unsent files aren't uploaded, their sources stay where they are, and kept mount changes
+don't hold imports back.
+
+The daemon's cancel answer counts what the cancel did, `kept` included, and `/v1/status`'s
+uploads gain `kept` (files with a kept change). The menu offers Cancel on a mount's change, says
+what it does beside the button ("Cancel keeps a change on this Mac, not uploaded. Saving the file
+again uploads it as it is then."), and says what it did afterwards. The bridge's `SyncState`
+gains `kept` as its last value, so an FSKit module built before it can't read that state from a
+newer agent; the app, the agent and the module ship in one bundle.
+
+The [evidence](../bench/results/mount-cancel-kept/README.md) has the Rust tests' output and the
+app's self-tests against an isolated test daemon: Finder's model badges a kept file and its
+folder through a pause, a resume and a conflict from `mount_peer` (35 checks), and the menu's
+model cancels a waiting mount change, which becomes kept, with the notice and the uploads line
+saying so, and leaves a conflict as it is. Not shown here: Cancel clicked in the real menu, and
+two Macs.
+
+### Item 8 on a live mount, 16 October
+
+**Item 8's live run, and what it changed.** The menu and Finder had each been checked without the
+other. This run mounted a new test drive through FSKit and compared, at each moment: Finder, the
+menu's lines and its view drawn offscreen, `void status`, `void uploads`, and the daemon's badge
+call. The user approved the registration changes and their restoration.
+
+Code changed with it:
+
+- **The menu reads the journal while no daemon runs** (`Journal` in `App/Transfers.swift`), as
+  `void status` does: "3 changes (8 B) wait in the journal, for the daemon to start · 1 file kept
+  on this Mac, not uploaded". It opens `state.sqlite` without changing it, and reads nothing from a
+  schema newer than it knows.
+- **The menu reads only what it shows.** With 10,000 changes queued, each `/v1/status` read the
+  whole journal (79 ms in a debug build), and the watch the menu follows sent every item each
+  second (1.4 MB a line). `Queue::unfinished` now answers status, lists and controls from memory,
+  with one count of the imports' finished entries (17 ms). `/v1/uploads` and its watch take
+  `limit`: the items that most need showing (uploading, failed, queued, kept, then finished), with
+  `more` counting the rest and `mountUnsent` counting a mount's changes still to send. The menu
+  asks for 6 (1.6 KB a line), and its app uses 0.1% CPU and 16 MB, half its footprint before.
+- **A drive's controls don't wait on the server.** A drive's pause, resume or cancel resolved the
+  drive's name through the server's `describe_drive`. With the server hung, that waited out a
+  120 s attempt, and the menu's drive pause failed after 30 s. `Sessions::control_names` takes the
+  spellings from the drive open on this Mac or from the alias memo. Only a name this Mac never saw
+  asks the server, and the queue holds only names this Mac resolved. A daemon test hangs a proxy
+  and checks that pause by alias, resume by id and cancel answer within 3 s; it fails without the
+  fix.
+- **A newer state doesn't fail the bridge.** An FSKit module built before `kept` can't read an
+  entry in that state, and on this Mac FSKit chose such a module from an older build. From this
+  build on, the bridge's `SyncState` reads a value it doesn't know as pending, rather than failing
+  the call.
+- **The self-test's new modes.** `transfers-selftest` gained `--no-daemon`, which checks the
+  journal's line with the daemon stopped, and `--look`, which only draws.
+
+The [evidence](../bench/results/item8-live/README.md) has every capture, with Finder screenshots
+of each phase:
+
+- Saved, saving (2 KiB/s), kept (cancelled mid-upload through the menu's model), paused and
+  conflict (from `mount_peer`) agreed in all four.
+- A daemon stop ended the mount, and the menu and `void status` read the journal. The start
+  brought back the mount, the queue, the kept file and the conflict about 2 s later.
+- The agent, killed, came back in about 2 s, and the mount and badges carried on.
+- Offline (the relay refusing), the mount wrote in 0.06 s and the menu's checks ran in 1.25 s.
+- Hung (the relay stopped), the status said online for 5 minutes, because only an upload with a
+  120 s attempt was asking, and the drive pause hung until the fix (0.68 s after it).
+- Degraded (every request 503), the status said so and controls ran in 0.66 s, while reads of what
+  wasn't cached failed with EIO, by design. It said degraded for 79 s after the link recovered,
+  until the feed's backed-off watch answered.
+
+Findings, each left for later:
+
+- **Finder showed no badges in `live/`** two minutes after the degraded link recovered. Earlier
+  phases showed every badge, the daemon restart included. Not investigated before the rig came
+  down.
+- **The drive's own icon.** Finder never asked the extension about the mounted volume's icon in
+  its parent folder, and a badge set on it unasked didn't show. Once it asked during a remount,
+  and the answer didn't show either. The icon kept a stale "saving" badge in one window and none
+  after a remount. The drive's state shows on its folders and in the menu.
+- **A bandwidth limit reads as degraded.** Uploads sent at 2 KiB/s take more than the 10 s that
+  `Connectivity` counts as a slow answer, so the status said "degraded" with the server healthy.
+- **Rebuilding unmounts.** Rebuilding the app re-registers it, which ends the FSKit module and
+  unmounts the volume, while the daemon still lists the mount until `void unmount`.
+- **Cancel on a waiting change.** The menu shows Cancel on a mount's change queued behind a
+  conflict, where it changes nothing and says so.
+- **SENT stays at 0%.** A mount's uploads show 0% until they finish.
+- **`void unmount <drive name>`** resolves the name through the server, like the drive pause did.
+
+Not shown: clicks in the real menu-bar menu (the view was driven through its model and drawn
+offscreen), the running menu app quit and reopened by hand, Finder screenshots of the hung-with-fix
+and degraded phases (screen capture failed then), and two Macs. Every registration and default
+was restored and compared with a snapshot taken before the run.

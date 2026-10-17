@@ -29,7 +29,8 @@ pub enum UploadsCommand {
     Pause(Target),
     /// Resume paused uploads, and try failed ones again at once
     Resume(Target),
-    /// Cancel uploads: nothing of them is published, and what was uploading stops
+    /// Cancel uploads: nothing of them is published, and what was uploading stops. A mount's
+    /// changes stay on this Mac, not uploaded, until the file is saved again
     Cancel(Target),
     /// Limit how fast uploads go, at once and across restarts: bytes a second, as `10MiB`, `500K`
     /// or `2MB/s`, or `unlimited`
@@ -119,7 +120,14 @@ pub async fn run(out: Out, args: &UploadsArgs) -> Result<()> {
         }
         Some(UploadsCommand::Cancel(t)) => {
             let a = c.cancel(&t.scope()).await.map_err(failure)?;
-            out.emit(&a, || format!("cancelled {} ({} unfinished)", t.what(), a.items))
+            out.emit(&a, || {
+                let mut line = format!("cancelled {} ({} unfinished)", t.what(), a.items);
+                if a.kept > 0 {
+                    line.push_str(&format!("\n{} of a mount {} on this Mac, not uploaded: saving the file again uploads it as it is then",
+                        count(a.kept as usize, "change"), if a.kept == 1 { "stays" } else { "stay" }));
+                }
+                line
+            })
         }
         Some(UploadsCommand::Limit { rate }) => {
             let l = c.limit(parse_rate(rate)?).await.map_err(failure)?;
@@ -163,6 +171,7 @@ fn state(i: &voidfs_client::Item) -> String {
         State::Failed => format!("failed: {}", i.error.as_deref().unwrap_or("")),
         _ if i.paused && !i.state.finished() => "paused".into(),
         State::Done if i.conflict.is_some() => "done, over a newer version".into(),
+        State::Kept => "kept on this Mac, not uploaded".into(),
         s => s.as_str().into(),
     }
 }
@@ -253,6 +262,10 @@ fn totals(l: &UploadList) -> String {
     if let Some(b) = q.bandwidth {
         total.push_str(&format!(" · limit {}/s", size(b)));
     }
+    let kept: std::collections::BTreeSet<_> = q.items.iter().filter(|i| i.state == State::Kept).map(|i| (&i.drive, &i.key)).collect();
+    if !kept.is_empty() {
+        total.push_str(&format!(" · {}", crate::daemon::kept(kept.len() as u64)));
+    }
     total
 }
 
@@ -290,7 +303,7 @@ mod tests {
             ],
             batches: Vec::new(), paused: false, paused_drives: Vec::new(), bandwidth: None, unpublished: 4, unpublished_bytes: 24,
         };
-        let text = render(&UploadList { queue, rate: 0, eta_secs: None });
+        let text = render(&UploadList { queue, rate: 0, eta_secs: None, more: 0, mount_unsent: 0 });
         assert_eq!(text.matches("conflict: the drive changed (now version 184.0); this Mac keeps its copy").count(), 2, "{text}");
         assert!(text.contains("conflict: the drive changed; this Mac keeps its copy"), "{text}");
         assert!(text.contains("failed: 403 AccessDenied") && !text.contains("failed: 412"), "{text}");

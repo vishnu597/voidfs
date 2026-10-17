@@ -25,6 +25,23 @@ pub(crate) struct ListQuery {
     #[serde(default)]
     all: bool,
     batch: Option<i64>,
+    /// At most this many items, those that most need showing first (see [`rank`]); `more`
+    /// counts the rest. For a view that shows a few, such as the menu bar's, read each second.
+    limit: Option<usize>,
+}
+
+/// The order a limited list keeps: uploading, failed, queued, kept, then finished, each oldest
+/// first.
+fn rank(i: &Item) -> (u8, i64) {
+    use voidfs_client::State;
+    let r = match i.state {
+        State::Uploading => 0,
+        State::Failed => 1,
+        State::Queued => 2,
+        State::Kept => 3,
+        State::Done | State::Cancelled => 4,
+    };
+    (r, i.id)
 }
 
 fn no_upload(what: String) -> Failure {
@@ -33,7 +50,8 @@ fn no_upload(what: String) -> Failure {
 
 impl Shared {
     async fn list(&self, q: &ListQuery) -> Result<UploadList, Failure> {
-        let mut queue = self.queue.status().await?;
+        // What isn't finished is in memory; the rest is read from the journal only when asked.
+        let mut queue = if q.all { self.queue.status().await? } else { self.queue.unfinished().await? };
         if let Some(b) = q.batch {
             if !queue.batches.iter().any(|x| x.id == b) {
                 return Err(no_upload(format!("no batch {b}")));
@@ -44,9 +62,16 @@ impl Shared {
         if !q.all {
             queue.items.retain(|i| !i.state.finished());
         }
+        let mount_unsent = queue.items.iter().filter(|i| i.batch.is_none() && i.state.to_send()).count() as u64;
+        let mut more = 0;
+        if let Some(limit) = q.limit.filter(|l| *l < queue.items.len()) {
+            queue.items.sort_by_key(rank);
+            more = (queue.items.len() - limit) as u64;
+            queue.items.truncate(limit);
+        }
         let rate = self.rate();
         let eta_secs = (rate > 0 && queue.unpublished_bytes > 0).then(|| queue.unpublished_bytes.div_ceil(rate));
-        Ok(UploadList { queue, rate, eta_secs })
+        Ok(UploadList { queue, rate, eta_secs, more, mount_unsent })
     }
 
     /// Imports retain their display alias; control includes mounted stable-ID entries too.
@@ -124,11 +149,11 @@ enum Control {
 async fn control(s: &Shared, scope: Scope, what: Control) -> Answer<Affected> {
     let scope = match scope {
         Scope::All => voidfs_client::Scope::All,
-        Scope::Drive(d) => voidfs_client::Scope::Drives(s.upload_drive(&d).await?.1),
+        Scope::Drive(d) => voidfs_client::Scope::Drives(s.sessions.control_names(s, &d).await?),
         Scope::Batch(b) => voidfs_client::Scope::Batch(b),
         Scope::Entry(e) => voidfs_client::Scope::Entry(e),
     };
-    let q = s.queue.status().await?;
+    let q = s.queue.unfinished().await?;
     match &scope {
         voidfs_client::Scope::Batch(b) if !q.batches.iter().any(|x| x.id == *b) => return Err(no_upload(format!("no batch {b}"))),
         voidfs_client::Scope::Entry(e) if !q.items.iter().any(|i| i.id == *e) => return Err(no_upload(format!("no upload {e}"))),
@@ -141,13 +166,17 @@ async fn control(s: &Shared, scope: Scope, what: Control) -> Answer<Affected> {
         voidfs_client::Scope::Batch(b) => i.batch == Some(*b),
         voidfs_client::Scope::Entry(e) => i.id == *e,
     };
-    let items = q.items.iter().filter(|i| !i.state.finished() && applies(i)).count() as u64;
+    let items = q.items.iter().filter(|i| i.state.to_send() && applies(i)).count() as u64;
     match what {
         Control::Pause => s.queue.pause(scope).await?,
         Control::Resume => s.queue.resume(scope).await?,
-        Control::Cancel => s.queue.cancel(scope).await?,
+        Control::Cancel => {
+            // What waits on a cancelled change goes with it, and a mount's conflicts stay.
+            let c = s.queue.cancel(scope).await?;
+            return Ok(Json(Affected { items: c.cancelled + c.kept, kept: c.kept }));
+        }
     }
-    Ok(Json(Affected { items }))
+    Ok(Json(Affected { items, kept: 0 }))
 }
 
 pub(crate) async fn pause(State(s): State<Arc<Shared>>, Json(scope): Json<Scope>) -> Answer<Affected> {

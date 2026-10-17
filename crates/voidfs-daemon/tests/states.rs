@@ -207,7 +207,8 @@ async fn badges_follow_the_queue_from_local_state_without_a_remote_request() {
     let requests = proxy.take();
     assert!(requests.is_empty(), "badges asked the server: {requests:?}");
 
-    // Error: a cancelled change. Conflict: a change the server's copy moved on from.
+    // Kept: a cancelled change, on this Mac and not uploaded. Conflict: a change the server's
+    // copy moved on from.
     let uploads = client.uploads(false, None).await.unwrap();
     let id = uploads.queue.items.iter().find(|item| item.key == "e.txt").expect("e.txt queued").id;
     client.cancel(&Scope::Entry(id)).await.unwrap();
@@ -217,10 +218,10 @@ async fn badges_follow_the_queue_from_local_state_without_a_remote_request() {
     client.resume(&Scope::All).await.unwrap();
     until("the edits publish, but c.txt's, which conflicts", async || {
         let top = client.folder_states(&folder("drive", "")).await.unwrap();
-        entries(&top) == [("c.txt", Sync::Conflict), ("e.txt", Sync::Error)]
+        entries(&top) == [("c.txt", Sync::Conflict), ("e.txt", Sync::Kept)]
     }).await;
     let top = client.folder_states(&folder("drive", "")).await.unwrap();
-    assert_eq!(top.state, Sync::Conflict, "a conflict outranks an error");
+    assert_eq!(top.state, Sync::Conflict, "a conflict outranks a kept change");
     let inner = client.folder_states(&folder("drive", "dir")).await.unwrap();
     assert!(inner.entries.is_empty() && inner.state == Sync::Saved, "{inner:?}");
     assert!(client.folder_states(&folder("drive", "big")).await.unwrap().entries.is_empty());
@@ -236,7 +237,7 @@ async fn badges_follow_the_queue_from_local_state_without_a_remote_request() {
     refused(client.folder_states(&folder("drive", "")).await, 404, "NotOpen");
     let session = client.session("drive", true).await.unwrap();
     let top = client.folder_states(&folder("drive", "")).await.unwrap();
-    assert_eq!(entries(&top), [("c.txt", Sync::Conflict), ("e.txt", Sync::Error)]);
+    assert_eq!(entries(&top), [("c.txt", Sync::Conflict), ("e.txt", Sync::Kept)]);
     session.release().await.unwrap();
     daemon.stop().await;
 }

@@ -43,8 +43,10 @@ pub type Fh = u64;
 pub type Result<T> = std::result::Result<T, FsError>;
 
 /// `Local`: a file this Mac keeps to itself ([`local_only`]); nothing it does is published.
+/// `Kept`: a change whose upload was cancelled. This Mac keeps it, not uploaded, until a later
+/// change needs it published (step 5, item 8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Sync { Saved, Pending, Saving, Conflict, Error, Local }
+pub enum Sync { Saved, Pending, Saving, Conflict, Error, Local, Kept }
 
 /// Names whose new files stay on this Mac: Finder rewrites `.DS_Store` whenever a window's view
 /// changes, and each rewrite would be a version every other computer downloads. Exact and
@@ -223,7 +225,7 @@ fn node(c: &Connection, drive: &str, ino: Ino) -> rusqlite::Result<Option<Node>>
         let sync: String = r.get(2)?;
         let sync = match sync.as_str() {
             "saved" => Sync::Saved, "pending" => Sync::Pending, "saving" => Sync::Saving, "conflict" => Sync::Conflict, "error" => Sync::Error,
-            "local" => Sync::Local,
+            "local" => Sync::Local, "kept" => Sync::Kept,
             _ => return Err(rusqlite::Error::InvalidQuery),
         };
         Ok(Node { ino, entry: decode_json(&r.get::<_, String>(0)?)?, generation: r.get(1)?, sync, entry_id: r.get(3)?, remote_key: r.get(4)? })
@@ -432,7 +434,7 @@ fn mutation_base(n: &Node) -> Result<crate::journal::StoredBase> {
 }
 
 fn save_node(c: &Connection, n: &Node) -> Result<()> {
-    let sync = match n.sync { Sync::Saved => "saved", Sync::Pending => "pending", Sync::Saving => "saving", Sync::Conflict => "conflict", Sync::Error => "error", Sync::Local => "local" };
+    let sync = match n.sync { Sync::Saved => "saved", Sync::Pending => "pending", Sync::Saving => "saving", Sync::Conflict => "conflict", Sync::Error => "error", Sync::Local => "local", Sync::Kept => "kept" };
     c.execute("UPDATE mount_inodes SET attrs=?2, generation=?3, sync=?4 WHERE ino=?1", params![n.ino, serde_json::to_string(&n.entry).expect("JSON"), n.generation, sync])?;
     Ok(())
 }

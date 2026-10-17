@@ -97,8 +97,10 @@ enum Bridge {
 /// The daemon's `Attr`, with its RFC 3339 time as seconds and nanoseconds.
 @objc(VoidfsBridgeAttr) final class BridgeAttr: NSObject, NSSecureCoding {
     @objc enum Kind: Int { case file, folder, symlink, unknown }
-    /// `local`: a file kept on this Mac (`.DS_Store`), never published.
-    @objc enum SyncState: Int { case saved, pending, saving, conflict, error, local }
+    /// `local`: a file kept on this Mac (`.DS_Store`), never published. `kept`: a change whose
+    /// upload was cancelled, kept on this Mac and not uploaded until a later save (step 5, item 8).
+    /// New states go last: the raw values cross the bridge.
+    @objc enum SyncState: Int { case saved, pending, saving, conflict, error, local, kept }
 
     let ino: UInt64
     let kind: Kind
@@ -136,7 +138,10 @@ enum Bridge {
     }
 
     init?(coder c: NSCoder) {
-        guard let kind = Kind(rawValue: c.decodeInteger(forKey: "k")), let sync = SyncState(rawValue: c.decodeInteger(forKey: "y")) else { return nil }
+        // A state from a newer agent reads as pending: the module doesn't use it, and it shouldn't
+        // fail the call.
+        guard let kind = Kind(rawValue: c.decodeInteger(forKey: "k")) else { return nil }
+        let sync = SyncState(rawValue: c.decodeInteger(forKey: "y")) ?? .pending
         let mode = c.decodeInt64(forKey: "m")
         guard mode >= 0, mode <= 0o7777 else { return nil }
         (self.ino, self.kind, self.size) = (UInt64(bitPattern: c.decodeInt64(forKey: "i")), kind, UInt64(bitPattern: c.decodeInt64(forKey: "s")))

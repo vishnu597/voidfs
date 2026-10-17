@@ -83,6 +83,9 @@ const MIGRATIONS: &[&str] = &[
          remote_missing INTEGER NOT NULL DEFAULT 0, error TEXT, remote_attrs TEXT, local_attrs TEXT, local_xattrs TEXT);
      CREATE TABLE mount_conflict_blockers(ino INTEGER PRIMARY KEY REFERENCES mount_inodes(ino),
          owner INTEGER NOT NULL REFERENCES mount_conflicts(ino) DEFERRABLE INITIALLY DEFERRED);",
+    // 10: a mount's cancelled changes, kept on this Mac until a later change queues them again
+    // (journal::State::Kept). Older versions would read the state as queued and publish them.
+    "CREATE INDEX entries_kept ON entries(mount_ino, id) WHERE state='kept';",
 ];
 
 pub(crate) struct MountLease { write: bool }

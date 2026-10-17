@@ -514,6 +514,7 @@ enum Wire {
         case "Conflict": y = .conflict
         case "Error": y = .error
         case "Local": y = .local
+        case "Kept": y = .kept
         default: throw DaemonSocketError.malformed("sync")
         }
         return BridgeAttr(ino: try number(o, "ino").uint64Value, kind: k, size: try number(o, "size").uint64Value, mtimeSeconds: seconds, mtimeNanoseconds: nanos,

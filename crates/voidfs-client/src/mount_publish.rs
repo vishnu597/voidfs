@@ -14,7 +14,8 @@ pub(crate) enum Completion {
     Success { version: Option<String>, object: Option<Object> },
     Conflict { status: u16, remote: Option<Object>, current_version: Option<String>, error: String, local: HashMap<Ino, LocalCopy> },
     Error { error: String },
-    Cancelled,
+    /// Cancelled, and kept on this Mac ([`crate::State::Kept`]).
+    Kept,
 }
 #[derive(Clone)]
 pub(crate) struct Report { pub ino: Ino, pub attr: Attr, pub published: Option<Attr>, pub clean: bool, pub linked: bool }
@@ -230,10 +231,12 @@ pub(crate) fn reconcile(tx: &rusqlite::Transaction<'_>, run: &[Entry], completio
                 let json: Option<String> = tx.query_row("SELECT record FROM mount_staged WHERE ino=?1", [ino], |r| r.get(0)).optional()?;
                 let dirty = json.map(|json| serde_json::from_str::<stage::Record>(&json).map(|record| record.revision != record.flushed)).transpose()
                     .map_err(|e| FsError::Io(e.to_string()))?.unwrap_or(false);
-                let unfinished: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM entries WHERE mount_ino=?1 AND state NOT IN ('done','cancelled'))", [ino], |r| r.get(0))?;
+                let unfinished: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM entries WHERE mount_ino=?1 AND state NOT IN ('done','cancelled','kept'))", [ino], |r| r.get(0))?;
+                let kept: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM entries WHERE mount_ino=?1 AND state='kept')", [ino], |r| r.get(0))?;
                 let blocked = n.entry_id.map(|id| blocked(tx, id)).transpose()?.flatten();
                 n.sync = match blocked { Some((_, true)) => Sync::Conflict, Some(_) => Sync::Error,
-                    None if latest && !unfinished && !dirty => Sync::Saved, None if dirty => Sync::Pending, None => Sync::Saving };
+                    None if dirty => Sync::Pending, None if unfinished => Sync::Saving, None if kept => Sync::Kept,
+                    None if latest => Sync::Saved, None => Sync::Saving };
                 if n.sync == Sync::Saved {
                     if let Some(attr) = &published {
                         n.entry.size = (n.entry.kind == Kind::File).then_some(attr.size);
@@ -275,7 +278,7 @@ pub(crate) fn reconcile(tx: &rusqlite::Transaction<'_>, run: &[Entry], completio
                     copy.map(|c| serde_json::to_string(&c.attr).expect("JSON")), copy.map(|c| serde_json::to_string(&c.xattrs).expect("JSON"))])?;
             }
             Completion::Error { error } => { let _ = error; n.sync = if pending(tx, ino)? == Sync::Conflict { Sync::Conflict } else { Sync::Error }; }
-            Completion::Cancelled => { n.sync = if pending(tx, ino)? == Sync::Conflict { Sync::Conflict } else { Sync::Error }; }
+            Completion::Kept => { n.sync = if pending(tx, ino)? == Sync::Conflict { Sync::Conflict } else { Sync::Kept }; }
             Completion::Success { .. } => {},
         }
         n.generation = n.generation.saturating_add(1);

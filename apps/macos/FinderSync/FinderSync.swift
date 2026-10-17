@@ -2,8 +2,8 @@
 //
 // The Finder Sync extension (step 5, item 8): badges on the items of mounted voidfs drives, as
 // the daemon reports them through the app's agent (`Badges/Badges.swift`), and a context menu
-// with the drive's pause or resume, as the menu bar has them. It never offers a cancel: for a
-// mount's changes that would mark the local copy as an error and delete its staged bytes.
+// with the drive's pause or resume, as the menu bar has them. Cancel is the menu bar's only (the
+// user's choice, 16 October): there the menu says what it does, keeping the change on this Mac.
 
 import Cocoa
 import FinderSync
