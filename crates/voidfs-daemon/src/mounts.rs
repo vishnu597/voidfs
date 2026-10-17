@@ -262,8 +262,8 @@ pub(crate) async fn mount(State(s): State<Arc<Shared>>, Json(m): Json<api::NewMo
 pub(crate) async fn unmount(State(s): State<Arc<Shared>>, Json(u): Json<api::Unmount>) -> Answer<api::Unmounted> {
     let _op = s.mounts.ops.lock().await;
     let target = if u.target.starts_with('/') { key(&u.target) } else { u.target.clone() };
-    // A drive named by id finds its mounts by alias.
-    let alias = if target.starts_with('/') { None } else { s.drive(&target).await.ok() };
+    // A drive named by id finds its mounts by alias, which the drive it keeps open here knows.
+    let alias = if target.starts_with('/') { None } else { s.sessions.mount_alias(&s, &target).await.ok() };
     let names = |drive: &str, mountpoint: &str| mountpoint == target || drive == target || alias.as_deref() == Some(drive);
     let store = s.store.clone();
     let remembered = blocking(move || voidfs_client::mounts::remembered(&store)).await?;

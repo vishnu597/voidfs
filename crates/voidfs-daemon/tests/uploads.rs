@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use voidfs_daemon::api::{Build, NewBatch, NewFile, Scope};
-use voidfs_daemon::{ClientError, Daemon, DaemonClient, DaemonConfig};
+use futures::future::BoxFuture;
+use voidfs_daemon::api::{Build, NewBatch, NewFile, NewMount, Scope};
+use voidfs_daemon::{Adapter, ClientError, Core, Daemon, DaemonClient, DaemonConfig, MountSpec, Mounted};
 use voidfs_server::test_server::{ADMIN_KEY_ID, ADMIN_SECRET, TestServer};
 
 fn state_dir(tag: &str) -> tempfile::TempDir {
@@ -263,15 +264,21 @@ async fn hanging(axum::extract::State(link): axum::extract::State<Arc<Hanging>>,
     output.body(axum::body::Body::from(response.bytes().await.unwrap())).unwrap()
 }
 
+/// A relay to `server` that hangs once its link's `hang` is set, and the endpoint it serves.
+async fn relay(server: &TestServer) -> (Arc<Hanging>, String, tokio::task::JoinHandle<std::io::Result<()>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+    let link = Arc::new(Hanging { endpoint: server.endpoint.clone(), http: reqwest::Client::new(), hang: AtomicBool::new(false) });
+    let relay = tokio::spawn(axum::serve(listener, axum::Router::new().fallback(hanging).with_state(link.clone())).into_future());
+    (link, endpoint, relay)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drive_controls_answer_while_the_link_hangs() {
     let server = TestServer::start().await.unwrap();
     let remote = voidfs_sdk::Client::new(sdk(&server)).unwrap();
     let id = remote.create_drive("footage", Default::default()).await.unwrap().drive_id;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://localhost:{}", listener.local_addr().unwrap().port());
-    let link = Arc::new(Hanging { endpoint: server.endpoint.clone(), http: reqwest::Client::new(), hang: AtomicBool::new(false) });
-    let relay = tokio::spawn(axum::serve(listener, axum::Router::new().fallback(hanging).with_state(link.clone())).into_future());
+    let (link, endpoint, relay) = relay(&server).await;
     let dir = state_dir("hang");
     let sdk = voidfs_sdk::Config { endpoint, timeout: Duration::from_secs(20), max_attempts: 1, ..sdk(&server) };
     let daemon = Daemon::start(DaemonConfig::new(dir.path(), sdk, Build::default())).await.unwrap();
@@ -297,6 +304,52 @@ async fn drive_controls_answer_while_the_link_hangs() {
     assert!(client.uploads(false, None).await.unwrap().queue.paused_drives.is_empty());
     let cancelled = tokio::time::timeout(quick, client.cancel(&Scope::Drive("footage".into()))).await.expect("a drive cancel doesn't wait on the link").unwrap();
     assert_eq!((cancelled.items, cancelled.kept), (queued.len() as u64, mounted), "the import is cancelled, the mount's changes kept");
+    daemon.stop().await;
+    relay.abort();
+}
+
+/// Mounts nothing: a mount table entry and its open drive.
+struct Fake;
+struct FakeMount;
+
+impl Adapter for Fake {
+    fn name(&self) -> &str { "fake" }
+    fn mount<'a>(&'a self, _spec: &'a MountSpec, _core: &'a Core) -> BoxFuture<'a, Result<Arc<dyn Mounted>, String>> {
+        Box::pin(async { Ok(Arc::new(FakeMount) as Arc<dyn Mounted>) })
+    }
+}
+
+impl Mounted for FakeMount {
+    fn unmount(self: Arc<Self>) -> BoxFuture<'static, Result<(), String>> { Box::pin(async { Ok(()) }) }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drive_unmounts_while_the_link_hangs() {
+    let server = TestServer::start().await.unwrap();
+    let remote = voidfs_sdk::Client::new(sdk(&server)).unwrap();
+    let id = remote.create_drive("footage", Default::default()).await.unwrap().drive_id;
+    remote.create_drive("other", Default::default()).await.unwrap();
+    let (link, endpoint, relay) = relay(&server).await;
+    let dir = state_dir("unmount");
+    let mut config = DaemonConfig::new(dir.path(), voidfs_sdk::Config { endpoint, timeout: Duration::from_secs(20), max_attempts: 1, ..sdk(&server) }, Build::default());
+    config.adapters = vec![Arc::new(Fake)];
+    let daemon = Daemon::start(config).await.unwrap();
+    let client = DaemonClient::new(daemon.socket());
+    let mountpoint = |drive: &str| dir.path().join(drive).display().to_string();
+    for drive in ["footage", "other"] {
+        client.mount(&NewMount { drive: drive.into(), mountpoint: Some(mountpoint(drive)), ..Default::default() }).await.unwrap();
+    }
+
+    // The server stops answering. An unmount by the drive's id or alias finds its mounts from the
+    // drive they keep open here, well inside the SDK's 20 s timeout.
+    link.hang.store(true, Ordering::SeqCst);
+    let quick = Duration::from_secs(3);
+    let by_id = tokio::time::timeout(quick, client.unmount(&id)).await.expect("an unmount by id doesn't wait on the link").unwrap();
+    assert_eq!(by_id.unmounted, [mountpoint("footage")]);
+    let by_alias = tokio::time::timeout(quick, client.unmount("other")).await.expect("an unmount by alias doesn't wait on the link").unwrap();
+    assert_eq!(by_alias.unmounted, [mountpoint("other")]);
+    let view = client.mounts().await.unwrap();
+    assert!(view.mounts.is_empty() && view.remembered.is_empty(), "both are unmounted and forgotten: {view:?}");
     daemon.stop().await;
     relay.abort();
 }

@@ -78,10 +78,6 @@ impl Shared {
     async fn upload_drive(&self, name: &str) -> Result<(String, Vec<String>), Failure> {
         self.sessions.upload_names(self, name).await
     }
-
-    pub(crate) async fn drive(&self, name: &str) -> Result<String, Failure> {
-        Ok(self.upload_drive(name).await?.0)
-    }
 }
 
 pub(crate) async fn list(State(s): State<Arc<Shared>>, Query(q): Query<ListQuery>) -> Answer<UploadList> {
