@@ -262,8 +262,11 @@ menu bar only. The daemon is the only source: the extension asks the app's launc
 daemon's `POST /v1/mounts/states`, read from the daemon's own state, never the server. A folder
 costs one call however many files it has, and a folder that hasn't changed answers `unchanged`.
 The extension badges the folders under the daemon's mounted mountpoints, so it needs the agent
-registered (above) and a drive mounted. Enable it in System Settings → General → Login Items &
-Extensions → Finder Extensions (or with `pluginkit -e use -i dev.voidfs.app.findersync`).
+registered (above) and a drive mounted. Finder keeps those folders as the volumes mounted there
+when it was told them, so the extension also watches the kernel's volume at each mountpoint and
+tells Finder again after a remount, however quick. Enable it in System Settings → General →
+Login Items & Extensions → Finder Extensions (or with
+`pluginkit -e use -i dev.voidfs.app.findersync`).
 Building registers the build folder's copy with LaunchServices, disabled. Rebuilding the app while
 a drive is mounted through FSKit ends the module and unmounts the volume, though the daemon still
 lists the mount: unmount first, or `void unmount` and `void mount` after.
@@ -278,4 +281,7 @@ runs the extension's model against the agent's badge listener in process, withou
 launchd. It makes each state on a fresh folder through bridge sessions, with `--peer <mount_peer>`
 for a conflict and `--metrics <url>` to count the server's requests while badges are read. Its
 modes `daemon-restart` and `refused` cover a restart and peer refusal
-([evidence and replay](../../bench/results/finder-sync-badges/README.md)).
+([evidence and replay](../../bench/results/finder-sync-badges/README.md)). `remount` changes the
+volume the model sees at the mount, as a daemon restart does when it remounts within a second, and
+checks that Finder is told the folder and the badges again. `--degraded` first waits for the link
+to answer errors ([lost badges](../../bench/results/item8-badge-loss/README.md)).

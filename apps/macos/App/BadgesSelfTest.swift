@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// `voidfs badges-selftest <drive> [main|daemon-restart|refused] [--socket <path>] [--peer <path>]
-// [--metrics <url>] [--files <n>] [--png <path>]`: Finder's badges end to end without Finder or
-// FSKit. The Finder extension's model (`Badges/Badges.swift`) runs here against the agent's badge
-// listener in process, which accepts this app's own signature (`refused` shows the Finder
-// extension's requirement turning it away); a bridge session, as a mount's would, makes the
-// edits. Each badge state is made on a fresh folder of the drive, and the check is what the
-// model told "Finder" for each item.
+// `voidfs badges-selftest <drive> [main|daemon-restart|remount|refused] [--socket <path>]
+// [--peer <path>] [--metrics <url>] [--files <n>] [--degraded] [--png <path>]`: Finder's badges end
+// to end without Finder or FSKit. The Finder extension's model (`Badges/Badges.swift`) runs here
+// against the agent's badge listener in process, which accepts this app's own signature
+// (`refused` shows the Finder extension's requirement turning it away); a bridge session, as a
+// mount's would, makes the edits. Each badge state is made on a fresh folder of the drive, and the
+// check is what the model told "Finder" for each item.
 //
 // A conflict needs a change on the drive while this Mac's edit waits: `--peer` names the SDK's
 // `mount_peer` example, run with the environment's `VOIDFS_ENDPOINT` and key. `--metrics` names
 // the server's admin `/metrics`, to count the server's requests while the badges are read.
+// `remount` mounts the drive again at the same place, as far as the model can tell (the kernel's
+// volume there changes), and with `--degraded` first waits for the link to answer errors.
 
 import Foundation
 
@@ -23,15 +25,25 @@ final class BadgesSelfTest: @unchecked Sendable {
     let say: (String) -> Void
     private let lock = NSLock()
     private var told: [String: String] = [:]
+    private var toldTimes: [String: Int] = [:]
     private var tells = 0
+    /// Each folder set Finder was told, in order.
+    private var directories: [Set<String>] = []
+    /// The volume the kernel has at the mountpoint, as the model reads it.
+    private var volume = "1"
 
     init(scenario: BridgeScenario, badges: BadgeClient, daemon: DaemonSocket, drive: String, say: @escaping (String) -> Void) {
         (self.scenario, self.daemon, self.drive, self.say) = (scenario, daemon, drive, say)
-        mountpoint = "/voidfs-badges-selftest/\(drive)"
+        let mountpoint = "/voidfs-badges-selftest/\(drive)"
+        self.mountpoint = mountpoint
         var record: ((String, URL) -> Void)?
+        var recordDirectories: ((Set<URL>) -> Void)?
+        var kernel: (() -> [String: String])?
         model = BadgeModel(client: badges, mounts: [BadgeModel.Mount(drive: drive, mountpoint: mountpoint, readOnly: false, paused: false)],
-                           setDirectories: { _ in }, setBadge: { record?($0, $1) })
-        record = { [unowned self] identifier, url in lock.withLock { told[url.path] = identifier; tells += 1 } }
+                           volumes: { kernel?() ?? [:] }, setDirectories: { recordDirectories?($0) }, setBadge: { record?($0, $1) })
+        record = { [unowned self] identifier, url in lock.withLock { told[url.path] = identifier; toldTimes[url.path, default: 0] += 1; tells += 1 } }
+        recordDirectories = { [unowned self] urls in lock.withLock { directories.append(Set(urls.map(\.path))) } }
+        kernel = { [unowned self] in lock.withLock { [mountpoint: volume] } }
     }
 
     static func run(_ args: [String]) async -> Int32 {
@@ -46,8 +58,10 @@ final class BadgesSelfTest: @unchecked Sendable {
         let metrics = option("--metrics").flatMap(URL.init(string:))
         let files = option("--files").flatMap(Int.init) ?? 200
         let png = option("--png")
+        let degraded = rest.contains("--degraded")
+        rest.removeAll { $0 == "--degraded" }
         guard let drive = rest.first, let socket else {
-            print("usage: badges-selftest <drive> [main|daemon-restart|refused] [--socket <path>] [--peer <path>] [--metrics <url>] [--files <n>] [--png <path>]")
+            print("usage: badges-selftest <drive> [main|daemon-restart|remount|refused] [--socket <path>] [--peer <path>] [--metrics <url>] [--files <n>] [--degraded] [--png <path>]")
             return 2
         }
         let mode = rest.count > 1 ? rest[1] : "main"
@@ -69,6 +83,7 @@ final class BadgesSelfTest: @unchecked Sendable {
         let test = BadgesSelfTest(scenario: scenario, badges: BadgeClient(endpoint: badges.endpoint), daemon: DaemonSocket(path: socket), drive: drive, say: say)
         switch mode {
         case "main", "daemon-restart": await test.main(peer: peer, metrics: metrics, files: files, restart: mode == "daemon-restart")
+        case "remount": await test.remount(degraded: degraded)
         case "refused": await test.refused()
         default:
             say("unknown mode \(mode)")
@@ -86,12 +101,32 @@ final class BadgesSelfTest: @unchecked Sendable {
 
     func badgeTold(_ path: String) -> String? { lock.withLock { told[url(path).path] } }
 
+    func timesTold(_ path: String) -> Int { lock.withLock { toldTimes[url(path).path, default: 0] } }
+
     var tellCount: Int { lock.withLock { tells } }
+
+    var directoriesTold: [Set<String>] { lock.withLock { directories } }
+
+    /// Waits for `done`, checking every 100 ms.
+    func wait(_ within: Duration, _ done: () throws -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now + within
+        while ContinuousClock.now < deadline {
+            if (try? done()) == true { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return (try? done()) == true
+    }
+
+    /// The daemon's link to the server: online, degraded or offline.
+    func link() throws -> String? { ((try json("GET", "/v1/status") as? [String: Any])?["connection"] as? [String: Any])?["link"] as? String }
 
     /// Waits until the model told Finder each item's expected badge. With `summary`, one check
     /// stands for them all.
     func expectBadges(_ phase: String, _ expected: [(String, String)], within: Duration = .seconds(30), summary: String? = nil) async {
         for (path, _) in expected { model.request(url(path)) }
+        // The model's queue has taken the requests, and answered those it could at once: what is
+        // counted after this isn't one of them.
+        _ = model.counts
         let deadline = ContinuousClock.now + within
         var wrong = expected
         while ContinuousClock.now < deadline {
@@ -301,6 +336,67 @@ final class BadgesSelfTest: @unchecked Sendable {
             try await s.release()
         } catch {
             check("the badge run", false, "\(error)")
+        }
+    }
+
+    /// The drive mounted again at the same place between two of the model's reads of the mounts,
+    /// as a daemon restart does within a second (16 October's lost badges): Finder is told the
+    /// folders again and the badges it had. Before that, Finder asking again, as after a listing
+    /// that failed, is answered each time, while the link answers errors with `degraded`.
+    func remount(degraded: Bool) async {
+        model.start()
+        defer { model.stop() }
+        do {
+            let s = try await scenario.client.open(drive: drive, readOnly: false)
+            let dir = "remount-\(Int(Date().timeIntervalSince1970 * 1000))"
+            say("folder \(dir)")
+            let folder = try await again { try await s.create(s.info.root, dir, mode: 0o755, directory: true) }.ino
+            let saved = try await file(s, folder, "saved.txt", "saved\n")
+            check("the first file is saved", try await waitSaved(s, [folder, saved]))
+            // A change held here by the drive's pause, so that not every badge is the same.
+            _ = try json("POST", "/v1/uploads/pause", ["drive": drive])
+            _ = try await file(s, folder, "waiting.txt", "waiting\n")
+            let items = [(dir, "saving"), ("\(dir)/saved.txt", "saved"), ("\(dir)/waiting.txt", "saving")]
+            await expectBadges("mounted", items)
+            model.observe(url(dir))
+            check("Finder is told the mount's folder once", directoriesTold == [[mountpoint]], "\(directoriesTold)")
+
+            if degraded {
+                say("ready: make the link answer errors now")
+                check("the link is degraded", await wait(.seconds(90)) { try self.link() == "degraded" }, "\((try? link()) ?? "no status")")
+            }
+            // Finder asks again, as after a listing that failed: every item is answered, unchanged.
+            let (calls0, _) = model.counts
+            let before = items.map { timesTold($0.0) }
+            model.unobserve(url(dir))
+            model.observe(url(dir))
+            await expectBadges(degraded ? "asked again, degraded" : "asked again", items)
+            let answered = await wait(.seconds(5)) { zip(items, before).allSatisfy { self.timesTold($0.0.0) > $0.1 } }
+            check("each item asked again is answered again", answered, "\(zip(items, before).map { "\($0.0.0): \(timesTold($0.0.0)) after \($0.1)" })")
+            check("the folder is still read", await wait(.seconds(5)) { self.model.counts.calls >= calls0 + 3 }, "\(model.counts.calls - calls0) reads")
+            await expectBadges(degraded ? "read while degraded" : "read again", items)
+            if degraded { say("ready: let the link forward again") }
+
+            // Mounted again: the mount table is the same, the volume isn't.
+            let told = directoriesTold.count
+            let timesBefore = items.map { timesTold($0.0) }
+            lock.withLock { volume = "2" }
+            let redone = await wait(.seconds(10)) { self.directoriesTold.count >= told + 2 }
+            let after = Array(directoriesTold.dropFirst(told))
+            check("Finder is told the folders without the mount, then with it", redone && after.prefix(2) == [[], [mountpoint]], "\(after)")
+            let retold = await wait(.seconds(5)) { zip(items, timesBefore).allSatisfy { self.timesTold($0.0.0) > $0.1 } }
+            check("and the badges again", retold, "\(items.map { "\($0.0): \(timesTold($0.0))" })")
+            await expectBadges("remounted", items)
+            try? await Task.sleep(for: BadgeModel.mountsEvery + .seconds(1))
+            check("only once", directoriesTold.count == told + 2, "\(directoriesTold.dropFirst(told))")
+
+            // The kernel's table, as the extension reads it: this Mac's root volume is in it.
+            check("the kernel's mounts are read here", BadgeModel.volumes()["/"] != nil, "\(BadgeModel.volumes().keys.sorted().prefix(3))")
+            _ = try json("POST", "/v1/uploads/resume", ["drive": drive])
+            say("left on the drive: \(dir)")
+            try await s.release()
+        } catch {
+            check("the remount run", false, "\(error)")
         }
     }
 

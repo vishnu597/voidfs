@@ -208,12 +208,20 @@ final class BadgeClient: @unchecked Sendable {
 /// lately, each second, with the version that makes an unchanged folder cost one short answer.
 /// A folder's entries that the daemon doesn't name are saved: whatever isn't is a change made on
 /// this Mac, which the daemon always names. A folder it can't find has no badges.
+///
+/// Finder takes the folders it asks about as the volumes mounted there when it was told them, so
+/// a drive mounted again at the same place (a daemon restart remounts within a second, between
+/// two of the model's reads of the mounts) has to be told again: the model compares what the
+/// kernel has mounted at each mountpoint, not only the daemon's mount table.
 final class BadgeModel: @unchecked Sendable {
     struct Mount: Equatable {
         let drive: String
         let mountpoint: String
         let readOnly: Bool
         let paused: Bool
+        /// The kernel's id of the volume mounted there now, new with each mount; nil when the
+        /// mountpoint is only a folder.
+        var volume: String? = nil
     }
 
     private struct Key: Hashable { let mountpoint: String; let folder: String }
@@ -251,6 +259,8 @@ final class BadgeModel: @unchecked Sendable {
     let client: BadgeClient
     private let setDirectories: (Set<URL>) -> Void
     private let setBadge: (String, URL) -> Void
+    /// What the kernel has mounted, by mountpoint: `volumes()`, or the self-test's.
+    private let volumes: () -> [String: String]
     private let queue = DispatchQueue(label: "dev.voidfs.badges")
     private var mounts: [Mount] = []
     private var folders: [Key: Folder] = [:]
@@ -263,8 +273,9 @@ final class BadgeModel: @unchecked Sendable {
     private(set) var calls = 0
     private(set) var unchanged = 0
 
-    init(client: BadgeClient, mounts fixed: [Mount]? = nil, setDirectories: @escaping (Set<URL>) -> Void, setBadge: @escaping (String, URL) -> Void) {
-        (self.client, self.fixed, self.setDirectories, self.setBadge) = (client, fixed, setDirectories, setBadge)
+    init(client: BadgeClient, mounts fixed: [Mount]? = nil, volumes: @escaping () -> [String: String] = BadgeModel.volumes,
+         setDirectories: @escaping (Set<URL>) -> Void, setBadge: @escaping (String, URL) -> Void) {
+        (self.client, self.fixed, self.volumes, self.setDirectories, self.setBadge) = (client, fixed, volumes, setDirectories, setBadge)
     }
 
     func start() {
@@ -351,6 +362,41 @@ final class BadgeModel: @unchecked Sendable {
         if path.hasPrefix("/private/") { return [path, String(path.dropFirst("/private".count))] }
         if ["/tmp", "/var", "/etc"].contains(where: { path == $0 || path.hasPrefix($0 + "/") }) { return [path, "/private" + path] }
         return [path]
+    }
+
+    /// The kernel's mounts: each mountpoint with its volume's file system id, which a new mount
+    /// at the same place doesn't keep. `MNT_NOWAIT` reads the kernel's table without asking any
+    /// file system, so a hung one can't hold it.
+    static func volumes() -> [String: String] {
+        let count = Int(getfsstat(nil, 0, MNT_NOWAIT))
+        guard count > 0 else { return [:] }
+        let room = count + 8
+        let table = UnsafeMutablePointer<statfs>.allocate(capacity: room)
+        defer { table.deallocate() }
+        let got = Int(getfsstat(table, Int32(room * MemoryLayout<statfs>.stride), MNT_NOWAIT))
+        var out: [String: String] = [:]
+        for i in 0..<max(got, 0) {
+            var s = table[i]
+            let path = withUnsafeBytes(of: &s.f_mntonname) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
+            out[path] = "\(s.f_fsid.val.0).\(s.f_fsid.val.1)"
+        }
+        return out
+    }
+
+    /// The mounts, each with what the kernel has mounted at it now. An empty table is a failed
+    /// read (`/` is always mounted): each keeps the volume it had.
+    private func withVolumes(_ list: [Mount]) -> [Mount] {
+        let kernel = volumes()
+        return list.map { m in
+            var m = m
+            m.volume = kernel.isEmpty ? mounts.first { $0.mountpoint == m.mountpoint }?.volume : Self.spellings(m.mountpoint).lazy.compactMap { kernel[$0] }.first
+            return m
+        }
+    }
+
+    /// The folders Finder is to ask about: the mountpoints, in both spellings.
+    private static func directories(_ list: [Mount]) -> Set<URL> {
+        Set(list.flatMap { spellings($0.mountpoint) }.map { URL(filePath: $0, directoryHint: .isDirectory) })
     }
 
     /// Where a path is: its mount, the folder that holds it (below the mount's top), and its name
@@ -469,12 +515,12 @@ final class BadgeModel: @unchecked Sendable {
     }
 
     private func refreshMounts() {
-        if let fixed { publish(fixed); return }
+        if let fixed { publish(withVolumes(fixed)); return }
         Task {
             do {
                 let all = try await client.mounts()
                 let mounted = all.filter { $0.state == "mounted" }.map { Mount(drive: $0.drive, mountpoint: $0.mountpoint, readOnly: $0.readOnly, paused: $0.paused) }
-                queue.async { self.mountFailures = 0; self.publish(mounted) }
+                queue.async { self.mountFailures = 0; self.publish(self.withVolumes(mounted)) }
             } catch {
                 let e = error as NSError
                 // No daemon: no mount is served. Anything else may pass: forget them on the second.
@@ -487,14 +533,24 @@ final class BadgeModel: @unchecked Sendable {
     }
 
     private func publish(_ now: [Mount]) {
-        let gone = Set(mounts.map(\.mountpoint)).subtracting(now.map(\.mountpoint))
-        let changed = Set(mounts.map(\.mountpoint)) != Set(now.map(\.mountpoint))
+        let before = Dictionary(mounts.map { ($0.mountpoint, $0.volume) }, uniquingKeysWith: { a, _ in a })
+        let gone = Set(before.keys).subtracting(now.map(\.mountpoint))
+        let changed = Set(before.keys) != Set(now.map(\.mountpoint))
+        // Mounted again where it was, between two reads: the daemon's table looks the same.
+        let remounted = Set(now.filter { m in before[m.mountpoint].map { $0 != m.volume } ?? false }.map(\.mountpoint))
         mounts = now
         for (key, f) in folders where gone.contains(key.mountpoint) {
             for url in f.asked.values { setBadge("", url) }
             if let top = f.top { setBadge("", top) }
             folders[key] = nil
         }
-        if changed { setDirectories(Set(now.flatMap { Self.spellings($0.mountpoint) }.map { URL(filePath: $0, directoryHint: .isDirectory) })) }
+        // Finder is told the folders again, as when a mount goes and comes back, then the badges
+        // it was told on the volume before.
+        if !remounted.isEmpty { setDirectories(Self.directories(now.filter { !remounted.contains($0.mountpoint) })) }
+        if changed || !remounted.isEmpty { setDirectories(Self.directories(now)) }
+        for (key, f) in folders where remounted.contains(key.mountpoint) && f.loaded {
+            for (name, url) in f.asked { setBadge(Self.badge(f, name), url) }
+            if let top = f.top { setBadge(Self.badge(f, nil), top) }
+        }
     }
 }

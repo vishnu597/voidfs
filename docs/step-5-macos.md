@@ -40,9 +40,10 @@ decode/export checks on this Mac, including direct cold/warm decoder opens on a 
 fresh fork; native Xcode open/edit/save/build/run also passes.
 QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and two
 independent Macs and the absent paid target apps remain explicitly untested.
-**Item 8 is built, and each clause of its done-when is shown on a live FSKit mount, with one
-finding open** (16 October). The menu shows the daemon's connection, queue and mounts in the CLI's
-words and controls the queue ([menu-bar transfers](#menu-bar-transfers-16-october)). A Finder Sync
+**Item 8 is built, and each clause of its done-when is shown on a live FSKit mount; its one
+finding is explained and fixed, not yet checked in Finder** (16 October). The menu shows the
+daemon's connection, queue and mounts in the CLI's words and controls the queue
+([menu-bar transfers](#menu-bar-transfers-16-october)). A Finder Sync
 extension badges mounted drives' items from one daemon call that reads only local state
 ([Finder Sync badges](#finder-sync-badges-16-october)). Cancelling a mount's change keeps it on
 this Mac, not uploaded, until the file is saved again, as the user chose; the menu offers it and
@@ -50,8 +51,11 @@ Finder doesn't ([cancelling](#cancelling-a-mounts-change-16-october)). On a live
 the menu and `void status` agreed through each state, daemon and agent restarts, and offline, hung
 and degraded links, and a drive's controls no longer wait on a hung server; the menu reads the
 journal while no daemon runs and lists only what it shows during a 10,000-file import
-([live mount](#item-8-on-a-live-mount-16-october)). Open: once, Finder showed no badges two minutes
-after a degraded link recovered, and that isn't explained yet. The drive's own icon carries no
+([live mount](#item-8-on-a-live-mount-16-october)). The one Finder window without badges, seen
+after a degraded link recovered, had been opened after a daemon restart that remounted the drive
+in 0.25 s. The Finder extension didn't notice the remount and never told Finder its folder again.
+It now compares the kernel's volume at each mountpoint. The fix is checked without Finder, not yet
+in a live Finder ([lost badges](#finders-lost-badges-16-october)). The drive's own icon carries no
 reliable badge, a Finder limit.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
@@ -361,18 +365,23 @@ actions, not actions performed by writing this plan.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
-**Built, 16 October; each clause shown, one finding open.** The slices: the menu's transfers
-([menu-bar transfers](#menu-bar-transfers-16-october)), Finder Sync badges and context menu
+**Built, 16 October; each clause shown; the one finding explained and fixed, not yet checked in
+Finder.** The slices: the menu's transfers ([menu-bar transfers](#menu-bar-transfers-16-october)),
+Finder Sync badges and context menu
 ([Finder Sync badges](#finder-sync-badges-16-october)), the fate of a mount's cancelled change
-([cancelling](#cancelling-a-mounts-change-16-october)), and a live mount with the menu bounded and
-a drive's controls freed from the server ([live mount](#item-8-on-a-live-mount-16-october)). The
+([cancelling](#cancelling-a-mounts-change-16-october)), a live mount with the menu bounded and
+a drive's controls freed from the server ([live mount](#item-8-on-a-live-mount-16-october)), and
+badges kept across a quick remount ([lost badges](#finders-lost-badges-16-october)). The
 done-when, clause by clause:
 
 - **Finder and the menu bar agree with CLI status: shown.** At every capture on a live FSKit mount
   (saved, saving, kept, paused, conflict, both restarts, offline, hung, degraded), the menu's lines
   and its drawn view, `void status`, `void uploads` and the daemon's badge call said the same, and
-  Finder's badges matched. Open: once, two minutes after a degraded link recovered, Finder showed
-  `live/` with no badges at all; not investigated. Limit: the drive's own icon carries no reliable
+  Finder's badges matched. Once, after a degraded link recovered, a window showed `live/` with no
+  badges at all. That window had been opened after a 0.25 s remount, which the Finder extension
+  didn't notice, so Finder never asked it about the new volume. The extension now tells Finder its
+  folders again after any remount, checked in process
+  ([lost badges](#finders-lost-badges-16-october)). Limit: the drive's own icon carries no reliable
   badge, because Finder doesn't ask the extension about a mounted volume's icon.
 - **Queue controls affect live mounts: shown.** The menu's model set and cleared a limit, paused
   and resumed everything, the drive and one change, and cancelled a change mid-upload, which
@@ -397,7 +406,9 @@ done-when, clause by clause:
 - **The fate of unpublished mounted-file writes before cancelling them: defined and shown.** Kept
   on this Mac, not uploaded, until the next save.
 
-Item 8 isn't marked complete until the missing badges are explained.
+The missing badges are explained (16 October), and the extension's fix is checked in process. A
+live Finder hasn't shown the fix: that needs the registration changes the user approves for each
+run. Item 8 is left unmarked until that check, or until the user accepts the in-process one.
 
 Use the existing daemon status/upload stream for mounts, connectivity, queue progress, per-item
 and global pause/resume, cancel and immediate bandwidth caps. Distinguish local durable saves
@@ -2572,9 +2583,9 @@ of each phase:
 
 Findings, each left for later:
 
-- **Finder showed no badges in `live/`** two minutes after the degraded link recovered. Earlier
-  phases showed every badge, the daemon restart included. Not investigated before the rig came
-  down.
+- **Finder showed no badges in `live/`** after the degraded link recovered. Explained the same
+  day: that window had been opened after phase O's 0.25 s remount, which the Finder extension
+  didn't notice ([lost badges](#finders-lost-badges-16-october)).
 - **The drive's own icon.** Finder never asked the extension about the mounted volume's icon in
   its parent folder, and a badge set on it unasked didn't show. Once it asked during a remount,
   and the answer didn't show either. The icon kept a stale "saving" badge in one window and none
@@ -2592,3 +2603,48 @@ Not shown: clicks in the real menu-bar menu (the view was driven through its mod
 offscreen), the running menu app quit and reopened by hand, Finder screenshots of the hung-with-fix
 and degraded phases (screen capture failed then), and two Macs. Every registration and default
 was restored and compared with a snapshot taken before the run.
+
+### Finder's lost badges, 16 October
+
+**Why one Finder window had no badges, and the fix.** The live run's last Finder capture showed
+`live/` with no badge on any item, after a degraded (503) link had recovered, while the daemon's
+badge call still reported `kept` and `conflict`. The [evidence](../bench/results/item8-badge-loss/README.md)
+has the timeline, the system log's excerpts, the in-process runs and the break.
+
+- **The window had never shown badges.** Phase O opened it 1 s after restarting the daemon with
+  the control fix. Screen capture failed during the hung and degraded phases, so its first
+  capture came after the link recovered. The earlier phases' badges were in another window.
+- **The restart remounted in 0.25 s.** The system log has fskitd unmounting the volume at
+  16:46:56.477 and mounting it again at 16:46:56.731. Finder opened `live` on the new volume, as
+  `.file/id=33114754.17` rather than `33059174.17`: each mount has a new file system id.
+- **The extension didn't notice.** Its model set Finder's `directoryURLs` only when the set of
+  mounted mountpoints changed. It reads the daemon's mounts every 3 s, and a read falls in a
+  0.25 s gap roughly one time in twelve. Finder held the folder as the volume it had been told
+  about, and asked the extension nothing about the new one. Phase I's restart, with the same
+  extension processes, left the volume gone for 9.8 s. The model told Finder there were no
+  folders, then the mountpoint again, and the window opened after it showed every badge.
+- **The 503 phase wasn't the cause.** The badge call reads only the daemon's local state, and it
+  answered during the 503s. A request for an item in a folder the model has read is answered at
+  once, so a window Finder re-lists after a failed listing gets its badges back.
+
+That Finder keeps a folder as the volume it was told about is an inference from these captures.
+Finder doesn't log its Finder Sync requests, and the extension had no logging in that build.
+
+**The fix** (`apps/macos/Badges/Badges.swift`). With each read of the mounts, the model also reads
+the kernel's mount table: `getfsstat(MNT_NOWAIT)`, which answers without asking any file system.
+That gives each mountpoint's volume id. When a mountpoint's volume changes, the model tells Finder
+the folders without that mount, then with it, as the slow restart did. Then it tells Finder again
+the badges of the items it had asked about there. `getfsstat` works in an App Sandbox like the
+extension's: a sandboxed probe read the kernel's twelve mounts.
+
+**The test.** `voidfs badges-selftest <drive> remount [--degraded]` changes the volume the model
+reads at the mount between two of its reads of the mounts. It checks that Finder is told the folders
+without the mount, then with it, and the badges again, once. With `--degraded` it first waits for
+the link to answer errors. It then checks that Finder asking again for each item, as after a failed
+listing, is answered each time while the folder is still read. Three runs with `--degraded` passed
+21 checks each. With the old comparison put back, three runs failed the re-registration and
+re-tell checks. `main`, `daemon-restart` and `refused` still pass. Nothing was mounted or
+registered for these runs.
+
+Not shown: a live Finder with a quick remount, before and after the fix. That needs the
+registration changes the user approves for each live run.

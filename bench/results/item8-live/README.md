@@ -145,10 +145,12 @@ it, at the drive root ([g root](raw/live/g-finder-root.jpg)), and in the menu.
   it waits for a conflict". The button could be hidden.
 - **Drive ids in mount rows.** The menu's and `void uploads`' rows show a mount's changes by drive
   id, and imports by the name used.
-- **No badges after the 503 phase.** A Finder screenshot of `live/` at 16:51, about 2 minutes after
-  the status said online, showed no badges at all ([r](raw/live/r-recovered-finder.jpg)). The
-  earlier phases, the daemon restart included, showed every badge. Not investigated before the
-  rig came down.
+- **No badges after the 503 phase.** A Finder screenshot of `live/` at 16:49:27, 3 s after the
+  status said online, showed no badges at all ([r](raw/live/r-recovered-finder.jpg)). It was
+  copied into the run's output at 16:51. The earlier phases, the daemon restart included, showed
+  every badge. Explained afterwards ([lost badges](../item8-badge-loss/README.md)): phase O opened
+  that window right after a daemon restart that remounted the volume in 0.25 s. The Finder
+  extension didn't notice the remount, so it never told Finder the folder again.
 
 ## The 10,000-file import
 
@@ -212,7 +214,7 @@ Everything else matches:
 - **Two Macs.**
 - **Finder screenshots for phases P and Q.** Screen capture failed then ("audio/video capture
   failure") and worked again for R.
-- **The missing badges after phase Q** (above), not investigated.
+- **The missing badges after phase Q** (above), explained in [lost badges](../item8-badge-loss/README.md).
 - **`void unmount <drive name>`.** It resolves the name through the server too
   (`crates/voidfs-daemon/src/mounts.rs`), so it can wait on a hung link like the drive pause did.
   Not tried; a follow-up.
