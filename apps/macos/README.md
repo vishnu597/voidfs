@@ -209,7 +209,11 @@ Finder; copied there by a script, a quarantined app runs from a translocated cop
 registers the build folders' copies with LaunchServices, and FSKit can use any registered copy of
 the module: `voidfs status` shows which one it uses, and
 `/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u <path to voidfs.app>`
-forgets a copy without deleting it.
+forgets a copy without deleting it. Keep another copy registered while switching or rebuilding
+copies: FSKit forgets the module's switch when the last copy is unregistered, and rebuilding the
+only registered copy does that too (fskit_agent logs "Removed 1 identifiers"). On 16 October,
+System Settings then refused to switch it back on with EPERM until the Mac was restarted
+([the live check](../../bench/results/item8-badge-loss/README.md#the-live-check)).
 
 ## The bridge to the daemon
 
@@ -263,8 +267,11 @@ menu bar only. The daemon is the only source: the extension asks the app's launc
 daemon's `POST /v1/mounts/states`, read from the daemon's own state, never the server. A folder
 costs one call however many files it has, and a folder that hasn't changed answers `unchanged`.
 The extension badges the folders under the daemon's mounted mountpoints, so it needs the agent
-registered (above) and a drive mounted. Enable it in System Settings → General → Login Items &
-Extensions → Finder Extensions (or with `pluginkit -e use -i dev.voidfs.app.findersync`).
+registered (above) and a drive mounted. Finder keeps those folders as the volumes mounted there
+when it was told them, so the extension also watches the kernel's volume at each mountpoint and
+tells Finder again after a remount, however quick. Enable it in System Settings → General →
+Login Items & Extensions → Finder Extensions (or with
+`pluginkit -e use -i dev.voidfs.app.findersync`).
 Building registers the build folder's copy with LaunchServices, disabled. Rebuilding the app while
 a drive is mounted through FSKit ends the module and unmounts the volume, though the daemon still
 lists the mount: unmount first, or `void unmount` and `void mount` after.
@@ -279,4 +286,7 @@ runs the extension's model against the agent's badge listener in process, withou
 launchd. It makes each state on a fresh folder through bridge sessions, with `--peer <mount_peer>`
 for a conflict and `--metrics <url>` to count the server's requests while badges are read. Its
 modes `daemon-restart` and `refused` cover a restart and peer refusal
-([evidence and replay](../../bench/results/finder-sync-badges/README.md)).
+([evidence and replay](../../bench/results/finder-sync-badges/README.md)). `remount` changes the
+volume the model sees at the mount, as a daemon restart does when it remounts within a second, and
+checks that Finder is told the folder and the badges again. `--degraded` first waits for the link
+to answer errors ([lost badges](../../bench/results/item8-badge-loss/README.md)).
