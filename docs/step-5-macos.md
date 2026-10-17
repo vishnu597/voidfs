@@ -2503,7 +2503,7 @@ computer's save in the meantime becomes a conflict, with both versions kept here
 kept creation folds into one put at its next save. A deletion after a kept edit publishes the edit
 first, so it stays in the file's history. Cancel leaves a mount's conflict, and what waits for one,
 as they are: both versions are already on this Mac and nothing of them is sent until the conflict
-is resolved, so the menu offers no Cancel for a conflict. Imports are unchanged: a cancelled
+is resolved, so the menu offers no Cancel for a conflict or for what waits for one. Imports are unchanged: a cancelled
 import's unsent files aren't uploaded, their sources stay where they are, and kept mount changes
 don't hold imports back.
 
@@ -2584,9 +2584,13 @@ Findings, each left for later:
 - **Rebuilding unmounts.** Rebuilding the app re-registers it, which ends the FSKit module and
   unmounts the volume, while the daemon still lists the mount until `void unmount`.
 - **Cancel on a waiting change.** The menu shows Cancel on a mount's change queued behind a
-  conflict, where it changes nothing and says so.
+  conflict, where it changes nothing and says so. Fixed since: the menu hides it, going by the
+  conflicts' keys ([evidence](../bench/results/item8-cancel-waits/README.md)).
 - **SENT stays at 0%.** A mount's uploads show 0% until they finish.
 - **`void unmount <drive name>`** resolves the name through the server, like the drive pause did.
+  Fixed since: it takes the alias from the drive open on this Mac or the memo, as the drive's
+  controls do. A daemon test hangs a proxy and unmounts by id and by alias within 3 s; it fails
+  without the fix.
 
 Not shown: clicks in the real menu-bar menu (the view was driven through its model and drawn
 offscreen), the running menu app quit and reopened by hand, Finder screenshots of the hung-with-fix
