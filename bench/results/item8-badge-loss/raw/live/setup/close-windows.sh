@@ -1,20 +1,12 @@
 #!/bin/bash
-# Closes the Finder windows showing a folder on the test mount, and only those: close-windows.sh <mountpoint>.
-/usr/bin/osascript - "$1" <<'OSA'
-on run argv
-  set m to item 1 of argv
-  set n to 0
-  tell application "Finder"
-    repeat with w in (every Finder window)
-      try
-        set p to POSIX path of (target of w as alias)
-        if p starts with m then
-          close w
-          set n to n + 1
-        end if
-      end try
-    end repeat
-  end tell
-  return "closed " & n
-end run
-OSA
+# Closes the Finder windows this run opened, by the ids open-live.sh recorded, and only those:
+# close-windows.sh <run dir>. Prints how many it closed.
+n=0
+for f in "$1"/out/*-window.txt; do
+  [ -f "$f" ] || continue
+  id=$(cat "$f")
+  c=$(/usr/bin/osascript -e "tell application \"Finder\" to count (every Finder window whose id is $id)")
+  if [ "$c" != 0 ]; then /usr/bin/osascript -e "tell application \"Finder\" to close Finder window id $id"; n=$((n + c)); fi
+  rm "$f"
+done
+echo "closed $n"

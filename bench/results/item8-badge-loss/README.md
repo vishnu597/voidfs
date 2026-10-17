@@ -111,13 +111,93 @@ lines by signalling the relay (503, then forwarding) or restarting the daemon.
 
 ## The live check
 
-The user approved a live run on 16 October. It ran from 21:31 to 21:50 and stopped before the
-first mount, because FSKit has the voidfs module switched off.
+After the Mac was restarted, FSKit reported the module switched on (`enabled=true` for
+`/Applications`), though the user found System Settings' switch still wouldn't change. The check
+ran on 16 October from 21:59 to 22:12, with the user's approval of the registration changes. On
+a live FSKit mount, a quick remount left a new Finder window without badges with the old
+comparison, and the fix brought them back ([evidence](raw/live/rerun/)).
+
+- **The rig.** As above, a `voidfs-server` filesystem store behind the relay (`127.0.0.1:9385`),
+  a test daemon with its own state under `/private/tmp/vbl.CpdeYu`, and the drive
+  `remount-1792202425`, here mounted through FSKit at the run's `mnt`. `live/` held four saved
+  files and `held.txt`, a change held by the drive's pause, so it stayed saving
+  ([mount-and-fill](raw/live/rerun/mount-and-fill.txt)).
+- **The builds** ([builds](raw/live/rerun/builds.txt)). The pre-fix build took `Badges.swift` and
+  `BadgesSelfTest.swift` from `28cec07` and everything else from this branch; its extension
+  doesn't import `getfsstat`. It was registered with [register.sh](raw/live/setup/register.sh),
+  with the other copies in [others.txt](raw/live/setup/others.txt) unregistered
+  ([register-old](raw/live/rerun/register-old.txt)). After its trials, the drive was unmounted
+  and the app rebuilt in place from this branch's sources
+  ([rebuild](raw/live/rerun/g-rebuild-fixed.txt)), then registered and mounted again. The Finder
+  extension then ran from the rebuild ([mount](raw/live/rerun/j-mount-fixed.txt)).
+- **Each trial** ([trial.sh](raw/live/setup/trial.sh)) closed the last test window, ran `void
+  daemon stop; void daemon start` as one command, which unmounts the drive and mounts it again, as
+  phase O did, waited for `live/` to be there, and opened it in Finder
+  ([open-live.sh](raw/live/setup/open-live.sh)). Then the window was captured. The control waited
+  5 s between the stop and the start, as phase I's slow restart did.
+
+The remount and open times are fskitd's and Finder's ([log](raw/live/rerun/logs/mounts-and-opens.txt));
+a capture's time is when it was saved, within about a second of the capture. Captures of the same
+view at the same size are the same bytes, so several files are identical.
+
+| Trial | Build | Volume gone | Finder opened `live` | Captures, after the open | Badges |
+| --- | --- | --- | --- | --- | --- |
+| a, baseline ([log](raw/live/rerun/a-baseline-old.txt)) | old | (mounted 22:00:39.9) | 22:01:02.8 | 6.1 s ([a](raw/live/rerun/a-baseline-old.jpg)) | all |
+| b ([log](raw/live/rerun/b-old-trial1.txt)) | old | 0.23 s | not opened | | opened before the mount was back; not counted |
+| c ([log](raw/live/rerun/c-old-trial2.txt)) | old | 0.23 s | 22:02:20.1 | 2.1 s ([c1](raw/live/rerun/c-old-trial2-first.jpg)), 36.4 s ([c2](raw/live/rerun/c-old-trial2-after-37s.jpg)) | none, none |
+| d ([log](raw/live/rerun/d-old-trial3.txt)) | old | 0.23 s | 22:03:05.8 | 5.1 s ([d](raw/live/rerun/d-old-trial3-first.jpg)) | none |
+| e, slow control ([log](raw/live/rerun/e-old-slow-control.txt)) | old | 5.26 s | 22:03:30.6 | 6.2 s ([e](raw/live/rerun/e-old-slow-control.jpg)) | all |
+| f ([log](raw/live/rerun/f-old-trial4.txt)) | old | 0.25 s | 22:03:51.1 | 5.2 s ([f](raw/live/rerun/f-old-trial4-first.jpg)) | none |
+| k, baseline ([log](raw/live/rerun/k-fixed-baseline.txt)) | fixed | (mounted 22:06:01.6) | 22:06:07.8 | 6.2 s ([k](raw/live/rerun/k-fixed-baseline.jpg)) | all |
+| l ([log](raw/live/rerun/l-fixed-trial1.txt)) | fixed | 0.25 s | 22:06:23.4 | 2.2 s ([l](raw/live/rerun/l-fixed-trial1-first.jpg)) | all |
+| m ([log](raw/live/rerun/m-fixed-trial2.txt)) | fixed | 0.25 s | 22:06:39.6 | 2.3 s ([m1](raw/live/rerun/m-fixed-trial2-first.jpg)), 102.4 s ([m2](raw/live/rerun/m-fixed-trial2-later.jpg)) | none, all |
+| n ([log](raw/live/rerun/n-fixed-trial3.txt)) | fixed | 0.24 s | 22:09:01.1 | 1.7 s ([n1](raw/live/rerun/n-fixed-trial3-first.jpg)), 3.4 s ([n2](raw/live/rerun/n-fixed-trial3-second.jpg)) | none, all |
+
+- **The old build reproduced phase O.** Three windows opened after a quarter-second remount had
+  no badge at all, 5 s or more after Finder opened them, longer than the model's 3 s between
+  reads; one still had none after 36 s. While it had none, the daemon's folder call said
+  `held.txt` was saving ([states](raw/live/rerun/c-old-trial2-states.json)). The same build
+  badged every item in the baseline and after the 5 s restart.
+- **The fixed build badged every window.** Each of three windows opened after the same remount got
+  every badge. In n, the badges weren't there 1.7 s after the open and were all there 3.4 s after
+  it, 3.7 s after the mount: the model's next read of the mounts saw the new volume and told Finder
+  again. m's first capture, also before that read, had none; its next had all. l's first capture
+  came after the read.
+- **What the check doesn't time.** Only n places the badges' return within one read; m's
+  isn't placed closer than 102 s. One old window was watched past 6 s.
+- **This run lost the switch once, and the user put it back.** The app was rebuilt in place while
+  it was the only registered copy of the module. fskit_agent logged "Removed 1 identifiers" at
+  22:04:37 ([log](raw/live/rerun/logs/fskit-agent-identifiers.txt)), and the rebuild, registered
+  again, said `enabled=false` ([module](raw/live/rerun/i-reregister-module.txt)). The user
+  switched it on in System Settings, which worked this time (`enabled=true` at 22:05:52). A rig
+  that rebuilds should keep another copy registered, or build into a second folder.
+- **Restored** ([rig-down](raw/live/rerun/z-rig-down.txt), [restore](raw/live/rerun/z-restore.txt),
+  [fix-ups](raw/live/rerun/z-restore-fixups.txt)):
+  - only the run's Finder windows were closed, found by window id;
+  - the drive's uploads were resumed and it was unmounted, and the rig was stopped;
+  - the other copies and `/Applications` were registered again before the build was
+    unregistered, and no identifier was removed;
+  - the agent was registered from `/Applications` again, `VoidfsStateDirectory` was deleted, and
+    the Finder Sync election set back to use;
+  - the build folder was deleted.
+
+  The restore also registered `compassionate-payne`'s Finder extension, which hadn't been
+  registered before, and pluginkit then listed it for Finder Sync. It was removed again and
+  `sleepy-germain`'s added back. [registrations-after](raw/live/rerun/registrations-after.txt)
+  equals [registrations-before](raw/live/rerun/registrations-before.txt), apart from ids, times
+  and order, with two differences: pluginkit shows the module's version as `(null)` rather than
+  `0.1`, and FSKit names `sleepy-germain`'s copy rather than `/Applications`'s. Both copies are
+  registered as before, and FSKit still says `enabled=true`.
+
+### The first attempt, blocked
+
+The user approved a live run on 16 October. The first attempt ran from 21:31 to 21:50 and stopped
+before the first mount, because FSKit had the voidfs module switched off.
 
 - **The plan.** Build the app from `28cec07`'s Swift sources, which have the old comparison, and
   register it ([register.sh](raw/live/setup/register.sh); the other copies in
   [others.txt](raw/live/setup/others.txt) unregistered). Then repeat phase O's quick remount
-  ([trial.sh](raw/live/setup/trial.sh), not run) and screenshot the new window. Then rebuild
+  and screenshot the new window. Then rebuild
   with the fix in the same place and repeat.
 - **The mount was refused** ([mount-refused](raw/live/mount-refused.txt)): `Module
   dev.voidfs.app.fskit is disabled!`. `voidfs status` said `enabled=false` for this build
@@ -134,14 +214,17 @@ first mount, because FSKit has the voidfs module switched off.
     `enabled=false`.
 
   So FSKit seems to forget the switch when every copy of a module is unregistered at once. That is
-  an inference from these logs: FSKit keeps the switch in a protected container.
+  an inference from these logs: FSKit keeps the switch in a protected container. The second
+  attempt saw it happen: rebuilding the only registered copy removed the identifier, and the
+  switch came back off.
 - **System Settings wouldn't switch it on.** The user tried for this build in the scratchpad and
   again for a rebuild in the worktree ([register-worktree](raw/live/register-worktree.txt)).
   Every attempt failed in Login Items with `Failed to enabled FSExtension:
   NSPOSIXErrorDomain Code=1` (EPERM), before any call reached fskitd ([log](raw/live/logs/switch-refused.txt)).
   LaunchServices recorded the user's election ([elections](raw/live/logs/elections.txt)), but that
   isn't FSKit's switch. `pluginkit -e use` changes only that election too
-  ([module-pluginkit](raw/live/module-pluginkit.txt)), and it was put back to default.
+  ([module-pluginkit](raw/live/module-pluginkit.txt)), and it was put back to default (the
+  restore script set it then; it now takes the election to put back).
 - **Restored** ([rig-down](raw/live/rig-down.txt), [restore.sh](raw/live/setup/restore.sh),
   [restore](raw/live/restore.txt)):
   - nothing was mounted, and no Finder window was opened;
@@ -151,14 +234,12 @@ first mount, because FSKit has the voidfs module switched off.
 
   [registrations-after](raw/live/registrations-after.txt) equals
   [registrations-before](raw/live/registrations-before.txt), apart from ids, times and order.
-  FSKit's switch is off, as it was before the run.
+  FSKit's switch was still off, as it was before the run, until the Mac was restarted.
 
 ## Not shown
 
-- **Finder itself.** No Finder ran against a mount here. Two things still need a live run, once
-  FSKit lets the module be switched on:
-  - that a quick remount leaves a new window without badges;
-  - that the model's re-telling brings them back.
+- **How fast the badges come back, in general.** The live check places one return within a read
+  of the mounts (3.7 s after the mount). A read can be up to 3 s after a remount.
 - **What Finder does with an unchanged `directoryURLs`.** The fix tells Finder the folders without
   the mount first, as the slow restart in phase I did, rather than relying on the same set
   twice.
@@ -176,3 +257,8 @@ bash raw/setup/rig-down.sh "$RUN"
 
 Building registers the build folder's copy with LaunchServices. Afterwards, `lsregister -u` the
 build and delete its products ([registrations](raw/registrations.md)).
+
+The live check, with the rig up and the app built: `register.sh <run> <app>`, mount the drive and
+fill `live/` ([mount-and-fill](raw/live/rerun/mount-and-fill.txt)), then, with the rig's `env.sh`
+sourced, `trial.sh <label>` for each trial and `restore.sh <run> <app> <election>`. Keep another
+copy of the module registered while rebuilding, or FSKit switches the module off.

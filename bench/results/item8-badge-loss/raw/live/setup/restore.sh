@@ -1,14 +1,14 @@
 #!/bin/bash
-# Puts back what register.sh changed: restore.sh <run dir> <app>. The other copies and
-# /Applications are registered again before this build is unregistered, so a copy of the module
-# stays registered throughout. Logs each command.
-R=$1; APP=$2
+# Puts back what register.sh changed: restore.sh <run dir> <app> [use|default]. The other copies
+# and /Applications are registered again before this build is unregistered, so a copy of the
+# module stays registered throughout. The third argument is the Finder Sync election the before
+# snapshot showed ("+" is use). Logs each command.
+R=$1; APP=$2; ELECT=${3:-default}
 LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 SLEEPY=/Users/vishnu/Coding/voidfs/.claude/worktrees/sleepy-germain-0cf80f/apps/macos/build/Build/Products/Release/voidfs.app
 set -x
-bash "$(dirname "$0")/close-windows.sh" "$R/mnt"
+bash "$(dirname "$0")/close-windows.sh" "$R"
 mount | grep -F "$R/mnt"
-pluginkit -e default -i dev.voidfs.app.findersync; echo rc=$?
 while read -r p; do
   [ -d "$p" ] || continue
   $LSREG -f -R "$p"; echo rc=$?
@@ -25,6 +25,7 @@ sleep 2
 $LSREG -u "$APP"; echo rc=$?
 /Applications/voidfs.app/Contents/MacOS/voidfs agent-register; echo rc=$?
 defaults delete dev.voidfs.app VoidfsStateDirectory; echo rc=$?
+pluginkit -e "$ELECT" -i dev.voidfs.app.findersync; echo rc=$?
 sleep 2
 /Applications/voidfs.app/Contents/MacOS/voidfs status | head -1
 /Applications/voidfs.app/Contents/MacOS/voidfs agent-status

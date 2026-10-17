@@ -208,10 +208,11 @@ Finder; copied there by a script, a quarantined app runs from a translocated cop
 registers the build folders' copies with LaunchServices, and FSKit can use any registered copy of
 the module: `voidfs status` shows which one it uses, and
 `/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u <path to voidfs.app>`
-forgets a copy without deleting it. Keep one copy registered while switching copies: FSKit
-appears to forget the module's switch when the last copy is unregistered (fskit_agent logs
-"Removed 1 identifiers"). On 16 October, System Settings then refused to switch it back on with
-EPERM ([the live check](../../bench/results/item8-badge-loss/README.md#the-live-check)).
+forgets a copy without deleting it. Keep another copy registered while switching or rebuilding
+copies: FSKit forgets the module's switch when the last copy is unregistered, and rebuilding the
+only registered copy does that too (fskit_agent logs "Removed 1 identifiers"). On 16 October,
+System Settings then refused to switch it back on with EPERM until the Mac was restarted
+([the live check](../../bench/results/item8-badge-loss/README.md#the-live-check)).
 
 ## The bridge to the daemon
 

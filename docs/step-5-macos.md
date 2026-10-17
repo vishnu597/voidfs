@@ -41,8 +41,7 @@ fresh fork; native Xcode open/edit/save/build/run also passes.
 QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and two
 independent Macs and the absent paid target apps remain explicitly untested.
 **Item 8 is built, and each clause of its done-when is shown on a live FSKit mount; its one
-finding is explained and fixed, not yet checked in Finder, because FSKit won't switch the module on**
-(16 October). The menu shows the
+finding is explained, and the fix is checked in a live Finder** (16 October). The menu shows the
 daemon's connection, queue and mounts in the CLI's words and controls the queue
 ([menu-bar transfers](#menu-bar-transfers-16-october)). A Finder Sync
 extension badges mounted drives' items from one daemon call that reads only local state
@@ -55,8 +54,9 @@ journal while no daemon runs and lists only what it shows during a 10,000-file i
 ([live mount](#item-8-on-a-live-mount-16-october)). The one Finder window without badges, seen
 after a degraded link recovered, had been opened after a daemon restart that remounted the drive
 in 0.25 s. The Finder extension didn't notice the remount and never told Finder its folder again.
-It now compares the kernel's volume at each mountpoint. The fix is checked without Finder, not yet
-in a live Finder ([lost badges](#finders-lost-badges-16-october)). The drive's own icon carries no
+It now compares the kernel's volume at each mountpoint. After the same quick remount, new windows
+had no badges with the old build and every badge with the fix
+([lost badges](#finders-lost-badges-16-october)). The drive's own icon carries no
 reliable badge, a Finder limit.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
@@ -366,7 +366,7 @@ actions, not actions performed by writing this plan.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
-**Built, 16 October; each clause shown; the one finding explained and fixed, not yet checked in
+**Built, 16 October; each clause shown; the one finding explained and fixed, checked in
 Finder.** The slices: the menu's transfers ([menu-bar transfers](#menu-bar-transfers-16-october)),
 Finder Sync badges and context menu
 ([Finder Sync badges](#finder-sync-badges-16-october)), the fate of a mount's cancelled change
@@ -381,7 +381,7 @@ done-when, clause by clause:
   Finder's badges matched. Once, after a degraded link recovered, a window showed `live/` with no
   badges at all. That window had been opened after a 0.25 s remount, which the Finder extension
   didn't notice, so Finder never asked it about the new volume. The extension now tells Finder its
-  folders again after any remount, checked in process
+  folders again after any remount, checked in process and in a live Finder
   ([lost badges](#finders-lost-badges-16-october)). Limit: the drive's own icon carries no reliable
   badge, because Finder doesn't ask the extension about a mounted volume's icon.
 - **Queue controls affect live mounts: shown.** The menu's model set and cleared a limit, paused
@@ -407,11 +407,11 @@ done-when, clause by clause:
 - **The fate of unpublished mounted-file writes before cancelling them: defined and shown.** Kept
   on this Mac, not uploaded, until the next save.
 
-The missing badges are explained (16 October), and the extension's fix is checked in process. A
-live Finder hasn't shown the fix: the approved live check couldn't mount, because FSKit has the
-voidfs module switched off and System Settings refuses to switch it on
-([the live check](#finders-lost-badges-16-october)). Item 8 is left unmarked until that check, or
-until the user accepts the in-process one.
+The missing badges are explained (16 October), and the extension's fix is checked in process and
+in a live Finder. With the old comparison, three windows opened after a 0.25 s remount had no
+badges. With the fix, three windows opened after the same remount got every badge, one of them
+3.7 s after the mount ([the live check](#finders-lost-badges-16-october)). Nothing the live run
+found is left unexplained; marking item 8 complete is left to the user.
 
 Use the existing daemon status/upload stream for mounts, connectivity, queue progress, per-item
 and global pause/resume, cancel and immediate bandwidth caps. Distinguish local durable saves
@@ -2649,12 +2649,25 @@ listing, is answered each time while the folder is still read. Three runs with `
 re-tell checks. `main`, `daemon-restart` and `refused` still pass. Nothing was mounted or
 registered for these runs.
 
-**The live check was blocked** (16 October, 21:31 to 21:50,
-[evidence](../bench/results/item8-badge-loss/README.md#the-live-check)). The user approved the
-registration changes, but FSKit refused the mount: the voidfs module is switched off, for every
-copy, `/Applications` included. The switch appears to have been lost at 16:52:41, when the live
-run's restore unregistered every copy at once and fskit_agent logged "Removed 1 identifiers".
-System Settings then wouldn't switch it on: each attempt failed with EPERM in Login Items.
-Everything was restored, and the switch is off as it was before. So a live Finder with a quick
-remount, before and after the fix, is still not shown. A rig that switches copies should register
-the new one before unregistering the last old one, so the identifier never disappears.
+**The live check** (16 October, 21:59 to 22:12,
+[evidence](../bench/results/item8-badge-loss/README.md#the-live-check)). The app was built with
+the old comparison, registered, and mounted through FSKit, with four saved files and a held
+change in `live/`. Each trial restarted the daemon in one command, which remounted the drive in
+about 0.25 s, as phase O did, then opened `live` in a new Finder window and captured it.
+
+- **The old build reproduced phase O.** Three windows had no badge at all 5 s or more after they
+  opened, one of them still after 36 s, while the daemon's folder call said `held.txt` was
+  saving. The baseline window, and a window opened after a 5 s restart, had every badge.
+- **The fix brought the badges back.** Rebuilt with the fix in place, three windows opened after the
+  same remount all got every badge. One had none 1.7 s after it opened and all of them 3.4 s
+  after, 3.7 s after the mount: the model's next read of the mounts saw the new volume.
+- **Everything was restored**, with a copy of the module registered throughout, and FSKit still
+  has the module switched on. FSKit now names another registered copy of the module than
+  `/Applications`'s, as it picks among the registered copies.
+
+A first attempt, at 21:31 to 21:50, was blocked before a mount: FSKit had the module switched off
+for every copy, after the live run's restore had unregistered every copy at once (fskit_agent
+logged "Removed 1 identifiers"). System Settings refused to switch it on, with EPERM in Login
+Items, until the Mac was restarted. The second attempt lost the switch the same way, by rebuilding
+the only registered copy, and the user switched it on again. A rig that switches or rebuilds
+copies should keep another one registered, so the identifier never disappears.
