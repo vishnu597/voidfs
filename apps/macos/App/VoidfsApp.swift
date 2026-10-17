@@ -15,7 +15,7 @@
 //     voidfs.app/Contents/MacOS/voidfs mount <drive> [mount-point]
 //     voidfs.app/Contents/MacOS/voidfs settings
 //     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status
-//     voidfs.app/Contents/MacOS/voidfs login-item on | off | status | look <folder>
+//     voidfs.app/Contents/MacOS/voidfs login-item on | off | status | look <folder> | selftest
 //     voidfs.app/Contents/MacOS/voidfs server-key status | sign-in … | sign-out | selftest
 //     voidfs.app/Contents/MacOS/voidfs bridge-check
 //     voidfs.app/Contents/MacOS/voidfs bridge-selftest <drive> [main|daemon-restart|agent-restart|remote <key>|refused|wire] [--socket <path>]
@@ -110,8 +110,13 @@ enum HostCommands {
                     print("login item: \(LoginItem.describe)")
                 case "status", nil:
                     print("login item: \(LoginItem.describe)")
+                    if LoginItem.service.status == .enabled, let why = LoginItem.refused() {
+                        print("launchd refuses the job: \(why); `login-item on` registers it again")
+                    }
+                case "selftest":
+                    return await LoginItemSelfTest.run()
                 default:
-                    print("usage: login-item on | off | status | look <folder>")
+                    print("usage: login-item on | off | status | look <folder> | selftest")
                     return 2
                 }
             case "server-key":
@@ -225,6 +230,12 @@ final class HostModel {
             status = enabled == nil ? "The file system extension is not installed." : ""
         } catch {
             status = "Could not list file system extensions: \(error.localizedDescription)"
+        }
+        // After an update that changed the job's program, launchd refuses it until it is
+        // registered again.
+        if let note = await LoginItem.repairIfRefused() {
+            loginNote = note
+            login = LoginItem.state
         }
     }
 
