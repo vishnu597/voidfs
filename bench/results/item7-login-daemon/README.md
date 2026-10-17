@@ -106,6 +106,16 @@ The before and after states are recorded in [registration.txt](raw/registration.
 - Adding the extension back and electing it (`pluginkit -a`, then `pluginkit -e use`) was blocked
   and is left to the user.
 
+To put the Finder extension back as it was, as after item 8's live run:
+
+```bash
+pluginkit -a ~/Coding/voidfs/.claude/worktrees/sleepy-germain-0cf80f/apps/macos/build/Build/Products/Release/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+```
+
+```bash
+pluginkit -e use -i dev.voidfs.app.findersync
+```
+
 At the end, FSKit names compassionate-payne's copy with the switch on. pluginkit has no voidfs
 Finder extension, so there are no badges until it is added back. LaunchServices' records are as
 before, apart from sleepy-germain's new record id. No `dev.voidfs.app.daemon` job, no
