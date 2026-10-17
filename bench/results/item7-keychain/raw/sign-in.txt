@@ -1,0 +1,42 @@
+$ voidfs server-key status
+not signed in, for <dir>
+login item: off: the daemon has no server and key yet
+exit 0
+$ voidfs server-key sign-in --key-file wrong.json --endpoint http://127.0.0.1:9372
+The server didn't accept it: 403 InvalidAccessKeyId: the access key id does not exist
+exit 1
+$ voidfs server-key status
+not signed in, for <dir>
+login item: off: the daemon has no server and key yet
+exit 0
+$ voidfs server-key sign-in --key-file key.json --endpoint http://127.0.0.1:9
+The server didn't accept it: dispatch failure: io error: client error (Connect): tcp connect error: Connection refused (os error 61) (DispatchFailure(DispatchFailure { source: ConnectorError { kind: Io, source: hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:9, Os { code: 61, kind: ConnectionRefused, message: "Connection refused" })), connection: Unknown } }))
+exit 1
+$ voidfs server-key sign-in --key-file key.json --endpoint ftp://127.0.0.1:9372
+The server must be a URL such as https://voidfs.example.com.
+exit 2
+$ voidfs server-key sign-in --key-file key.env
+Signed in to http://127.0.0.1:9372 as VFKEVFA3NAMUU3DGAQDU. Turn on Start at login to start the daemon with it.
+exit 0
+$ voidfs server-key status
+signed in to http://127.0.0.1:9372 (region us-east-1) as VFKEVFA3NAMUU3DGAQDU, for <dir>
+login item: off
+exit 0
+$ voidfs server-key sign-in --key-file key.json --endpoint http://127.0.0.1:9372 --region eu-west-1
+Signed in to http://127.0.0.1:9372 as VFKEVFA3NAMUU3DGAQDU. Turn on Start at login to start the daemon with it.
+exit 0
+$ voidfs server-key status
+signed in to http://127.0.0.1:9372 (region eu-west-1) as VFKEVFA3NAMUU3DGAQDU, for <dir>
+login item: off
+exit 0
+$ voidfs server-key sign-out
+Signed out.
+exit 0
+$ voidfs server-key status
+not signed in, for <dir>
+login item: off: the daemon has no server and key yet
+exit 0
+$ voidfs server-key sign-out
+Not signed in.
+exit 0
+dir <dir>

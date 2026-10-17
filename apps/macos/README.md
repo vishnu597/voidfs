@@ -11,7 +11,7 @@ FSKit spike that started it is in [`docs/spikes/fskit.md`](../../docs/spikes/fsk
 
 | Folder | What |
 |---|---|
-| `App/` | The host app and its menu of transfers, Start at login for the daemon, the launch agent that bridges the extensions to the daemon, and the in-process checks of the bridge, the transfers and the badges. Run from a terminal it also takes `status`, `transfers`, `mount`, `settings`, `login-item` and the agent, bridge and badge commands |
+| `App/` | The host app and its menu of transfers, Start at login for the daemon, the launch agent that bridges the extensions to the daemon, and the in-process checks of the bridge, the transfers and the badges. Run from a terminal it also takes `status`, `transfers`, `mount`, `settings`, `login-item`, `server-key` and the agent, bridge and badge commands |
 | `FSModule/` | The FSKit module: a `FSUnaryFileSystem` that serves `voidfs://<drive>` resources from daemon sessions |
 | `FinderSync/` | The Finder Sync extension: badges and the context menu |
 | `Badges/` | The badges' XPC interface, client, model and pictures, shared by the extension and the app |
@@ -27,8 +27,11 @@ FSKit spike that started it is in [`docs/spikes/fskit.md`](../../docs/spikes/fsk
 - A Rust toolchain: the voidfs target's "Bundle void" phase builds `void` with cargo
   (`~/.cargo/bin/cargo`, or one on `PATH`) into `build/cargo-target`, and signs it inside the app.
 - An Apple Developer team. `com.apple.developer.fskit.fsmodule` is a restricted entitlement:
-  without a provisioning profile that grants it, macOS kills the extension at launch. With Xcode
-  signed in to your team, automatic signing creates the profile. The project uses team
+  without a provisioning profile that grants it, macOS kills the extension at launch. The app's
+  `keychain-access-groups`, for the server key, is restricted too: without a profile for
+  `dev.voidfs.app` the build fails, and a copy signed without one is killed at launch. With Xcode
+  signed in to your team (Settings → Accounts), automatic signing creates the development
+  profiles (the app gets the team's wildcard one). The project uses team
   `HAUTK68F56`; set `DEVELOPMENT_TEAM` to your own, and change the App Group
   (`HAUTK68F56.dev.voidfs` in `Config/*.entitlements`, `Shared/Bridge.swift` and
   `LaunchAgents/dev.voidfs.agent.plist`, whose two Mach services carry it) and the team in the
@@ -59,20 +62,40 @@ void daemon start
 apps/macos/build/Build/Products/Release/voidfs.app/Contents/MacOS/voidfs agent-register
 ```
 
+**Sign in.** The menu's Sign in… asks for the server, its region and an access key, or imports a
+key file. The app checks the key with the bundled `void`, then keeps it in the shared team
+Keychain (access group `HAUTK68F56.dev.voidfs`), one item for each state directory. Headless:
+
+```bash
+apps/macos/build/Build/Products/Release/voidfs.app/Contents/MacOS/voidfs server-key sign-in --endpoint https://voidfs.example.com --key-file key.json
+```
+
+`server-key status` names the server and the key's id; `server-key sign-out` removes it. The
+key file is the JSON `void keys generate` prints, or `VOIDFS_*` lines; `-` reads it from stdin.
+
 **Start at login.** The menu's "Start the daemon at login", or `voidfs login-item on`, registers
-the app's own `void` with SMAppService as the job `dev.voidfs.app.daemon`. It starts the daemon now
-and at each login, and the job appears under voidfs in Login Items. The daemon needs a server and
-key first: start it once from a terminal, as above, and it keeps them in `daemon.json`. The app
-takes over the state directory:
+the job `dev.voidfs.app.daemon` with SMAppService. It starts the daemon now and at each login, and
+the job appears under voidfs in Login Items. The job runs the app's own binary
+(`voidfs daemon-launch`), which reads the key from the Keychain and starts the bundled `void`
+with it on a pipe, once it has checked that process is voidfs's own `void`. Sign in first; a
+`daemon.json` that `void daemon start` left in the state directory moves into the Keychain, and
+the file is deleted. The app takes over the state directory:
 - its daemon removes the agent `void daemon install` wrote for the same directory, and stops a
   daemon started otherwise;
 - while the job is loaded, `void daemon install` refuses, and `void daemon start` asks launchd for
-  the app's daemon.
+  the app's daemon, writes no `daemon.json`, and says so at once if the app has no key.
 
 Turning it off stops the daemon. `void daemon status` says who starts the daemon at login. It was
 checked on a registered copy with a throwaway state directory: the takeover, the refusal, stop,
 start and a crash. Login Items' approval flow, logout and reboot are untested
-([step 5, item 7](../../docs/step-5-macos.md#the-apps-login-daemon-17-october)).
+([step 5, item 7](../../docs/step-5-macos.md#the-apps-login-daemon-17-october)). The Keychain
+handover was checked on a registered development build: the adopted `daemon.json`, a restart on a
+new sign-in, and the stop on sign-out
+([the Keychain slice](../../docs/step-5-macos.md#the-server-key-in-the-keychain-17-october)).
+launchd may refuse the job after you switch between differently signed copies, or after its
+program changes ("Launch Constraint Violation" in its log, exit code 78). Turning Start at login
+on, and opening the menu, notice that and register the job again; `voidfs login-item status`
+reports it, and `voidfs login-item selftest` checks the logic.
 
 Then mount a drive by its alias or id. `void mount` asks the daemon, which mounts it with the
 module (the `fskit` adapter) and mounts it again when it starts:
@@ -213,6 +236,9 @@ stapled, then checked with `codesign`, `spctl` and `stapler` (the
 - a Developer ID provisioning profile for `dev.voidfs.app.fskit` with the FSKit Module capability,
   named `voidfs FSKit Developer ID` (or change `scripts/ExportOptions-DeveloperID.plist`), installed
   in `~/Library/Developer/Xcode/UserData/Provisioning Profiles/<UUID>.provisionprofile`;
+- a Developer ID provisioning profile for `dev.voidfs.app`, which grants `keychain-access-groups`
+  (Apple's profiles grant `HAUTK68F56.*`), named `voidfs App Developer ID` and installed the same
+  way;
 - notarization credentials in the keychain, saved once with an app-specific password:
 
 ```bash

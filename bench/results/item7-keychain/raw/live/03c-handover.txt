@@ -1,0 +1,52 @@
+$ launchctl print gui/$UID/dev.voidfs.app.daemon (excerpt)
+	state = running
+	program identifier = Contents/MacOS/voidfs (mode: 2)
+	runs = 1
+	pid = 80649
+		state = active
+		state = active
+job pid 80649; daemon pid 80650
+$ ps -o pid,ppid,command -p 80649,80650
+80649     1 voidfs daemon-launch
+80650 80649 void daemon run --app --logged --endpoint http://127.0.0.1:9372 --key-file /dev/stdin
+$ ps -p 79888 (the terminal's daemon)
+gone
+$ ls -A $D
+cache
+daemon.log
+daemon.sock
+journal
+lock
+state.sqlite
+state.sqlite-shm
+state.sqlite-wal
+$ voidfs server-key status
+signed in to http://127.0.0.1:9372 (region us-east-1) as VFKEVFA3NAMUU3DGAQDU, for $D
+login item: on: the daemon starts at login (dev.voidfs.app.daemon)
+exit 0
+$ VOIDFS_STATE_DIR=$D void daemon status --json
+{
+  "accessKeyId": "VFKEVFA3NAMUU3DGAQDU",
+  "commit": "68c5296",
+  "commitDate": "2026-10-17",
+  "endpoint": "http://127.0.0.1:9372",
+  "loginJob": "dev.voidfs.app.daemon",
+  "pid": 80650,
+  "running": true,
+  "socket": "$D/daemon.sock",
+  "started": "2026-10-17T19:36:36Z",
+  "stateDir": "$D",
+  "uptimeSecs": 13,
+  "version": "0.0.0"
+}
+exit 0
+$ the daemon's log since the job started
+2026-10-17T19:33:20.569Z void 0.0.0 (68c5296, 2026-10-17) daemon started: pid 79888, socket $D/daemon.sock, server http://127.0.0.1:9372
+2026-10-17T19:36:36.364Z moved the server key from daemon.json into the Keychain, and deleted the file
+2026-10-17T19:36:36.373Z stopping (asked to stop)
+2026-10-17T19:36:36.382Z stopped
+2026-10-17T19:36:36.395Z stopped the daemon that was running (pid 79888), to take over
+2026-10-17T19:36:36.493Z void 0.0.0 (68c5296, 2026-10-17) daemon started: pid 80650, socket $D/daemon.sock, server http://127.0.0.1:9372
+secret in pid 80650's arguments or environment: False
+secret in pid 80649's arguments or environment: False
+secret in daemon.log: False

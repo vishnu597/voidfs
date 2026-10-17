@@ -1,0 +1,54 @@
+$ voidfs login-item on
+15:33:32.506
+Registered, but the daemon didn't answer within 20.0 seconds: see daemon.log in $D.
+login item: on: the daemon starts at login (dev.voidfs.app.daemon)
+exit 0
+15:33:52
+$ launchctl print gui/$UID/dev.voidfs.app.daemon (excerpt)
+	path = (submitted by smd.340)
+	state = spawn scheduled
+	program identifier = Contents/MacOS/voidfs (mode: 2)
+	parent bundle identifier = dev.voidfs.app
+	runs = 3
+	last exit code = 78: EX_CONFIG
+		state = active
+		state = active
+$ ps -o pid,ppid,command for the job's process and its children
+ps: option requires an argument -- p
+usage: ps [-AaCcEefhjlMmrSTvwXx] [-O fmt | -o fmt] [-G gid[,gid...]]
+          [-g grp[,grp...]] [-u [uid,uid...]]
+          [-p pid[,pid...]] [-t tty[,tty...]] [-U user[,user...]]
+       ps [-L]
+$ ps -p 79888 (the terminal's daemon)
+still running
+$ ls -A $D
+cache
+daemon.json
+daemon.log
+daemon.sock
+journal
+lock
+state.sqlite
+state.sqlite-shm
+state.sqlite-wal
+$ voidfs server-key status
+not signed in, for $D
+daemon.json: there, with a key the terminal kept
+login item: on: the daemon starts at login (dev.voidfs.app.daemon)
+exit 0
+$ VOIDFS_STATE_DIR=$D void daemon status --json
+{
+  "accessKeyId": "VFKEVFA3NAMUU3DGAQDU",
+  "commit": "68c5296",
+  "commitDate": "2026-10-17",
+  "endpoint": "http://127.0.0.1:9372",
+  "loginJob": "dev.voidfs.app.daemon",
+  "pid": 79888,
+  "running": true,
+  "socket": "$D/daemon.sock",
+  "started": "2026-10-17T19:33:20Z",
+  "stateDir": "$D",
+  "uptimeSecs": 32,
+  "version": "0.0.0"
+}
+exit 0

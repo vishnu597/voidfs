@@ -1,0 +1,32 @@
+$ VOIDFS_STATE_DIR=$D void daemon stop
+daemon stopped (pid 80822)
+exit 0
+15 s later:
+	state = not running
+	runs = 2
+	last exit code = 0
+$ env -i HOME=$HOME VOIDFS_STATE_DIR=$D void daemon start (no key anywhere in its environment)
+daemon started (pid 80940, socket $D/daemon.sock)
+exit 0
+	state = running
+	runs = 3
+	pid = 80939
+	last exit code = 0
+$ VOIDFS_STATE_DIR=$D VOIDFS_ENDPOINT=http://127.0.0.1:9372 VOIDFS_KEY_FILE=key.json void daemon restart (a terminal key)
+daemon restarted (pid 80983, socket $D/daemon.sock)
+exit 0
+$ VOIDFS_STATE_DIR=$D void daemon status --json (endpoint, key id, pid)
+  "accessKeyId": "VFJQRJTHF7T6X7YFQCZ2",
+  "endpoint": "http://127.0.0.1:9373",
+  "pid": 80983,
+$ ls -A $D | grep daemon
+daemon.log
+daemon.sock
+$ kill -9 80983 (the daemon)
+15:37:41
+15:37:51
+answering again: pid 81502
+	state = running
+	runs = 5
+	pid = 81501
+	last terminating signal = Killed: 9
