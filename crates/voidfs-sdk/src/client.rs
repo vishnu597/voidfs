@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use base64::Engine;
@@ -60,12 +60,77 @@ pub struct Observation {
     pub sent: bool,
     /// Until the answer's headers, or the failure.
     pub elapsed: Duration,
+    /// Of `elapsed`, how long the body waited on [`Config::upload_bandwidth`]: time this client
+    /// chose to take, not the server's.
+    pub paced: Duration,
 }
 
 /// Watches a client's requests, for a view of the link to the server (the client core's
 /// connectivity).
 pub trait Observe: Send + Sync + 'static {
     fn observe(&self, o: &Observation);
+
+    /// An attempt is going out; [`Observe::observe`] reports what it came to. An observer may keep
+    /// it (a `Weak` is enough: the attempt lets go of it when it ends) to see what it waits on.
+    fn sending(&self, _attempt: &Arc<InFlight>) {}
+}
+
+/// One attempt of a request while it is out ([`Observe::sending`]): whether it waits on the
+/// server or on the upload limit.
+#[derive(Debug)]
+pub struct InFlight(std::sync::Mutex<Flight>);
+
+#[derive(Debug)]
+struct Flight {
+    /// When the attempt last sent the server anything (or began), or when the wait a long poll
+    /// gives the server ends.
+    quiet: Instant,
+    /// Since when its body has waited on the upload limit, while it does.
+    pacing: Option<Instant>,
+    /// How long its body waited on the upload limit before that.
+    paced: Duration,
+}
+
+impl InFlight {
+    fn new(quiet: Instant) -> Arc<InFlight> {
+        Arc::new(InFlight(std::sync::Mutex::new(Flight { quiet, pacing: None, paced: Duration::ZERO })))
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut Flight) -> T) -> T {
+        f(&mut self.0.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Since when the attempt has waited on the server, sending it nothing and hearing nothing;
+    /// `None` while its body waits on the upload limit. For a long poll, it starts when the wait
+    /// the server may take is over.
+    pub fn waiting_since(&self) -> Option<Instant> {
+        self.with(|f| if f.pacing.is_some() { None } else { Some(f.quiet) })
+    }
+
+    /// How long its body has waited on the upload limit so far.
+    pub fn paced(&self) -> Duration {
+        self.with(|f| f.paced + f.pacing.map_or(Duration::ZERO, |p| p.elapsed()))
+    }
+
+    /// The body moved on: the last piece went out, and the next is wanted.
+    fn moved(&self) {
+        self.with(|f| f.quiet = f.quiet.max(Instant::now()));
+    }
+
+    /// The body waits on the upload limit until [`InFlight::paced_out`].
+    fn pacing(&self) {
+        self.with(|f| f.pacing = Some(Instant::now()));
+    }
+
+    fn paced_out(&self) {
+        self.with(|f| {
+            let now = Instant::now();
+            if let Some(p) = f.pacing.take() {
+                f.paced += now.duration_since(p);
+            }
+            f.quiet = f.quiet.max(now);
+        });
+    }
 }
 
 impl Default for Config {
@@ -252,15 +317,26 @@ impl Reply {
     }
 }
 
-/// `body` in pieces, each after the limit allows it.
-pub(crate) fn paced(body: Bytes, bw: Arc<Bandwidth>) -> impl futures::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + 'static {
-    futures::stream::unfold((body, bw), |(mut rest, bw)| async move {
+/// `body` in pieces, each after the limit allows it, telling `flight` how it goes.
+pub(crate) fn paced(body: Bytes, bw: Option<Arc<Bandwidth>>, flight: Option<Arc<InFlight>>) -> impl futures::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + 'static {
+    futures::stream::unfold((body, bw, flight), |(mut rest, bw, flight)| async move {
+        if let Some(f) = &flight {
+            f.moved();
+        }
         if rest.is_empty() {
             return None;
         }
         let piece = rest.split_to(rest.len().min(crate::bandwidth::PIECE));
-        bw.take(piece.len()).await;
-        Some((Ok(piece), (rest, bw)))
+        if let Some(bw) = &bw {
+            if let Some(f) = &flight {
+                f.pacing();
+            }
+            bw.take(piece.len()).await;
+            if let Some(f) = &flight {
+                f.paced_out();
+            }
+        }
+        Some((Ok(piece), (rest, bw, flight)))
     })
 }
 
@@ -380,11 +456,17 @@ impl Client {
     async fn attempt(&self, req: &Req, patience: Patience) -> Result<reqwest::Response> {
         let signed = self.0.signer.sign(req.method.as_str(), &req.path, &req.query_string(), req.headers.clone(), &[], req.body.clone())?;
         let mut request = reqwest::Request::try_from(signed).map_err(|e| Error::Invalid(e.to_string()))?;
-        if let Some(bw) = &self.0.config.upload_bandwidth
-            && !req.body.is_empty()
-        {
-            // Sent a piece at a time as the limit allows; its length still says how much.
-            let pieces = paced(req.body.clone(), bw.clone());
+        let started = Instant::now();
+        let observer = self.0.config.observer.as_ref();
+        let flight = observer.map(|_| InFlight::new(match patience {
+            Patience::Wait(w) => started + w,
+            _ => started,
+        }));
+        let bw = self.0.config.upload_bandwidth.clone();
+        if !req.body.is_empty() && (bw.is_some() || flight.is_some()) {
+            // Sent a piece at a time as the limit allows, and so that the observer sees it go; its
+            // length still says how much.
+            let pieces = paced(req.body.clone(), bw, flight.clone());
             request.headers_mut().insert(http::header::CONTENT_LENGTH, req.body.len().into());
             *request.body_mut() = Some(reqwest::Body::wrap_stream(pieces));
         }
@@ -396,14 +478,16 @@ impl Client {
             }
             Patience::Stream => &self.0.http_wait,
         };
-        let started = std::time::Instant::now();
+        if let (Some(o), Some(f)) = (observer, &flight) {
+            o.sending(f);
+        }
         let resp = http.execute(request).await;
-        if let Some(o) = &self.0.config.observer {
+        if let (Some(o), Some(f)) = (observer, &flight) {
             let (status, sent) = match &resp {
                 Ok(r) => (Some(r.status().as_u16()), true),
                 Err(e) => (None, !e.is_connect()),
             };
-            o.observe(&Observation { status, sent, elapsed: started.elapsed() });
+            o.observe(&Observation { status, sent, elapsed: started.elapsed(), paced: f.paced() });
         }
         let resp = resp?;
         let status = resp.status().as_u16();
@@ -572,11 +656,15 @@ impl Client {
             let body = ByteStream::read_from().path(path).buffer_size(crate::bandwidth::PIECE).length(Length::Exact(size)).build().await
                 .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
             let bandwidth = self.0.config.upload_bandwidth.clone();
+            let started = Instant::now();
+            let observer = self.0.config.observer.as_ref();
+            let flight = observer.map(|_| InFlight::new(started));
             let (activity, updates) = tokio::sync::watch::channel(Some(tokio::time::Instant::now()));
             // The HTTP layer may drop its exact-length body without polling EOF. Keep the
             // channel alive while response headers are still outstanding.
             let _activity = activity.clone();
-            let pieces = futures::stream::unfold((body, bandwidth, activity, progress.clone()), |(mut body, bandwidth, activity, progress)| async move {
+            let pieces = futures::stream::unfold((body, bandwidth, activity, progress.clone(), flight.clone()), |(mut body, bandwidth, activity, progress, flight)| async move {
+                if let Some(f) = &flight { f.moved(); }
                 let piece = match body.next().await {
                     Some(piece) => piece,
                     None => { activity.send_replace(Some(tokio::time::Instant::now())); return None; }
@@ -584,28 +672,32 @@ impl Client {
                 if let Ok(bytes) = &piece {
                     if let Some(limit) = &bandwidth {
                         activity.send_replace(None);
+                        if let Some(f) = &flight { f.pacing(); }
                         limit.take(bytes.len()).await;
+                        if let Some(f) = &flight { f.paced_out(); }
                     }
                     if let Some(progress) = &progress { progress.fetch_add(bytes.len() as u64, Ordering::Relaxed); }
                 }
                 activity.send_replace(Some(tokio::time::Instant::now()));
-                Some((piece, (body, bandwidth, activity, progress)))
+                Some((piece, (body, bandwidth, activity, progress, flight)))
             });
             let signed = self.0.signer.sign_prehashed(req.method.as_str(), &req.path, "", req.headers.clone(), content_sha256)?;
             let mut request = reqwest::Request::try_from(signed).map_err(|e| Error::Invalid(e.to_string()))?;
             *request.body_mut() = Some(reqwest::Body::wrap_stream(pieces));
-            let started = std::time::Instant::now();
+            if let (Some(o), Some(f)) = (observer, &flight) {
+                o.sending(f);
+            }
             let response = tokio::select! {
                 response = self.0.http_wait.execute(request) => response.map_err(Error::from),
                 _ = upload_silence(updates, self.0.config.timeout) => Err(Error::Transport { message: "streamed upload or response headers timed out".into(), sent: true }),
             };
-            if let Some(observer) = &self.0.config.observer {
+            if let (Some(o), Some(f)) = (observer, &flight) {
                 let (status, sent) = match &response {
                     Ok(r) => (Some(r.status().as_u16()), true),
                     Err(Error::Transport { sent, .. }) => (None, *sent),
                     Err(_) => (None, false),
                 };
-                observer.observe(&Observation { status, sent, elapsed: started.elapsed() });
+                o.observe(&Observation { status, sent, elapsed: started.elapsed(), paced: f.paced() });
             }
             let result = match response {
                 Ok(response) => {

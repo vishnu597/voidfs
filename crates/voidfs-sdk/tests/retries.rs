@@ -200,3 +200,53 @@ async fn every_attempt_is_observed() {
     assert!(gone.get_object("drv", "k", Default::default()).await.is_err());
     assert_eq!(seen.0.lock().unwrap().last(), Some(&(None, false)));
 }
+
+/// Each attempt as it went out, and what it came to.
+#[derive(Default)]
+struct Flights {
+    out: std::sync::Mutex<Vec<std::sync::Weak<InFlight>>>,
+    came: std::sync::Mutex<Vec<Observation>>,
+}
+
+impl Observe for Flights {
+    fn observe(&self, o: &Observation) {
+        self.came.lock().unwrap().push(o.clone());
+    }
+
+    fn sending(&self, attempt: &std::sync::Arc<InFlight>) {
+        self.out.lock().unwrap().push(std::sync::Arc::downgrade(attempt));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn time_at_the_upload_limit_and_time_waiting_on_the_server_are_observed_apart() {
+    let s = server().await;
+    let p = Proxy::start(&s.endpoint).await;
+    let flights = std::sync::Arc::new(Flights::default());
+    let bw = std::sync::Arc::new(Bandwidth::new(Some(256 << 10)));
+    let c = client_for(&p.endpoint, Config { observer: Some(flights.clone()), upload_bandwidth: Some(bw.clone()), ..Default::default() });
+    c.create_drive("drv", Default::default()).await.unwrap();
+    // Three 64 KiB pieces a quarter of a second apart.
+    c.put_object("drv", "paced", vec![1u8; 192 << 10], Default::default()).await.unwrap();
+    let o = flights.came.lock().unwrap().last().cloned().unwrap();
+    assert!(o.paced >= Duration::from_millis(400) && o.elapsed >= o.paced, "{o:?}");
+    bw.set(None);
+    c.put_object("drv", "unlimited", vec![1u8; 192 << 10], Default::default()).await.unwrap();
+    let o = flights.came.lock().unwrap().last().cloned().unwrap();
+    assert!(o.paced < Duration::from_millis(50), "the limit lifted: {o:?}");
+    assert!(flights.out.lock().unwrap().iter().all(|f| f.strong_count() == 0), "an attempt lets go when it ends");
+
+    // Its body sent, an attempt whose answer is held waits on the server from then on.
+    p.fault(Fault::Hang(Duration::from_millis(800)));
+    let t = std::time::Instant::now();
+    let held = tokio::spawn({
+        let c = c.clone();
+        async move { c.put_object("drv", "held", "x", Default::default()).await }
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let attempt = flights.out.lock().unwrap().last().and_then(|f| f.upgrade()).expect("out");
+    let since = attempt.waiting_since().expect("waiting on the server");
+    assert!(since >= t && since.elapsed() >= Duration::from_millis(300), "{:?}", since.elapsed());
+    drop(attempt);
+    held.await.unwrap().unwrap();
+}
