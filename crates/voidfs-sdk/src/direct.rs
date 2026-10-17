@@ -94,7 +94,7 @@ impl Client {
                 req = req.header(k, v);
             }
             req = match &self.config().upload_bandwidth {
-                Some(bw) => req.header(http::header::CONTENT_LENGTH, bytes.len()).body(reqwest::Body::wrap_stream(paced(bytes.clone(), bw.clone()))),
+                Some(bw) => req.header(http::header::CONTENT_LENGTH, bytes.len()).body(reqwest::Body::wrap_stream(paced(bytes.clone(), Some(bw.clone()), None))),
                 None => req.body(bytes.clone()),
             };
             let r = match req.send().await {

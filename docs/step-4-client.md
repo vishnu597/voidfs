@@ -803,6 +803,14 @@ What the third built (the change-feed client and connectivity):
   reset or timed out) make the link offline; any answer makes it online; three server errors
   (`5xx`, `429`) or answers slower than 10 s within 30 s make it degraded. The feed's stream counts
   too. It doesn't read the operating system's network state; the Mac app can add that in step 5.
+  Since 16 October ([step 5, item 8](step-5-macos.md#item-8-menu-bar-transfers-and-finder-sync)),
+  the time a body waits on the upload limit (the SDK's `Observation::paced`) doesn't count toward
+  the 10 s, so a limit the user set doesn't read as degraded. And a request that has waited on the
+  server for the patience (5 s), while nothing else heard from it either, gets a probe (the SDK
+  shows each attempt as it goes out, `Observe::sending`); when the probe goes unanswered for the
+  patience as well, the link is offline. A server that holds connections open and answers nothing
+  is then found in about 10 s, not when a long upload's 120 s attempt runs out. A server that
+  answers gets no probes, nor does one a body is still going out to.
 - **Offline:** a block the cache doesn't have fails at once with `Error::Offline` (cached blocks
   are still read), and the queue holds its publishes. A probe (`ListBuckets`, 2 s after going
   offline, then twice as long each time up to 30 s) finds the server again, and the queue goes

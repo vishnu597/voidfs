@@ -2,15 +2,17 @@
 //! Whether the server can be reached (step 4, item 3): online, degraded or offline, from the
 //! outcome of every request a client makes and the change feed's liveness. Offline, the cache
 //! and the mount fail at once instead of waiting out timeouts and retries, and the upload queue
-//! holds its publishes; a probe finds out when the server answers again.
+//! holds its publishes; a probe finds out when the server answers again. A server that holds
+//! connections open and answers nothing is found out too: a request left waiting on it gets a
+//! probe.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::watch;
-use voidfs_sdk::{Client, Observation, Observe};
+use tokio::sync::{Notify, watch};
+use voidfs_sdk::{Client, InFlight, Observation, Observe};
 
 use crate::error::{Error, Result};
 
@@ -31,13 +33,17 @@ pub struct ConnectivityConfig {
     /// Server errors (`5xx`, `429`) or slow answers within `window` before it is degraded.
     pub degraded_after: u32,
     pub window: Duration,
-    /// An answer slower than this counts against the link.
+    /// An answer slower than this counts against the link, less the time its body waited on the
+    /// upload limit: a limit the user set isn't a slow server.
     pub slow: Duration,
     /// The first wait between probes while offline; it doubles up to `probe_max`.
     pub probe_every: Duration,
     pub probe_max: Duration,
     /// How long a filesystem call waits on the server while the server answers nothing at all,
-    /// to anyone: then the link is offline, and the call fails rather than wait out timeouts.
+    /// to anyone: then the link is offline, and the call fails rather than wait out timeouts. Any
+    /// other request that waits this long, while nothing else hears from the server either, gets
+    /// a probe (with [`Connectivity::probe`] running), and a probe unanswered for as long again
+    /// takes the link offline.
     pub patience: Duration,
 }
 
@@ -68,6 +74,10 @@ struct Inner {
     cfg: ConnectivityConfig,
     tx: watch::Sender<Link>,
     counts: Mutex<Counts>,
+    /// The requests out now, as the clients that send them show them ([`Observe::sending`]).
+    flights: Mutex<Vec<Weak<InFlight>>>,
+    /// Told when a request goes out (it keeps one telling until it is waited on).
+    sending: Notify,
 }
 
 /// The link to the server. Cloning shares it; give it to a client as its observer
@@ -90,7 +100,13 @@ impl Default for Connectivity {
 impl Connectivity {
     pub fn new(cfg: ConnectivityConfig) -> Connectivity {
         let (tx, _) = watch::channel(Link::Online);
-        Connectivity(Arc::new(Inner { cfg, tx, counts: Mutex::new(Counts { unanswered: 0, troubles: VecDeque::new(), answer: None }) }))
+        Connectivity(Arc::new(Inner {
+            cfg,
+            tx,
+            counts: Mutex::new(Counts { unanswered: 0, troubles: VecDeque::new(), answer: None }),
+            flights: Mutex::new(Vec::new()),
+            sending: Notify::new(),
+        }))
     }
 
     pub fn link(&self) -> Link {
@@ -160,16 +176,28 @@ impl Connectivity {
         self.set(Link::Offline);
     }
 
+    /// Whether any request is out, and since when the one that has waited longest on the server
+    /// has waited ([`InFlight::waiting_since`]).
+    fn waiting(&self) -> (bool, Option<Instant>) {
+        let mut flights = self.0.flights.lock().unwrap_or_else(|p| p.into_inner());
+        flights.retain(|f| f.strong_count() > 0);
+        let since = flights.iter().filter_map(|f| f.upgrade()?.waiting_since()).min();
+        (!flights.is_empty(), since)
+    }
+
     /// While offline, asks the server something small (`ListBuckets`), `probe_every` apart and
-    /// further apart each time, until it answers.
+    /// further apart each time, until it answers. Otherwise, watches for a server that answers
+    /// nothing ([`Connectivity::watch_for_hangs`]).
     pub fn probe(&self, client: Client) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
             let mut rx = this.watch();
+            let mut hangs = Hangs { quiet: this.0.cfg.patience, asked: None };
             loop {
                 if *rx.borrow_and_update() != Link::Offline {
-                    if rx.changed().await.is_err() {
-                        return;
+                    tokio::select! {
+                        changed = rx.changed() => if changed.is_err() { return },
+                        () = this.watch_for_hangs(&client, &mut hangs) => {},
                     }
                     continue;
                 }
@@ -187,14 +215,77 @@ impl Connectivity {
             }
         })
     }
+
+    /// Returns once the server looks hung: a request has waited on it for `patience` while
+    /// nothing else heard from it either, and a probe then got no answer within `patience`. The
+    /// link is offline then, as [`Connectivity::silent`] makes it. A probe that is answered
+    /// means a slow answer, not a hung server, and the next waits on twice as much silence, up to
+    /// `probe_max`. A server that answers gets no probes, nor does one a body is still going out
+    /// to, at the upload limit's pace or not.
+    async fn watch_for_hangs(&self, client: &Client, hangs: &mut Hangs) {
+        let cfg = &self.0.cfg;
+        loop {
+            let (out, since) = self.waiting();
+            let Some(since) = since else {
+                hangs.quiet = cfg.patience;
+                if out {
+                    // A body at the limit's pace doesn't say when it is done: look again soon.
+                    tokio::time::sleep(cfg.patience / 4).await;
+                } else {
+                    self.0.sending.notified().await;
+                }
+                continue;
+            };
+            let answer = self.0.counts.lock().unwrap_or_else(|p| p.into_inner()).answer;
+            let due = match answer.max(hangs.asked) {
+                Some(heard) => (since + cfg.patience).max(heard + hangs.quiet),
+                None => since + cfg.patience,
+            };
+            if Instant::now() < due {
+                // A request sent meanwhile can't make it sooner.
+                tokio::time::sleep_until(due.into()).await;
+                continue;
+            }
+            hangs.asked = Some(Instant::now());
+            // Through the AWS client, which the observer doesn't see: counted here.
+            match tokio::time::timeout(cfg.patience, client.list_drives()).await {
+                Ok(Ok(_)) => self.answered(false),
+                Ok(Err(e)) => match e.status() {
+                    Some(s) => self.answered(s >= 500 || s == 429),
+                    None => self.unanswered(),
+                },
+                Err(_) => {
+                    self.silent();
+                    return;
+                }
+            }
+            hangs.quiet = (hangs.quiet * 2).min(cfg.probe_max.max(cfg.patience));
+        }
+    }
+}
+
+/// What [`Connectivity::watch_for_hangs`] keeps between its runs.
+struct Hangs {
+    /// How long nothing must be heard from the server, nor asked of it, before the next probe.
+    quiet: Duration,
+    /// When the last probe went.
+    asked: Option<Instant>,
 }
 
 impl Observe for Connectivity {
     fn observe(&self, o: &Observation) {
         match o.status {
-            Some(s) => self.answered(s >= 500 || s == 429 || o.elapsed > self.0.cfg.slow),
+            Some(s) => self.answered(s >= 500 || s == 429 || o.elapsed.saturating_sub(o.paced) > self.0.cfg.slow),
             None => self.unanswered(),
         }
+    }
+
+    fn sending(&self, attempt: &Arc<InFlight>) {
+        let mut flights = self.0.flights.lock().unwrap_or_else(|p| p.into_inner());
+        flights.retain(|f| f.strong_count() > 0);
+        flights.push(Arc::downgrade(attempt));
+        drop(flights);
+        self.0.sending.notify_one();
     }
 }
 
@@ -203,7 +294,7 @@ mod tests {
     use super::*;
 
     fn obs(status: Option<u16>) -> Observation {
-        Observation { status, sent: true, elapsed: Duration::from_millis(5) }
+        Observation { status, sent: true, elapsed: Duration::from_millis(5), paced: Duration::ZERO }
     }
 
     #[test]
@@ -238,9 +329,24 @@ mod tests {
         assert_eq!(c.link(), Link::Online, "any answer is an answer");
         c.observe(&obs(Some(503)));
         assert_eq!(c.link(), Link::Online);
-        c.observe(&Observation { status: Some(200), sent: true, elapsed: Duration::from_secs(11) });
+        c.observe(&Observation { status: Some(200), sent: true, elapsed: Duration::from_secs(11), paced: Duration::ZERO });
         assert_eq!(c.link(), Link::Degraded, "a server error and a slow answer");
         c.observe(&obs(None));
         assert_eq!(c.link(), Link::Degraded, "one unanswered request isn't offline");
+    }
+
+    #[test]
+    fn time_at_the_upload_limit_is_not_a_slow_answer() {
+        let c = Connectivity::new(ConnectivityConfig { degraded_after: 3, ..Default::default() });
+        let at_the_limit = Observation { status: Some(200), sent: true, elapsed: Duration::from_secs(40), paced: Duration::from_secs(39) };
+        for _ in 0..3 {
+            c.observe(&at_the_limit);
+        }
+        assert_eq!(c.link(), Link::Online, "a second of the server's own");
+        let slow_after_the_body = Observation { paced: Duration::from_secs(29), ..at_the_limit };
+        for _ in 0..3 {
+            c.observe(&slow_after_the_body);
+        }
+        assert_eq!(c.link(), Link::Degraded, "eleven seconds of the server's own");
     }
 }
