@@ -41,7 +41,8 @@ fresh fork; native Xcode open/edit/save/build/run also passes.
 QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and two
 independent Macs and the absent paid target apps remain explicitly untested.
 **Item 8 is built, and each clause of its done-when is shown on a live FSKit mount; its one
-finding is explained and fixed, not yet checked in Finder** (16 October). The menu shows the
+finding is explained and fixed, not yet checked in Finder, because FSKit won't switch the module on**
+(16 October). The menu shows the
 daemon's connection, queue and mounts in the CLI's words and controls the queue
 ([menu-bar transfers](#menu-bar-transfers-16-october)). A Finder Sync
 extension badges mounted drives' items from one daemon call that reads only local state
@@ -407,8 +408,10 @@ done-when, clause by clause:
   on this Mac, not uploaded, until the next save.
 
 The missing badges are explained (16 October), and the extension's fix is checked in process. A
-live Finder hasn't shown the fix: that needs the registration changes the user approves for each
-run. Item 8 is left unmarked until that check, or until the user accepts the in-process one.
+live Finder hasn't shown the fix: the approved live check couldn't mount, because FSKit has the
+voidfs module switched off and System Settings refuses to switch it on
+([the live check](#finders-lost-badges-16-october)). Item 8 is left unmarked until that check, or
+until the user accepts the in-process one.
 
 Use the existing daemon status/upload stream for mounts, connectivity, queue progress, per-item
 and global pause/resume, cancel and immediate bandwidth caps. Distinguish local durable saves
@@ -2646,5 +2649,12 @@ listing, is answered each time while the folder is still read. Three runs with `
 re-tell checks. `main`, `daemon-restart` and `refused` still pass. Nothing was mounted or
 registered for these runs.
 
-Not shown: a live Finder with a quick remount, before and after the fix. That needs the
-registration changes the user approves for each live run.
+**The live check was blocked** (16 October, 21:31 to 21:50,
+[evidence](../bench/results/item8-badge-loss/README.md#the-live-check)). The user approved the
+registration changes, but FSKit refused the mount: the voidfs module is switched off, for every
+copy, `/Applications` included. The switch appears to have been lost at 16:52:41, when the live
+run's restore unregistered every copy at once and fskit_agent logged "Removed 1 identifiers".
+System Settings then wouldn't switch it on: each attempt failed with EPERM in Login Items.
+Everything was restored, and the switch is off as it was before. So a live Finder with a quick
+remount, before and after the fix, is still not shown. A rig that switches copies should register
+the new one before unregistering the last old one, so the identifier never disappears.

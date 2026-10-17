@@ -109,10 +109,54 @@ lines by signalling the relay (503, then forwarding) or restarting the daemon.
   compares anything. With the old `publish` it then failed the re-tell check too. The runs above
   are of the final code, built once for them and once for the break.
 
+## The live check
+
+The user approved a live run on 16 October. It ran from 21:31 to 21:50 and stopped before the
+first mount, because FSKit has the voidfs module switched off.
+
+- **The plan.** Build the app from `28cec07`'s Swift sources, which have the old comparison, and
+  register it ([register.sh](raw/live/setup/register.sh); the other copies in
+  [others.txt](raw/live/setup/others.txt) unregistered). Then repeat phase O's quick remount
+  ([trial.sh](raw/live/setup/trial.sh), not run) and screenshot the new window. Then rebuild
+  with the fix in the same place and repeat.
+- **The mount was refused** ([mount-refused](raw/live/mount-refused.txt)): `Module
+  dev.voidfs.app.fskit is disabled!`. `voidfs status` said `enabled=false` for this build
+  ([register-scratchpad](raw/live/register-scratchpad.txt)). The `/Applications` copy, registered
+  again later in the run to check, said the same ([register-applications](raw/live/register-applications.txt)).
+- **The switch was already off.**
+  - In the live run, at about 16:20, FSKit reported another build's copy enabled
+    ([register.txt](../item8-live/raw/live/setup/register.txt)).
+  - At 16:52:41, that run's restore unregistered its build before registering `/Applications`
+    again. fskit_agent logged "Removed 1 identifiers", then "Added 1 identifiers"
+    ([log](raw/live/logs/fskit-agent-identifiers.txt)).
+  - This run didn't remove the identifier before its first check (its first build was registered
+    at 21:33, before the other copies were unregistered), and the check already said
+    `enabled=false`.
+
+  So FSKit seems to forget the switch when every copy of a module is unregistered at once. That is
+  an inference from these logs: FSKit keeps the switch in a protected container.
+- **System Settings wouldn't switch it on.** The user tried for this build in the scratchpad and
+  again for a rebuild in the worktree ([register-worktree](raw/live/register-worktree.txt)).
+  Every attempt failed in Login Items with `Failed to enabled FSExtension:
+  NSPOSIXErrorDomain Code=1` (EPERM), before any call reached fskitd ([log](raw/live/logs/switch-refused.txt)).
+  LaunchServices recorded the user's election ([elections](raw/live/logs/elections.txt)), but that
+  isn't FSKit's switch. `pluginkit -e use` changes only that election too
+  ([module-pluginkit](raw/live/module-pluginkit.txt)), and it was put back to default.
+- **Restored** ([rig-down](raw/live/rig-down.txt), [restore.sh](raw/live/setup/restore.sh),
+  [restore](raw/live/restore.txt)):
+  - nothing was mounted, and no Finder window was opened;
+  - this run's agent was unregistered and `/Applications`'s registered again;
+  - the build was unregistered and both its folders were deleted;
+  - the other copies were registered again, and `VoidfsStateDirectory` deleted.
+
+  [registrations-after](raw/live/registrations-after.txt) equals
+  [registrations-before](raw/live/registrations-before.txt), apart from ids, times and order.
+  FSKit's switch is off, as it was before the run.
+
 ## Not shown
 
-- **Finder itself.** Nothing here ran Finder, FSKit or the registered extension. Two things need a
-  live run, with the user's approval for the registration changes:
+- **Finder itself.** No Finder ran against a mount here. Two things still need a live run, once
+  FSKit lets the module be switched on:
   - that a quick remount leaves a new window without badges;
   - that the model's re-telling brings them back.
 - **What Finder does with an unchanged `directoryURLs`.** The fix tells Finder the folders without
