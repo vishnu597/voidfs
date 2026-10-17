@@ -65,7 +65,8 @@ reliable badge, a Finder limit.
 terminal's `void daemon install` agent, as the user chose, so that one daemon, started one way,
 owns a state directory. On a registered copy, with a throwaway state directory, the app took over
 from a real agent and from a hand-started daemon, and launchd kept, restarted and stopped the
-daemon as intended. The approval flow, logout and reboot, and the Developer ID export remain.
+daemon as intended. The Developer ID export signs the bundled `void` for distribution, and
+Apple notarized the app with it. The approval flow, logout and reboot remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -2809,6 +2810,17 @@ of `7fb2658`, a local test server, and a throwaway state directory set as the ap
 
 Everything was restored afterwards.
 
+**The Developer ID export** (17 October, notarization approved by the user,
+[evidence](../bench/results/item7-login-daemon/README.md#the-developer-id-export-and-notarization)).
+`main` at `57cfae8`, archived and exported as `apps/macos/scripts/release.sh` does:
+
+- `xcodebuild -exportArchive` signs `Contents/MacOS/void` again with Developer ID Application
+  (HAUTK68F56) and a secure timestamp, keeping its identifier and the hardened runtime. The
+  "Bundle void" phase needs nothing more for distribution.
+- Apple's notary service accepted the app with no issues, its ticket covering `void`. Stapled,
+  `spctl` accepts it as "Notarized Developer ID" and `syspolicy_check distribution` passes.
+- `xcrun stapler` registers the copy it staples with LaunchServices; `lsregister -u` undoes it.
+
 **Registration on this Mac.**
 - Each Release build, and each run of the built app, registered that copy with LaunchServices and
   pluginkit. Unregistering the copy put pluginkit's list back each time.
@@ -2822,8 +2834,8 @@ Everything was restored afterwards.
   approval" state appears only when the user switches the item off in System Settings.
 - **Logout and login, and a reboot**, with remembered mounts coming back, are untested. They are
   the item's done-when.
-- **The Developer ID export is untested**: whether `xcodebuild -exportArchive` re-signs `void`
-  with Developer ID and a timestamp, and whether notarization accepts it.
+- **The notarized build hasn't run from `/Applications`**: the export wasn't installed, and its
+  job wasn't registered.
 - **Turning Start at login off stops the daemon**, and with it the mounts, until
   `void daemon start`.
 - **Not started:** credentials still come from `daemon.json` rather than the Keychain, and there
