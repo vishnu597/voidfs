@@ -4,8 +4,9 @@
 // against a running daemon, through the same model calls as the menu's buttons, each checked in the
 // daemon's status or queue afterwards. It restores the limit and the pauses it changes. `--cancel`
 // also cancels the newest unfinished import and clears finished uploads, which can't be undone,
-// and cancels the oldest mount change waiting, which then stays on this Mac, not uploaded, until
-// its file is saved again. A mount's conflict, if there is one, is cancelled too, and stays a conflict.
+// and cancels the oldest mount change the menu offers Cancel for, which then stays on this Mac, not
+// uploaded, until its file is saved again. A mount's conflict, if there is one, is cancelled too, and
+// stays a conflict, as does a change that waits for one; the menu offers Cancel for neither.
 // `--no-daemon` expects the daemon stopped, and checks that the menu reads what waits in its journal.
 // `--look` changes nothing: it prints the menu's uploads line, for drawing the menu as it is.
 // `--png` draws the menu's view, offscreen, to a file.
@@ -123,12 +124,23 @@ enum TransfersSelfTest {
                 print("skip no unfinished import to cancel")
             }
             if let c = t.queue?.items.first(where: { $0.batch == nil && $0.conflict != nil && $0.toSend }) {
-                check("a mount's conflict has no Cancel", !c.cancellable)
+                check("a mount's conflict has no Cancel", t.queue?.cancellable(c) == false)
                 await t.cancel(.entry(c.id))
                 check("cancelling conflict \(c.id) leaves it a conflict", await eventually { t.queue?.items.first { $0.id == c.id }.map { $0.conflict != nil && $0.toSend } ?? false })
                 check("the menu says nothing was cancelled", t.notice == Words.nothingCancelled, t.notice ?? "no notice")
             }
-            if let i = t.queue?.items.first(where: { $0.batch == nil && $0.conflict == nil && $0.toSend }) {
+            // A mount's change to a conflict's file, made after the conflict, waits for it: the
+            // menu has no Cancel for it, and a cancel leaves it as it is.
+            if let q = t.queue, let w = q.items.first(where: { $0.batch == nil && $0.conflict == nil && $0.cancellable && !q.cancellable($0) }) {
+                print("change \(w.id) (\(w.key), \(w.state)) waits for a conflict")
+                await t.cancel(.entry(w.id))
+                let after = t.queue?.items.first { $0.id == w.id }
+                check("cancelling change \(w.id), which waits for a conflict, leaves it waiting", after.map { $0.state == w.state && !$0.kept } ?? false, "\(String(describing: after?.state))")
+                check("the menu says nothing was cancelled", t.notice == Words.nothingCancelled, t.notice ?? "no notice")
+            } else {
+                print("skip no mount change waiting for a conflict")
+            }
+            if let q = t.queue, let i = q.items.first(where: { $0.batch == nil && $0.conflict == nil && q.cancellable($0) }) {
                 let keptBefore = t.status?.uploads.kept ?? 0
                 await t.cancel(.entry(i.id))
                 check("cancel change \(i.id) keeps it on this Mac", await eventually { t.queue?.items.first { $0.id == i.id }?.kept == true }, "\(String(describing: t.queue?.items.first { $0.id == i.id }?.state))")

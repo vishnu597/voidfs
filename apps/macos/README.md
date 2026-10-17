@@ -93,7 +93,8 @@ control and checks the daemon afterwards. `--no-daemon` checks the journal's lin
 stopped, and `--look` changes nothing, for drawing the menu as it is. Run it against a test daemon
 with `-VoidfsStateDirectory <dir>` ([evidence](../../bench/results/menu-transfers/README.md),
 [cancel](../../bench/results/mount-cancel-kept/README.md),
-[a live mount](../../bench/results/item8-live/README.md)). Logs:
+[a live mount](../../bench/results/item8-live/README.md),
+[changes behind a conflict](../../bench/results/item8-cancel-waits/README.md)). Logs:
 `log stream --predicate 'subsystem == "dev.voidfs"'` (the module logs as category `fs`, the agent
 as `agent`).
 

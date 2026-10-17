@@ -81,6 +81,20 @@ struct UploadList: Decodable {
     let etaSecs: UInt64?
     /// Items a `limit` left out, and a mount's changes still to send, listed or not.
     let more, mountUnsent: UInt64?
+
+    /// Whether the menu offers Cancel for `i`. A mount's change that waits for a conflict, on its
+    /// file or on a folder it's in, stays as it is, as the conflict does: none of it is sent until
+    /// the conflict is resolved. The queue knows what waits by inode; the menu goes by the
+    /// conflicts' keys, which a limited list holds, as it lists failures before what is queued.
+    func cancellable(_ i: Item) -> Bool {
+        guard i.cancellable, i.batch == nil else { return i.cancellable }
+        let paths = [i.key, i.toKey].compactMap { $0 }
+        return !items.contains { c in
+            c.batch == nil && c.conflict != nil && c.toSend && c.drive == i.drive && [c.key, c.toKey].compactMap { $0 }.contains { held in
+                paths.contains { $0 == held || held.hasSuffix("/") && $0.hasPrefix(held) }
+            }
+        }
+    }
 }
 
 /// What a pause, a resume or a cancel applies to, as the daemon reads it.
@@ -521,7 +535,7 @@ struct TransfersView: View {
                         } else {
                             Button("Pause", action: act { await $0.pause(.entry(i.id)) })
                         }
-                        if i.cancellable {
+                        if q.cancellable(i) {
                             Button("Cancel", action: act { await $0.cancel(.entry(i.id)) })
                                 .help(i.batch == nil ? Self.keepsHere : "Cancel this file's upload. Its source stays where it is.")
                         }
