@@ -3002,12 +3002,19 @@ above each waited 10 s.
 registering, as the bridge agent did on 9 October
 ([the Swift bridge](#the-swift-bridge-9-october)). An update whose job runs a program with
 another signing identifier, or a switch between differently signed copies, is then refused until
-the job is registered again. The first slice's job never shipped, but the app should notice the
-refusal (launchd's exit code 78, or a daemon that never answers) and register once more.
+the job is registered again. The first slice's job never shipped, but the app now notices it:
+- **The check** reads `launchctl print` for the job. launchd refuses it if its requirement names
+  another signing identifier than this binary's, or its last exit code is 78 (EX_CONFIG).
+- **Turning Start at login on**, or on again, checks while it waits for the daemon. On a refusal
+  it registers the job once more and says why. Opening the menu checks once per run, for a job
+  left on across an update. `login-item status` reports a refusal.
+- **`voidfs login-item selftest`** passed all 15 checks on the signed build, using the live run's
+  `launchctl print` output and stand-ins for the daemon and launchd. Three breaks each failed it
+  ([evidence](../bench/results/item7-keychain/README.md#registering-again)). It wasn't run
+  against a real kept requirement.
 
 **Not done yet.**
 
 - **The Developer ID profile** for `dev.voidfs.app`, and so the export and its notarization.
-- **Registering again** when launchd refuses the job for a kept launch requirement.
 - **Logout and login, and a reboot**: the key read at login, and before the first unlock.
 - **The form in the running menu**, and Import key file….

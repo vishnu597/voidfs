@@ -240,10 +240,48 @@ same on 9 October when switching between Developer ID and development copies
 slice's job never shipped, but an update that changes a job's program, or a switch between
 differently signed copies, would hit it.
 
+## Registering again
+
+After the live run, at the user's request, Start at login notices that refusal and registers the
+job once more (`apps/macos/App/LoginItem.swift`):
+
+- **The check** reads `launchctl print gui/<uid>/dev.voidfs.app.daemon`. launchd refuses the job
+  if its LWCR block names another `signing-identifier` than this binary's own (the job runs this
+  binary), or if its last exit code is 78 (EX_CONFIG). Neither `void` nor the launcher exits 78.
+- **Turning it on** checks while it waits for the daemon, about once a second. On a refusal it
+  unregisters and registers the job, once, and waits again. Its note says why, for example
+  "launchd refused the job (its launch requirement names dev.voidfs.void, not dev.voidfs.app), so
+  it was registered again."
+- **Turning it on while it is on**, and **opening the menu**, check too. The menu checks once per
+  run of the app, for a job left on across an update.
+- `login-item status` says when launchd refuses the job.
+
+`voidfs login-item selftest` ([output](raw/login-item-selftest.txt)) passed all 15 checks on the
+signed Release build:
+- the check against `launchctl print` as it was in the live run: the kept requirement (with and
+  without exit code 78), the job's own requirement, exit code 78 alone, clean and failed exits, a
+  signing identifier outside the requirement's block, and an unsigned binary;
+- this binary's signing identifier, `dev.voidfs.app`;
+- the wait, with stand-ins for the daemon and launchd: refused then answering; refused still (once
+  only, the wait starting over); not refused, past the old daemon; registering again failing; and
+  the note.
+
+Three breaks each failed it, run as a plain `swiftc` build of the app's sources, whose own
+identifier check fails by design ([output](raw/login-item-breaks.txt)). The file was restored byte
+for byte afterwards.
+- With the identifier comparison removed, the kept requirement isn't named, and without exit 78 isn't caught.
+- With registration repeated on every refusal, a refusal that stays makes it register twice.
+- With the requirement's block never ending, an identifier after it counts.
+
+The fix wasn't run against a real kept requirement: that needs a job registered with another
+program first. Its build registered the copy with LaunchServices and pluginkit, and unregistering
+it put both back ([snapshots](raw/registration.txt)).
+
 ## Not covered
 
 - **The Developer ID export**: it needs the "voidfs App Developer ID" profile, then notarizing.
 - **Logout and login, and a reboot**: the key read by the job at login, and before the first
   unlock.
-- **A fix for the kept launch requirement**: the app doesn't yet notice it, nor register again.
+- **Registering again against a real kept requirement**, rather than recorded `launchctl print`
+  output and stand-ins.
 - **The form in the running menu**, and its Import key file panel.

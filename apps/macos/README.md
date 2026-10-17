@@ -91,9 +91,11 @@ start and a crash. Login Items' approval flow, logout and reboot are untested
 ([step 5, item 7](../../docs/step-5-macos.md#the-apps-login-daemon-17-october)). The Keychain
 handover was checked on a registered development build: the adopted `daemon.json`, a restart on a
 new sign-in, and the stop on sign-out
-([the Keychain slice](../../docs/step-5-macos.md#the-server-key-in-the-keychain-17-october)). If
-launchd refuses the job after you switch between differently signed copies ("Launch Constraint
-Violation" in its log, exit code 78), turn Start at login off and on again.
+([the Keychain slice](../../docs/step-5-macos.md#the-server-key-in-the-keychain-17-october)).
+launchd may refuse the job after you switch between differently signed copies, or after its
+program changes ("Launch Constraint Violation" in its log, exit code 78). Turning Start at login
+on, and opening the menu, notice that and register the job again; `voidfs login-item status`
+reports it, and `voidfs login-item selftest` checks the logic.
 
 Then mount a drive by its alias or id. `void mount` asks the daemon, which mounts it with the
 module (the `fskit` adapter) and mounts it again when it starts:
