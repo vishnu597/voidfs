@@ -1,0 +1,65 @@
+## xcodebuild -scheme voidfs -configuration Release -allowProvisioningUpdates build
+/Users/vishnu/Coding/voidfs/apps/macos/voidfs.xcodeproj: error: No Accounts: Add a new account in Accounts settings. (in target 'voidfs' from project 'voidfs')
+/Users/vishnu/Coding/voidfs/apps/macos/voidfs.xcodeproj: error: No profiles for 'dev.voidfs.app' were found: Xcode couldn't find any Mac App Development provisioning profiles matching 'dev.voidfs.app'. (in target 'voidfs' from project 'voidfs')
+** BUILD FAILED **
+
+## The unsigned build: xcodebuild ... CODE_SIGNING_ALLOWED=NO build
+** BUILD SUCCEEDED **
+
+## Test copy 1: Developer ID, keychain-access-groups, no profile
+entitlements:
+{
+  "com.apple.application-identifier" => "HAUTK68F56.dev.voidfs.app"
+  "com.apple.developer.team-identifier" => "HAUTK68F56"
+  "com.apple.security.application-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+  "keychain-access-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+}
+$ voidfs.app/Contents/MacOS/voidfs server-key selftest
+Killed: 9 (exit 137)
+amfid, from log show:
+E  amfid: Restricted entitlements not validated, bailing out. Error: Error Domain=AppleMobileFileIntegrityError Code=-413 "No matching profile found"
+Df amfid: $SCRATCH/test/voidfs.app/Contents/MacOS/voidfs not valid: Error Domain=AppleMobileFileIntegrityError Code=-413 "No matching profile found"
+
+## Test copy 2, which ran everything here
+$ ls voidfs.app/Contents voidfs.app/Contents/MacOS
+Info.plist
+Library
+MacOS
+PkgInfo
+_CodeSignature
+embedded.provisionprofile
+void
+voidfs
+$ codesign -dv --verbose=2 voidfs.app
+Identifier=dev.voidfs.app
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20500 size=5338 flags=0x10000(runtime) hashes=156+7 location=embedded
+Authority=Apple Development: … (VN95MHY574)
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=HAUTK68F56
+$ codesign -d --entitlements - voidfs.app
+{
+  "com.apple.application-identifier" => "HAUTK68F56.dev.voidfs.app.fskit"
+  "com.apple.developer.team-identifier" => "HAUTK68F56"
+  "com.apple.security.application-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+  "keychain-access-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+}
+embedded.provisionprofile: Mac Team Provisioning Profile: dev.voidfs.app.fskit (212b8b5a-3ae6-48e2-817f-c2833beea556)
+$ codesign -dv --verbose=2 voidfs.app/Contents/MacOS/void
+Identifier=dev.voidfs.void
+CodeDirectory v=20500 size=66299 flags=0x10000(runtime) hashes=2066+2 location=embedded
+Authority=Developer ID Application: … (HAUTK68F56)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=HAUTK68F56
+$ codesign --verify --deep --strict voidfs.app
+verifies

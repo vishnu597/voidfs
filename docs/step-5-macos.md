@@ -66,7 +66,11 @@ terminal's `void daemon install` agent, as the user chose, so that one daemon, s
 owns a state directory. On a registered copy, with a throwaway state directory, the app took over
 from a real agent and from a hand-started daemon, and launchd kept, restarted and stopped the
 daemon as intended. The Developer ID export signs the bundled `void` for distribution, and
-Apple notarized the app with it. The approval flow, logout and reboot remain.
+Apple notarized the app with it. You now sign in from the menu: the server key goes into the
+shared team Keychain, and the login job hands it to `void` on a pipe
+([Keychain](#the-server-key-in-the-keychain-17-october)). That slice passed its tests and a
+self-test on a hand-signed copy; the real build waits for a provisioning profile for
+`dev.voidfs.app`. The approval flow, logout and reboot remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -376,8 +380,10 @@ actions, not actions performed by writing this plan.
 **Started, 17 October:** the first slice, [the app's login daemon](#the-apps-login-daemon-17-october),
 packages `void` in the app and registers it with SMAppService. It shows the approval-required and
 disabled states, guides the user to switch on both extensions, and keeps the terminal's agent
-compatible, with the app taking over its state directory. Keychain credentials, the `/Volumes`
-helper and the done-when come later.
+compatible, with the app taking over its state directory. The second,
+[the server key in the Keychain](#the-server-key-in-the-keychain-17-october), signs in from the
+menu and keeps the key out of files and arguments; its build needs a profile for
+`dev.voidfs.app`. The `/Volumes` helper and the done-when come later.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
@@ -2838,8 +2844,8 @@ Everything was restored afterwards.
   job wasn't registered.
 - **Turning Start at login off stops the daemon**, and with it the mounts, until
   `void daemon start`.
-- **Not started:** credentials still come from `daemon.json` rather than the Keychain, and there
-  is no `/Volumes` helper. Busy eject and the done-when are open.
+- **Not started:** there is no `/Volumes` helper. Busy eject and the done-when are open.
+  Credentials moved into the Keychain in the [next slice](#the-server-key-in-the-keychain-17-october).
 
 **The Keychain probe** (17 October,
 [evidence](../bench/results/item7-keychain-probe/README.md)). The user chose the shared team
@@ -2857,4 +2863,103 @@ moved there from `daemon.json`, with the daemon reading it itself. Throwaway pro
   can't, so the slice doesn't rely on it.
 - So the app needs profiles for `dev.voidfs.app`. A daemon reading the key itself needs its own
   helper bundle, App ID and profiles too.
+- **The user then chose the app to hand the key over**, so that only `dev.voidfs.app` needs
+  profiles: the next slice.
 
+### The server key in the Keychain, 17 October
+
+Item 7's second slice: you sign in to the voidfs server from the menu, the key goes into the
+shared team Keychain, and the login job hands it to the daemon. The user chose, on 17 October,
+the shared team Keychain, moving `daemon.json` into it, and the app handing the key over, so that
+only `dev.voidfs.app` needs profiles.
+[Evidence](../bench/results/item7-keychain/README.md).
+
+**The item** (`apps/macos/App/ServerKey.swift`).
+
+- A generic password in the data-protection keychain, access group `HAUTK68F56.dev.voidfs`,
+  readable after the first unlock and never synced or moved to another Mac.
+- One for each state directory: service `dev.voidfs.daemon`, the directory's path as the account.
+- It holds what `daemon.json` holds: the server, its region, and the key's id and secret. Debug
+  and Release builds share it, being one team and one group.
+
+**Signing in** (`apps/macos/App/SignIn.swift`).
+
+- **The menu.** It shows "Not signed in to a voidfs server" with a Sign in… button, which opens a
+  form: server, region (us-east-1 when empty), access key id, and the secret in a secure field.
+  Import key file… fills the form from a key file. Signed in, the menu shows the server and the
+  key's id, and a Sign out button.
+- **The check.** Before keeping a key, the app runs the bundled `void drives` with it on stdin.
+  A key the server refuses, or a server that doesn't answer within 30 s, isn't kept, and the menu
+  says why.
+- **While Start at login is on**, signing in restarts the daemon with the new key, and signing out
+  stops it and deletes any `daemon.json`.
+- **Start at login** can't be switched on until there is a key, in the Keychain or in a
+  `daemon.json`: its "not configured" state now says to sign in first.
+- **Headless:** `voidfs server-key status | sign-in --endpoint <url> [--region <region>]
+  --key-file <file | -> | sign-out | selftest`. The key file is the JSON `void keys generate`
+  prints, or `VOIDFS_*` lines, which may also name the server and region. Status names the server
+  and the key's id, never the secret.
+
+**The handover.** The job's plist now runs the app's own binary, `voidfs daemon-launch`, rather
+than `void`. It:
+
+1. opens the state directory's `daemon.log`, moving it aside past 8 MiB as the CLI does;
+2. moves a `daemon.json` that the terminal left into the Keychain, unless the Keychain has a key
+   already, and deletes the file either way. A file the Keychain refuses stays, and its key
+   starts the daemon; one that can't be read stays too;
+3. reads the key. With none, it logs "no server key in voidfs.app for <dir>: sign in from its menu;
+   not starting" and exits 0, so that launchd doesn't run it again every 10 s;
+4. starts the bundled `void daemon run --app --logged --endpoint <server> --key-file /dev/stdin`
+   suspended, with a fixed environment (`PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`,
+   `VOIDFS_STATE_DIR` and `VOIDFS_REGION`);
+5. checks the started process against voidfs's code requirement: Apple-issued, team
+   `HAUTK68F56`, identifier `dev.voidfs.void`. Anything else is killed before it reads a byte;
+6. writes the key to the pipe and lets `void` run.
+
+The launcher stays as `void`'s parent for launchd to watch. It passes SIGTERM and SIGINT on,
+ignores SIGHUP, exits as `void` does, and dies by the same signal when `void` is killed, so that
+launchd runs the job again. Once the key is in the Keychain, its secret is in no file, argument,
+environment variable, status or log line.
+
+**The CLI, while the app has the directory.** `void daemon start` and every command that starts
+the daemon write no `daemon.json`: the app's key is the one the daemon uses. If the app has no
+key, they fail at once with `NoCredentials`, saying to sign in from the menu and quoting the log,
+rather than waiting 20 s. `daemon run --app --logged` is the launcher's: it doesn't run itself
+again into the log.
+
+**Profiles.** Every executable that claims the Keychain group needs a provisioning profile
+embedded in its own bundle; now that is the app alone. `App.entitlements` claims
+`keychain-access-groups`. The signed build needs a Mac App Development profile for
+`dev.voidfs.app`, and the Developer ID export needs one named "voidfs App Developer ID"
+(`ExportOptions-DeveloperID.plist`). Xcode on this Mac has no account to make the first, so the
+signed build failed; a Developer ID copy without a profile was killed at launch (amfid -413).
+
+**Evidence.**
+
+- `the_apps_daemon_takes_its_key_from_the_app` runs the job with a stand-in `launchctl` that does
+  what the launcher does. With no key in the app, `daemon start` fails with `NoCredentials` within
+  10 s and writes no `daemon.json`, though the terminal has a key. With one, it starts the daemon
+  from an empty environment. Two breaks each failed the test. All 55 CLI tests and workspace
+  clippy pass.
+- A test copy of the app ran `voidfs server-key selftest`, and all 19 checks passed. The copy was
+  hand-signed with Apple Development, its extensions removed, and borrowed the FSKit extension's
+  development profile as a harness. The checks covered:
+  - the store, and adopting `daemon.json` both ways;
+  - `/bin/cat` and an ad hoc `void` refused;
+  - the launcher's daemon answering with the Keychain's server, its stop, SIGTERM and `kill -9`;
+  - no key, and no secret in the log.
+- From the same copy, `server-key sign-in` against a local test server kept a good key and
+  refused an unknown key, an unreachable server and a non-HTTP URL. `sign-out` removed the key.
+- The menu's new rows were drawn offscreen.
+
+**Registration.** Nothing was registered with SMAppService, and no defaults were written. The
+unsigned build and the test copy were each registered with LaunchServices by building or running
+them, and unregistered.
+
+**Not done yet.**
+
+- **The profiles** for `dev.voidfs.app`, development and Developer ID, and so the real build, the
+  export and its notarization.
+- **The live run**: the job registered, launchd running `daemon-launch`, a sign-in that restarts
+  the daemon and a sign-out that stops it, and the key read at login.
+- **The form in the running menu**, and Import key file….

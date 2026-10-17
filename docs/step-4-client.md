@@ -890,6 +890,8 @@ adapters. What the first built:
   reads that file. A daemon launchd starts at login then needs no secret in its plist. `daemon
   run` uses a connection it is given, else the file. Space's daemon uses the session `space
   login` keeps in its `config.json`; the Keychain can hold the key once accounts exist (step 6).
+  While voidfs.app starts the daemon, the key is in the app's Keychain instead, and `daemon start`
+  writes no file ([step 5, item 7](step-5-macos.md#the-server-key-in-the-keychain-17-october)).
 - **`daemon start`** launches `void daemon run` in its own process group, so that the terminal's
   Ctrl-C doesn't reach it (it ignores SIGHUP too), with its output in `<state>/daemon.log`
   (moved to `daemon.log.1` past 8 MiB), and returns once the socket answers, or with the log's

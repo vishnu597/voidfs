@@ -173,9 +173,12 @@ billing or plans), this page says so.
     **Item 7 has started** (17 October, [step 5](step-5-macos.md#the-apps-login-daemon-17-october)):
     the app carries its own `void` and can register it with SMAppService as the daemon at login,
     taking over from `void daemon install`'s agent. A live run on a registered copy with a throwaway
-    state directory showed the takeover, the refusal, stop, start and a crash restart. Login
-    Items' approval flow, logout and reboot, the Developer ID export, Keychain credentials and the
-    `/Volumes` helper are still to come.
+    state directory showed the takeover, the refusal, stop, start and a crash restart. Apple
+    notarized the Developer ID export with the bundled `void`. You sign in from the menu, the key
+    goes into the shared team Keychain, and the login job hands it to `void` on a pipe
+    ([Keychain](step-5-macos.md#the-server-key-in-the-keychain-17-october)); that ran on a
+    hand-signed copy, and the real build needs a provisioning profile for `dev.voidfs.app`. Login
+    Items' approval flow, logout and reboot and the `/Volumes` helper are still to come.
     Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
