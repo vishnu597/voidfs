@@ -5,9 +5,11 @@
 // limit and clear. The daemon is the only source: the app keeps no state of its own, so what the
 // menu shows comes back after the app, the bridge or the daemon restarts.
 //
-// A mount's unpublished saves can be paused and resumed here, not cancelled. Cancelling one marks
-// the file's copy on this Mac as an error and deletes the bytes staged for it, and the menu doesn't
-// yet say so. Imports, whose source files stay where they are, can be cancelled.
+// Cancel stops an upload. For an import, its unsent files aren't uploaded; their sources stay where
+// they are. For a mount's change, the user chose the fate (16 October): the copy on this Mac keeps
+// the change, not uploaded ("kept"), and the next save of the file uploads it as it is then,
+// guarded on the drive's version, so another computer's save meanwhile becomes a conflict. The
+// menu says so beside the button, and again after a cancel. Finder's context menu has no cancel.
 
 import Foundation
 import Observation
@@ -22,6 +24,8 @@ struct DaemonStatus: Decodable {
 
     struct Uploads: Decodable {
         let uploading, queued, failed, conflicts, pausedItems, unpublished, unpublishedBytes, rate: UInt64
+        /// Files with a cancelled mount change, kept on this Mac; older daemons don't send it.
+        let kept: UInt64?
         let paused: Bool
         let pausedDrives: [String]
         let bandwidth: UInt64?
@@ -51,6 +55,11 @@ struct UploadList: Decodable {
         let size, sent: UInt64
         let conflict, error: String?
         var finished: Bool { state == "done" || state == "cancelled" }
+        /// A mount's change whose upload was cancelled: on this Mac, not uploaded.
+        var kept: Bool { state == "kept" }
+        var toSend: Bool { !finished && !kept }
+        /// A mount's conflict isn't cancelled: both versions stay on this Mac until it's resolved.
+        var cancellable: Bool { toSend && !(batch == nil && conflict != nil) }
     }
 
     struct Batch: Decodable, Identifiable {
@@ -119,9 +128,23 @@ enum Words {
         }
     }
 
+    /// `void status`'s words for files with a kept change.
+    static func kept(_ files: UInt64) -> String {
+        "\(files) \(files == 1 ? "file" : "files") kept on this Mac, not uploaded"
+    }
+
+    /// What a cancel says it did to a mount's changes.
+    static func keptByCancel(_ changes: UInt64) -> String {
+        "\(changes) \(changes == 1 ? "change stays" : "changes stay") on this Mac, not uploaded: saving the file again uploads it as it is then."
+    }
+
+    /// What a cancel that changed nothing says.
+    static let nothingCancelled = "Nothing was cancelled: it was sent already, or it waits for a conflict, which stays on this Mac until it's resolved."
+
     /// `void status`'s uploads line.
     static func uploads(_ u: DaemonStatus.Uploads) -> String {
-        if u.unpublished == 0 { return u.paused ? "idle · paused" : "idle" }
+        let kept = (u.kept ?? 0) > 0 ? " · \(Self.kept(u.kept ?? 0))" : ""
+        if u.unpublished == 0 { return (u.paused ? "idle · paused" : "idle") + kept }
         let parts = [(u.uploading, "uploading"), (u.queued, "queued"), (u.failed, "failed"), (u.conflicts, "in conflict")].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
         var line = "\(parts.joined(separator: ", ")) · \(size(u.unpublishedBytes)) to send"
         if u.rate > 0 { line += " · \(size(u.rate))/s" }
@@ -132,7 +155,7 @@ enum Words {
         }
         if !u.pausedDrives.isEmpty { line += " · paused on \(u.pausedDrives.joined(separator: ", "))" }
         if let b = u.bandwidth { line += " · limit \(size(b))/s" }
-        return line
+        return line + kept
     }
 
     /// An item's state, as `void uploads` says it.
@@ -144,6 +167,7 @@ enum Words {
         case "failed": return "failed: \(i.error ?? "")"
         case _ where i.paused && !i.finished: return "paused"
         case "done" where i.conflict != nil: return "done, over a newer version"
+        case "kept": return "kept on this Mac, not uploaded"
         default: return i.state
         }
     }
@@ -183,6 +207,8 @@ final class Transfers {
     private(set) var problem: String?
     /// The last control's failure, until the next control.
     private(set) var controlError: String?
+    /// What the last control did that its button doesn't show: a cancel keeping a mount's changes.
+    private(set) var notice: String?
     @ObservationIgnored let socket: DaemonSocket?
     @ObservationIgnored private var started = false
 
@@ -244,19 +270,32 @@ final class Transfers {
 
     func pause(_ scope: UploadScope) async { await call("POST", "/v1/uploads/pause", scope.json) }
     func resume(_ scope: UploadScope) async { await call("POST", "/v1/uploads/resume", scope.json) }
-    /// Offered for imports only; see the top of this file.
-    func cancel(_ scope: UploadScope) async { await call("POST", "/v1/uploads/cancel", scope.json) }
+    /// For an import and for a mount's change, which stays on this Mac; see the top of this file.
+    func cancel(_ scope: UploadScope) async {
+        let answer = await call("POST", "/v1/uploads/cancel", scope.json)
+        let kept = (answer?["kept"] as? NSNumber)?.uint64Value ?? 0
+        if kept > 0 {
+            notice = Words.keptByCancel(kept)
+        } else if (answer?["items"] as? NSNumber)?.uint64Value == 0 {
+            notice = Words.nothingCancelled
+        }
+    }
     func limit(_ bytesPerSecond: UInt64?) async { await call("PUT", "/v1/uploads/limit", ["bytesPerSecond": bytesPerSecond.map { $0 as Any } ?? NSNull()]) }
     func clearFinished() async { await call("POST", "/v1/uploads/clear", nil) }
     /// As `void unmount`: the daemon unmounts it and forgets it; its unpublished changes still go.
     func unmount(_ m: DaemonStatus.Mount) async { await call("POST", "/v1/mounts/unmount", ["target": m.mountpoint]) }
 
-    private func call(_ method: String, _ target: String, _ body: Any?) async {
-        guard let socket else { return }
+    /// The daemon's answer to a control, when it succeeded.
+    @discardableResult
+    private func call(_ method: String, _ target: String, _ body: Any?) async -> [String: Any]? {
+        guard let socket else { return nil }
+        notice = nil
+        var answer: [String: Any]?
         do {
             let data = try body.map { try JSONSerialization.data(withJSONObject: $0, options: .fragmentsAllowed) } ?? Data()
             let r = try await socket.request(method, target, generation: nil, contentType: body == nil ? nil : "application/json", body: data, limit: 1 << 20)
             controlError = (200..<300).contains(r.status) ? nil : Self.message(r)
+            if controlError == nil { answer = (try? JSONSerialization.jsonObject(with: r.body)) as? [String: Any] }
         } catch DaemonSocketError.notRunning {
             controlError = "The voidfs daemon isn't running."
         } catch {
@@ -264,6 +303,7 @@ final class Transfers {
         }
         await refresh()
         await refreshQueue()
+        return answer
     }
 
     /// The daemon's error message, or its status code.
@@ -324,6 +364,7 @@ struct TransfersView: View {
                 changes(q)
                 imports(q)
             }
+            if let n = transfers.notice { Text(n).font(.caption).textSelection(.enabled) }
             if let e = transfers.controlError { Text(e).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
         }
     }
@@ -382,16 +423,24 @@ struct TransfersView: View {
         }
     }
 
-    /// Unfinished changes: the uploading ones first, then those that need looking at.
+    /// What Cancel does to a mount's change, beside the button.
+    static let keepsHere = "Cancel keeps a change on this Mac, not uploaded. Saving the file again uploads it as it is then."
+
+    /// Unfinished changes: the uploading ones first, then those that need looking at, then those
+    /// kept on this Mac.
     @ViewBuilder
     private func changes(_ q: UploadList) -> some View {
-        let order = ["uploading": 0, "failed": 1, "queued": 2]
+        let order = ["uploading": 0, "failed": 1, "queued": 2, "kept": 4]
         let open = q.items.filter { !$0.finished }.sorted { (order[$0.state] ?? 3, $0.id) < (order[$1.state] ?? 3, $1.id) }
-        let saved = open.filter { $0.batch == nil }.count
+        let saved = open.filter { $0.batch == nil && $0.toSend }.count
+        let kept = Set(open.filter(\.kept).map { "\($0.drive)/\($0.key)" }).count
         if !open.isEmpty {
             Divider()
             if saved > 0 {
-                Text("\(saved) \(saved == 1 ? "change is" : "changes are") saved on this Mac and not yet on the drive.").font(.caption).foregroundStyle(.secondary)
+                Text("\(saved) \(saved == 1 ? "change is" : "changes are") saved on this Mac and not yet on the drive. \(Self.keepsHere)").font(.caption).foregroundStyle(.secondary)
+            }
+            if kept > 0 {
+                Text("\(Words.kept(UInt64(kept))): saving one again uploads it.").font(.caption).foregroundStyle(.secondary)
             }
             ForEach(open.prefix(Self.shownItems)) { i in
                 HStack(alignment: .firstTextBaseline) {
@@ -402,13 +451,16 @@ struct TransfersView: View {
                     .font(.caption)
                     .textSelection(.enabled)
                     Spacer()
-                    if i.paused {
-                        Button("Resume", action: act { await $0.resume(.entry(i.id)) })
-                    } else {
-                        Button("Pause", action: act { await $0.pause(.entry(i.id)) })
-                    }
-                    if i.batch != nil {
-                        Button("Cancel", action: act { await $0.cancel(.entry(i.id)) })
+                    if i.toSend {
+                        if i.paused {
+                            Button("Resume", action: act { await $0.resume(.entry(i.id)) })
+                        } else {
+                            Button("Pause", action: act { await $0.pause(.entry(i.id)) })
+                        }
+                        if i.cancellable {
+                            Button("Cancel", action: act { await $0.cancel(.entry(i.id)) })
+                                .help(i.batch == nil ? Self.keepsHere : "Cancel this file's upload. Its source stays where it is.")
+                        }
                     }
                 }
                 .controlSize(.small)

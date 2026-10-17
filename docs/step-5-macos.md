@@ -8,7 +8,8 @@ and attribute changes added 8 October; the signed-bundle probe, the rest of the 
 the Swift bridge and one daemon for the CLI and the app added 9 October; read-only FSKit on the
 daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October; the
 application matrix and its first fixes added 13 October; held mmap delivery and its durability
-policy clarified 14 October; menu-bar transfers and Finder Sync badges added 16 October. **Item 1 is complete**
+policy clarified 14 October; menu-bar transfers, Finder Sync badges and the fate of a mount's
+cancelled change added 16 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -39,14 +40,15 @@ decode/export checks on this Mac, including direct cold/warm decoder opens on a 
 fresh fork; native Xcode open/edit/save/build/run also passes.
 QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and two
 independent Macs and the absent paid target apps remain explicitly untested.
-**Item 8's first two slices are built, not complete** (16 October): the menu shows the daemon's
+**Item 8's first three slices are built, not complete** (16 October): the menu shows the daemon's
 connection, queue and mounts in the CLI's words and controls the queue
 ([menu-bar transfers](#menu-bar-transfers-16-october)), and a Finder Sync extension badges mounted
 drives' items from one new daemon call that reads only local state
 ([Finder Sync badges](#finder-sync-badges-16-october)). Every badge state and the context menu's
 pause and resume were shown in a live Finder on an FSKit mount the same day
-([live run](../bench/results/finder-sync-badges-live/README.md)). Neither offers cancel for a
-mount's changes.
+([live run](../bench/results/finder-sync-badges-live/README.md)). Cancelling a mount's change
+keeps it on this Mac, not uploaded, until the file is saved again, as the user chose; the menu
+offers it and Finder doesn't ([cancelling](#cancelling-a-mounts-change-16-october)).
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -355,14 +357,15 @@ actions, not actions performed by writing this plan.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
-**Two slices built, 16 October, not complete.** The menu's transfers view and its queue controls,
+**Three slices built, 16 October, not complete.** The menu's transfers view and its queue controls,
 checked against a test daemon ([menu-bar transfers](#menu-bar-transfers-16-october)). Finder Sync
 badges for saved, pending, saving, error and conflict, a drive's pause and resume in the context
 menu, and the daemon call behind them, checked against a test daemon without Finder and then in a
 live Finder on an FSKit mount ([Finder Sync badges](#finder-sync-badges-16-october)); badge reads
-cost no server request. A mount's changes can be paused but not cancelled until the app can say
-what happens to the copy on this Mac. A live mount's rows in the menu, offline states, the bridge
-restarting and Finder beside the menu bar remain.
+cost no server request. The fate of a mount's cancelled change is defined and shown: it stays on
+this Mac, not uploaded, until the next save uploads the file as it is then, and the menu offers
+Cancel and says so ([cancelling](#cancelling-a-mounts-change-16-october)). A live mount's rows in
+the menu, offline states, the bridge restarting and Finder beside the menu bar remain.
 
 Use the existing daemon status/upload stream for mounts, connectivity, queue progress, per-item
 and global pause/resume, cancel and immediate bandwidth caps. Distinguish local durable saves
@@ -2435,3 +2438,53 @@ Not shown: Finder beside the menu bar's transfers view
 ([menu-bar transfers](#menu-bar-transfers-16-october), merged in
 [PR #74](https://github.com/vishnu597/voidfs/pull/74)), an offline link, and two Macs. A pending
 deletion leaves no name to badge, so it doesn't mark its folder. Item 8's done-when is not met.
+
+### Cancelling a mount's change, 16 October
+
+**Item 8's cancel.** Until now, cancelling a mount's change marked the file's copy on this Mac as
+an error and deleted the bytes the queue had frozen for it. A Rust test at `main` showed what
+followed ([before](../bench/results/mount-cancel-kept/raw/cancel-before.txt)): the copy here kept
+the cancelled bytes, every later save of the file failed for good ("the mount edit's predecessor
+was not published"), another computer's save didn't show and wasn't a conflict, and deleting the
+file here never reached the drive. The user chose the fate on 16 October: **cancel keeps the
+change on this Mac, not uploaded, and the next save uploads the whole file as it is then.**
+Nothing is lost, no open app sees its file change under it, and the file no longer gets stuck.
+The user also kept cancel in the menu bar only; Finder's context menu keeps the drive's Pause
+Uploads and Resume Uploads.
+
+The journal has a new state, `kept` (store migration 10, whose index finds a mount's kept
+changes; a binary from before it refuses to open the state, "written by a newer voidfs", rather
+than publish them). A cancel
+turns a mount's change in its scope into `kept`, with every later mount change that would have
+waited for it. Kept changes stay in the journal with their frozen bytes and are never scheduled.
+What was uploading stops at its next request, and an attempt that may have landed still goes
+alone later and is recognized by its marker. The file's state on this Mac becomes `kept`: Finder
+badges it "Not uploaded: kept on this Mac", ranked below error and conflict and above saving and
+pending in a folder's state; `void uploads` says "kept on this Mac, not uploaded"; `void status`
+and the menu add "N files kept on this Mac, not uploaded", and `void status` says so from the
+journal while no daemon runs.
+
+The next mount change that needs a kept one queues it again in the same transaction: a save of
+the same file, its rename or deletion, or a change that must come after it. The drive then gets
+the file as it is on this Mac, guarded on the version the kept change was made on, so another
+computer's save in the meantime becomes a conflict, with both versions kept here. A new file's
+kept creation folds into one put at its next save. A deletion after a kept edit publishes the edit
+first, so it stays in the file's history. Cancel leaves a mount's conflict, and what waits for one,
+as they are: both versions are already on this Mac and nothing of them is sent until the conflict
+is resolved, so the menu offers no Cancel for a conflict. Imports are unchanged: a cancelled
+import's unsent files aren't uploaded, their sources stay where they are, and kept mount changes
+don't hold imports back.
+
+The daemon's cancel answer counts what the cancel did, `kept` included, and `/v1/status`'s
+uploads gain `kept` (files with a kept change). The menu offers Cancel on a mount's change, says
+what it does beside the button ("Cancel keeps a change on this Mac, not uploaded. Saving the file
+again uploads it as it is then."), and says what it did afterwards. The bridge's `SyncState`
+gains `kept` as its last value, so an FSKit module built before it can't read that state from a
+newer agent; the app, the agent and the module ship in one bundle.
+
+The [evidence](../bench/results/mount-cancel-kept/README.md) has the Rust tests' output and the
+app's self-tests against an isolated test daemon: Finder's model badges a kept file and its
+folder through a pause, a resume and a conflict from `mount_peer` (35 checks), and the menu's
+model cancels a waiting mount change, which becomes kept, with the notice and the uploads line
+saying so, and leaves a conflict as it is. Not shown here: Cancel clicked in the real menu, and
+two Macs.

@@ -191,14 +191,17 @@ final class BadgesSelfTest: @unchecked Sendable {
             try await write(s, conflict, "mine\n")
             _ = try await file(s, folder, "saving.txt", "saving\n")
             _ = try await file(s, folder, "pending.txt", nil)
-            _ = try await file(s, folder, "error.txt", "error\n")
+            _ = try await file(s, folder, "kept.txt", "kept\n")
             let nested = try await again { try await s.create(folder, "nested", mode: 0o755, directory: true) }.ino
             _ = try await file(s, nested, "inner.txt", nil)
-            // A cancelled entry is an error: the local copy is kept, not published.
+            // A cancelled entry is kept: the local copy keeps it, not uploaded, until a later save.
             let uploads = try json("GET", "/v1/uploads") as? [String: Any]
-            let entries = (uploads?["items"] as? [[String: Any]] ?? []).filter { $0["key"] as? String == "\(dir)/error.txt" && ["queued", "uploading"].contains($0["state"] as? String ?? "") }
+            let entries = (uploads?["items"] as? [[String: Any]] ?? []).filter { $0["key"] as? String == "\(dir)/kept.txt" && ["queued", "uploading"].contains($0["state"] as? String ?? "") }
             for e in entries { _ = try json("POST", "/v1/uploads/cancel", ["entry": e["id"] as Any]) }
-            check("error.txt's \(entries.count) entries are cancelled", !entries.isEmpty)
+            let ids = Set(entries.compactMap { $0["id"] as? Int })
+            let after = (try json("GET", "/v1/uploads") as? [String: Any])?["items"] as? [[String: Any]] ?? []
+            let states = Set(after.filter { ids.contains($0["id"] as? Int ?? -1) }.compactMap { $0["state"] as? String })
+            check("kept.txt's \(entries.count) entries are cancelled, and kept on this Mac", !entries.isEmpty && states == ["kept"], "\(states)")
             // Someone else saves conflict.txt meanwhile: this Mac's guarded save will be refused.
             var theirs = false
             if let peer {
@@ -213,17 +216,17 @@ final class BadgesSelfTest: @unchecked Sendable {
                 say("no --peer: conflict.txt can't conflict, and stays saving until the resume saves it")
             }
             await expectBadges("paused", [
-                (dir, "error"), ("\(dir)/saved.txt", "saved"), ("\(dir)/saving.txt", "saving"), ("\(dir)/pending.txt", "pending"),
-                ("\(dir)/error.txt", "error"), ("\(dir)/conflict.txt", "saving"), ("\(dir)/nested", "pending"), ("\(dir)/nested/inner.txt", "pending"),
+                (dir, "kept"), ("\(dir)/saved.txt", "saved"), ("\(dir)/saving.txt", "saving"), ("\(dir)/pending.txt", "pending"),
+                ("\(dir)/kept.txt", "kept"), ("\(dir)/conflict.txt", "saving"), ("\(dir)/nested", "pending"), ("\(dir)/nested/inner.txt", "pending"),
             ])
             model.observe(url(dir))
             model.observe(url("\(dir)/nested"))
 
-            // Released: everything saves but the cancelled file, and the drive refuses conflict.txt.
+            // Released: everything saves but the kept file, and the drive refuses conflict.txt.
             _ = try json("POST", "/v1/uploads/resume", ["drive": drive])
             await expectBadges("resumed", [
-                (dir, theirs ? "conflict" : "error"), ("\(dir)/saved.txt", "saved"), ("\(dir)/saving.txt", "saved"), ("\(dir)/pending.txt", "saved"),
-                ("\(dir)/error.txt", "error"), ("\(dir)/conflict.txt", theirs ? "conflict" : "saved"), ("\(dir)/nested", "saved"), ("\(dir)/nested/inner.txt", "saved"),
+                (dir, theirs ? "conflict" : "kept"), ("\(dir)/saved.txt", "saved"), ("\(dir)/saving.txt", "saved"), ("\(dir)/pending.txt", "saved"),
+                ("\(dir)/kept.txt", "kept"), ("\(dir)/conflict.txt", theirs ? "conflict" : "saved"), ("\(dir)/nested", "saved"), ("\(dir)/nested/inner.txt", "saved"),
             ], within: .seconds(60))
 
             // Unknown: a folder that isn't there.
@@ -290,11 +293,11 @@ final class BadgesSelfTest: @unchecked Sendable {
                 guard let fresh else { check("a new session after the restart", false); return }
                 s = fresh
                 await expectBadges("restarted", [
-                    (dir, theirs ? "conflict" : "error"), ("\(dir)/saved.txt", "saved"), ("\(dir)/saving.txt", "saved"),
-                    ("\(dir)/error.txt", "error"), ("\(dir)/conflict.txt", theirs ? "conflict" : "saved"), ("\(dir)/nested", "saved"),
+                    (dir, theirs ? "conflict" : "kept"), ("\(dir)/saved.txt", "saved"), ("\(dir)/saving.txt", "saved"),
+                    ("\(dir)/kept.txt", "kept"), ("\(dir)/conflict.txt", theirs ? "conflict" : "saved"), ("\(dir)/nested", "saved"),
                 ], within: .seconds(60))
             }
-            say("left on the drive: \(dir) (its error and conflict files keep their states until someone resolves them)")
+            say("left on the drive: \(dir) (its kept and conflict files keep their states until the next save or until someone resolves them)")
             try await s.release()
         } catch {
             check("the badge run", false, "\(error)")

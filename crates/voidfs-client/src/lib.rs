@@ -31,5 +31,5 @@ pub use error::{Error, Result};
 pub use fetch::{ApiFetcher, Content, Fetch};
 pub use journal::{Attrs, Base, BatchId, EntryId, Op, State};
 pub use mounts::Remembered;
-pub use queue::{BatchStatus, Import, Item, Queue, QueueConfig, Scope, Status};
+pub use queue::{BatchStatus, Cancelled, Import, Item, Queue, QueueConfig, Scope, Status};
 pub use store::{Store, default_dir};

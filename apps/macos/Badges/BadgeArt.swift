@@ -20,6 +20,7 @@ enum BadgeArt {
         Badge(identifier: "saving", symbol: "arrow.up.circle.fill", color: .systemBlue, label: "Saving"),
         Badge(identifier: "error", symbol: "xmark.circle.fill", color: .systemRed, label: "Not saved: an error"),
         Badge(identifier: "conflict", symbol: "exclamationmark.triangle.fill", color: .systemOrange, label: "Not saved: changed on the drive"),
+        Badge(identifier: "kept", symbol: "minus.circle.fill", color: .systemPurple, label: "Not uploaded: kept on this Mac"),
     ]
 
     static let side: CGFloat = 320

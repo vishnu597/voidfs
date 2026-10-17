@@ -75,12 +75,18 @@ Unmount with `void unmount footage` or `umount /tmp/voidfs-mnt`. The app's `moun
 The menu also shows the daemon's transfers, in the words `void status` and `void uploads` use:
 the server and its link, the uploads line, the mounts, and the unfinished changes and imports. It
 can pause and resume everything, a drive, an import or one change, set a bandwidth limit, clear
-finished uploads and unmount. Imports can be cancelled there; a mount's changes can't, since
-cancelling one marks the file's copy on this Mac as an error and deletes its staged bytes
-(`void uploads cancel` still does it). `voidfs transfers` prints the menu's lines, and
+finished uploads and unmount. It can cancel an import, whose sources stay where they are, and a
+mount's change: the copy on this Mac keeps the change, not uploaded ("kept on this Mac"), and the
+next save of the file uploads it as it is then, guarded on the drive's version, so another
+computer's save meanwhile becomes a conflict. A mount's conflict has no Cancel: both versions
+already stay on this Mac until it's resolved. The menu says so beside the button and after a
+cancel; `void uploads cancel` does the same
+([cancelling a mount's change](../../docs/step-5-macos.md#cancelling-a-mounts-change-16-october)).
+`voidfs transfers` prints the menu's lines, and
 `voidfs transfers-selftest <drive> [--cancel] [--png <path>]` calls each control and checks the
 daemon afterwards; run it against a test daemon with `-VoidfsStateDirectory <dir>`
-([evidence](../../bench/results/menu-transfers/README.md)). Logs:
+([evidence](../../bench/results/menu-transfers/README.md),
+[cancel](../../bench/results/mount-cancel-kept/README.md)). Logs:
 `log stream --predicate 'subsystem == "dev.voidfs"'` (the module logs as category `fs`, the agent
 as `agent`).
 
@@ -240,10 +246,11 @@ launchctl kickstart -k gui/$(id -u)/dev.voidfs.agent
 
 ## Finder badges
 
-`VoidfsFinder.appex` badges the items of mounted drives as saved, pending, saving, error or
-conflict, and its context menu pauses or resumes the drive's uploads (step 5, item 8;
-[Finder Sync badges](../../docs/step-5-macos.md#finder-sync-badges-16-october)). It has no cancel
-for a mount's changes. The daemon is the only source: the extension asks the app's launch agent on
+`VoidfsFinder.appex` badges the items of mounted drives as saved, pending, saving, error,
+conflict or not uploaded (kept on this Mac after a cancel), and its context menu pauses or resumes
+the drive's uploads (step 5, item 8;
+[Finder Sync badges](../../docs/step-5-macos.md#finder-sync-badges-16-october)). Cancel is in the
+menu bar only. The daemon is the only source: the extension asks the app's launch agent on
 `HAUTK68F56.dev.voidfs.badges`, which accepts only the Finder extension's signature and asks the
 daemon's `POST /v1/mounts/states`, read from the daemon's own state, never the server. A folder
 costs one call however many files it has, and a folder that hasn't changed answers `unchanged`.

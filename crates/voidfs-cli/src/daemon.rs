@@ -333,19 +333,27 @@ pub async fn info(out: Out) -> Result<()> {
     })
 }
 
-/// What the journal holds unpublished while no daemon runs, if its state can be read.
-fn waiting(dir: &Path) -> Option<(u64, u64)> {
+/// What the journal holds unpublished while no daemon runs, if its state can be read: its
+/// changes to send and their bytes, and the files with a change kept on this Mac.
+fn waiting(dir: &Path) -> Option<(u64, u64, u64)> {
     if !dir.join("state.sqlite").exists() {
         return None;
     }
     let store = voidfs_client::Store::open(dir).ok()?;
-    voidfs_client::queue::unpublished(&store).ok()
+    let (n, bytes) = voidfs_client::queue::unpublished(&store).ok()?;
+    Some((n, bytes, voidfs_client::queue::kept(&store).ok()?))
+}
+
+/// Files with a mount change whose upload was cancelled (step 5, item 8).
+pub fn kept(files: u64) -> String {
+    format!("{} kept on this Mac, not uploaded", count(files as usize, "file"))
 }
 
 /// The uploads line of `status`.
 fn uploads_line(u: &api::Uploads) -> String {
     if u.unpublished == 0 {
-        return if u.paused { "idle · paused".into() } else { "idle".into() };
+        let idle = if u.paused { "idle · paused" } else { "idle" };
+        return if u.kept > 0 { format!("{idle} · {}", kept(u.kept)) } else { idle.into() };
     }
     let mut parts = Vec::new();
     for (n, what) in [(u.uploading, "uploading"), (u.queued, "queued"), (u.failed, "failed"), (u.conflicts, "in conflict")] {
@@ -368,6 +376,9 @@ fn uploads_line(u: &api::Uploads) -> String {
     if let Some(b) = u.bandwidth {
         line.push_str(&format!(" · limit {}/s", size(b)));
     }
+    if u.kept > 0 {
+        line.push_str(&format!(" · {}", kept(u.kept)));
+    }
     line
 }
 
@@ -377,13 +388,18 @@ pub async fn status(out: Out) -> Result<()> {
         let socket = place.socket().display();
         let waiting = waiting(&place.dir);
         let mut v = json!({ "daemon": { "running": false, "socket": place.socket() } });
-        if let Some((n, bytes)) = waiting {
-            v["uploads"] = json!({ "unpublished": n, "unpublishedBytes": bytes });
+        if let Some((n, bytes, kept)) = waiting {
+            v["uploads"] = json!({ "unpublished": n, "unpublishedBytes": bytes, "kept": kept });
         }
         return out.emit(&v, || {
             let mut text = format!("daemon    not running (socket {socket})\n          start it with `void daemon start`");
-            if let Some((n, bytes)) = waiting.filter(|(n, _)| *n > 0) {
-                text.push_str(&format!("\nuploads   {} ({}) wait in the journal, for the daemon to start", count(n as usize, "change"), size(bytes)));
+            match waiting {
+                Some((n, bytes, k)) if n > 0 => {
+                    text.push_str(&format!("\nuploads   {} ({}) wait in the journal, for the daemon to start", count(n as usize, "change"), size(bytes)));
+                    if k > 0 { text.push_str(&format!(" · {}", kept(k))); }
+                }
+                Some((_, _, k)) if k > 0 => text.push_str(&format!("\nuploads   {}", kept(k))),
+                _ => {}
             }
             text
         });
@@ -436,5 +452,9 @@ mod tests {
         assert_eq!(uploads_line(&u), "2 uploading, 3 queued · 3.0 MiB to send · 1 paused · limit 1.0 MiB/s");
         u = api::Uploads { failed: 1, conflicts: 2, unpublished: 5, unpublished_bytes: 30, ..Default::default() };
         assert_eq!(uploads_line(&u), "1 failed, 2 in conflict · 30 B to send");
+        u.kept = 1;
+        assert_eq!(uploads_line(&u), "1 failed, 2 in conflict · 30 B to send · 1 file kept on this Mac, not uploaded");
+        u = api::Uploads { kept: 2, ..Default::default() };
+        assert_eq!(uploads_line(&u), "idle · 2 files kept on this Mac, not uploaded");
     }
 }

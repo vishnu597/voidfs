@@ -142,6 +142,10 @@ pub enum State {
     Done,
     Failed,
     Cancelled,
+    /// A mount's change whose upload was cancelled: this Mac keeps it, and it isn't published
+    /// until a later change needs it (a save of the same file, or a change that must come
+    /// after it), which queues it again (step 5, item 8).
+    Kept,
 }
 
 impl State {
@@ -152,6 +156,7 @@ impl State {
             State::Done => "done",
             State::Failed => "failed",
             State::Cancelled => "cancelled",
+            State::Kept => "kept",
         }
     }
 
@@ -161,12 +166,18 @@ impl State {
             "done" => State::Done,
             "failed" => State::Failed,
             "cancelled" => State::Cancelled,
+            "kept" => State::Kept,
             _ => State::Queued,
         }
     }
 
     pub fn finished(self) -> bool {
         matches!(self, State::Done | State::Cancelled)
+    }
+
+    /// Not finished, and waiting to be sent: neither finished nor kept on this Mac.
+    pub fn to_send(self) -> bool {
+        !self.finished() && self != State::Kept
     }
 }
 

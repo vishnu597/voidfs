@@ -141,13 +141,17 @@ async fn control(s: &Shared, scope: Scope, what: Control) -> Answer<Affected> {
         voidfs_client::Scope::Batch(b) => i.batch == Some(*b),
         voidfs_client::Scope::Entry(e) => i.id == *e,
     };
-    let items = q.items.iter().filter(|i| !i.state.finished() && applies(i)).count() as u64;
+    let items = q.items.iter().filter(|i| i.state.to_send() && applies(i)).count() as u64;
     match what {
         Control::Pause => s.queue.pause(scope).await?,
         Control::Resume => s.queue.resume(scope).await?,
-        Control::Cancel => s.queue.cancel(scope).await?,
+        Control::Cancel => {
+            // What waits on a cancelled change goes with it, and a mount's conflicts stay.
+            let c = s.queue.cancel(scope).await?;
+            return Ok(Json(Affected { items: c.cancelled + c.kept, kept: c.kept }));
+        }
     }
-    Ok(Json(Affected { items }))
+    Ok(Json(Affected { items, kept: 0 }))
 }
 
 pub(crate) async fn pause(State(s): State<Arc<Shared>>, Json(scope): Json<Scope>) -> Answer<Affected> {
