@@ -14,6 +14,10 @@ The user chose, on 17 October:
   [probe](../item7-keychain-probe/README.md) showed a `void` reading it itself would need its own
   bundle, App ID and profiles.
 
+The first runs used a hand-signed test copy, because Xcode had no account to make a profile for
+`dev.voidfs.app`. The user then signed Xcode in to the team, and the signed Release build ran the
+same self-test and sign-ins.
+
 Nothing here registered the job with SMAppService, wrote defaults, or touched
 `~/Library/Application Support/voidfs`, which was absent before and after
 ([snapshots](raw/registration.txt)). The drawings' first row read whether the Keychain has a key
@@ -46,16 +50,26 @@ Results ([output](raw/tests-cli.txt)):
 
 ## The build
 
-- **The signed build failed** ([output](raw/build.txt)). The app target now claims
-  `keychain-access-groups`, so it needs a Mac App Development profile for `dev.voidfs.app`. Xcode
-  has no account signed in ("No Accounts"), so `-allowProvisioningUpdates` couldn't make one.
-  Every build of the app now needs that profile, and the Developer ID export needs one named
-  "voidfs App Developer ID" (`ExportOptions-DeveloperID.plist`).
+- **The signed build failed at first** ([output](raw/build.txt)). The app target now claims
+  `keychain-access-groups`, so it needs a development profile that covers `dev.voidfs.app`. Xcode
+  had no account signed in ("No Accounts"), so `-allowProvisioningUpdates` couldn't make one.
+- **Signed in, it built.** With the user's account added in Xcode → Settings → Accounts, the
+  Release build with `-allowProvisioningUpdates` succeeded:
+  - Xcode made the team's wildcard profile, "Mac Team Provisioning Profile: *" (`db3784cb…`,
+    `HAUTK68F56.*`, granting `keychain-access-groups HAUTK68F56.*`, expiring 17 October 2027),
+    and embedded it in the app. The FSKit extension kept its own profile, and the Finder
+    extension needs none.
+  - The app is signed with Apple Development, `application-identifier HAUTK68F56.dev.voidfs.app`,
+    the group, and `get-task-allow`, as a development build has.
+  - The bundled `void` is signed with Apple Development too, and meets the handover's code
+    requirement. `codesign --verify --deep --strict` passes.
+  - The Developer ID export still needs a profile named "voidfs App Developer ID"
+    (`ExportOptions-DeveloperID.plist`), made on the developer website.
 - **Without a profile, a Developer ID bundle is killed.** Test copy 1 was the unsigned build with
   its extensions removed, signed with Developer ID and the app's entitlements. It was killed at
   launch (exit 137), amfid -413 "No matching profile found". Bare Developer ID tools ran without
   one in the probe; bundles don't.
-- **Test copy 2 ran everything below.** It is the unsigned Release build of this branch with
+- **Test copy 2 ran everything below first.** It is the unsigned Release build of this branch with
   `Contents/Extensions` and `Contents/PlugIns` removed, so that no plug-in could register.
   - Its `void` is signed with Developer ID, identifier `dev.voidfs.void`, the hardened runtime.
   - The app is signed with Apple Development, claiming the group with
@@ -69,9 +83,10 @@ Results ([output](raw/tests-cli.txt)):
 
 ## The Keychain self-test
 
-`voidfs server-key selftest` ([output](raw/selftest.txt)) used a throwaway state directory
-(`/private/tmp/vks.…`, made by `mkdtemp`) and a server address nothing listens on. All 19 checks
-passed:
+`voidfs server-key selftest` used a throwaway state directory (`/private/tmp/vks.…`, made by
+`mkdtemp`) and a server address nothing listens on. All 19 checks passed on test copy 2
+([output](raw/selftest.txt)), and again on the signed build, whose `void` is signed with Apple
+Development rather than Developer ID ([output](raw/selftest-real-build.txt)):
 
 - **The store.** No key at first. A saved key reads back, saving again replaces it, and the key
   can be removed.
@@ -96,7 +111,7 @@ The item and the directory were removed at the end.
 ## Signing in from the command line
 
 `voidfs server-key …` against a local `voidfs-server --store memory`, with a throwaway admin key
-from `void keys generate` and a throwaway state directory
+from `void keys generate` and a throwaway state directory, from test copy 2
 ([output](raw/sign-in.txt), the directory shown as `<dir>`):
 
 | Run | Result |
@@ -108,6 +123,9 @@ from `void keys generate` and a throwaway state directory
 | `sign-in --key-file key.env`, the server from the file's `VOIDFS_ENDPOINT` | signed in |
 | `sign-in` again with `--region eu-west-1` | replaced; `status` shows the region |
 | `sign-out`, twice | "Signed out.", then "Not signed in." |
+
+The signed build repeated the unknown key, `key.env`, a key file on stdin (`--key-file -`) with
+`--region eu-west-1`, and the sign-out, with the same results ([output](raw/sign-in-real-build.txt)).
 
 No secret appeared in the output. Each check runs the bundled `void drives` with the key on
 stdin. The connection-refused message is the CLI's whole error, which is long for the menu. The
@@ -128,14 +146,20 @@ until you sign in, with "Sign in to your voidfs server first: the daemon starts 
 
 - The unsigned build registered its copy with LaunchServices, and `lsregister -u` removed it.
   pluginkit ignored its unsigned extensions.
-- After test copy 2's runs, LaunchServices had a record for it, removed with `lsregister -u`.
-- Everything else was as before throughout: FSKit kept `/Applications`'s module switched on, and
-  the app's job was never loaded.
+- After test copy 2's runs, LaunchServices had a record for it, removed with `lsregister -u`. It
+  came back by itself before the signed build, so both test copies were unregistered and deleted.
+- The signed build registered its copy with LaunchServices, and pluginkit chose its FSKit and
+  Finder extensions. `pluginkit -r` of both and `lsregister -u` of the copy put LaunchServices and
+  pluginkit back as they were.
+- **FSKit then named another copy of the module.** Before the build, it named `/Applications`'s;
+  afterwards, the compassionate-payne worktree's, three times over 30 s. The switch stayed on. The
+  first slice's runs saw the same drift, and an `lsregister -f` to steer it did harm then, so it
+  was left for the user.
+- The app's job was never loaded, and no defaults were written.
 
 ## Not covered
 
-- **The real build**: neither a development build nor the Developer ID export has a profile for
-  `dev.voidfs.app` yet.
+- **The Developer ID export**: it needs the "voidfs App Developer ID" profile, then notarizing.
 - **The live run**: the job registered with SMAppService, launchd running `voidfs daemon-launch`,
   a sign-in that restarts the daemon, a sign-out that stops it, and a key read before the first
   unlock after a reboot.

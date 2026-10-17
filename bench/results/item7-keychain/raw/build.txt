@@ -63,3 +63,48 @@ Authority=Apple Root CA
 TeamIdentifier=HAUTK68F56
 $ codesign --verify --deep --strict voidfs.app
 verifies
+
+## The signed build, after the user signed Xcode in to the team (Settings → Accounts)
+$ xcodebuild -scheme voidfs -configuration Release -allowProvisioningUpdates -allowProvisioningDeviceRegistration build
+** BUILD SUCCEEDED **
+$ codesign -dv --verbose=2 voidfs.app
+Identifier=dev.voidfs.app
+CodeDirectory v=20500 size=5338 flags=0x10000(runtime) hashes=156+7 location=embedded
+Authority=Apple Development: … (VN95MHY574)
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=HAUTK68F56
+$ codesign -d --entitlements - voidfs.app
+{
+  "com.apple.application-identifier" => "HAUTK68F56.dev.voidfs.app"
+  "com.apple.developer.team-identifier" => "HAUTK68F56"
+  "com.apple.security.application-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+  "com.apple.security.get-task-allow" => true
+  "keychain-access-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+}
+embedded.provisionprofile: Mac Team Provisioning Profile: * (db3784cb-bb58-44be-afad-a9b932b04b41), made by Xcode 2026-10-17T19:26:59Z, expires 2027-10-17T19:26:59Z; its entitlements:
+{
+  "com.apple.application-identifier" => "HAUTK68F56.*"
+  "com.apple.developer.team-identifier" => "HAUTK68F56"
+  "keychain-access-groups" => [
+    0 => "HAUTK68F56.*"
+  ]
+}
+$ codesign -dv --verbose=2 voidfs.app/Contents/MacOS/void
+Identifier=dev.voidfs.void
+CodeDirectory v=20500 size=66299 flags=0x10000(runtime) hashes=2066+2 location=embedded
+Authority=Apple Development: … (VN95MHY574)
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=HAUTK68F56
+$ codesign --verify -R='anchor apple generic and certificate leaf[subject.OU] = "HAUTK68F56" and identifier "dev.voidfs.void"' voidfs.app/Contents/MacOS/void
+satisfies
+extensions' profiles:
+  VoidfsFS.appex: Mac Team Provisioning Profile: dev.voidfs.app.fskit
+  VoidfsFinder.appex: none
+$ codesign --verify --deep --strict voidfs.app
+verifies

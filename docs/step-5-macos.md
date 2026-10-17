@@ -68,9 +68,9 @@ from a real agent and from a hand-started daemon, and launchd kept, restarted an
 daemon as intended. The Developer ID export signs the bundled `void` for distribution, and
 Apple notarized the app with it. You now sign in from the menu: the server key goes into the
 shared team Keychain, and the login job hands it to `void` on a pipe
-([Keychain](#the-server-key-in-the-keychain-17-october)). That slice passed its tests and a
-self-test on a hand-signed copy; the real build waits for a provisioning profile for
-`dev.voidfs.app`. The approval flow, logout and reboot remain.
+([Keychain](#the-server-key-in-the-keychain-17-october)). That slice passed its tests, and its
+self-test passed on the signed development build; it hasn't been registered or exported yet.
+The approval flow, logout and reboot remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -382,8 +382,9 @@ packages `void` in the app and registers it with SMAppService. It shows the appr
 disabled states, guides the user to switch on both extensions, and keeps the terminal's agent
 compatible, with the app taking over its state directory. The second,
 [the server key in the Keychain](#the-server-key-in-the-keychain-17-october), signs in from the
-menu and keeps the key out of files and arguments; its build needs a profile for
-`dev.voidfs.app`. The `/Volumes` helper and the done-when come later.
+menu and keeps the key out of files and arguments; the signed development build passed its
+self-test, and its live run and Developer ID export are next. The `/Volumes` helper and the
+done-when come later.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
@@ -2929,10 +2930,14 @@ again into the log.
 
 **Profiles.** Every executable that claims the Keychain group needs a provisioning profile
 embedded in its own bundle; now that is the app alone. `App.entitlements` claims
-`keychain-access-groups`. The signed build needs a Mac App Development profile for
-`dev.voidfs.app`, and the Developer ID export needs one named "voidfs App Developer ID"
-(`ExportOptions-DeveloperID.plist`). Xcode on this Mac has no account to make the first, so the
-signed build failed; a Developer ID copy without a profile was killed at launch (amfid -413).
+`keychain-access-groups`.
+- **Development builds** need a profile that covers `dev.voidfs.app`. With no account in Xcode
+  the signed build failed ("No Accounts"), and a Developer ID copy without a profile was killed
+  at launch (amfid -413). Once the user signed Xcode in, automatic signing made the team's
+  wildcard profile ("Mac Team Provisioning Profile: *", granting `HAUTK68F56.*`) and the build
+  succeeded.
+- **The Developer ID export** needs a profile for `dev.voidfs.app` named "voidfs App Developer
+  ID" (`ExportOptions-DeveloperID.plist`), made on the developer website.
 
 **Evidence.**
 
@@ -2941,25 +2946,28 @@ signed build failed; a Developer ID copy without a profile was killed at launch 
   10 s and writes no `daemon.json`, though the terminal has a key. With one, it starts the daemon
   from an empty environment. Two breaks each failed the test. All 55 CLI tests and workspace
   clippy pass.
-- A test copy of the app ran `voidfs server-key selftest`, and all 19 checks passed. The copy was
-  hand-signed with Apple Development, its extensions removed, and borrowed the FSKit extension's
-  development profile as a harness. The checks covered:
+- `voidfs server-key selftest` passed all 19 checks on a hand-signed test copy, and again on the
+  signed development build, whose `void` is signed with Apple Development. The test copy had its
+  extensions removed and borrowed the FSKit extension's development profile as a harness. The
+  checks covered:
   - the store, and adopting `daemon.json` both ways;
   - `/bin/cat` and an ad hoc `void` refused;
   - the launcher's daemon answering with the Keychain's server, its stop, SIGTERM and `kill -9`;
   - no key, and no secret in the log.
-- From the same copy, `server-key sign-in` against a local test server kept a good key and
-  refused an unknown key, an unreachable server and a non-HTTP URL. `sign-out` removed the key.
+- From both, `server-key sign-in` against a local test server kept a good key, from a file or
+  stdin, and refused an unknown key; the test copy also refused an unreachable server and a
+  non-HTTP URL. `sign-out` removed the key.
 - The menu's new rows were drawn offscreen.
 
-**Registration.** Nothing was registered with SMAppService, and no defaults were written. The
-unsigned build and the test copy were each registered with LaunchServices by building or running
-them, and unregistered.
+**Registration.** Nothing was registered with SMAppService, and no defaults were written. Each
+build and copy was registered with LaunchServices by building or running it, and pluginkit chose
+the signed build's extensions; `pluginkit -r` and `lsregister -u` put both back. FSKit, though,
+then named the compassionate-payne worktree's copy of the module instead of `/Applications`'s,
+with the switch still on, as in the first slice's runs. It was left for the user.
 
 **Not done yet.**
 
-- **The profiles** for `dev.voidfs.app`, development and Developer ID, and so the real build, the
-  export and its notarization.
+- **The Developer ID profile** for `dev.voidfs.app`, and so the export and its notarization.
 - **The live run**: the job registered, launchd running `daemon-launch`, a sign-in that restarts
   the daemon and a sign-out that stops it, and the key read at login.
 - **The form in the running menu**, and Import key file….

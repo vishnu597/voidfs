@@ -30,7 +30,8 @@ FSKit spike that started it is in [`docs/spikes/fskit.md`](../../docs/spikes/fsk
   without a provisioning profile that grants it, macOS kills the extension at launch. The app's
   `keychain-access-groups`, for the server key, is restricted too: without a profile for
   `dev.voidfs.app` the build fails, and a copy signed without one is killed at launch. With Xcode
-  signed in to your team (Settings → Accounts), automatic signing creates both profiles. The project uses team
+  signed in to your team (Settings → Accounts), automatic signing creates the development
+  profiles (the app gets the team's wildcard one). The project uses team
   `HAUTK68F56`; set `DEVELOPMENT_TEAM` to your own, and change the App Group
   (`HAUTK68F56.dev.voidfs` in `Config/*.entitlements`, `Shared/Bridge.swift` and
   `LaunchAgents/dev.voidfs.agent.plist`, whose two Mach services carry it) and the team in the
@@ -88,7 +89,7 @@ Turning it off stops the daemon. `void daemon status` says who starts the daemon
 checked on a registered copy with a throwaway state directory: the takeover, the refusal, stop,
 start and a crash. Login Items' approval flow, logout and reboot are untested
 ([step 5, item 7](../../docs/step-5-macos.md#the-apps-login-daemon-17-october)). The Keychain
-handover passed its self-test on a hand-signed copy, not yet on a registered one
+handover passed its self-test on the signed development build, not yet on a registered one
 ([the Keychain slice](../../docs/step-5-macos.md#the-server-key-in-the-keychain-17-october)).
 
 Then mount a drive by its alias or id. `void mount` asks the daemon, which mounts it with the
