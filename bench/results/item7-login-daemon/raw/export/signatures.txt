@@ -1,0 +1,53 @@
+$ codesign -dv --verbose=2 voidfs.app/Contents/MacOS/void (exported)
+Identifier=dev.voidfs.void
+Format=Mach-O thin (arm64)
+CodeDirectory v=20500 size=66459 flags=0x10000(runtime) hashes=2066+7 location=embedded
+Signature size=8993
+Authority=Developer ID Application: … (HAUTK68F56)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=Oct 17, 2026 at 1:59:44 PM
+Info.plist=not bound
+TeamIdentifier=HAUTK68F56
+Runtime Version=27.0.0
+Sealed Resources=none
+Internal requirements count=1 size=208
+Total signatures=1
+Chosen signature=1
+
+$ codesign -d --entitlements - voidfs.app/Contents/MacOS/void
+[Dict]
+
+$ codesign -dv voidfs.app (the app)
+Identifier=dev.voidfs.app
+CodeDirectory v=20500 size=2906 flags=0x10000(runtime) hashes=80+7 location=embedded
+Authority=Developer ID Application: … (HAUTK68F56)
+Authority=Developer ID Certification Authority
+Timestamp=Oct 17, 2026 at 1:59:52 PM
+TeamIdentifier=HAUTK68F56
+
+$ codesign -dv VoidfsFS.appex
+Identifier=dev.voidfs.app.fskit
+CodeDirectory v=20500 size=1376 flags=0x10000(runtime) hashes=32+7 location=embedded
+Authority=Developer ID Application: … (HAUTK68F56)
+Authority=Developer ID Certification Authority
+Timestamp=Oct 17, 2026 at 1:59:41 PM
+TeamIdentifier=HAUTK68F56
+
+$ codesign --verify --deep --strict --verbose=2 voidfs.app
+--prepared:$EXPORT/out/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+--validated:$EXPORT/out/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+--prepared:$EXPORT/out/voidfs.app/Contents/MacOS/void
+--validated:$EXPORT/out/voidfs.app/Contents/MacOS/void
+$EXPORT/out/voidfs.app: valid on disk
+$EXPORT/out/voidfs.app: satisfies its Designated Requirement
+
+$ codesign --verify -R="anchor apple generic and certificate leaf[subject.OU] = HAUTK68F56" void
+satisfies the team requirement
+
+$ spctl --assess --type execute --verbose=4 voidfs.app (not notarized yet)
+$EXPORT/out/voidfs.app: rejected
+source=Unnotarized Developer ID
+
+$ voidfs.app/Contents/MacOS/void version
+void 0.0.0 (57cfae8, 2026-10-17)

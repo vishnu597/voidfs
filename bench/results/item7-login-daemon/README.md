@@ -180,14 +180,42 @@ Approved by the user, run on 17 October from 13:05 to 13:07 (local time). Its ou
 
 Nothing from the run was left running.
 
+## The Developer ID export and notarization
+
+On 17 October, after #82 merged, `main` at `57cfae8` was archived and exported as
+`apps/macos/scripts/release.sh` does, into a scratch folder (`$EXPORT`). The user approved the
+upload to Apple's notary service. Nothing was installed.
+
+- **The export re-signs `void`** ([signatures](raw/export/signatures.txt)). The archive signs it
+  with the build's identity, and `xcodebuild -exportArchive` with
+  `scripts/ExportOptions-DeveloperID.plist` signs it again with "Developer ID Application: …
+  (HAUTK68F56)". It keeps the identifier `dev.voidfs.void`, the hardened runtime and a secure
+  timestamp, and has no entitlements. Before notarization `spctl` rejected the app as
+  "Unnotarized Developer ID", as expected.
+- **Notarization accepted it with no issues** ([output](raw/export/notarization.txt),
+  [log](raw/export/notary-log.json)), submission `8c243d76-bb4d-48b9-820b-796055bc7398`. The
+  ticket lists `Contents/MacOS/void` with the cdhash its signature has.
+- **Stapled**, then `stapler validate` passes, `spctl --assess` says "accepted, Notarized
+  Developer ID", `codesign --verify --deep --strict` passes, and `syspolicy_check distribution`
+  says ready for distribution. The exported `void` runs and reports `57cfae8`.
+
+**Registration.** The archive registered its intermediate copy with LaunchServices and pluginkit,
+and FSKit named the main checkout's copy for a while; unregistering that copy put everything back
+([before](raw/export/registration-before.txt), [after the export](raw/export/registration-after-export.txt),
+[after](raw/export/registration-after.txt)). `xcrun stapler` registered the exported copy with
+LaunchServices, with no plug-ins ([after notarizing](raw/export/registration-after-notarize.txt));
+`lsregister -u` of it put the records back as they were
+([restored](raw/export/registration-after-notarize-restore.txt)). `spctl`, `codesign`,
+`syspolicy_check` and running `void` registered nothing.
+
 ## Not run
 
 - **Login Items' approval flow.** Registration was enabled at once. The "needs approval" state
   appears when the user switches the item off in System Settings, which is theirs to do.
 - **Logout and login, and a reboot**, which the done-when asks for, with remembered mounts.
   Nothing was mounted in this run.
-- **The Developer ID export**: whether `xcodebuild -exportArchive` re-signs `void` with the Developer
-  ID identity and a timestamp, and whether notarization accepts the app with it.
+- **The notarized build installed and started at login.** The export wasn't installed in
+  `/Applications`, and its job wasn't registered.
 
 ## Replay
 

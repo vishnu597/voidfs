@@ -1,0 +1,13 @@
+values: V1=probe-63df9f1c V2=probe-21aaf930 (throwaway)
+P0 bare tool, keychain-access-groups, no profile, read   exit 1   rust error: OSStatus -25300 The specified item could not be found in the keychain. (1.2 ms)  [SecurityAgent 1->1]
+P1 bundle's main (Swift), profile, writes V1             exit 0   swift ok: wrote (8.0 ms)  [SecurityAgent 1->1]
+P2 tool beside it in Contents/MacOS (Rust), reads        exit 0   rust ok: read "probe-63df9f1c" (1.8 ms)  [SecurityAgent 1->1]
+P3 tool beside it, reads, no group named                 exit 0   rust ok: read "probe-63df9f1c" (1.6 ms)  [SecurityAgent 1->1]
+P4 bare void, App Group only, reads                      exit 1   rust error: OSStatus -34018 A required entitlement is not present. (1.0 ms)  [SecurityAgent 1->1]
+P5 bare void, no entitlements, reads                     exit 1   rust error: OSStatus -34018 A required entitlement is not present. (0.9 ms)  [SecurityAgent 1->1]
+P6 tool beside it (Rust) writes V2                       exit 0   rust ok: wrote (8.7 ms)  [SecurityAgent 1->1]
+P7 bundle's main (Swift) reads                           exit 0   swift ok: read "probe-21aaf930" group=HAUTK68F56.dev.voidfs (1.8 ms)  [SecurityAgent 1->1]
+P8 login keychain: security find-generic-password -s dev.voidfs.probe
+   exit 44 (44 = not found)
+P9 tool beside it (Rust) deletes                         exit 0   rust ok: deleted (1.3 ms)  [SecurityAgent 1->1]
+P10 bundle's main (Swift) reads                          exit 1   swift error: OSStatus -25300 The specified item could not be found in the keychain. (1.0 ms)  [SecurityAgent 1->1]
