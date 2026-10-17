@@ -1,0 +1,30 @@
+Median of 5 (before) or 7 (after) calls over the daemon's socket with curl, 10,000 changes of a
+paused 10,000-file import queued and about 10,000 more finished in the journal (debug build).
+
+Before (main's daemon: every status reads the whole journal)
+/v1/status               median 79.4 ms
+/v1/uploads              median 120.1 ms
+/v1/uploads?batch=1      median 78.3 ms
+GET /v1/uploads once: 1,442,659-byte body (the watch's line size, below)
+
+After (Queue::unfinished from memory; limit on the list)
+/v1/status               median 16.6 ms
+/v1/uploads              median 59.1 ms
+/v1/uploads?limit=6      median 16.8 ms
+/v1/uploads?all=true     median 165.2 ms
+GET /v1/uploads          1,442,684 bytes
+GET /v1/uploads?limit=6  1,622 bytes
+
+Watch lines, 20 s each: before 19 lines of 1,442,659 bytes; after, unlimited 1,442,684 bytes,
+limited (?limit=6) 1,622 bytes.
+
+Daemon CPU (average over 20 s, import paused, from sample.sh):
+before: no watch 0%, one unlimited watch 11.9%
+after:  no watch 0%, one unlimited watch 6.5%, one limited watch 1.9%, the menu app (limited
+        watch and its /v1/status every 2 s) 2.8%
+
+Menu app (Release build, menu closed), 10,000 changes queued:
+before (unlimited watch, import uploading): 1.4% CPU over 30 s, footprint 32 MB
+after  (limited watch): paused 0.1% over 20 s, uploading 0% over 30 s; footprint 16 MB
+The daemon while uploading at 64 KiB/s (about 64 one-KiB files a second): 55.3% before (with
+the app), 58.1% after (with the app): the uploads, not the menu.
