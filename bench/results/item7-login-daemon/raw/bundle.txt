@@ -1,0 +1,58 @@
+$ ls -l voidfs.app/Contents/MacOS voidfs.app/Contents/Library/LaunchAgents
+voidfs.app/Contents/Library/LaunchAgents:
+total 16
+-rw-r--r--@ 1 vishnu  wheel  1033 Oct 17 12:43 dev.voidfs.agent.plist
+-rw-r--r--@ 1 vishnu  wheel  1171 Oct 17 12:43 dev.voidfs.app.daemon.plist
+
+voidfs.app/Contents/MacOS:
+total 70784
+-rwxr-xr-x@ 1 vishnu  wheel  33932880 Oct 17 12:46 void
+-rwxr-xr-x@ 1 vishnu  wheel   2304560 Oct 17 12:46 voidfs
+
+$ codesign -dv --verbose=2 voidfs.app/Contents/MacOS/void
+Identifier=dev.voidfs.void
+Format=Mach-O thin (arm64)
+CodeDirectory v=20500 size=66299 flags=0x10000(runtime) hashes=2066+2 location=embedded
+Signature size=4799
+Authority=Apple Development: …
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+Signed Time=Oct 17, 2026 at 12:46:22 PM
+Info.plist=not bound
+TeamIdentifier=HAUTK68F56
+Runtime Version=27.0.0
+Sealed Resources=none
+Internal requirements count=1 size=188
+Total signatures=1
+Chosen signature=1
+
+$ codesign --verify --deep --strict --verbose=2 voidfs.app
+--prepared:voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+--validated:voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+--prepared:voidfs.app/Contents/MacOS/void
+--validated:voidfs.app/Contents/MacOS/void
+voidfs.app: valid on disk
+voidfs.app: satisfies its Designated Requirement
+
+$ voidfs.app/Contents/MacOS/void version
+void 0.0.0 (4dd327a, 2026-10-17)
+voidfs.app/Contents/MacOS/void: Mach-O 64-bit executable arm64
+
+$ plutil -p voidfs.app/Contents/Library/LaunchAgents/dev.voidfs.app.daemon.plist
+{
+  "AssociatedBundleIdentifiers" => [
+    0 => "dev.voidfs.app"
+  ]
+  "BundleProgram" => "Contents/MacOS/void"
+  "KeepAlive" => {
+    "SuccessfulExit" => false
+  }
+  "Label" => "dev.voidfs.app.daemon"
+  "ProgramArguments" => [
+    0 => "void"
+    1 => "daemon"
+    2 => "run"
+    3 => "--app"
+  ]
+  "RunAtLoad" => true
+}

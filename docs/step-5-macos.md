@@ -9,7 +9,8 @@ the Swift bridge and one daemon for the CLI and the app added 9 October; read-on
 daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October; the
 application matrix and its first fixes added 13 October; held mmap delivery and its durability
 policy clarified 14 October; menu-bar transfers, Finder Sync badges and the fate of a mount's
-cancelled change added 16 October; item 8 marked complete 17 October. **Item 1 is complete**
+cancelled change added 16 October; item 8 marked complete and the app's login daemon added
+17 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -59,6 +60,12 @@ It now compares the kernel's volume at each mountpoint. After the same quick rem
 had no badges with the old build and every badge with the fix
 ([lost badges](#finders-lost-badges-16-october)). The drive's own icon carries no
 reliable badge, a Finder limit.
+**Item 7 has started** ([17 October](#the-apps-login-daemon-17-october)). The app carries its own
+`void` and registers it with SMAppService as the daemon at login. The app takes over from the
+terminal's `void daemon install` agent, as the user chose, so that one daemon, started one way,
+owns a state directory. On a registered copy, with a throwaway state directory, the app took over
+from a real agent and from a hand-started daemon, and launchd kept, restarted and stopped the
+daemon as intended. The approval flow, logout and reboot, and the Developer ID export remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -364,6 +371,12 @@ Test authorization failure, helper absence, busy eject, orderly stop and login r
 eject a busy drive without losing acknowledged local writes, and the helper operates only on
 the permitted voidfs volumes. Registration and credentials testing are implementation-time
 actions, not actions performed by writing this plan.
+
+**Started, 17 October:** the first slice, [the app's login daemon](#the-apps-login-daemon-17-october),
+packages `void` in the app and registers it with SMAppService. It shows the approval-required and
+disabled states, guides the user to switch on both extensions, and keeps the terminal's agent
+compatible, with the app taking over its state directory. Keychain credentials, the `/Volumes`
+helper and the done-when come later.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
@@ -2686,3 +2699,133 @@ logged "Removed 1 identifiers"). System Settings refused to switch it on, with E
 Items, until the Mac was restarted. The second attempt lost the switch the same way, by rebuilding
 the only registered copy, and the user switched it on again. A rig that switches or rebuilds
 copies should keep another one registered, so the identifier never disappears.
+
+### The app's login daemon, 17 October
+
+Item 7's first slice: the app carries its own `void`, starts the daemon at login with
+SMAppService, and takes over from the terminal's `void daemon install` agent. The user chose two
+things on 17 October:
+- **The app takes over.** One daemon, started one way, owns a state directory.
+- **The bundled daemon comes first**, before Keychain credentials and the `/Volumes` helper.
+
+[Evidence](../bench/results/item7-login-daemon/README.md).
+
+**What the app carries.**
+
+- **`Contents/MacOS/void`.** The voidfs target's "Bundle void" phase
+  (`apps/macos/scripts/bundle-void.sh`) builds it from this repository: `cargo build -p
+  voidfs-cli --locked`, with `--release` for a Release build, in `apps/macos/build/cargo-target`.
+  - It is signed with the app's identity, identifier `dev.voidfs.void` and the hardened runtime,
+    with a timestamp when archiving. The app's own signature then seals it.
+  - The phase runs on every build, which costs cargo's check when nothing changed.
+  - Building the app now needs a Rust toolchain.
+- **`Contents/Library/LaunchAgents/dev.voidfs.app.daemon.plist`.** It runs `void daemon run --app`
+  at load, and again if it dies but not after it stopped as asked, as the terminal's agent does.
+  It names `dev.voidfs.app` as its bundle, so Login Items lists it under voidfs.
+- **Start the daemon at login, in the menu** (`App/LoginItem.swift`).
+  - Turning it on registers the job, and the bridge agent if that isn't registered. It then waits
+    up to 20 s for a daemon other than the one running before to answer.
+  - Turning it off unregisters the job, which stops the daemon, as switching it off in Login Items
+    does.
+  - Headless: `voidfs login-item on | off | status`. `login-item look <folder>` draws the menu's
+    setup rows in each state.
+- **The menu's setup rows.**
+  - The file system extension's switch, as before.
+  - The Finder extension's switch (`FIFinderSyncController.isExtensionEnabled`), with a button that
+    opens its settings.
+  - Start at login, in five states: on; off; waiting for approval in Login Items, with a button
+    that opens them; not in this copy; and not configured.
+  - "Not in this copy" means the bundle has no plist or no `void`. SMAppService reports `notFound`
+    for a job that was never registered, so the app checks its bundle instead.
+  - "Not configured" means the state directory has no `daemon.json`. The menu says to start the
+    daemon once from a terminal with the connection's variables set.
+
+**The app's daemon.** `void daemon run --app` is a hidden flag.
+
+- **Its state directory** is the app's `VoidfsStateDirectory` default if that is a path, read
+  with `defaults`, else `~/Library/Application Support/voidfs`. Its own `VOIDFS_STATE_DIR` doesn't
+  count.
+- **Its log.** The job's plist is fixed in the signed app, so it can't name that directory or the
+  log in it. The daemon runs itself again with `exec`, keeping the pid launchd watches, with
+  `VOIDFS_STATE_DIR` set and its output going to that directory's `daemon.log`. Redirecting in
+  place would need `dup2`, and the workspace forbids `unsafe`.
+- **The takeover**, each step logged:
+  1. If the terminal's agent is installed for this directory, it is booted out, which stops its
+     daemon, and its plist is removed. The agent's directory is its plist's `VOIDFS_STATE_DIR`,
+     or the default when it has none.
+  2. A daemon still answering on the socket, started by `void daemon start` or by hand, is asked
+     to stop.
+  3. It waits up to 10 s for the directory's lock, then starts.
+- **Without `daemon.json`** it logs why and exits 0, so that launchd doesn't start it again every
+  10 s.
+
+**The CLI, while the app has it.** The app's job is loaded when `launchctl print
+gui/<uid>/dev.voidfs.app.daemon` finds it. The app owns a state directory when its job is loaded
+and the directory is the app's.
+
+- `void daemon install` refuses with `ManagedByApp`, naming the job and Start at login.
+- `void daemon start`, `restart`, and every command that starts the daemon kickstart the app's
+  job, as they kickstart the agent when it is installed. launchd then keeps the daemon it started.
+- `void daemon status` says who starts the daemon at login: voidfs.app, the agent, or neither.
+  The JSON form has `loginJob`.
+- `void daemon uninstall` says so when the app starts the daemon.
+- **A fix on the way.** `daemon start` kickstarted the agent whenever its plist existed, even an
+  agent installed for another state directory, and then waited 20 s on the wrong socket. It now
+  kickstarts only the agent for its own directory.
+
+**Evidence.**
+
+- `the_apps_daemon_takes_over_the_state_directory` runs the app's daemon as launchd would, with
+  stand-ins for `launchctl` and `defaults`. It covers:
+  - the takeover from the agent, and from a daemon started by hand;
+  - the pid kept across the `exec`, and the log;
+  - the refusal, the status lines, and the kickstart of the app's job.
+
+  Three runs passed. With the takeover, the refusal or the app's job removed in turn, the test
+  failed each time. All 54 CLI tests and workspace clippy pass.
+- The Release build has `void` in the bundle, signed for team HAUTK68F56 with the hardened
+  runtime, and `codesign --verify --deep --strict` passes.
+- The menu's rows are drawn offscreen in each state.
+
+**The live run** (17 October, approved by the user,
+[evidence](../bench/results/item7-login-daemon/README.md#the-live-run)). It used the Release build
+of `7fb2658`, a local test server, and a throwaway state directory set as the app's
+`VoidfsStateDirectory`.
+
+1. With no `daemon.json`, `login-item on` explained how to make one and registered nothing.
+2. `void daemon start`, then `void daemon install`, put a real terminal agent's daemon under
+   launchd for that directory.
+3. `login-item on` registered the job, enabled at once with no approval step. Within about 0.3 s
+   the app's daemon:
+   - booted out the agent and removed its plist, and the agent's daemon stopped;
+   - started, with launchd's pid as its own, and logged to the directory.
+4. While the app had it:
+   - `void daemon install` failed with `ManagedByApp`;
+   - `void daemon stop` left the job stopped (exit 0);
+   - `void daemon start` kickstarted it;
+   - after a `kill -9`, launchd ran it again 1.1 s later.
+5. A daemon started by hand gave way when the job was kickstarted, as at login.
+6. `login-item off` unregistered the job, and launchd stopped the daemon.
+
+Everything was restored afterwards.
+
+**Registration on this Mac.**
+- Each Release build, and each run of the built app, registered that copy with LaunchServices and
+  pluginkit. Unregistering the copy put pluginkit's list back each time.
+- An `lsregister -f` of another copy, run to make FSKit name it again, dropped that copy's Finder
+  extension from pluginkit. It was added back after the live run.
+- FSKit kept the module switched on throughout. It now names `/Applications`'s copy.
+
+**Not done yet.**
+
+- **Login Items' approval flow** is untested: registration was enabled at once, and the "needs
+  approval" state appears only when the user switches the item off in System Settings.
+- **Logout and login, and a reboot**, with remembered mounts coming back, are untested. They are
+  the item's done-when.
+- **The Developer ID export is untested**: whether `xcodebuild -exportArchive` re-signs `void`
+  with Developer ID and a timestamp, and whether notarization accepts it.
+- **Turning Start at login off stops the daemon**, and with it the mounts, until
+  `void daemon start`.
+- **Not started:** credentials still come from `daemon.json` rather than the Keychain, and there
+  is no `/Volumes` helper. Busy eject and the done-when are open.
+

@@ -155,7 +155,7 @@ enum DriveCommand {
 #[derive(Subcommand, Debug)]
 enum DaemonCommand {
     /// Run the daemon in the foreground, until it is stopped (launchd runs this)
-    Run(daemon::DaemonOptions),
+    Run(daemon::RunOptions),
     /// Start the daemon in the background, if it isn't running. The connection it is given is
     /// kept, readable by you only, for when it starts again
     Start(daemon::DaemonOptions),

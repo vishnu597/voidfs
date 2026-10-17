@@ -170,6 +170,12 @@ billing or plans), this page says so.
     the menu and `void status` agreed through each state, daemon and agent restarts, and offline,
     hung and degraded links. Not shown: clicks in the real menu, the menu app restarted by hand,
     and a badge on the drive's own icon (Finder doesn't ask for one).
+    **Item 7 has started** (17 October, [step 5](step-5-macos.md#the-apps-login-daemon-17-october)):
+    the app carries its own `void` and can register it with SMAppService as the daemon at login,
+    taking over from `void daemon install`'s agent. A live run on a registered copy with a throwaway
+    state directory showed the takeover, the refusal, stop, start and a crash restart. Login
+    Items' approval flow, logout and reboot, the Developer ID export, Keychain credentials and the
+    `/Volumes` helper are still to come.
     Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan

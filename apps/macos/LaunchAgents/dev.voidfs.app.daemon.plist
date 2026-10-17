@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The daemon at login (step 5, item 7): the app's own copy of `void`, run as `void daemon run
+     --app`, which finds the app's state directory (its VoidfsStateDirectory default, or the CLI's
+     default), logs to the daemon.log there and takes over from a daemon started otherwise, the
+     agent `void daemon install` wrote included. Start at login in the menu registers it with
+     SMAppService. launchd runs it again if it dies, but not after it stopped as asked, as the
+     terminal's agent does. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.voidfs.app.daemon</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/void</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>void</string>
+		<string>daemon</string>
+		<string>run</string>
+		<string>--app</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>dev.voidfs.app</string>
+	</array>
+</dict>
+</plist>

@@ -1,8 +1,9 @@
 # voidfs for macOS
 
 The macOS drive: `voidfs.app`, a SwiftUI menu-bar app that contains an FSKit module
-(`VoidfsFS.appex`) and a Finder Sync extension for sync badges (`VoidfsFinder.appex`), and runs as
-the launch agent that bridges both to the `void` daemon. A
+(`VoidfsFS.appex`), a Finder Sync extension for sync badges (`VoidfsFinder.appex`) and its own copy
+of `void`, which it can start at login as the daemon. It runs as the launch agent that bridges both
+extensions to the daemon. A
 mount is writable unless mounted read-only ([step 5, item 4](../../docs/step-5-macos.md#writable-fskit-12-october));
 the module reads and writes every byte and name through the daemon, which holds the server and
 key and stages writes on this Mac before it publishes them. The
@@ -10,18 +11,21 @@ FSKit spike that started it is in [`docs/spikes/fskit.md`](../../docs/spikes/fsk
 
 | Folder | What |
 |---|---|
-| `App/` | The host app and its menu of transfers, the launch agent that bridges the extensions to the daemon, and the in-process checks of the bridge, the transfers and the badges. Run from a terminal it also takes `status`, `transfers`, `mount`, `settings` and the agent, bridge and badge commands |
+| `App/` | The host app and its menu of transfers, Start at login for the daemon, the launch agent that bridges the extensions to the daemon, and the in-process checks of the bridge, the transfers and the badges. Run from a terminal it also takes `status`, `transfers`, `mount`, `settings`, `login-item` and the agent, bridge and badge commands |
 | `FSModule/` | The FSKit module: a `FSUnaryFileSystem` that serves `voidfs://<drive>` resources from daemon sessions |
 | `FinderSync/` | The Finder Sync extension: badges and the context menu |
 | `Badges/` | The badges' XPC interface, client, model and pictures, shared by the extension and the app |
 | `Shared/` | The bridge's XPC interface and the extension's client of it, with its metadata memo |
 | `Probe/` | `voidfs-probe`, the spike's HTTP calls without FSKit or the daemon, for baselines |
 | `Config/` | The extensions' `Info.plist`s and the entitlements |
-| `scripts/` | Measurements and checks of a mounted drive, the semantics probes, and the release script |
+| `LaunchAgents/` | The plists of the jobs the app registers with SMAppService: the bridge, `dev.voidfs.agent`, and the daemon at login, `dev.voidfs.app.daemon` |
+| `scripts/` | Measurements and checks of a mounted drive, the semantics probes, the release script, and `bundle-void.sh`, the build phase that puts `void` in the app |
 
 ## Requirements
 
 - macOS 27 and Xcode 27.
+- A Rust toolchain: the voidfs target's "Bundle void" phase builds `void` with cargo
+  (`~/.cargo/bin/cargo`, or one on `PATH`) into `build/cargo-target`, and signs it inside the app.
 - An Apple Developer team. `com.apple.developer.fskit.fsmodule` is a restricted entitlement:
   without a provisioning profile that grants it, macOS kills the extension at launch. With Xcode
   signed in to your team, automatic signing creates the profile. The project uses team
@@ -54,6 +58,21 @@ void daemon start
 ```bash
 apps/macos/build/Build/Products/Release/voidfs.app/Contents/MacOS/voidfs agent-register
 ```
+
+**Start at login.** The menu's "Start the daemon at login", or `voidfs login-item on`, registers
+the app's own `void` with SMAppService as the job `dev.voidfs.app.daemon`. It starts the daemon now
+and at each login, and the job appears under voidfs in Login Items. The daemon needs a server and
+key first: start it once from a terminal, as above, and it keeps them in `daemon.json`. The app
+takes over the state directory:
+- its daemon removes the agent `void daemon install` wrote for the same directory, and stops a
+  daemon started otherwise;
+- while the job is loaded, `void daemon install` refuses, and `void daemon start` asks launchd for
+  the app's daemon.
+
+Turning it off stops the daemon. `void daemon status` says who starts the daemon at login. It was
+checked on a registered copy with a throwaway state directory: the takeover, the refusal, stop,
+start and a crash. Login Items' approval flow, logout and reboot are untested
+([step 5, item 7](../../docs/step-5-macos.md#the-apps-login-daemon-17-october)).
 
 Then mount a drive by its alias or id. `void mount` asks the daemon, which mounts it with the
 module (the `fskit` adapter) and mounts it again when it starts:
