@@ -69,8 +69,9 @@ takes over the state directory:
 - while the job is loaded, `void daemon install` refuses, and `void daemon start` asks launchd for
   the app's daemon.
 
-Turning it off stops the daemon. `void daemon status` says who starts the daemon at login. This is
-tested with stand-ins for launchctl and defaults, not yet on a registered copy
+Turning it off stops the daemon. `void daemon status` says who starts the daemon at login. It was
+checked on a registered copy with a throwaway state directory: the takeover, the refusal, stop,
+start and a crash. Login Items' approval flow, logout and reboot are untested
 ([step 5, item 7](../../docs/step-5-macos.md#the-apps-login-daemon-17-october)).
 
 Then mount a drive by its alias or id. `void mount` asks the daemon, which mounts it with the

@@ -63,8 +63,9 @@ reliable badge, a Finder limit.
 **Item 7 has started** ([17 October](#the-apps-login-daemon-17-october)). The app carries its own
 `void` and registers it with SMAppService as the daemon at login. The app takes over from the
 terminal's `void daemon install` agent, as the user chose, so that one daemon, started one way,
-owns a state directory. The takeover is tested with stand-ins for launchctl and defaults. It has
-not been registered for real, nor exported with Developer ID.
+owns a state directory. On a registered copy, with a throwaway state directory, the app took over
+from a real agent and from a hand-started daemon, and launchd kept, restarted and stopped the
+daemon as intended. The approval flow, logout and reboot, and the Developer ID export remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -2786,23 +2787,41 @@ and the directory is the app's.
   runtime, and `codesign --verify --deep --strict` passes.
 - The menu's rows are drawn offscreen in each state.
 
-**Registration on this Mac.** Each Release build, and each run of the built app, registered that
-copy with LaunchServices and pluginkit. Unregistering the copy put pluginkit's list back each
-time. An `lsregister -f` of another copy, run to make FSKit name it again, dropped that copy's
-Finder extension from pluginkit, and adding it back is left to the user. FSKit kept the module
-switched on throughout.
+**The live run** (17 October, approved by the user,
+[evidence](../bench/results/item7-login-daemon/README.md#the-live-run)). It used the Release build
+of `7fb2658`, a local test server, and a throwaway state directory set as the app's
+`VoidfsStateDirectory`.
+
+1. With no `daemon.json`, `login-item on` explained how to make one and registered nothing.
+2. `void daemon start`, then `void daemon install`, put a real terminal agent's daemon under
+   launchd for that directory.
+3. `login-item on` registered the job, enabled at once with no approval step. Within about 0.3 s
+   the app's daemon:
+   - booted out the agent and removed its plist, and the agent's daemon stopped;
+   - started, with launchd's pid as its own, and logged to the directory.
+4. While the app had it:
+   - `void daemon install` failed with `ManagedByApp`;
+   - `void daemon stop` left the job stopped (exit 0);
+   - `void daemon start` kickstarted it;
+   - after a `kill -9`, launchd ran it again 1.1 s later.
+5. A daemon started by hand gave way when the job was kickstarted, as at login.
+6. `login-item off` unregistered the job, and launchd stopped the daemon.
+
+Everything was restored afterwards.
+
+**Registration on this Mac.**
+- Each Release build, and each run of the built app, registered that copy with LaunchServices and
+  pluginkit. Unregistering the copy put pluginkit's list back each time.
+- An `lsregister -f` of another copy, run to make FSKit name it again, dropped that copy's Finder
+  extension from pluginkit. It was added back after the live run.
+- FSKit kept the module switched on throughout. It now names `/Applications`'s copy.
 
 **Not done yet.**
 
-- **No real registration has run.** That needs the user's OK. It would cover:
-  - the takeover from a real agent;
-  - Login Items' approval flow;
-  - turning Start at login off;
-  - logout and login, and a reboot.
-
-  Earlier runs say to expect that an agent registered from a differently signed copy keeps the
-  old launch constraint once ([the bridge's findings](#the-swift-bridge-9-october)), and that the
-  rig should keep one copy registered.
+- **Login Items' approval flow** is untested: registration was enabled at once, and the "needs
+  approval" state appears only when the user switches the item off in System Settings.
+- **Logout and login, and a reboot**, with remembered mounts coming back, are untested. They are
+  the item's done-when.
 - **The Developer ID export is untested**: whether `xcodebuild -exportArchive` re-signs `void`
   with Developer ID and a timestamp, and whether notarization accepts it.
 - **Turning Start at login off stops the daemon**, and with it the mounts, until
