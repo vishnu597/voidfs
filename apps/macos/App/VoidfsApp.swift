@@ -3,8 +3,9 @@
 // voidfs.app: the menu-bar host FSKit requires. It shows whether the extensions are enabled and
 // whether the daemon starts at login (LoginItem.swift), the daemon's transfers with their controls
 // (Transfers.swift), and asks the daemon to mount drives, which it does with the extension (the
-// `fskit` adapter) and remembers. The daemon holds the server and key (`void daemon start`); the
-// extensions and the app hold none.
+// `fskit` adapter) and remembers. You sign in to the server from the menu: the app keeps the
+// server and key in the Keychain and hands them to the daemon it starts at login (ServerKey.swift,
+// SignIn.swift). The extensions hold none.
 //
 // It also runs headless, for scripts:
 //
@@ -15,13 +16,15 @@
 //     voidfs.app/Contents/MacOS/voidfs settings
 //     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status
 //     voidfs.app/Contents/MacOS/voidfs login-item on | off | status | look <folder>
+//     voidfs.app/Contents/MacOS/voidfs server-key status | sign-in … | sign-out | selftest
 //     voidfs.app/Contents/MacOS/voidfs bridge-check
 //     voidfs.app/Contents/MacOS/voidfs bridge-selftest <drive> [main|daemon-restart|agent-restart|remote <key>|refused|wire] [--socket <path>]
 //     voidfs.app/Contents/MacOS/voidfs badges-selftest <drive> [main|daemon-restart|refused] [--socket <path>] [--peer <path>] [--metrics <url>] [--files <n>] [--png <path>]
 //     voidfs.app/Contents/MacOS/voidfs badges-check
 //
 // `agent` is how launchd runs it as the extensions' bridge to the daemon (Agent.swift, BadgeAgent.swift).
-// The daemon itself starts at login from the app's copy of `void` (LoginItem.swift).
+// `daemon-launch` is how launchd runs it to start the daemon at login, from the app's copy of
+// `void`, with the Keychain's key (LoginItem.swift, ServerKey.swift).
 
 import FSKit
 import FinderSync
@@ -34,6 +37,7 @@ let extensionBundleID = "dev.voidfs.app.fskit"
 enum Launcher {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
+        if args.first == "daemon-launch" { DaemonLaunch.run() }
         if args.first == "agent" { Agent.serve() }
         if args.first == "login-item", args.dropFirst().first == "look" {
             // Drawing needs AppKit's main thread, as the transfers self-test's does.
@@ -47,7 +51,7 @@ enum Launcher {
             NSApplication.shared.setActivationPolicy(.prohibited)
             NSApplication.shared.run()
         }
-        if let command = args.first, ["status", "transfers", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "login-item", "bridge-check", "bridge-selftest", "badges-selftest", "badges-check"].contains(command) {
+        if let command = args.first, ["status", "transfers", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "login-item", "server-key", "bridge-check", "bridge-selftest", "badges-selftest", "badges-check"].contains(command) {
             Task {
                 let code = await HostCommands.run(args)
                 exit(code)
@@ -110,6 +114,8 @@ enum HostCommands {
                     print("usage: login-item on | off | status | look <folder>")
                     return 2
                 }
+            case "server-key":
+                return await SignIn.command(Array(args.dropFirst()))
             case "bridge-check":
                 // The installed agent must refuse anything but the extension, this app included.
                 let client = BridgeClient()
@@ -203,8 +209,14 @@ final class HostModel {
     var login = LoginItem.state
     var loginNote = ""
     var loginBusy = false
+    var signedIn = SignIn.summary()
+    var signingIn = false
+    var form = SignInFields()
+    var keyNote = ""
+    var keyBusy = false
 
     func refresh() async {
+        signedIn = SignIn.summary()
         login = LoginItem.state
         finderEnabled = FIFinderSyncController.isExtensionEnabled
         do {
@@ -222,6 +234,50 @@ final class HostModel {
         loginNote = on ? await LoginItem.turnOn() : await LoginItem.turnOff()
         login = LoginItem.state
         loginBusy = false
+    }
+
+    func signIn() async {
+        switch SignIn.key(endpoint: form.endpoint, region: form.region, accessKeyId: form.accessKeyId, secretAccessKey: form.secretAccessKey) {
+        case .failure(let f):
+            keyNote = f.message
+        case .success(let key):
+            keyBusy = true
+            keyNote = "Checking the server…"
+            let (kept, note) = await SignIn.signIn(key)
+            keyNote = note
+            if kept {
+                signingIn = false
+                form = SignInFields()
+            }
+            signedIn = SignIn.summary()
+            login = LoginItem.state
+            keyBusy = false
+        }
+    }
+
+    func signOut() async {
+        keyBusy = true
+        keyNote = await SignIn.signOut()
+        signedIn = SignIn.summary()
+        login = LoginItem.state
+        keyBusy = false
+    }
+
+    /// Fills the form from a key file, as `void keys generate` writes them.
+    func importKeyFile() {
+        let panel = NSOpenPanel()
+        panel.message = "A key file from `void keys generate --format json` or `--format env`"
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let text = try? String(contentsOf: url, encoding: .utf8), let found = SignIn.keyFile(text) else {
+            keyNote = "\(url.lastPathComponent) isn't a key file: it needs an access key id and secret."
+            return
+        }
+        form.accessKeyId = found["VOIDFS_ACCESS_KEY_ID"] ?? ""
+        form.secretAccessKey = found["VOIDFS_SECRET_ACCESS_KEY"] ?? ""
+        if let e = found["VOIDFS_ENDPOINT"] { form.endpoint = e }
+        if let r = found["VOIDFS_REGION"] { form.region = r }
+        keyNote = "Read the key from \(url.lastPathComponent)."
     }
 
     func mount() async {
@@ -282,6 +338,7 @@ struct SetupView: View {
                 Button("Open Finder extension settings") { FIFinderSyncController.showExtensionManagementInterface() }
             case nil: EmptyView()
             }
+            ServerKeyView(model: model)
             LoginItemView(model: model)
         }
     }
@@ -308,5 +365,62 @@ struct LoginItemView: View {
             }
             if !model.loginNote.isEmpty { Text(model.loginNote).font(.caption).textSelection(.enabled) }
         }
+    }
+}
+
+/// The sign-in form's fields; the secret stays here only until the form closes.
+struct SignInFields: Equatable {
+    var endpoint = ""
+    var region = ""
+    var accessKeyId = ""
+    var secretAccessKey = ""
+}
+
+/// The server and key the daemon starts with, in the Keychain: who you are signed in as, or a
+/// form to sign in with.
+struct ServerKeyView: View {
+    @Bindable var model: HostModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let s = model.signedIn {
+                Label("Signed in to \(s.endpoint) as \(s.accessKeyId)", systemImage: "key")
+                Button("Sign out") { Task { await model.signOut() } }.disabled(model.keyBusy)
+            } else if model.signingIn {
+                SignInFormView(model: model)
+            } else {
+                Label("Not signed in to a voidfs server", systemImage: "key.slash")
+                Button("Sign in…") {
+                    model.signingIn = true
+                    model.keyNote = ""
+                }
+            }
+            if !model.keyNote.isEmpty { Text(model.keyNote).font(.caption).textSelection(.enabled) }
+        }
+    }
+}
+
+struct SignInFormView: View {
+    @Bindable var model: HostModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextField("Server", text: $model.form.endpoint, prompt: Text("https://voidfs.example.com"))
+            TextField("Region", text: $model.form.region, prompt: Text(ServerKey.defaultRegion))
+            TextField("Access key ID", text: $model.form.accessKeyId)
+            SecureField("Secret access key", text: $model.form.secretAccessKey)
+            HStack {
+                Button("Import key file…") { model.importKeyFile() }
+                Spacer()
+                Button("Cancel") {
+                    model.signingIn = false
+                    model.form = SignInFields()
+                    model.keyNote = ""
+                }
+                Button("Sign in") { Task { await model.signIn() } }.keyboardShortcut(.defaultAction)
+            }
+            .disabled(model.keyBusy)
+        }
+        .textFieldStyle(.roundedBorder)
     }
 }

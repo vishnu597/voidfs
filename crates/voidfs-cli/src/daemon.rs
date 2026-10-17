@@ -11,6 +11,7 @@ use voidfs_daemon::api::{self, Build};
 use voidfs_daemon::{ClientError, Daemon, DaemonClient, DaemonConfig, Settings};
 
 use crate::config::Connection;
+use crate::launchd::Login;
 use crate::output::{Failure, Out, Result, count, size};
 
 /// How long `start` waits for a new daemon to answer.
@@ -23,6 +24,10 @@ const TAKE_OVER_WAIT: Duration = Duration::from_secs(10);
 const CONFLICT_LOOK: Duration = Duration::from_secs(5);
 /// A log larger than this is moved to `daemon.log.1` when the daemon starts.
 const LOG_MAX: u64 = 8 << 20;
+/// How the app's daemon, or the app's job before it, says in the log that it has no key.
+const NO_KEY: &str = "no server key in voidfs.app for ";
+/// The end of that line, which `daemon start` looks for.
+const NOT_STARTING: &str = "sign in from its menu; not starting";
 /// The connection variables a daemon `start` launches must not see: it reads `daemon.json`.
 const CONNECTION_VARS: [&str; 5] = ["VOIDFS_ENDPOINT", "VOIDFS_ACCESS_KEY_ID", "VOIDFS_SECRET_ACCESS_KEY", "VOIDFS_KEY_FILE", "VOIDFS_REGION"];
 
@@ -46,7 +51,9 @@ pub struct RunOptions {
     /// app's state directory, logging to its log, and taking over from a daemon started otherwise
     #[arg(long, hide = true)]
     pub app: bool,
-    /// The app's daemon once its output goes to the log
+    /// The app's daemon once its output goes to the log, in the state directory
+    /// `VOIDFS_STATE_DIR` names. The app's job starts it so, with the server's key from the app's
+    /// Keychain on stdin (`--key-file /dev/stdin`)
     #[arg(long, hide = true, requires = "app")]
     pub logged: bool,
 }
@@ -191,9 +198,9 @@ pub async fn run(conn: &Connection, opts: &RunOptions) -> Result<()> {
     }
     let config = match connection(conn, &place.dir) {
         // Without a key, the app's daemon has nothing to run, and launchd shouldn't run it again
-        // until it is asked: `daemon start` keeps the key first.
+        // until it is asked: a sign-in in the app's menu keeps the key first.
         Err(f) if opts.app && f.code == "NoCredentials" => {
-            log(&format!("{}: not starting", f.message));
+            log(&format!("{NO_KEY}{}: {NOT_STARTING}", place.dir.display()));
             return Ok(());
         }
         r => r?,
@@ -249,6 +256,20 @@ fn open_log(dir: &Path) -> Result<std::fs::File> {
     std::fs::File::options().create(true).append(true).mode(0o600).open(&path).map_err(|e| Failure::local(&path, e))
 }
 
+/// The log's length now, from where to look for what a daemon about to start says.
+fn log_len(dir: &Path) -> u64 {
+    std::fs::metadata(dir.join(voidfs_daemon::LOG)).map_or(0, |m| m.len())
+}
+
+/// The line the app's job, or its daemon, wrote to the log after `from` to say it has no key.
+fn no_key(dir: &Path, from: u64) -> Option<String> {
+    let text = std::fs::read(dir.join(voidfs_daemon::LOG)).ok()?;
+    // A log moved aside as it started is new.
+    let from = if (text.len() as u64) < from { 0 } else { from as usize };
+    let text = String::from_utf8_lossy(&text[from..]);
+    text.lines().find(|l| l.contains(NO_KEY) && l.ends_with(NOT_STARTING)).map(str::to_owned)
+}
+
 /// The last lines of the log, to say why a daemon didn't start.
 fn log_tail(dir: &Path) -> String {
     let text = std::fs::read_to_string(dir.join(voidfs_daemon::LOG)).unwrap_or_default();
@@ -262,17 +283,28 @@ pub async fn ensure_started(conn: &Connection, opts: &DaemonOptions, place: &Pla
     if let Some(s) = place.status().await? {
         return Ok((s, false));
     }
-    let config = connection(conn, &place.dir)?;
-    Settings::of(&config).save(&place.dir).map_err(|e| Failure::local(&Settings::path(&place.dir), e))?;
+    let login = crate::launchd::login(&place.dir);
+    // voidfs.app keeps the key for its state directory in its Keychain, and hands it to the daemon
+    // its job starts (step 5, item 7): nothing here writes one to disk for it.
+    if login != Some(Login::App) {
+        let config = connection(conn, &place.dir)?;
+        Settings::of(&config).save(&place.dir).map_err(|e| Failure::local(&Settings::path(&place.dir), e))?;
+    }
     // The job that starts it at login, the app's or the agent, so that launchd keeps the daemon
     // it starts.
-    if let Some(login) = crate::launchd::login(&place.dir)
+    let from = log_len(&place.dir);
+    if let Some(login) = login
         && crate::launchd::kickstart(login)
     {
         let deadline = Instant::now() + START_WAIT;
         loop {
             if let Some(s) = place.status().await? {
                 return Ok((s, true));
+            }
+            if login == Login::App
+                && let Some(line) = no_key(&place.dir, from)
+            {
+                return Err(Failure::new("NoCredentials", format!("voidfs.app has no server key for the daemon: sign in from its menu. Its log says:\n{line}")));
             }
             if Instant::now() > deadline {
                 return Err(Failure::new("DaemonFailed", format!("launchd started {}, but its daemon didn't answer within {} s; its log:\n{}", login.label(), START_WAIT.as_secs(), log_tail(&place.dir))));
@@ -374,7 +406,7 @@ pub fn uptime(secs: u64) -> String {
 }
 
 /// Who starts the daemon at login, for `daemon status`: a line on macOS.
-fn login_line(login: Option<crate::launchd::Login>) -> String {
+fn login_line(login: Option<Login>) -> String {
     match login {
         _ if !cfg!(target_os = "macos") => String::new(),
         Some(l) => format!("\nstarts at login: {}", l.describe()),
@@ -385,7 +417,7 @@ fn login_line(login: Option<crate::launchd::Login>) -> String {
 pub async fn daemon_status(out: Out) -> Result<()> {
     let place = Place::new()?;
     let login = crate::launchd::login(&place.dir);
-    let label = login.map(crate::launchd::Login::label);
+    let label = login.map(Login::label);
     match place.status().await? {
         Some(s) => {
             let d = &s.daemon;

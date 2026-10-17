@@ -2,7 +2,9 @@
 //
 // Start at login (step 5, item 7): the daemon, from the app's own copy of `void`
 // (`Contents/MacOS/void`, which Xcode's "Bundle void" phase builds), registered with SMAppService
-// as the job in `Contents/Library/LaunchAgents/dev.voidfs.app.daemon.plist`. The app takes over:
+// as the job in `Contents/Library/LaunchAgents/dev.voidfs.app.daemon.plist`. The job runs this
+// binary, which hands the daemon the server's key from the Keychain (ServerKey.swift, SignIn.swift).
+// The app takes over:
 // once registered, its daemon removes the agent `void daemon install` wrote for the same state
 // directory and stops a daemon started otherwise, and `void daemon install` refuses while the job
 // is loaded. One daemon, started one way, owns the state directory. Turning it off stops the
@@ -25,7 +27,7 @@ enum LoginItem {
         case needsApproval
         /// This copy of the app has no job or no `void`: built without the "Bundle void" phase.
         case notBundled
-        /// Off, and the daemon has no server and key to start with.
+        /// Off, and the app has no server and key for the daemon: not signed in.
         case notConfigured
     }
 
@@ -39,7 +41,7 @@ enum LoginItem {
         }
     }
 
-    /// The job's plist and the `void` it runs are in this copy of the app.
+    /// The job's plist and the `void` it starts are in this copy of the app.
     static var bundled: Bool {
         let contents = Bundle.main.bundleURL.appending(path: "Contents")
         return FileManager.default.fileExists(atPath: contents.appending(path: "Library/LaunchAgents/\(label).plist").path)
@@ -58,12 +60,13 @@ enum LoginItem {
 
     static let label = "dev.voidfs.app.daemon"
     static let turnedOffNote = "The daemon stopped and doesn't start at login. `void daemon start` starts it until you log out."
-    static let notConfiguredHelp = "Start the daemon once from a terminal, with VOIDFS_ENDPOINT, VOIDFS_ACCESS_KEY_ID and VOIDFS_SECRET_ACCESS_KEY set: `void daemon start`. It keeps them for the app's daemon."
+    static let notConfiguredHelp = "Sign in to your voidfs server first: the daemon starts with that key."
 
-    /// The daemon's settings, its server and key, are kept: it has something to start with.
+    /// The daemon has a server and key to start with: the Keychain's, or a `daemon.json` the
+    /// terminal kept, which moves into the Keychain when the daemon starts.
     static var configured: Bool {
         guard let dir = Agent.stateDirectory else { return false }
-        return FileManager.default.fileExists(atPath: dir.appending(path: "daemon.json").path)
+        return (try? ServerKeys.load(dir)) != nil || FileManager.default.fileExists(atPath: ServerKeys.file(dir).path)
     }
 
     /// The agent `void daemon install` writes, which the app's daemon replaces.
@@ -141,7 +144,7 @@ enum LoginItem {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let now = HostModel()
         await now.refresh()
-        print("now: login item \(describe); file system extension enabled=\(now.enabled.map(String.init) ?? "not installed"); Finder extension enabled=\(now.finderEnabled.map(String.init) ?? "unknown")")
+        print("now: login item \(describe); file system extension enabled=\(now.enabled.map(String.init) ?? "not installed"); Finder extension enabled=\(now.finderEnabled.map(String.init) ?? "unknown"); signed in: \(now.signedIn != nil)")
         var failed = 0
         func draw(_ name: String, _ model: HostModel) async {
             let path = dir.appending(path: "\(name).png").path
@@ -157,14 +160,33 @@ enum LoginItem {
             ("not-bundled", .notBundled, ""),
             ("not-configured", .notConfigured, ""),
         ]
+        let example = SignIn.Summary(endpoint: "https://voidfs.example.com", region: ServerKey.defaultRegion, accessKeyId: "VFEXAMPLE0000000000")
         for (i, (name, state, note)) in notes.enumerated() {
             let m = HostModel()
             m.enabled = i != 1
             m.finderEnabled = i != 2
             m.login = state
             m.loginNote = note
+            m.signedIn = state == .notConfigured ? nil : example
             await draw(name, m)
         }
+        // Signing in: the form, filled in with a secret it doesn't show, and a refusal.
+        let form = HostModel()
+        form.enabled = true
+        form.finderEnabled = true
+        form.login = .notConfigured
+        form.signedIn = nil
+        form.signingIn = true
+        form.form = SignInFields(endpoint: "https://voidfs.example.com", region: "", accessKeyId: "VFEXAMPLE0000000000", secretAccessKey: "not-a-real-secret")
+        form.keyNote = "The server didn't accept it: 403 InvalidAccessKeyId: the access key isn't known"
+        await draw("sign-in", form)
+        let signedIn = HostModel()
+        signedIn.enabled = true
+        signedIn.finderEnabled = true
+        signedIn.login = .on
+        signedIn.signedIn = example
+        signedIn.keyNote = "Signed in to https://voidfs.example.com as VFEXAMPLE0000000000. The daemon (pid 4242) runs with it."
+        await draw("signed-in", signedIn)
         return failed == 0 ? 0 : 1
     }
 }

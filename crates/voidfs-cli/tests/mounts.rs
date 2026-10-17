@@ -243,6 +243,82 @@ exit 0
     let _ = std::fs::remove_dir_all(&agents);
 }
 
+/// The app's job hands its daemon the server's key from the app's Keychain on stdin (step 5,
+/// item 7). With the app's job loaded, `daemon start` writes no `daemon.json`, whatever key the
+/// terminal has, and says at once when the app has none. A stand-in for launchctl runs the job as
+/// the app's launcher does: from launchd's empty environment, with the key on a pipe if the
+/// stand-in Keychain, a file here, has one, and with its output in the log.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_apps_daemon_takes_its_key_from_the_app() {
+    let f = Fixture::new("appkey");
+    let s = State::new(&f, "key");
+    let agents = s.dir.with_extension("agents");
+    let _ = std::fs::remove_dir_all(&agents);
+    std::fs::create_dir_all(&agents).unwrap();
+    let (log, fake, defaults, keychain) = (agents.join("launchctl.log"), agents.join("launchctl"), agents.join("defaults"), agents.join("keychain.json"));
+    let script = r#"#!/bin/sh
+echo "$@" >> '@LOG@'
+job="${2##*/}"
+launchd="/usr/bin/env -i HOME=$HOME VOIDFS_LAUNCH_AGENTS_DIR=@DIR@ VOIDFS_LAUNCHCTL=@DIR@/launchctl VOIDFS_DEFAULTS=@DIR@/defaults"
+case "$1" in
+  print) [ -e "@DIR@/$job.loaded" ] || exit 113 ;;
+  kickstart) [ -e "@DIR@/$job.loaded" ] || exit 113
+    if [ -e '@DIR@/keychain.json' ]; then
+      cat '@DIR@/keychain.json' | $launchd VOIDFS_STATE_DIR='@STATE@' VOIDFS_REGION=us-east-1 '@VOID@' daemon run --app --logged --endpoint '@ENDPOINT@' --key-file /dev/stdin >> '@STATE@/daemon.log' 2>&1 &
+    else
+      $launchd '@VOID@' daemon run --app </dev/null >/dev/null 2>&1 &
+    fi ;;
+esac
+exit 0
+"#;
+    let script = script.replace("@LOG@", path(&log)).replace("@DIR@", path(&agents)).replace("@STATE@", path(&s.dir)).replace("@ENDPOINT@", &f.endpoint).replace("@VOID@", env!("CARGO_BIN_EXE_void"));
+    std::fs::write(&fake, script).unwrap();
+    std::fs::write(&defaults, format!("#!/bin/sh\n[ \"$*\" = 'read dev.voidfs.app VoidfsStateDirectory' ] || exit 1\necho '{}'\n", s.dir.display())).unwrap();
+    for f in [&fake, &defaults] {
+        std::fs::set_permissions(f, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    let tools = [("VOIDFS_LAUNCH_AGENTS_DIR", path(&agents).to_owned()), ("VOIDFS_LAUNCHCTL", path(&fake).to_owned()), ("VOIDFS_DEFAULTS", path(&defaults).to_owned())];
+    // The terminal has a key of its own, and the state directory.
+    let mut env = s.env.clone();
+    env.extend(tools.iter().cloned());
+    let mut bare = s.bare();
+    bare.extend(tools.iter().cloned());
+    std::fs::create_dir_all(&s.dir).unwrap();
+    std::fs::write(agents.join("dev.voidfs.app.daemon.loaded"), "").unwrap();
+    let settings = s.dir.join("daemon.json");
+
+    // The app has no key: the job's daemon says so in the log and stops, and `daemon start` says
+    // so as soon as it has, without keeping the terminal's key.
+    let started = Instant::now();
+    let e = run(&["daemon", "start", "--json"], &env, None).fails(1).error();
+    assert_eq!(e["code"], "NoCredentials", "{e}");
+    let message = e["message"].as_str().unwrap();
+    assert!(message.starts_with("voidfs.app has no server key for the daemon: sign in from its menu"), "{message}");
+    assert!(message.contains(&format!("no server key in voidfs.app for {}: sign in from its menu; not starting", s.dir.display())), "{message}");
+    assert!(started.elapsed() < Duration::from_secs(10), "it waited {:?}", started.elapsed());
+    assert!(!settings.exists(), "the terminal's key isn't written for the app's directory");
+
+    // The app has one: its daemon starts with it, from no file.
+    std::fs::write(&keychain, format!(r#"{{"accessKeyId": "{ADMIN_KEY_ID}", "secretAccessKey": "{ADMIN_SECRET}"}}"#)).unwrap();
+    let j = run(&["daemon", "start", "--json"], &bare, None).ok().json();
+    assert_eq!(j["started"], true, "{j}");
+    let status = run(&["daemon", "status", "--json"], &bare, None).ok().json();
+    assert_eq!((status["running"].as_bool(), status["loginJob"].as_str()), (Some(true), Some("dev.voidfs.app.daemon")), "{status}");
+    let page = run(&["status", "--json"], &bare, None).ok().json();
+    assert_eq!(page["connection"]["endpoint"], f.endpoint.as_str(), "{page}");
+    assert!(!settings.exists(), "nothing wrote a daemon.json");
+    let text = std::fs::read_to_string(s.dir.join("daemon.log")).unwrap();
+    assert!(text.contains(&format!("pid {}, socket {}, server {}", j["pid"], s.socket().display(), f.endpoint)), "{text}");
+    assert!(!text.contains(ADMIN_SECRET), "the key isn't logged");
+    run(&["daemon", "stop"], &bare, None).ok();
+
+    let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output().unwrap().stdout).unwrap().trim().to_owned();
+    let calls: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().filter(|l| !l.starts_with("print ")).map(str::to_owned).collect();
+    assert_eq!(calls, [format!("kickstart gui/{uid}/dev.voidfs.app.daemon"), format!("kickstart gui/{uid}/dev.voidfs.app.daemon")]);
+    let _ = std::fs::remove_dir_all(&agents);
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn daemon_install_is_for_macos_until_step_9() {
