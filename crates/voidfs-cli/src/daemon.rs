@@ -17,6 +17,8 @@ use crate::output::{Failure, Out, Result, count, size};
 const START_WAIT: Duration = Duration::from_secs(20);
 /// How long `stop` waits for the daemon to let go of the state directory.
 const STOP_WAIT: Duration = Duration::from_secs(60);
+/// How long the app's daemon waits for one it took over from to let go of the state directory.
+const TAKE_OVER_WAIT: Duration = Duration::from_secs(10);
 /// How often `daemon run` looks for new conflicts to log.
 const CONFLICT_LOOK: Duration = Duration::from_secs(5);
 /// A log larger than this is moved to `daemon.log.1` when the daemon starts.
@@ -33,6 +35,20 @@ pub struct DaemonOptions {
     /// The size of each part, in MiB (at least 5)
     #[arg(long, hide = true, value_name = "MIB")]
     pub part_size: Option<u64>,
+}
+
+/// `daemon run`'s options.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct RunOptions {
+    #[command(flatten)]
+    pub daemon: DaemonOptions,
+    /// voidfs.app's daemon, which launchd starts from the app's job (step 5, item 7): in the
+    /// app's state directory, logging to its log, and taking over from a daemon started otherwise
+    #[arg(long, hide = true)]
+    pub app: bool,
+    /// The app's daemon once its output goes to the log
+    #[arg(long, hide = true, requires = "app")]
+    pub logged: bool,
 }
 
 impl DaemonOptions {
@@ -123,13 +139,66 @@ pub fn connection(conn: &Connection, dir: &Path) -> Result<voidfs_sdk::Config> {
     }
 }
 
+/// `daemon run --app`, as launchd starts it: its output goes to the log of the app's state
+/// directory, which the job's plist, fixed in the app, can't name. It runs itself again on it, in
+/// that directory, as the agent's plist gives its daemon both.
+fn app_logged(opts: &RunOptions) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    if !cfg!(target_os = "macos") {
+        return Err(Failure::new("NotSupported", "`daemon run --app` is voidfs.app's daemon, on macOS"));
+    }
+    let dir = crate::launchd::app_dir().ok_or_else(|| Failure::new("NoStateDirectory", "no state directory for the app's daemon: no HOME"))?;
+    let log = open_log(&dir)?;
+    let exe = std::env::current_exe().map_err(|e| Failure::new("InternalError", format!("finding the void binary: {e}")))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["daemon", "run", "--app", "--logged"]).args(opts.daemon.args()).env("VOIDFS_STATE_DIR", &dir);
+    cmd.stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e| Failure::local(&dir, e))?).stderr(log);
+    Err(Failure::new("InternalError", format!("running the app's daemon: {}", cmd.exec())))
+}
+
+/// The app's daemon takes over (step 5, item 7): the terminal's agent for its state directory goes,
+/// and a daemon started otherwise stops, so that one daemon, started one way, owns the directory.
+async fn take_over(place: &Place) {
+    if crate::launchd::installed_for(&place.dir) {
+        match crate::launchd::remove_agent() {
+            Ok(loaded) => log(&format!("voidfs.app starts the daemon at login now: removed {} ({})", crate::launchd::LABEL, if loaded { "it was loaded, and its daemon stopped" } else { "it wasn't loaded" })),
+            Err(e) => log(&format!("removing {}: {}", crate::launchd::LABEL, e.message)),
+        }
+    }
+    match stop_daemon(place).await {
+        Ok(Some(pid)) => log(&format!("stopped the daemon that was running (pid {pid}), to take over")),
+        Ok(None) => {}
+        Err(e) => log(&format!("stopping the daemon that was running: {}", e.message)),
+    }
+    // A daemon launchd stopped may let go of the directory just after it answers no more.
+    let deadline = Instant::now() + TAKE_OVER_WAIT;
+    while !free(&place.dir) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// `daemon run`: the daemon in the foreground, until a client or a signal stops it.
-pub async fn run(conn: &Connection, opts: &DaemonOptions) -> Result<()> {
+pub async fn run(conn: &Connection, opts: &RunOptions) -> Result<()> {
+    if opts.app && !opts.logged {
+        return app_logged(opts);
+    }
     let place = Place::new()?;
+    if opts.app {
+        take_over(&place).await;
+    }
     if let Some(s) = place.status().await? {
         return Err(Failure::new("DaemonRunning", format!("a daemon is already running on {} (pid {})", place.dir.display(), s.daemon.pid)));
     }
-    let config = connection(conn, &place.dir)?;
+    let config = match connection(conn, &place.dir) {
+        // Without a key, the app's daemon has nothing to run, and launchd shouldn't run it again
+        // until it is asked: `daemon start` keeps the key first.
+        Err(f) if opts.app && f.code == "NoCredentials" => {
+            log(&format!("{}: not starting", f.message));
+            return Ok(());
+        }
+        r => r?,
+    };
+    let opts = &opts.daemon;
     let endpoint = config.endpoint.clone();
     let mut cfg = DaemonConfig::new(&place.dir, config, build());
     // Mounting: FSKit, through voidfs.app's module (step 5, item 3).
@@ -195,15 +264,18 @@ pub async fn ensure_started(conn: &Connection, opts: &DaemonOptions, place: &Pla
     }
     let config = connection(conn, &place.dir)?;
     Settings::of(&config).save(&place.dir).map_err(|e| Failure::local(&Settings::path(&place.dir), e))?;
-    // The launchd agent, when it is installed, so that launchd keeps the daemon it starts.
-    if crate::launchd::installed() && crate::launchd::kickstart() {
+    // The job that starts it at login, the app's or the agent, so that launchd keeps the daemon
+    // it starts.
+    if let Some(login) = crate::launchd::login(&place.dir)
+        && crate::launchd::kickstart(login)
+    {
         let deadline = Instant::now() + START_WAIT;
         loop {
             if let Some(s) = place.status().await? {
                 return Ok((s, true));
             }
             if Instant::now() > deadline {
-                return Err(Failure::new("DaemonFailed", format!("launchd started {}, but its daemon didn't answer within {} s; its log:\n{}", crate::launchd::LABEL, START_WAIT.as_secs(), log_tail(&place.dir))));
+                return Err(Failure::new("DaemonFailed", format!("launchd started {}, but its daemon didn't answer within {} s; its log:\n{}", login.label(), START_WAIT.as_secs(), log_tail(&place.dir))));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -301,14 +373,29 @@ pub fn uptime(secs: u64) -> String {
     }
 }
 
+/// Who starts the daemon at login, for `daemon status`: a line on macOS.
+fn login_line(login: Option<crate::launchd::Login>) -> String {
+    match login {
+        _ if !cfg!(target_os = "macos") => String::new(),
+        Some(l) => format!("\nstarts at login: {}", l.describe()),
+        None => "\ndoesn't start at login: `void daemon install`, or Start at login in voidfs.app's menu".into(),
+    }
+}
+
 pub async fn daemon_status(out: Out) -> Result<()> {
     let place = Place::new()?;
+    let login = crate::launchd::login(&place.dir);
+    let label = login.map(crate::launchd::Login::label);
     match place.status().await? {
         Some(s) => {
             let d = &s.daemon;
-            out.emit(d, || format!("daemon running · pid {} · up {} · {} · socket {}", d.pid, uptime(d.uptime_secs), count(s.mounts.len(), "mount"), d.socket))
+            let mut v = serde_json::to_value(d).map_err(|e| Failure::new("InternalError", e.to_string()))?;
+            v["loginJob"] = json!(label);
+            out.emit(&v, || format!("daemon running · pid {} · up {} · {} · socket {}{}", d.pid, uptime(d.uptime_secs), count(s.mounts.len(), "mount"), d.socket, login_line(login)))
         }
-        None => out.emit(&json!({ "running": false, "socket": place.socket() }), || format!("daemon not running (socket {})", place.socket().display())),
+        None => out.emit(&json!({ "running": false, "socket": place.socket(), "loginJob": label }), || {
+            format!("daemon not running (socket {}){}", place.socket().display(), login_line(login))
+        }),
     }
 }
 

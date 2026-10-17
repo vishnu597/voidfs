@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `void mount|unmount|mounts` against a daemon started in this process on a socket of its own,
-//! with a fake adapter (the binary has none until step 5); and `void daemon install|uninstall`,
-//! with the plist in a temporary folder and a stand-in for launchctl.
+//! with a fake adapter (the binary has none until step 5); and `void daemon install|uninstall` and
+//! the app's daemon, with the plist in a temporary folder and stand-ins for launchctl and defaults.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -125,6 +125,122 @@ fn void_mounts_with_fskit_on_macos_and_has_no_adapter_elsewhere() {
     assert_eq!(s.void(&["daemon", "status", "--json"]).ok().json()["running"], true);
     assert!(s.void(&["mounts", "--json"]).ok().json()["remembered"].as_array().unwrap().is_empty());
     assert!(lines(&s.void(&["status"]).ok().out()).contains(&"mounts none".to_owned()));
+}
+
+/// voidfs.app's daemon (step 5, item 7), run as launchd runs the app's job: it takes over from the
+/// terminal's agent and from a daemon started by hand, in the app's state directory, and logs
+/// there; while the app's job is loaded `daemon install` refuses and `daemon start` asks launchd
+/// for the app's. The stand-ins for launchctl and defaults are in a temporary folder.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_apps_daemon_takes_over_the_state_directory() {
+    let f = Fixture::new("appdaemon");
+    let s = State::new(&f, "app");
+    let agents = s.dir.with_extension("agents");
+    let _ = std::fs::remove_dir_all(&agents);
+    std::fs::create_dir_all(&agents).unwrap();
+    let log = agents.join("launchctl.log");
+    let fake = agents.join("launchctl");
+    // As launchctl, for both jobs: print succeeds for a loaded job, bootstrap loads the agent and
+    // runs it, kickstart runs a loaded job and bootout stops and unloads one.
+    let script = r#"#!/bin/sh
+echo "$@" >> 'LOG'
+job="${2##*/}"
+case "$1" in
+  print) [ -e "DIR/$job.loaded" ] || exit 113 ;;
+  bootstrap) touch 'DIR/dev.voidfs.daemon.loaded'; 'VOID' daemon run </dev/null >/dev/null 2>&1 & ;;
+  kickstart) [ -e "DIR/$job.loaded" ] || exit 113
+    if [ "$job" = dev.voidfs.app.daemon ]; then 'VOID' daemon run --app </dev/null >/dev/null 2>&1 &
+    else 'VOID' daemon run </dev/null >/dev/null 2>&1 & fi ;;
+  bootout) [ -e "DIR/$job.loaded" ] || exit 3; rm "DIR/$job.loaded"; 'VOID' daemon stop >/dev/null 2>&1 ;;
+esac
+exit 0
+"#;
+    let script = script.replace("LOG", path(&log)).replace("DIR", path(&agents)).replace("VOID", env!("CARGO_BIN_EXE_void"));
+    std::fs::write(&fake, script).unwrap();
+    // As defaults: the app's VoidfsStateDirectory is this test's.
+    let defaults = agents.join("defaults");
+    std::fs::write(&defaults, format!("#!/bin/sh\n[ \"$*\" = 'read dev.voidfs.app VoidfsStateDirectory' ] || exit 1\necho '{}'\n", s.dir.display())).unwrap();
+    for f in [&fake, &defaults] {
+        std::fs::set_permissions(f, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    let mut env = s.env.clone();
+    env.push(("VOIDFS_LAUNCH_AGENTS_DIR", path(&agents).into()));
+    env.push(("VOIDFS_LAUNCHCTL", path(&fake).into()));
+    env.push(("VOIDFS_DEFAULTS", path(&defaults).into()));
+    let void = |args: &[&str]| run(args, &env, None);
+    let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output().unwrap().stdout).unwrap().trim().to_owned();
+    let status = || void(&["daemon", "status", "--json"]).ok().json();
+    let answers = |pid: u32| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while status()["pid"].as_u64() != Some(pid.into()) {
+            assert!(Instant::now() < deadline, "pid {pid} didn't answer: {}", std::fs::read_to_string(s.dir.join("daemon.log")).unwrap_or_default());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // launchd's environment has neither the state directory nor the connection: the app's daemon
+    // finds the one in the app's defaults, and the other in its daemon.json.
+    let launchd: Vec<(&str, String)> = env.iter().filter(|(k, _)| !k.starts_with("VOIDFS_") || matches!(*k, "VOIDFS_LAUNCH_AGENTS_DIR" | "VOIDFS_LAUNCHCTL" | "VOIDFS_DEFAULTS")).cloned().collect();
+    let app = || {
+        std::fs::write(agents.join("dev.voidfs.app.daemon.loaded"), "").unwrap();
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_void"));
+        cmd.args(["daemon", "run", "--app"]).env_clear().envs(launchd.iter().cloned()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        cmd.spawn().unwrap()
+    };
+
+    // The terminal's agent runs the daemon.
+    void(&["daemon", "install"]).ok();
+    let plist = agents.join("dev.voidfs.daemon.plist");
+    assert!(plist.exists());
+    let agents_pid = status()["pid"].as_u64().unwrap();
+    assert_eq!(status()["loginJob"], "dev.voidfs.daemon");
+
+    // SMAppService registers the app's job, and launchd runs it: the agent goes, its daemon stops,
+    // and the app's answers, in the process launchd started, with its output in the log.
+    let mut child = app();
+    answers(child.id());
+    assert!(!plist.exists(), "the agent is removed");
+    assert_ne!(Some(child.id().into()), Some(agents_pid));
+    assert_eq!(status()["loginJob"], "dev.voidfs.app.daemon");
+    let text = std::fs::read_to_string(s.dir.join("daemon.log")).unwrap();
+    assert!(text.contains("voidfs.app starts the daemon at login now: removed dev.voidfs.daemon (it was loaded, and its daemon stopped)"), "{text}");
+    assert!(text.contains(&format!("daemon started: pid {}, socket {}", child.id(), s.socket().display())), "{text}");
+
+    // While the app has it, `daemon install` refuses, and `daemon status` says who starts it.
+    let e = void(&["daemon", "install", "--json"]).fails(1).error();
+    assert_eq!(e["code"], "ManagedByApp", "{e}");
+    assert!(!plist.exists());
+    let text = void(&["daemon", "status"]).ok().out();
+    assert!(text.contains("starts at login: voidfs.app (dev.voidfs.app.daemon, Start at login in its menu)"), "{text}");
+    assert!(void(&["daemon", "uninstall"]).ok().out().contains("wasn't installed; voidfs.app starts it (dev.voidfs.app.daemon)"));
+
+    // Stopped as asked, it exits 0, which launchd leaves stopped; `daemon start` asks launchd.
+    void(&["daemon", "stop"]).ok();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(void(&["daemon", "start", "--json"]).ok().json()["started"], true);
+    assert_eq!(status()["running"], true);
+    void(&["daemon", "stop"]).ok();
+
+    // A daemon started by hand makes way for the app's at the next login.
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_void"));
+    cmd.args(["daemon", "run"]).env_clear().envs(env.iter().cloned()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let mut hand = cmd.spawn().unwrap();
+    answers(hand.id());
+    let mut child = app();
+    answers(child.id());
+    assert!(hand.wait().unwrap().success(), "the daemon started by hand stopped as asked");
+    let text = std::fs::read_to_string(s.dir.join("daemon.log")).unwrap();
+    assert!(text.contains(&format!("stopped the daemon that was running (pid {}), to take over", hand.id())), "{text}");
+    void(&["daemon", "stop"]).ok();
+    assert!(child.wait().unwrap().success());
+
+    // `print` asks whether the app's job is loaded, as every status does.
+    let calls: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().filter(|l| !l.starts_with("print ")).map(str::to_owned).collect();
+    let (agent, app_job) = (format!("gui/{uid}/dev.voidfs.daemon"), format!("gui/{uid}/dev.voidfs.app.daemon"));
+    let (bootout, bootstrap) = (format!("bootout {agent}"), format!("bootstrap gui/{uid} {}", plist.display()));
+    // Install's, the app's daemon's, uninstall's.
+    assert_eq!(calls, [bootout.clone(), bootstrap, bootout.clone(), bootout, format!("kickstart {app_job}")]);
+    let _ = std::fs::remove_dir_all(&agents);
 }
 
 #[cfg(not(target_os = "macos"))]

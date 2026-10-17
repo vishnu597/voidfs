@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// voidfs.app: the menu-bar host FSKit requires. It shows whether the extension is enabled, the
-// daemon's transfers with their controls (Transfers.swift), and asks the daemon to mount drives,
-// which it does with the extension (the `fskit` adapter) and remembers. The daemon holds the server
-// and key (`void daemon start`); the extension and the app hold none.
+// voidfs.app: the menu-bar host FSKit requires. It shows whether the extensions are enabled and
+// whether the daemon starts at login (LoginItem.swift), the daemon's transfers with their controls
+// (Transfers.swift), and asks the daemon to mount drives, which it does with the extension (the
+// `fskit` adapter) and remembers. The daemon holds the server and key (`void daemon start`); the
+// extensions and the app hold none.
 //
 // It also runs headless, for scripts:
 //
@@ -13,14 +14,17 @@
 //     voidfs.app/Contents/MacOS/voidfs mount <drive> [mount-point]
 //     voidfs.app/Contents/MacOS/voidfs settings
 //     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status
+//     voidfs.app/Contents/MacOS/voidfs login-item on | off | status | look <folder>
 //     voidfs.app/Contents/MacOS/voidfs bridge-check
 //     voidfs.app/Contents/MacOS/voidfs bridge-selftest <drive> [main|daemon-restart|agent-restart|remote <key>|refused|wire] [--socket <path>]
 //     voidfs.app/Contents/MacOS/voidfs badges-selftest <drive> [main|daemon-restart|refused] [--socket <path>] [--peer <path>] [--metrics <url>] [--files <n>] [--png <path>]
 //     voidfs.app/Contents/MacOS/voidfs badges-check
 //
 // `agent` is how launchd runs it as the extensions' bridge to the daemon (Agent.swift, BadgeAgent.swift).
+// The daemon itself starts at login from the app's copy of `void` (LoginItem.swift).
 
 import FSKit
+import FinderSync
 import ServiceManagement
 import SwiftUI
 
@@ -31,13 +35,19 @@ enum Launcher {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
         if args.first == "agent" { Agent.serve() }
+        if args.first == "login-item", args.dropFirst().first == "look" {
+            // Drawing needs AppKit's main thread, as the transfers self-test's does.
+            Task { @MainActor in exit(await LoginItem.look(Array(args.dropFirst(2)))) }
+            NSApplication.shared.setActivationPolicy(.prohibited)
+            NSApplication.shared.run()
+        }
         if args.first == "transfers-selftest" {
             // It draws with AppKit, which needs the main thread that dispatchMain() gives up.
             Task { @MainActor in exit(await TransfersSelfTest.run(Array(args.dropFirst()))) }
             NSApplication.shared.setActivationPolicy(.prohibited)
             NSApplication.shared.run()
         }
-        if let command = args.first, ["status", "transfers", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "bridge-check", "bridge-selftest", "badges-selftest", "badges-check"].contains(command) {
+        if let command = args.first, ["status", "transfers", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "login-item", "bridge-check", "bridge-selftest", "badges-selftest", "badges-check"].contains(command) {
             Task {
                 let code = await HostCommands.run(args)
                 exit(code)
@@ -85,6 +95,21 @@ enum HostCommands {
                 print("agent: \(Agent.status)")
             case "agent-status":
                 print("agent: \(Agent.status)")
+            case "login-item":
+                switch args.dropFirst().first {
+                case "on":
+                    print(await LoginItem.turnOn())
+                    print("login item: \(LoginItem.describe)")
+                    return LoginItem.state == .on ? 0 : 1
+                case "off":
+                    print(await LoginItem.turnOff())
+                    print("login item: \(LoginItem.describe)")
+                case "status", nil:
+                    print("login item: \(LoginItem.describe)")
+                default:
+                    print("usage: login-item on | off | status | look <folder>")
+                    return 2
+                }
             case "bridge-check":
                 // The installed agent must refuse anything but the extension, this app included.
                 let client = BridgeClient()
@@ -174,8 +199,14 @@ final class HostModel {
     var drive = ""
     var status = ""
     var enabled: Bool?
+    var finderEnabled: Bool?
+    var login = LoginItem.state
+    var loginNote = ""
+    var loginBusy = false
 
     func refresh() async {
+        login = LoginItem.state
+        finderEnabled = FIFinderSyncController.isExtensionEnabled
         do {
             let modules = try await FSClient.shared.installedExtensions
             enabled = modules.first { $0.bundleIdentifier == extensionBundleID }?.isEnabled
@@ -183,6 +214,14 @@ final class HostModel {
         } catch {
             status = "Could not list file system extensions: \(error.localizedDescription)"
         }
+    }
+
+    func setLogin(_ on: Bool) async {
+        loginBusy = true
+        loginNote = on ? "Starting the daemon…" : "Stopping the daemon…"
+        loginNote = on ? await LoginItem.turnOn() : await LoginItem.turnOff()
+        login = LoginItem.state
+        loginBusy = false
     }
 
     func mount() async {
@@ -206,13 +245,7 @@ struct HostView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("voidfs").font(.headline)
-            switch model.enabled {
-            case true?: Label("File system extension enabled", systemImage: "checkmark.circle")
-            case false?:
-                Label("File system extension disabled", systemImage: "exclamationmark.triangle")
-                Button("Open File System Extensions settings") { _ = FSClient.shared.openFileSystemExtensionsSettings() }
-            case nil: EmptyView()
-            }
+            SetupView(model: model)
             TransfersView(transfers: transfers)
             Divider()
             TextField("Drive", text: $model.drive)
@@ -226,5 +259,54 @@ struct HostView: View {
         .padding()
         .frame(width: 400)
         .task { await model.refresh() }
+    }
+}
+
+/// What voidfs needs switched on: the extensions, and the daemon at login.
+struct SetupView: View {
+    @Bindable var model: HostModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch model.enabled {
+            case true?: Label("File system extension enabled", systemImage: "checkmark.circle")
+            case false?:
+                Label("File system extension disabled", systemImage: "exclamationmark.triangle")
+                Button("Open File System Extensions settings") { _ = FSClient.shared.openFileSystemExtensionsSettings() }
+            case nil: EmptyView()
+            }
+            switch model.finderEnabled {
+            case true?: Label("Finder extension enabled", systemImage: "checkmark.circle")
+            case false?:
+                Label("Finder extension disabled: no sync badges", systemImage: "exclamationmark.triangle")
+                Button("Open Finder extension settings") { FIFinderSyncController.showExtensionManagementInterface() }
+            case nil: EmptyView()
+            }
+            LoginItemView(model: model)
+        }
+    }
+}
+
+/// Start at login: the daemon, from the app's copy of `void`.
+struct LoginItemView: View {
+    @Bindable var model: HostModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            let on = Binding(get: { model.login == .on || model.login == .needsApproval }, set: { v in Task { await model.setLogin(v) } })
+            Toggle("Start the daemon at login", isOn: on)
+                .disabled(model.loginBusy || model.login == .notBundled || model.login == .notConfigured)
+            switch model.login {
+            case .needsApproval:
+                Label("Waiting for your approval in Login Items", systemImage: "exclamationmark.triangle")
+                Button("Open Login Items settings") { SMAppService.openSystemSettingsLoginItems() }
+            case .notBundled:
+                Text("This copy of voidfs has no daemon to start: build it with the Bundle void phase.").font(.caption)
+            case .notConfigured:
+                Text(LoginItem.notConfiguredHelp).font(.caption).textSelection(.enabled)
+            case .on, .off: EmptyView()
+            }
+            if !model.loginNote.isEmpty { Text(model.loginNote).font(.caption).textSelection(.enabled) }
+        }
     }
 }

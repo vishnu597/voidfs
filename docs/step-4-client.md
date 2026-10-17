@@ -1011,11 +1011,15 @@ What the third built (the mount table and the launchd agent):
   and removes the plist. With the agent installed, `daemon start` asks launchd (`kickstart`), so
   that launchd keeps the daemon it starts. On Linux, `install` says the systemd user unit comes
   with step 9. Space 0.2.343's `daemon install` is Linux-only; on macOS its app brings the daemon
-  back (§1.2).
-- **launchd in the tests:** `VOIDFS_LAUNCH_AGENTS_DIR` and `VOIDFS_LAUNCHCTL` put the plist, and
-  the `launchctl` the CLI runs, elsewhere. The tests use a stand-in that logs what it is asked and
-  runs the daemon as launchd would, and check the plist with `plutil -lint`; nothing was written
-  to `~/Library/LaunchAgents`, and launchd was asked nothing, while building it.
+  back (§1.2). voidfs.app does too, since step 5's item 7: while its Start at login job
+  (`dev.voidfs.app.daemon`) owns the state directory, `install` refuses with `ManagedByApp` and
+  `daemon start` kickstarts the app's job; the app's daemon removes this agent when it starts
+  ([the app's login daemon](step-5-macos.md#the-apps-login-daemon-17-october)).
+- **launchd in the tests:** `VOIDFS_LAUNCH_AGENTS_DIR`, `VOIDFS_LAUNCHCTL` and `VOIDFS_DEFAULTS`
+  put the plist, and the `launchctl` and `defaults` the CLI runs, elsewhere. The tests use a
+  stand-in that logs what it is asked and runs the daemon as launchd would, and check the plist
+  with `plutil -lint`; nothing was written to `~/Library/LaunchAgents`, and launchd was asked
+  nothing, while building it.
 
 **Design.** The `void` binary also runs as the per-user agent (`void daemon run`), as
 `spacefs-fskitd` is both; the spike decided on a per-user agent for the Rust core (spike §4.1).
