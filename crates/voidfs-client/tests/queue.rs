@@ -261,6 +261,35 @@ async fn a_cancel_never_publishes_and_takes_what_was_built_on_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_unfinished_status_is_the_status_without_finished_entries() {
+    let (_s, _p, _direct, c) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let q = open(dir.path(), &c, config()).await;
+    let files: Vec<_> = (0..6u64).map(|i| {
+        let p = dir.path().join(format!("f{i}"));
+        std::fs::write(&p, bytes_of(i, 1000 + i)).unwrap();
+        p
+    }).collect();
+    let import = |range: std::ops::Range<usize>| files[range].iter().map(|p| Import { path: p.clone(), drive: "drv".into(), key: p.file_name().unwrap().to_string_lossy().into_owned() }).collect::<Vec<_>>();
+    let first = q.import("first", import(0..2)).await.unwrap();
+    q.put("drv", "loose", "done".into(), Base::Absent, Attrs::default()).await.unwrap();
+    q.settle().await;
+    q.pause(Scope::All).await.unwrap();
+    let second = q.import("second", import(2..6)).await.unwrap();
+    q.put("drv", "waiting", "queued".into(), Base::Absent, Attrs::default()).await.unwrap();
+    let ids: Vec<_> = q.status().await.unwrap().items.iter().filter(|i| i.batch == Some(second)).map(|i| i.id).collect();
+    q.cancel(Scope::Entry(ids[0])).await.unwrap();
+    q.pause(Scope::Entry(ids[1])).await.unwrap();
+
+    let mut expected = q.status().await.unwrap();
+    expected.items.retain(|i| !i.state.finished());
+    assert_eq!(q.unfinished().await.unwrap(), expected);
+    assert_eq!(expected.batches.iter().map(|b| (b.id, b.label.as_str(), b.items, b.done, b.cancelled, b.bytes)).collect::<Vec<_>>(),
+        [(first, "first", 2, 2, 0, 2001), (second, "second", 4, 0, 1, 4014)], "the finished entries are counted, not listed");
+    assert_eq!(expected.items.len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_bandwidth_limit_holds() {
     let (_s, _p, _direct, c) = setup().await;
     let dir = tempfile::tempdir().unwrap();

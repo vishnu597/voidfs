@@ -82,11 +82,18 @@ computer's save meanwhile becomes a conflict. A mount's conflict has no Cancel: 
 already stay on this Mac until it's resolved. The menu says so beside the button and after a
 cancel; `void uploads cancel` does the same
 ([cancelling a mount's change](../../docs/step-5-macos.md#cancelling-a-mounts-change-16-october)).
+The menu lists the six changes that most need showing, uploading first, and counts the rest; its
+watch asks the daemon for only those (`/v1/uploads/watch?limit=6`), so with a 10,000-file import
+queued its line is about 1.6 KB a second rather than 1.4 MB. While no daemon runs, the menu reads
+what waits in the daemon's journal, writing nothing, and says so as `void status` does. A drive's
+pause, resume and cancel answer from this Mac even while the server hangs.
 `voidfs transfers` prints the menu's lines, and
-`voidfs transfers-selftest <drive> [--cancel] [--png <path>]` calls each control and checks the
-daemon afterwards; run it against a test daemon with `-VoidfsStateDirectory <dir>`
-([evidence](../../bench/results/menu-transfers/README.md),
-[cancel](../../bench/results/mount-cancel-kept/README.md)). Logs:
+`voidfs transfers-selftest <drive> [--cancel | --no-daemon | --look] [--png <path>]` calls each
+control and checks the daemon afterwards. `--no-daemon` checks the journal's line with the daemon
+stopped, and `--look` changes nothing, for drawing the menu as it is. Run it against a test daemon
+with `-VoidfsStateDirectory <dir>` ([evidence](../../bench/results/menu-transfers/README.md),
+[cancel](../../bench/results/mount-cancel-kept/README.md),
+[a live mount](../../bench/results/item8-live/README.md)). Logs:
 `log stream --predicate 'subsystem == "dev.voidfs"'` (the module logs as category `fs`, the agent
 as `agent`).
 
@@ -257,7 +264,14 @@ costs one call however many files it has, and a folder that hasn't changed answe
 The extension badges the folders under the daemon's mounted mountpoints, so it needs the agent
 registered (above) and a drive mounted. Enable it in System Settings → General → Login Items &
 Extensions → Finder Extensions (or with `pluginkit -e use -i dev.voidfs.app.findersync`).
-Building registers the build folder's copy with LaunchServices, disabled.
+Building registers the build folder's copy with LaunchServices, disabled. Rebuilding the app while
+a drive is mounted through FSKit ends the module and unmounts the volume, though the daemon still
+lists the mount: unmount first, or `void unmount` and `void mount` after.
+
+The drive's own icon, on the desktop or in its parent folder, carries no reliable badge: Finder
+doesn't ask the extension about a mounted volume's icon, and doesn't show one set unasked. The
+drive's state shows on the folders inside it and in the menu
+([a live mount](../../bench/results/item8-live/README.md)).
 
 `badges-check` shows that the installed agent turns the app itself away. `badges-selftest <drive>`
 runs the extension's model against the agent's badge listener in process, without Finder, FSKit or

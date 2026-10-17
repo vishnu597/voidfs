@@ -303,7 +303,7 @@ mod tests {
             ],
             batches: Vec::new(), paused: false, paused_drives: Vec::new(), bandwidth: None, unpublished: 4, unpublished_bytes: 24,
         };
-        let text = render(&UploadList { queue, rate: 0, eta_secs: None });
+        let text = render(&UploadList { queue, rate: 0, eta_secs: None, more: 0, mount_unsent: 0 });
         assert_eq!(text.matches("conflict: the drive changed (now version 184.0); this Mac keeps its copy").count(), 2, "{text}");
         assert!(text.contains("conflict: the drive changed; this Mac keeps its copy"), "{text}");
         assert!(text.contains("failed: 403 AccessDenied") && !text.contains("failed: 412"), "{text}");
