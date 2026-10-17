@@ -2841,3 +2841,20 @@ Everything was restored afterwards.
 - **Not started:** credentials still come from `daemon.json` rather than the Keychain, and there
   is no `/Volumes` helper. Busy eject and the done-when are open.
 
+**The Keychain probe** (17 October,
+[evidence](../bench/results/item7-keychain-probe/README.md)). The user chose the shared team
+Keychain (the data-protection keychain, access group `HAUTK68F56.dev.voidfs`) for the server key,
+moved there from `daemon.json`, with the daemon reading it itself. Throwaway probes in Rust
+(security-framework, already in `Cargo.lock`) and Swift found:
+
+- Reads take about 2 ms with no prompt. Ad hoc code that claims the group is killed at launch,
+  and code without the group is refused.
+- The App Group alone doesn't count: secd ignores it without a provisioning profile. Each
+  executable must claim `keychain-access-groups`, a restricted entitlement, backed by a profile
+  in its own bundle. With Apple Development signing, a tool in an app's `Contents/MacOS` or
+  `Contents/Helpers` doesn't use the app's profile and is killed (-413).
+- Developer ID tools ran without a profile, but that is undocumented, and development builds
+  can't, so the slice doesn't rely on it.
+- So the app needs profiles for `dev.voidfs.app`. A daemon reading the key itself needs its own
+  helper bundle, App ID and profiles too.
+
