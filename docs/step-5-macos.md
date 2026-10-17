@@ -9,7 +9,7 @@ the Swift bridge and one daemon for the CLI and the app added 9 October; read-on
 daemon added 10 October; the SMB feasibility spike and writable FSKit added 12 October; the
 application matrix and its first fixes added 13 October; held mmap delivery and its durability
 policy clarified 14 October; menu-bar transfers, Finder Sync badges and the fate of a mount's
-cancelled change added 16 October. **Item 1 is complete**
+cancelled change added 16 October; item 8 marked complete 17 October. **Item 1 is complete**
 ([8 October](#setting-mode-and-mtime-8-october)): the Rust mount namespace, snapshot handles,
 durable namespace mutations, staged writes, publication reconciliation, recovery, advertised
 capabilities and attribute changes. **Item 2 is complete**
@@ -40,8 +40,9 @@ decode/export checks on this Mac, including direct cold/warm decoder opens on a 
 fresh fork; native Xcode open/edit/save/build/run also passes.
 QuickTime GUI trim/export and several exact GUI controls remain unvalidated, and two
 independent Macs and the absent paid target apps remain explicitly untested.
-**Item 8 is built, and each clause of its done-when is shown on a live FSKit mount; its one
-finding is explained, and the fix is checked in a live Finder** (16 October). The menu shows the
+**Item 8 is complete** ([17 October](#item-8-menu-bar-transfers-and-finder-sync)): each clause of
+its done-when is shown on a live FSKit mount, and its one finding is explained and the fix
+checked in a live Finder (16 October). The menu shows the
 daemon's connection, queue and mounts in the CLI's words and controls the queue
 ([menu-bar transfers](#menu-bar-transfers-16-october)). A Finder Sync
 extension badges mounted drives' items from one daemon call that reads only local state
@@ -366,8 +367,10 @@ actions, not actions performed by writing this plan.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
-**Built, 16 October; each clause shown; the one finding explained and fixed, checked in
-Finder.** The slices: the menu's transfers ([menu-bar transfers](#menu-bar-transfers-16-october)),
+**Complete, 17 October:** every clause of the done-when is shown on a live FSKit mount, and the
+one finding is explained and fixed, checked in Finder; the user marked the item complete with the
+limits below (the real menu's clicks, the menu app's restart by hand, the drive's own icon). The
+slices: the menu's transfers ([menu-bar transfers](#menu-bar-transfers-16-october)),
 Finder Sync badges and context menu
 ([Finder Sync badges](#finder-sync-badges-16-october)), the fate of a mount's cancelled change
 ([cancelling](#cancelling-a-mounts-change-16-october)), a live mount with the menu bounded and
@@ -399,8 +402,12 @@ done-when, clause by clause:
   (no server request over a 1,000-file folder, none in 10 s of polling three folders) and live.
 - **The app stays usable while offline: shown.** Offline, the mount wrote in 0.06 s and the
   menu's checks ran in 1.25 s. Hung, after the fix, they ran in 0.68 s. Degraded, they ran in
-  0.66 s, while reads of what wasn't cached failed, by design. The status says offline and
-  degraded, but says online while the server hangs with only a long upload asking.
+  0.66 s, while reads of what wasn't cached failed, by design. The status said offline and
+  degraded, but said online while the server hung with only a long upload asking; since
+  [PR #79](https://github.com/vishnu597/voidfs/pull/79) (17 October), a request that waits on a
+  silent server gets a probe, and the link goes offline in about 10 s
+  ([step 4, item 3](step-4-client.md#item-3-the-client-core)). Checked against a fault proxy in
+  process, not again on a live mount.
 - **The app stays usable while a large upload runs: shown.** With 10,000 changes queued, a status
   takes 17 ms rather than 79, and the menu's watch line is 1.6 KB rather than 1.4 MB. The menu app
   uses 0.1% CPU and 16 MB. The live run's controls ran while uploads were in flight.
@@ -411,7 +418,7 @@ The missing badges are explained (16 October), and the extension's fix is checke
 in a live Finder. With the old comparison, three windows opened after a 0.25 s remount had no
 badges. With the fix, three windows opened after the same remount got every badge, one of them
 3.7 s after the mount ([the live check](#finders-lost-badges-16-october)). Nothing the live run
-found is left unexplained; marking item 8 complete is left to the user.
+found is left unexplained. The user marked item 8 complete on 17 October.
 
 Use the existing daemon status/upload stream for mounts, connectivity, queue progress, per-item
 and global pause/resume, cancel and immediate bandwidth caps. Distinguish local durable saves
@@ -2579,7 +2586,9 @@ of each phase:
 - The agent, killed, came back in about 2 s, and the mount and badges carried on.
 - Offline (the relay refusing), the mount wrote in 0.06 s and the menu's checks ran in 1.25 s.
 - Hung (the relay stopped), the status said online for 5 minutes, because only an upload with a
-  120 s attempt was asking, and the drive pause hung until the fix (0.68 s after it).
+  120 s attempt was asking, and the drive pause hung until the fix (0.68 s after it). Fixed
+  since: such a hang takes the link offline in about 10 s
+  ([PR #79](https://github.com/vishnu597/voidfs/pull/79)).
 - Degraded (every request 503), the status said so and controls ran in 0.66 s, while reads of what
   wasn't cached failed with EIO, by design. It said degraded for 79 s after the link recovered,
   until the feed's backed-off watch answered.
@@ -2595,6 +2604,8 @@ Findings, each left for later:
   after a remount. The drive's state shows on its folders and in the menu.
 - **A bandwidth limit reads as degraded.** Uploads sent at 2 KiB/s take more than the 10 s that
   `Connectivity` counts as a slow answer, so the status said "degraded" with the server healthy.
+  Fixed since: time a body waits on the upload limit doesn't count toward the 10 s
+  ([PR #79](https://github.com/vishnu597/voidfs/pull/79)).
 - **Rebuilding unmounts.** Rebuilding the app re-registers it, which ends the FSKit module and
   unmounts the volume, while the daemon still lists the mount until `void unmount`.
 - **Cancel on a waiting change.** The menu shows Cancel on a mount's change queued behind a

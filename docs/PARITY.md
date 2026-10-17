@@ -9,7 +9,8 @@ and then for the Mac apps head to head; provider follow-ups and the step 5 plan 
 2026-10-04, with step 5 decisions, namespace and snapshot-read slices on 2026-10-05, and bounded
 moved-snapshot resolution, local namespace changes and staged file writes on 2026-10-06,
 Rust daemon sessions/shared feeds and guarded publication on 2026-10-07, and mount recovery on
-2026-10-08, writable FSKit on 2026-10-12, and the application matrix on 2026-10-13. The first was taken
+2026-10-08, writable FSKit on 2026-10-12, the application matrix on 2026-10-13, and step 5's item 8
+(menu-bar transfers and Finder Sync) complete on 2026-10-17. The first was taken
 on 2026-09-27.*
 
 Sources:
@@ -162,6 +163,13 @@ billing or plans), this page says so.
     The declared 50 GB synthetic-media workload and native Xcode edit/build/run scope pass on
     this Mac. QuickTime GUI trim/export remains unvalidated, and two independent Macs remain
     untested; those scoped passes do not complete the application matrix.
+    **Item 8 is complete** (17 October, [step 5](step-5-macos.md#item-8-menu-bar-transfers-and-finder-sync)):
+    the menu bar shows the daemon's connection, queue and mounts and controls the queue, a Finder
+    Sync extension badges mounted drives' items from local state alone, and a mount's cancelled
+    change is kept on this Mac, not uploaded, until the next save. On a live FSKit mount, Finder,
+    the menu and `void status` agreed through each state, daemon and agent restarts, and offline,
+    hung and degraded links. Not shown: clicks in the real menu, the menu app restarted by hand,
+    and a badge on the drive's own icon (Finder doesn't ask for one).
     Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan
@@ -906,7 +914,8 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
      waits for Apple to fix the miss. The volume writes through the core (item 4), with a flush
      within a second standing in for the fsync FSKit doesn't pass on; `RENAME_SWAP` overwrites on
      every FSKit volume, a second release blocker. Item 6's application matrix now runs on this
-     Mac; free alternatives have separate rows and do not certify the absent target apps.
+     Mac; free alternatives have separate rows and do not certify the absent target apps. The
+     menu bar's transfers and Finder Sync badges are shown on a live mount: item 8 is complete.
    - The design the spike chose: the per-user agent and a thin extension.
    - Mac file semantics (xattrs, no `._` files, atomic saves) and snapshot-at-open reads.
    - A connectivity state that fails fast when offline, and read-ahead for video.
@@ -923,6 +932,19 @@ Each step lists what it delivers and when it counts as done. Later steps depend 
    - A notarized Developer ID build.
    - **Done when:** the Phase 2 criteria are met. A 50 GB video project and a code repo can be
      edited from two Macs, changes show within 5 s, and the app-compatibility matrix is green.
+   - **Status (2026-10-17):** items 1–3 and 8 of 10 done, item 3 with a release blocker; item 4
+     built and not complete; item 6 in progress, not complete. Item 8 merged in
+     [#74](https://github.com/vishnu597/voidfs/pull/74) (menu-bar transfers, `98f660a`),
+     [#75](https://github.com/vishnu597/voidfs/pull/75) (Finder Sync badges, `c8e37a1`),
+     [#76](https://github.com/vishnu597/voidfs/pull/76) (a mount's cancelled change kept on this
+     Mac, `3fefd1d`), [#77](https://github.com/vishnu597/voidfs/pull/77) (the live mount, the
+     menu's bounded reads and a drive's controls freed from the server, `c40c9df`),
+     [#78](https://github.com/vishnu597/voidfs/pull/78) (unmount by name off the server, no Cancel
+     behind a conflict, `1faf5b0`), [#79](https://github.com/vishnu597/voidfs/pull/79) (a hung
+     server goes offline in about 10 s and the upload limit isn't a slow answer, `99ddcb1`) and
+     [#80](https://github.com/vishnu597/voidfs/pull/80) (badges kept across a quick remount,
+     checked in a live Finder, `a79c413`). The user marked it complete on 17 October, with the
+     real menu's clicks, the menu app restarted by hand and the drive's own icon not shown.
    - **Status (2026-10-14):** PRs #62–#66 merged on 13 October: fixture stabilization
      (#62, `baa8369`), FinderInfo listing (#63, `fa3ab3e`), drive-scoped uploads (#64, `7734d9d`),
      guarded large-file publication (#65, `ceedeee`) and the application matrix rig/evidence
