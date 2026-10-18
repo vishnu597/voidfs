@@ -1,0 +1,72 @@
+$ ditto -c -k --keepParent out/voidfs.app voidfs.zip
+sha256 330b8f6c4e466de33c1c57c34a0d92afbe7eac8c7418771a8539fa395e1c699d, 12497336 bytes
+
+$ xcrun notarytool submit voidfs.zip --keychain-profile voidfs-notary --wait
+Conducting pre-submission checks for voidfs.zip and initiating connection to the Apple notary service...
+Submission ID received
+  id: 684662cc-6303-4123-9183-00b3934f1e01
+Successfully uploaded file
+  id: 684662cc-6303-4123-9183-00b3934f1e01
+  path: $EXPORT/voidfs.zip
+Waiting for processing to complete.
+Current status: In Progress...Current status: In Progress....Current status: In Progress.....Current status: Accepted......Processing complete
+  id: 684662cc-6303-4123-9183-00b3934f1e01
+  status: Accepted
+
+exit 0
+
+$ xcrun notarytool log 684662cc-6303-4123-9183-00b3934f1e01 --keychain-profile voidfs-notary (notary-log.json)
+status: Accepted | summary: Ready for distribution | issues: None
+  ticket: voidfs.zip/voidfs.app/Contents/MacOS/void arm64 10b5cc9237e32e5f986b8277bb40b1e11fdad6d2
+  ticket: voidfs.zip/voidfs.app/Contents/PlugIns/VoidfsFinder.appex arm64 e28a757e833c0b11e276ccdb842a2a7e7437204f
+  ticket: voidfs.zip/voidfs.app arm64 4a33de6ad973f1bd0b4415d0e0cbf20e565fd530
+  ticket: voidfs.zip/voidfs.app/Contents/MacOS/void arm64 10b5cc9237e32e5f986b8277bb40b1e11fdad6d2
+  ticket: voidfs.zip/voidfs.app/Contents/MacOS/voidfs arm64 4a33de6ad973f1bd0b4415d0e0cbf20e565fd530
+  ticket: voidfs.zip/voidfs.app/Contents/PlugIns/VoidfsFinder.appex/Contents/MacOS/VoidfsFinder arm64 e28a757e833c0b11e276ccdb842a2a7e7437204f
+  ticket: voidfs.zip/voidfs.app/Contents/Extensions/VoidfsFS.appex/Contents/MacOS/VoidfsFS arm64 0398d9203f3246d1e412a2494b24d7649a29d2dc
+
+$ codesign -dv --verbose=4 out/voidfs.app/Contents/MacOS/void | grep CDHash
+CDHash=10b5cc9237e32e5f986b8277bb40b1e11fdad6d2
+
+$ codesign -dv --verbose=4 out/voidfs.app/Contents/MacOS/voidfs | grep CDHash
+CDHash=4a33de6ad973f1bd0b4415d0e0cbf20e565fd530
+
+$ codesign -dv --verbose=4 out/voidfs.app/Contents/Extensions/VoidfsFS.appex | grep CDHash
+CDHash=0398d9203f3246d1e412a2494b24d7649a29d2dc
+
+$ codesign -dv --verbose=4 out/voidfs.app/Contents/PlugIns/VoidfsFinder.appex | grep CDHash
+CDHash=e28a757e833c0b11e276ccdb842a2a7e7437204f
+
+$ xcrun stapler staple out/voidfs.app
+Processing: $EXPORT/out/voidfs.app
+Processing: $EXPORT/out/voidfs.app
+The staple and validate action worked!
+exit 0
+
+$ xcrun stapler validate out/voidfs.app
+Processing: $EXPORT/out/voidfs.app
+The validate action worked!
+exit 0
+
+$ spctl --assess --type execute --verbose=4 out/voidfs.app
+out/voidfs.app: accepted
+source=Notarized Developer ID
+exit 0
+
+$ codesign --verify --deep --strict --verbose=2 out/voidfs.app
+--prepared:$EXPORT/out/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+--validated:$EXPORT/out/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+--prepared:$EXPORT/out/voidfs.app/Contents/MacOS/void
+--validated:$EXPORT/out/voidfs.app/Contents/MacOS/void
+out/voidfs.app: valid on disk
+out/voidfs.app: satisfies its Designated Requirement
+exit 0
+
+$ syspolicy_check distribution out/voidfs.app
+Only one signature found in out/voidfs.app -- file://$EXPORT/, skipping dual signature check
+App passed all pre-distribution checks and is ready for distribution.
+exit 0
+
+$ out/voidfs.app/Contents/MacOS/void --version
+void 0.0.0 (2986b57, 2026-10-17)
+exit 0

@@ -65,8 +65,9 @@ Results ([output](raw/tests-cli.txt)):
     the group, and `get-task-allow`, as a development build has.
   - The bundled `void` is signed with Apple Development too, and meets the handover's code
     requirement. `codesign --verify --deep --strict` passes.
-  - The Developer ID export still needs a profile named "voidfs App Developer ID"
-    (`ExportOptions-DeveloperID.plist`), made on the developer website.
+  - The Developer ID export needs a profile named "voidfs App Developer ID"
+    (`ExportOptions-DeveloperID.plist`), made on the developer website. The user made it after
+    #84 merged ([below](#the-developer-id-export-and-notarization)).
 - **Without a profile, a Developer ID bundle is killed.** Test copy 1 was the unsigned build with
   its extensions removed, signed with Developer ID and the app's entitlements. It was killed at
   launch (exit 137), amfid -413 "No matching profile found". Bare Developer ID tools ran without
@@ -277,9 +278,53 @@ The fix wasn't run against a real kept requirement: that needs a job registered 
 program first. Its build registered the copy with LaunchServices and pluginkit, and unregistering
 it put both back ([snapshots](raw/registration.txt)).
 
+## The Developer ID export and notarization
+
+After #84 merged, the user made the "voidfs App Developer ID" profile for `dev.voidfs.app` on the
+developer website. It was in `~/Downloads`, so it was copied into Xcode's profiles folder under
+its UUID ([profile and build](raw/export/build.txt)):
+- `HAUTK68F56.dev.voidfs.app`, granting `keychain-access-groups HAUTK68F56.*`;
+- the Developer ID Application certificate, on all devices, expiring in 2044.
+
+`main` at `2986b57` was archived and exported as `apps/macos/scripts/release.sh` does, into a
+scratch folder (`$EXPORT`) ([signatures](raw/export/signatures.txt)). The user approved the
+upload to Apple's notary service. Nothing was installed.
+
+- **The app** is signed with Developer ID and a secure timestamp. It embeds "voidfs App Developer
+  ID", and claims the application identifier, the App Group and `keychain-access-groups
+  HAUTK68F56.dev.voidfs`, without `get-task-allow`.
+- **`void`** is signed with Developer ID and a timestamp, identifier `dev.voidfs.void`, with no
+  entitlements. It meets the handover's code requirement.
+- **The extensions** are signed with Developer ID too. The FSKit extension embeds "voidfs FSKit
+  Developer ID"; the Finder extension needs no profile.
+- `codesign --verify --deep --strict` passes. Before notarization `spctl` rejected the export as
+  "Unnotarized Developer ID", as expected.
+
+**Both self-tests passed from the export**:
+[`server-key selftest`](raw/export/selftest-keychain.txt), 19 of 19, and
+[`login-item selftest`](raw/export/selftest-login-item.txt), 15 of 15. So the Developer ID
+bundle, which was killed at launch without a profile, now reads and writes the Keychain item and
+hands the key to a Developer ID `void`.
+
+**Notarization accepted it with no issues** ([output](raw/export/notarization.txt),
+[log](raw/export/notary-log.json)), submission `684662cc-6303-4123-9183-00b3934f1e01`:
+- The ticket lists the app, `void` and both extensions, each with the cdhash its signature has.
+- **Stapled**, then `stapler validate` passes, `spctl --assess` says "accepted, Notarized
+  Developer ID", `codesign --verify --deep --strict` passes, and `syspolicy_check distribution`
+  says ready for distribution.
+- The exported `void` runs and reports `2986b57`.
+
+**Registration** ([snapshots](raw/export/registration.txt)). The archive's intermediate copy in
+DerivedData and the export were registered with LaunchServices and pluginkit, and FSKit named the
+intermediate copy for a while. `pluginkit -r` and `lsregister -u` put everything back, and the
+earlier `ddr` build's copy, which kept coming back to LaunchServices, was unregistered and deleted.
+`xcrun stapler` then registered the exported copy with LaunchServices, with no plug-ins, and
+`lsregister -u` of it put the records back as they were.
+
 ## Not covered
 
-- **The Developer ID export**: it needs the "voidfs App Developer ID" profile, then notarizing.
+- **The notarized export installed and run as the login job.** It wasn't installed; the
+  self-tests ran from it before it was stapled.
 - **Logout and login, and a reboot**: the key read by the job at login, and before the first
   unlock.
 - **Registering again against a real kept requirement**, rather than recorded `launchctl print`
