@@ -277,6 +277,26 @@ fn log_tail(dir: &Path) -> String {
     lines[lines.len().saturating_sub(5)..].join("\n")
 }
 
+/// A daemon starting has its socket before it answers: a request waits there, and goes with the
+/// daemon if it fails then. So for one this started, a request that fails once it is sent is no
+/// answer yet, like no socket; what it says is kept, for when the daemon never answers.
+async fn starting(place: &Place, failed: &mut Option<String>) -> Result<Option<api::Status>> {
+    match place.client.status().await {
+        Ok(s) => Ok(Some(s)),
+        Err(ClientError::NotRunning { .. }) => Ok(None),
+        Err(ClientError::Failed(m)) => {
+            *failed = Some(m);
+            Ok(None)
+        }
+        Err(e) => Err(failure(e)),
+    }
+}
+
+/// The deadline's message: what the last request that failed said, if one did.
+fn no_answer(failed: Option<&str>) -> String {
+    failed.map_or_else(String::new, |m| format!(" (the last request: {m})"))
+}
+
 /// Starts a daemon in the background unless one answers; returns its status, and whether it was
 /// started now.
 pub async fn ensure_started(conn: &Connection, opts: &DaemonOptions, place: &Place) -> Result<(api::Status, bool)> {
@@ -296,9 +316,9 @@ pub async fn ensure_started(conn: &Connection, opts: &DaemonOptions, place: &Pla
     if let Some(login) = login
         && crate::launchd::kickstart(login)
     {
-        let deadline = Instant::now() + START_WAIT;
+        let (deadline, mut failed) = (Instant::now() + START_WAIT, None);
         loop {
-            if let Some(s) = place.status().await? {
+            if let Some(s) = starting(place, &mut failed).await? {
                 return Ok((s, true));
             }
             if login == Login::App
@@ -307,7 +327,10 @@ pub async fn ensure_started(conn: &Connection, opts: &DaemonOptions, place: &Pla
                 return Err(Failure::new("NoCredentials", format!("voidfs.app has no server key for the daemon: sign in from its menu. Its log says:\n{line}")));
             }
             if Instant::now() > deadline {
-                return Err(Failure::new("DaemonFailed", format!("launchd started {}, but its daemon didn't answer within {} s; its log:\n{}", login.label(), START_WAIT.as_secs(), log_tail(&place.dir))));
+                return Err(Failure::new(
+                    "DaemonFailed",
+                    format!("launchd started {}, but its daemon didn't answer within {} s{}; its log:\n{}", login.label(), START_WAIT.as_secs(), no_answer(failed.as_deref()), log_tail(&place.dir)),
+                ));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -322,16 +345,16 @@ pub async fn ensure_started(conn: &Connection, opts: &DaemonOptions, place: &Pla
         cmd.env_remove(v);
     }
     let mut child = cmd.spawn().map_err(|e| Failure::new("InternalError", format!("starting the daemon: {e}")))?;
-    let deadline = Instant::now() + START_WAIT;
+    let (deadline, mut failed) = (Instant::now() + START_WAIT, None);
     loop {
-        if let Some(s) = place.status().await? {
+        if let Some(s) = starting(place, &mut failed).await? {
             return Ok((s, true));
         }
         if let Ok(Some(exit)) = child.try_wait() {
             return Err(Failure::new("DaemonFailed", format!("the daemon exited ({exit}) as it started:\n{}", log_tail(&place.dir))));
         }
         if Instant::now() > deadline {
-            return Err(Failure::new("DaemonFailed", format!("the daemon didn't answer within {} s; its log:\n{}", START_WAIT.as_secs(), log_tail(&place.dir))));
+            return Err(Failure::new("DaemonFailed", format!("the daemon didn't answer within {} s{}; its log:\n{}", START_WAIT.as_secs(), no_answer(failed.as_deref()), log_tail(&place.dir))));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

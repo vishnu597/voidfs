@@ -110,6 +110,38 @@ fn a_restart_keeps_the_connection_it_was_given() {
 }
 
 #[test]
+fn a_daemon_that_fails_once_it_has_its_socket_says_why() {
+    let f = Fixture::new("late");
+    let s = State::new(&f, "l");
+    s.void(&["daemon", "start"]).ok();
+    // The new daemon makes its socket, then reads its drive alias memo: from this FIFO, until the
+    // test closes it, with `restart`'s status request waiting on the socket. It ends in what isn't
+    // JSON, so the daemon exits with that request unanswered.
+    let memo = s.dir.join("drive-aliases.json");
+    assert!(Command::new("mkfifo").arg(&memo).status().unwrap().success());
+    let mut fifo = std::fs::File::options().read(true).write(true).open(&memo).unwrap();
+    let restart = std::thread::spawn({
+        let env = s.bare();
+        move || run(&["daemon", "restart", "--json"], &env, None)
+    });
+    // The old daemon removes its socket before its last line: a socket after that is the new one's.
+    let stopped = || std::fs::read_to_string(s.dir.join("daemon.log")).unwrap().lines().any(|l| l.ends_with(" stopped"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !(stopped() && s.socket().exists()) {
+        assert!(Instant::now() < deadline && !restart.is_finished(), "the new daemon didn't make its socket");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // `restart` asks every 20 ms: its request is waiting now.
+    std::thread::sleep(Duration::from_millis(300));
+    std::io::Write::write_all(&mut fifo, b"not JSON").unwrap();
+    drop(fifo);
+    let e = restart.join().unwrap().fails(1).error();
+    assert_eq!(e["code"], "DaemonFailed", "{e}");
+    let m = e["message"].as_str().unwrap();
+    assert!(m.contains("exited") && m.contains("invalid drive alias memo"), "its exit and its log, not a request that failed: {m}");
+}
+
+#[test]
 fn one_daemon_per_state_directory_and_a_dead_ones_socket_is_replaced() {
     let f = Fixture::new("one");
     let s = State::new(&f, "o");
@@ -219,6 +251,23 @@ fn stop_returns_when_the_daemon_died_on_the_way() {
     assert_eq!((v["stopped"].as_bool(), v["pid"].as_u64()), (Some(true), Some(4242)));
     assert!(t.elapsed() < Duration::from_secs(20), "it saw the state directory free, socket or not");
     assert!(s.socket().exists());
+}
+
+#[test]
+fn a_request_the_daemon_dropped_says_how() {
+    let f = Fixture::new("dropped");
+    let s = State::new(&f, "x");
+    std::fs::create_dir_all(&s.dir).unwrap();
+    // Something on the socket that reads the request and closes the connection without an answer.
+    let listener = std::os::unix::net::UnixListener::bind(s.socket()).unwrap();
+    let fake = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let _ = std::io::Read::read(&mut conn, &mut [0u8; 4096]).unwrap();
+    });
+    let e = s.void(&["daemon", "status", "--json"]).fails(1).error();
+    fake.join().unwrap();
+    assert_eq!(e["code"], "DaemonFailed", "{e}");
+    assert!(e["message"].as_str().unwrap().contains("connection closed before message completed"), "{e}");
 }
 
 #[test]
