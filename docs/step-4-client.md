@@ -774,7 +774,10 @@ What the second built (the journal and the upload queue):
   opens it tries it then (at once if that has passed, once the server can be reached), as a change
   that may have landed, with the backoff starting again. Until 18 October it was kept only in
   memory, and a restart left such a failure waiting for a resume (found by step 5, item 7's login
-  check). A failed change holds back the later changes to its key.
+  check). Nor is a change sent at the daemon's start before anything is known of the link: a
+  change saved offline stays queued while the server is down, rather than being tried at once and
+  shown failed (the same check, after a reboot; the same day). A failed change holds back the
+  later changes to its key.
 - **Attributes:** an import keeps its modification time and permission bits (on the put) and its
   extended attributes (as an attribute version after it), but `com.apple.quarantine`,
   `com.apple.provenance`, `security.*` and `system.*`. Space's uploader drops extended attributes
@@ -818,7 +821,10 @@ What the third built (the change-feed client and connectivity):
 - **Offline:** a block the cache doesn't have fails at once with `Error::Offline` (cached blocks
   are still read), and the queue holds its publishes. A probe (`ListBuckets`, 2 s after going
   offline, then twice as long each time up to 30 s) finds the server again, and the queue goes
-  on.
+  on. Since 18 October the daemon's link starts unknown (`Connectivity::unknown`): online to the
+  cache and the mount, but the queue holds until the probe's first `ListBuckets`, sent at once,
+  is answered (online) or isn't within the patience (offline). A server that is up costs the
+  start's uploads that one request.
 
 **Design.** A crate `voidfs-client`, which the daemon (item 4) and the mount (step 5) run. One
 SQLite database per user (`state.sqlite`, WAL, in the platform's application-support or state

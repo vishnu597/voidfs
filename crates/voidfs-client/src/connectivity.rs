@@ -7,6 +7,7 @@
 //! probe.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -78,6 +79,9 @@ struct Inner {
     flights: Mutex<Vec<Weak<InFlight>>>,
     /// Told when a request goes out (it keeps one telling until it is waited on).
     sending: Notify,
+    /// Whether the link is known: the server answered, or the link was found offline
+    /// ([`Connectivity::unknown`]).
+    known: AtomicBool,
 }
 
 /// The link to the server. Cloning shares it; give it to a client as its observer
@@ -106,7 +110,24 @@ impl Connectivity {
             counts: Mutex::new(Counts { unanswered: 0, troubles: VecDeque::new(), answer: None }),
             flights: Mutex::new(Vec::new()),
             sending: Notify::new(),
+            known: AtomicBool::new(true),
         }))
+    }
+
+    /// A link nothing is known of yet, as at a start: online to the cache and the mount, but the
+    /// upload queue holds its publishes until the server answers or the link is found offline,
+    /// so that a change isn't sent to a server that isn't there and shown failed. With
+    /// [`Connectivity::probe`] running, which asks at once.
+    pub fn unknown(cfg: ConnectivityConfig) -> Connectivity {
+        let c = Connectivity::new(cfg);
+        c.0.known.store(false, Ordering::SeqCst);
+        c
+    }
+
+    /// Whether the server has answered, or the link was found offline: always, but for a link
+    /// made [`Connectivity::unknown`]. Watchers are told when it becomes known.
+    pub fn known(&self) -> bool {
+        self.0.known.load(Ordering::SeqCst)
     }
 
     pub fn link(&self) -> Link {
@@ -124,8 +145,9 @@ impl Connectivity {
     }
 
     fn set(&self, link: Link) {
+        let found = !self.0.known.swap(true, Ordering::SeqCst);
         self.0.tx.send_if_modified(|l| {
-            let changed = *l != link;
+            let changed = *l != link || found;
             *l = link;
             changed
         });
@@ -187,10 +209,22 @@ impl Connectivity {
 
     /// While offline, asks the server something small (`ListBuckets`), `probe_every` apart and
     /// further apart each time, until it answers. Otherwise, watches for a server that answers
-    /// nothing ([`Connectivity::watch_for_hangs`]).
+    /// nothing ([`Connectivity::watch_for_hangs`]). A link not yet known is asked about at once:
+    /// no answer within `patience` is offline.
     pub fn probe(&self, client: Client) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
+            if !this.known() {
+                // Through the AWS client, which the observer doesn't see: counted here.
+                match tokio::time::timeout(this.0.cfg.patience, client.list_drives()).await {
+                    Ok(Ok(_)) => this.answered(false),
+                    Ok(Err(e)) => match e.status() {
+                        Some(s) => this.answered(s >= 500 || s == 429),
+                        None => this.silent(),
+                    },
+                    Err(_) => this.silent(),
+                }
+            }
             let mut rx = this.watch();
             let mut hangs = Hangs { quiet: this.0.cfg.patience, asked: None };
             loop {
@@ -333,6 +367,25 @@ mod tests {
         assert_eq!(c.link(), Link::Degraded, "a server error and a slow answer");
         c.observe(&obs(None));
         assert_eq!(c.link(), Link::Degraded, "one unanswered request isn't offline");
+    }
+
+    #[test]
+    fn an_unknown_link_is_known_once_answered_or_found_offline_and_says_so() {
+        assert!(Connectivity::default().known());
+        let c = Connectivity::unknown(ConnectivityConfig { offline_after: 3, ..Default::default() });
+        let mut rx = c.watch();
+        assert_eq!((c.known(), c.link(), c.check().is_ok()), (false, Link::Online, true), "the cache and the mount go on");
+        c.observe(&obs(None));
+        assert!(!c.known(), "one request without an answer isn't offline yet");
+        c.observe(&obs(Some(200)));
+        assert_eq!((c.known(), c.link()), (true, Link::Online));
+        assert!(rx.has_changed().unwrap(), "the queue is told, though the link is still online");
+        rx.borrow_and_update();
+        c.observe(&obs(Some(200)));
+        assert!(!rx.has_changed().unwrap(), "and only once");
+        let c = Connectivity::unknown(ConnectivityConfig::default());
+        c.silent();
+        assert_eq!((c.known(), c.link()), (true, Link::Offline));
     }
 
     #[test]

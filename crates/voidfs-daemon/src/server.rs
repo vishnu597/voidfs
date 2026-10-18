@@ -290,7 +290,8 @@ impl Daemon {
     }
 
     async fn open_core(cfg: &DaemonConfig, store: &Arc<Store>) -> Result<(Queue, Cache, Connectivity, voidfs_sdk::Client), Error> {
-        let conn = Connectivity::new(cfg.connectivity.clone());
+        // Unknown until the probe's first ask, which the queue waits for (Connectivity::unknown).
+        let conn = Connectivity::unknown(cfg.connectivity.clone());
         let client = voidfs_sdk::Client::new(voidfs_sdk::Config { observer: Some(Arc::new(conn.clone())), upload_bandwidth: None, ..cfg.client.clone() }).map_err(voidfs_client::Error::from)?;
         // Straight from the bucket where the server issues storage credentials (protocol §5.5),
         // through the API elsewhere.

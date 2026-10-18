@@ -353,3 +353,46 @@ async fn a_drive_unmounts_while_the_link_hangs() {
     daemon.stop().await;
     relay.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_saved_offline_waits_at_a_start_until_the_server_answers() {
+    let server = TestServer::start().await.unwrap();
+    let remote = voidfs_sdk::Client::new(sdk(&server)).unwrap();
+    remote.create_drive("footage", Default::default()).await.unwrap();
+    // Nothing listens there yet: connections are refused, as by a server that isn't up.
+    let at = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let down = voidfs_sdk::Config { endpoint: format!("http://localhost:{}", at.port()), ..sdk(&server) };
+    let dir = state_dir("w");
+    {
+        // Saved while the link was offline, before a logout: journaled, not sent.
+        let conn = voidfs_client::Connectivity::default();
+        conn.silent();
+        let store = Arc::new(voidfs_client::Store::open(dir.path()).unwrap());
+        let cfg = voidfs_client::QueueConfig { connectivity: Some(conn), ..Default::default() };
+        let q = voidfs_client::Queue::open(store, voidfs_sdk::Client::new(down.clone()).unwrap(), cfg).await.unwrap();
+        q.put("footage", "saved.txt", "saved offline".into(), voidfs_client::Base::Absent, voidfs_client::Attrs::default()).await.unwrap();
+        q.close().await;
+    }
+    let mut cfg = DaemonConfig::new(dir.path(), down, Build::default());
+    cfg.connectivity.probe_every = Duration::from_millis(100);
+    cfg.connectivity.probe_max = Duration::from_millis(100);
+    let d = Daemon::start(cfg).await.unwrap();
+    let c = DaemonClient::new(d.socket());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while c.status().await.unwrap().connection.link != voidfs_daemon::api::Link::Offline {
+        assert!(Instant::now() < deadline, "the link is found offline");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let item = c.uploads(true, None).await.unwrap().queue.items.remove(0);
+    assert_eq!((item.state, item.error.as_deref()), (voidfs_client::State::Queued, None), "waits, not tried and failed: {item:?}");
+    // The server comes up where the daemon looks for it.
+    let listener = tokio::net::TcpListener::bind(at).await.unwrap();
+    let link = Arc::new(Hanging { endpoint: server.endpoint.clone(), http: reqwest::Client::new(), hang: AtomicBool::new(false) });
+    let _relay = tokio::spawn(axum::serve(listener, axum::Router::new().fallback(hanging).with_state(link)).into_future());
+    while c.uploads(true, None).await.unwrap().queue.items[0].state != voidfs_client::State::Done {
+        assert!(Instant::now() < deadline, "published once the server answers");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(&remote.get_object("footage", "saved.txt", Default::default()).await.unwrap().body[..], b"saved offline");
+    d.stop().await;
+}

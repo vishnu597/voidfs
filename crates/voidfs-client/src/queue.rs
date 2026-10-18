@@ -1151,7 +1151,9 @@ impl Queue {
                 if st.closed && st.runs == 0 {
                     break;
                 }
-                let offline = self.0.cfg.connectivity.as_ref().is_some_and(|c| c.link() == Link::Offline);
+                // Nothing goes while the server can't be reached, nor before anything is known of
+                // it: a start's change would otherwise fail against a server that isn't there.
+                let offline = self.0.cfg.connectivity.as_ref().is_some_and(|c| !c.known() || c.link() == Link::Offline);
                 let (runs, wait) = if st.closed || offline { (Vec::new(), None) } else { self.select(&mut st) };
                 st.idle = st.runs == 0 && runs.is_empty() && wait.is_none();
                 st.idle_offline = offline;

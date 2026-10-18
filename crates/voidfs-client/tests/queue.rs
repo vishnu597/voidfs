@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::{Fault, Proxy, client_for, server};
-use voidfs_client::{Attrs, Base, Import, Op, Queue, QueueConfig, Scope, State, Store};
+use voidfs_client::{Attrs, Base, Connectivity, ConnectivityConfig, Import, Link, Op, Queue, QueueConfig, Scope, State, Store};
 use voidfs_sdk::{Client, Config, ReadOptions};
 
 const MIB: u64 = 1 << 20;
@@ -474,4 +474,80 @@ async fn a_refused_change_still_waits_for_a_resume_after_a_restart() {
     q.resume(Scope::Entry(id)).await.unwrap();
     q.settle().await;
     assert_eq!(text(&direct, "k").await.as_deref(), Some("refused"));
+}
+
+/// A port nothing listens on: connections to it are refused, as by a server that isn't up yet.
+fn refused_port() -> std::net::SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+}
+
+/// The server comes up at `at`: connections to it are forwarded to the server at `endpoint`.
+async fn relay(at: std::net::SocketAddr, endpoint: &str) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::TcpListener::bind(at).await.unwrap();
+    let upstream = endpoint.trim_start_matches("http://").to_owned();
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = tokio::net::TcpStream::connect(&upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    })
+}
+
+/// Journals a put to `k` while the link is offline, as a save before a logout: not sent.
+async fn saved_offline(dir: &Path, c: &Client, body: &'static str) {
+    let conn = Connectivity::default();
+    conn.silent();
+    let q = open(dir, c, QueueConfig { connectivity: Some(conn), ..config() }).await;
+    q.put("drv", "k", body.into(), Base::Absent, Attrs::default()).await.unwrap();
+    q.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queue_opened_before_the_server_answers_keeps_its_changes_queued() {
+    let s = server().await;
+    let direct = client_for(&s.endpoint, Config::default());
+    direct.create_drive("drv", Default::default()).await.unwrap();
+    let at = refused_port();
+    let dir = tempfile::tempdir().unwrap();
+    saved_offline(dir.path(), &client_for(&format!("http://{at}"), Config::default()), "saved offline").await;
+    // As the daemon starts: nothing known of the link, and the queue open before the probe asks.
+    let conn = Connectivity::unknown(ConnectivityConfig { probe_every: Duration::from_millis(100), probe_max: Duration::from_millis(100), ..Default::default() });
+    let c = client_for(&format!("http://{at}"), Config { max_attempts: 1, observer: Some(Arc::new(conn.clone())), ..Default::default() });
+    let q = open(dir.path(), &c, QueueConfig { connectivity: Some(conn.clone()), ..config() }).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _probe = conn.probe(c.clone());
+    while conn.link() != Link::Offline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let item = q.status().await.unwrap().items.remove(0);
+    assert_eq!((item.state, item.error.as_deref()), (State::Queued, None), "waits, not tried and failed: {item:?}");
+    let _relay = relay(at, &s.endpoint).await;
+    while conn.link() == Link::Offline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    q.settle().await;
+    let item = q.status().await.unwrap().items.remove(0);
+    assert_eq!(item.state, State::Done, "{item:?}");
+    assert_eq!(text(&direct, "k").await.as_deref(), Some("saved offline"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queue_opened_with_the_server_up_publishes_at_once() {
+    let s = server().await;
+    let direct = client_for(&s.endpoint, Config::default());
+    direct.create_drive("drv", Default::default()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    saved_offline(dir.path(), &direct, "saved before").await;
+    // A probe's interval is far longer than the wait allowed: the probe's first ask is at once.
+    let conn = Connectivity::unknown(ConnectivityConfig { probe_every: Duration::from_secs(60), probe_max: Duration::from_secs(60), ..Default::default() });
+    let c = client_for(&s.endpoint, Config { observer: Some(Arc::new(conn.clone())), ..Default::default() });
+    let q = open(dir.path(), &c, QueueConfig { connectivity: Some(conn.clone()), ..config() }).await;
+    let _probe = conn.probe(c.clone());
+    tokio::time::timeout(Duration::from_secs(5), q.settle()).await.expect("published without waiting");
+    assert_eq!((conn.known(), conn.link()), (true, Link::Online));
+    assert_eq!(text(&direct, "k").await.as_deref(), Some("saved before"));
 }
