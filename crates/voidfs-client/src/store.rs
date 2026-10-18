@@ -86,6 +86,10 @@ const MIGRATIONS: &[&str] = &[
     // 10: a mount's cancelled changes, kept on this Mac until a later change queues them again
     // (journal::State::Kept). Older versions would read the state as queued and publish them.
     "CREATE INDEX entries_kept ON entries(mount_ino, id) WHERE state='kept';",
+    // 11: when a failed entry is tried again (journal::Entry::retry_at), so that a restart tries
+    // a server's or the network's failure again rather than waiting for a resume. Entries failed
+    // before it have none, and wait for a resume as they did.
+    "ALTER TABLE entries ADD COLUMN retry_at INTEGER;",
 ];
 
 pub(crate) struct MountLease { write: bool }
@@ -352,6 +356,19 @@ mod tests {
             assert_eq!(c.query_row("SELECT count(*) FROM mount_conflicts", [], |r| r.get::<_, u64>(0))?,0);
             Ok(())
         }).unwrap();
+    }
+
+    #[test]
+    fn retry_migration_leaves_earlier_failures_waiting_for_a_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        for sql in &MIGRATIONS[..10] { c.execute_batch(sql).unwrap(); }
+        c.pragma_update(None, "user_version", 10).unwrap();
+        c.execute("INSERT INTO entries(id,drive,key,op,base,state,created,error) VALUES (7,'drive','file','put','absent','failed',1,'tcp connect error')", []).unwrap();
+        drop(c);
+        let s = Store::open(dir.path()).unwrap();
+        let e = s.with(|c| crate::journal::get(c, 7)).unwrap().unwrap();
+        assert_eq!((e.state, e.error.as_deref(), e.retry_at), (crate::journal::State::Failed, Some("tcp connect error"), None));
     }
 
 }

@@ -236,6 +236,9 @@ pub(crate) struct Entry {
     pub published_attrs: bool,
     pub conflict: Option<String>,
     pub error: Option<String>,
+    /// When a failed entry is tried again, in ms since the epoch: set for a server's or the
+    /// network's failure, so that a restart tries it too. `None`: it waits for a resume.
+    pub retry_at: Option<i64>,
     pub upload_id: Option<String>,
     pub created: i64,
     /// Mount edits preserve a competing remote version instead of retrying without a guard.
@@ -271,6 +274,7 @@ impl Entry {
             published_attrs: false,
             conflict: None,
             error: None,
+            retry_at: None,
             upload_id: None,
             created: now_ms(),
             mount: false,
@@ -288,7 +292,7 @@ pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-const COLUMNS: &str = "id, drive, key, op, base, source, staged, stamp, pos, length, to_key, overwrite, attrs, batch, state, paused, sent, size, version, conflict, error, upload_id, created, mount, mount_ino, published_version, published_key, published_attrs";
+const COLUMNS: &str = "id, drive, key, op, base, source, staged, stamp, pos, length, to_key, overwrite, attrs, batch, state, paused, sent, size, version, conflict, error, upload_id, created, mount, mount_ino, published_version, published_key, published_attrs, retry_at";
 
 fn from_row(r: &Row) -> rusqlite::Result<Entry> {
     let attrs: Option<String> = r.get(12)?;
@@ -322,6 +326,7 @@ fn from_row(r: &Row) -> rusqlite::Result<Entry> {
         published_version: r.get(25)?,
         published_key: r.get(26)?,
         published_attrs: r.get(27)?,
+        retry_at: r.get(28)?,
     })
 }
 
@@ -368,8 +373,8 @@ pub(crate) fn amend(c: &Connection, e: &Entry) -> rusqlite::Result<()> {
 /// Writes the fields that change as an entry is published.
 pub(crate) fn update(c: &Connection, e: &Entry) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE entries SET state = ?2, paused = ?3, sent = ?4, size = ?5, version = ?6, conflict = ?7, error = ?8, upload_id = ?9, stamp = ?10, base = ?11, published_version=?12, published_key=?13, published_attrs=?14 WHERE id = ?1",
-        params![e.id, e.state.as_str(), e.paused, e.sent as i64, e.size as i64, e.version, e.conflict, e.error, e.upload_id, e.stamp.map(|s| s.encode()), e.base.encode(), e.published_version, e.published_key, e.published_attrs],
+        "UPDATE entries SET state = ?2, paused = ?3, sent = ?4, size = ?5, version = ?6, conflict = ?7, error = ?8, upload_id = ?9, stamp = ?10, base = ?11, published_version=?12, published_key=?13, published_attrs=?14, retry_at=?15 WHERE id = ?1",
+        params![e.id, e.state.as_str(), e.paused, e.sent as i64, e.size as i64, e.version, e.conflict, e.error, e.upload_id, e.stamp.map(|s| s.encode()), e.base.encode(), e.published_version, e.published_key, e.published_attrs, e.retry_at],
     )?;
     Ok(())
 }

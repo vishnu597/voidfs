@@ -388,7 +388,7 @@ enum Journal {
     }
 
     /// The newest schema this build reads (crates/voidfs-client/src/store.rs's migrations).
-    static let schema: Int64 = 10
+    static let schema: Int64 = 11
 
     /// Reads `state.sqlite`, writing nothing. `nil` when there is none, or a newer voidfs wrote it.
     /// The connection may write, though: a read-only one can't open the WAL database once a

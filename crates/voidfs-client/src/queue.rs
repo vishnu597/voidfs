@@ -396,10 +396,19 @@ impl Queue {
         config.upload_bandwidth = Some(bandwidth.clone());
         let client = Client::new(config)?;
         let mut st = QState { paused_all, paused_drives: drives.into_iter().collect(), paused_batches: batches.into_iter().collect(), ..Default::default() };
+        let now = journal::now_ms();
         for mut e in entries {
             if e.state == State::Uploading {
                 st.may_have_landed.insert(e.id);
                 e.state = State::Queued;
+            }
+            // A failure the queue was to try again is tried when it was due, or at once if that
+            // has passed, and the backoff starts again. Like a send found in flight, it may have
+            // landed.
+            if e.state == State::Failed && let Some(at) = e.retry_at {
+                let wait = Duration::from_millis(u64::try_from(at.saturating_sub(now)).unwrap_or(0)).min(cfg.retry_max);
+                st.retry_at.insert(e.id, Instant::now() + wait);
+                st.may_have_landed.insert(e.id);
             }
             st.pending.insert(e.id, e);
         }
@@ -865,6 +874,7 @@ impl Queue {
                     if let Some(e) = st.pending.get_mut(&id) {
                         e.state = State::Queued;
                         e.error = None;
+                        e.retry_at = None;
                         let e = e.clone();
                         s.with(|c| journal::update(c, &e))?;
                     }
@@ -1141,7 +1151,9 @@ impl Queue {
                 if st.closed && st.runs == 0 {
                     break;
                 }
-                let offline = self.0.cfg.connectivity.as_ref().is_some_and(|c| c.link() == Link::Offline);
+                // Nothing goes while the server can't be reached, nor before anything is known of
+                // it: a start's change would otherwise fail against a server that isn't there.
+                let offline = self.0.cfg.connectivity.as_ref().is_some_and(|c| !c.known() || c.link() == Link::Offline);
                 let (runs, wait) = if st.closed || offline { (Vec::new(), None) } else { self.select(&mut st) };
                 st.idle = st.runs == 0 && runs.is_empty() && wait.is_none();
                 st.idle_offline = offline;
@@ -1531,11 +1543,21 @@ impl Queue {
         let mut st = self.st();
         let mut entries = Vec::new();
         let closed = st.closed;
+        // A server's or the network's failure is tried again after 2, 4, 8 … seconds. The journal
+        // keeps when, so that a restart tries it again too.
+        let retry = match &outcome {
+            Outcome::Failed { transient: true, .. } => {
+                let n = st.attempts.get(&run[0].id).map_or(1, |n| n + 1);
+                Some(Duration::from_secs(1u64 << n.min(10)).min(self.0.cfg.retry_max))
+            }
+            _ => None,
+        };
         for (i, e) in run.iter().enumerate() {
             let cancelled = st.cancelled.contains(&e.id);
             let Some(p) = st.pending.get(&e.id) else { continue };
             let mut p = p.clone();
             if i == 0 { p.upload_id = upload_id.clone(); }
+            p.retry_at = None;
             p.published_version = e.published_version.clone().or(p.published_version);
             p.published_key = e.published_key.clone().or(p.published_key);
             if e.published_version.is_some() { p.published_attrs = e.published_attrs; }
@@ -1550,6 +1572,7 @@ impl Queue {
                 }
                 Outcome::Failed { error, .. } | Outcome::Rejected { error, .. } if i == 0 => {
                     p.state = State::Failed; p.sent = sent.min(p.size); p.error = Some(error.clone());
+                    p.retry_at = retry.map(|d| journal::now_ms() + d.as_millis() as i64);
                 }
                 Outcome::Stopped(Why::Cancel) if cancelled => p.state = if p.mount { State::Kept } else { State::Cancelled },
                 _ => {
@@ -1575,12 +1598,11 @@ impl Queue {
             let id = run[0].id;
             // A timeout or a lost connection may have followed a request that landed.
             if *transient { st.may_have_landed.insert(id); }
-            let n = st.attempts.entry(id).or_insert(0);
-            *n += 1;
-            if *transient {
-                let d = Duration::from_secs(1u64 << (*n).min(10)).min(self.0.cfg.retry_max);
-                st.retry_at.insert(id, Instant::now() + d);
-            } else { st.retry_at.remove(&id); }
+            *st.attempts.entry(id).or_insert(0) += 1;
+            match retry {
+                Some(d) => { st.retry_at.insert(id, Instant::now() + d); }
+                None => { st.retry_at.remove(&id); }
+            }
         } else if matches!(outcome, Outcome::Conflict { .. }) {
             for e in &run { st.retry_at.remove(&e.id); }
         }
