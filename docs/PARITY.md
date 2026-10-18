@@ -178,8 +178,14 @@ billing or plans), this page says so.
     goes into the shared team Keychain, and the login job hands it to `void` on a pipe
     ([Keychain](step-5-macos.md#the-server-key-in-the-keychain-17-october)). A live run on a
     registered development build showed the handover, a restart on a new sign-in and the stop on
-    sign-out. Apple notarized its Developer ID export too. Login Items' approval flow, logout and
-    reboot and the `/Volumes` helper are still to come.
+    sign-out. Apple notarized its Developer ID export too. Installed in `/Applications` with Start
+    at login and a remembered mount, it brought the mount back after a logout and login and after a
+    reboot, offline and then online, without the app being opened
+    ([18 October](step-5-macos.md#logout-login-and-a-reboot-18-october)). It also found three
+    faults. A failed upload isn't tried again after a restart. A file saved on this Mac isn't
+    cached once it uploads, so it can't be read offline after a restart. And a queued save is
+    tried at the daemon's start, before the daemon knows it's offline. Login Items' approval
+    flow, a busy eject and the `/Volumes` helper are still to come.
     Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan

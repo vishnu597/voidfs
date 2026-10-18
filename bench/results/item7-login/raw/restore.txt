@@ -1,0 +1,51 @@
+## restore (2026-10-18 10:46:13)
+$ void unmount login-test
+unmounted ~/voidfs/login-test, and forgot it
+exit 0
+$ void mounts
+no drives mounted (mount one with `void mount <drive>`)
+
+$ voidfs server-key sign-out
+Signed out: the daemon (pid 1654) stopped, and starts again once you sign in.
+exit 0
+$ voidfs login-item off
+The daemon stopped and doesn't start at login. `void daemon start` starts it until you log out.
+login item: off: the daemon has no server and key yet
+exit 0
+$ launchctl print gui/$UID/dev.voidfs.app.daemon
+Bad request.
+Could not find service "dev.voidfs.app.daemon" in domain for user gui: 501
+$ defaults delete dev.voidfs.app VoidfsStateDirectory
+exit 0
+Error: Could not find key 'VoidfsStateDirectory' in domain 'dev.voidfs.app'.
+$ launchctl kickstart -k gui/$UID/dev.voidfs.agent (it reads the default only at launch)
+exit 0
+$ stop the test server (pid 6620)
+server gone
+
+$ processes
+11462 voidfs agent
+$ mount | grep voidfs
+(none above means unmounted)
+
+## the user kept the notarized build in /Applications and left the other copies unregistered (10:47:16)
+$ lsregister -u ~/Coding/voidfs/apps/macos/build/Build/Products/Release/voidfs.app
+exit 0
+$ lsregister -u /private/tmp/claude-501/-Users-vishnu-Coding-voidfs/136b37c5-1812-4ea4-a817-8a75253edd1a/scratchpad/item7/dd/Build/Products/Release/voidfs.app
+exit 0
+$ lsregister -u /private/tmp/claude-501/-Users-vishnu-Coding-voidfs/136b37c5-1812-4ea4-a817-8a75253edd1a/scratchpad/xcbuild/Build/Products/Debug/voidfs.app
+exit 0
+$ lsregister -dump | grep voidfs.app paths
+path:                       /Applications/voidfs.app (0x9170)
+path:                       /Applications/voidfs.app/Contents/Extensions/VoidfsFS.appex (0x9178)
+path:                       /Applications/voidfs.app/Contents/PlugIns/VoidfsFinder.appex (0x9174)
+path:                       ~/Library/HTTPStorages/dev.voidfs.app (0x8d00)
+$ pluginkit -m -v | grep dev.voidfs
++    dev.voidfs.app.findersync(0.1)	2E64C489-12AF-48B1-894A-C6A3F9053E42	2026-10-18 14:27:32 +0000	/Applications/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+     dev.voidfs.app.fskit(0.1)	9087C180-C04D-46B1-9A83-14EB7C77FA34	2026-10-18 14:27:32 +0000	/Applications/voidfs.app/Contents/Extensions/VoidfsFS.appex
+$ voidfs status | head -1
+dev.voidfs.app.fskit	enabled=true	/Applications/voidfs.app/Contents/Extensions/VoidfsFS.appex
+$ rmdir ~/voidfs/login-test; rm -rf ~/.voidfs-login-rig (the 9 October backup, the throwaway key, the pool and state) at 10:47:27
+$ ls ~/voidfs
+h2h
+spike

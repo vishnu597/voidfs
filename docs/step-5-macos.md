@@ -72,7 +72,12 @@ shared team Keychain, and the login job hands it to `void` on a pipe
 job moved a `daemon.json` into the Keychain, restarted on a new sign-in and stopped on sign-out.
 Its first registration was refused, because a launch requirement from the first slice's job was
 kept, until it was registered again. Apple notarized this slice's Developer ID export too, signed
-with the app's own profile. The approval flow, logout and reboot remain.
+with the app's own profile. Installed in `/Applications` with Start at login and a remembered
+mount, the notarized app brought the mount back after a logout and login and after a reboot. The
+mount came back offline, read its cached files, and went online when the server returned, all
+without the app being opened. The same check found three faults in the upload queue and the cache
+([18 October](#logout-login-and-a-reboot-18-october)). The approval flow, a busy eject and the
+`/Volumes` helper remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -385,8 +390,17 @@ disabled states, guides the user to switch on both extensions, and keeps the ter
 compatible, with the app taking over its state directory. The second,
 [the server key in the Keychain](#the-server-key-in-the-keychain-17-october), signs in from the
 menu and keeps the key out of files and arguments. Its live run passed on a registered
-development build, after a kept launch requirement made the first registration fail. The
-Developer ID export, the `/Volumes` helper and the done-when come later.
+development build, after a kept launch requirement made the first registration fail. Apple
+notarized both slices' Developer ID exports.
+
+**Remembered mounts at login, 18 October:** the notarized export, installed in `/Applications`,
+brought a remembered mount back after a logout and login and after a reboot
+([the check](#logout-login-and-a-reboot-18-october)). It found three faults to fix:
+- A failed upload isn't tried again after a restart.
+- A file saved on this Mac isn't cached once it uploads.
+- A queued save is tried at the daemon's start, before the daemon knows the link is offline.
+
+A busy eject and the `/Volumes` helper, the done-when's other parts, come later.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
@@ -3025,6 +3039,70 @@ the job is registered again. The first slice's job never shipped, but the app no
 
 **Not done yet.**
 
-- **The notarized export installed**, and so run as the login job.
-- **Logout and login, and a reboot**: the key read at login, and before the first unlock.
+- **The notarized export installed**, and so run as the login job: done on 18 October
+  ([logout, login and a reboot](#logout-login-and-a-reboot-18-october)).
+- **Logout and login, and a reboot**: the key was read at both logins, on the same day. A login
+  before the first unlock wasn't seen, since the job runs in the login session.
 - **The form in the running menu**, and Import key file….
+
+### Logout, login and a reboot, 18 October
+
+Item 7's done-when, first half: the app brings remembered mounts back after a logout and login
+and after a reboot. The user approved the run, did the logout, the reboot and FSKit's switch, and
+then kept the notarized build in `/Applications` with no other copy registered
+([evidence](../bench/results/item7-login/README.md)).
+
+**The setup.** The notarized export of `2986b57` replaced the 9 October copy in `/Applications`.
+The other copies were unregistered. It used a local test server with a throwaway key, signed in
+from the app, and a throwaway state directory set as `VoidfsStateDirectory`. The other client was
+the CLI in its own state directory. A drive of four files was mounted with `void mount`, so the
+daemon remembers it, and read through the mount, so this Mac cached it.
+- **`login-item on` met a real kept launch requirement and recovered.** launchd refused the job
+  with exit 78, the app registered it again, and it ran 11 s later. That is the case #84's check
+  was written for, which the self-test had only stood in for.
+- **The bridge agent had kept a development requirement** (`validation-category` 3) and was
+  refused. It took two unregister/register rounds to clear, which explains the `/Applications`
+  agent refusals since 15 October. The app doesn't re-register the agent by itself yet.
+- The first mount failed because the agent had started before `VoidfsStateDirectory` was set,
+  and it reads the default only at launch. Restarting the agent fixed it. That is a quirk of the
+  rig, not of an install.
+
+**Logout and login.** The daemon stopped cleanly at the logout. After the login, the agent started
+at once. launchd held the login job "pending spawn, domain in on-demand-only mode" and spawned it
+"because speculative" about 11 s after the login, as it did eleven other jobs. The job read the
+key from the Keychain and started `void`, and `void` restored the mount at once, offline. Every
+file read from the cache. With the server back, the link went online within the offline probe's
+30 s ceiling, and the other client's new file appeared in 0.03 s.
+
+**A reboot.** The same, from a cold boot: the agent at the login, the job 12 s later, and the mount
+restored offline 16 s after the login. The cached files read offline. With the server back, the
+link was online in 3 s and the waiting save published by itself.
+
+**Three faults.**
+1. **A failed upload isn't tried again after a restart.** A save made as the server went away
+   was refused, "Connection refused", and marked failed. It survived the logout and was still
+   failed 121 s after the link came back; `void uploads resume` published it. The queue keeps a
+   failed entry's retry time in memory only (`retry_at`, `crates/voidfs-client/src/queue.rs`)
+   and skips a failed entry without one. After a restart, a network failure therefore waits for a
+   resume, like a `409`, against [step 4's rule](step-4-client.md) that such failures are tried
+   again after 2, 4 … 60 s.
+2. **A file saved on this Mac isn't cached once it uploads.** After the reboot, offline, that save
+   failed to read with "Network is down", the rule for uncached bytes. Publication drops the
+   staged copy, and nothing puts its bytes in the read cache. So a file written here, and
+   uploaded, can't be read offline after a restart.
+3. **A queued save is tried at the daemon's start.** A save made while offline stayed queued
+   through the shutdown, then failed with "Connection refused" just after the start, before the
+   daemon knew it was offline. Its retry time held in that process, so it published once online.
+   After another restart before the server returned, fault 1 would have kept it.
+
+**A missed name after the reboot.** The first new file from the other client after the first
+online was missing by name. The rig looked it up every 50 ms. The mount's first answers were "no
+such file", and FSKit then kept that miss at the root, [item 3's blocker](#the-blocker-a-name-missed-while-its-folder-is-in-use),
+though the listing had the name. Before the logout and after the login, the same lookups found
+the file in 0.03 s, and so did lookups after the reboot, once the listing was used to wait. The
+cause isn't confirmed: perhaps the restored folder was served as complete before the change feed
+caught up.
+
+**Not covered.** Login Items' approval flow (SMAppService enabled the job at once). A login before
+the keychain's first unlock (the job runs in the login session). The menu app at login: Start at
+login starts the daemon, not the menu. A busy eject and the `/Volumes` helper.

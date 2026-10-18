@@ -1,0 +1,31 @@
+## stop the server: 10:28:48
+still running
+link: online (10:29:15)
+
+$ printf ... > ~/voidfs/login-test/written-offline-before-logout.txt (through the mount)
+exit 0
+2e2259bcc09f93f20ca9488b7cfe6be251ee35eb5ae6194681dc84c24ee80cb3  ~/voidfs/login-test/written-offline-before-logout.txt
+
+$ void uploads
+ID  DRIVE                                   KEY                                SIZE  SENT  STATE
+1   d-01a14f68-3e10-7715-9de3-b427c31f4f47  written-offline-before-logout.txt  69 B  0%    failed: request failed: error sending request for url (http://127.0.0.1:9372/d-01a14f68-3e10-7715-9de3-b427c31f4f47/written-offline-before-logout.txt): client error (Connect): tcp connect error: Connection refused (os error 61)
+
+0 uploading, 0 queued, 1 failed · 69 B to send
+
+$ void status
+daemon    running · pid 33446 · up 2m 23s · socket ~/.voidfs-login-rig/state/daemon.sock
+server    http://127.0.0.1:9372 · offline: uploads wait, and reads of what isn't cached fail
+uploads   1 failed · 69 B to send
+cache     3.0 MiB of 20.0 GiB on disk · 3.0 MiB of 192.0 MiB in memory
+mounts    login-test at ~/voidfs/login-test · fskit · mounted · feed at 4, 1 change
+
+## the server had closed its listener but was waiting on an open connection: kill -9 at 10:29:39
+server gone
+$ void status
+daemon    running · pid 33446 · up 2m 46s · socket ~/.voidfs-login-rig/state/daemon.sock
+server    http://127.0.0.1:9372 · offline: uploads wait, and reads of what isn't cached fail
+uploads   1 failed · 69 B to send
+cache     3.0 MiB of 20.0 GiB on disk · 3.0 MiB of 192.0 MiB in memory
+mounts    login-test at ~/voidfs/login-test · fskit · mounted · feed at 4, 1 change
+$ cat ~/voidfs/login-test/written-offline-before-logout.txt
+saved through the mount while the server was down, before the logout
