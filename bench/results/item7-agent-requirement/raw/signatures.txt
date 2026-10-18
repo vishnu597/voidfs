@@ -1,0 +1,41 @@
+# The two requirements LaunchRequirement.swift reads a validation category from, checked read-only
+development (3): anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.12] exists
+Developer ID (6): anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists
+
+$ codesign -dvv ~/Coding/voidfs/.claude/worktrees/compassionate-payne-edbb8f/apps/macos/build/Build/Products/Release/voidfs.app (excerpt)
+Identifier=dev.voidfs.app
+Authority=Apple Development: …
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=HAUTK68F56
+  meets the development requirement
+  doesn't meet the Developer ID requirement
+
+$ codesign -dvv ~/Coding/voidfs/.claude/worktrees/loving-mahavira-5fa530/apps/macos/build/Build/Products/Release/voidfs.app (excerpt)
+Identifier=dev.voidfs.app
+Authority=Apple Development: …
+Authority=Apple Worldwide Developer Relations Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=HAUTK68F56
+  meets the development requirement
+  doesn't meet the Developer ID requirement
+
+$ codesign -dvv /Applications/voidfs.app (excerpt)
+Identifier=dev.voidfs.app
+Authority=Developer ID Application: … (HAUTK68F56)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=HAUTK68F56
+  doesn't meet the development requirement
+  meets the Developer ID requirement
+
+# launchd's view of the agent now (read only; inherited environment left out)
+$ launchctl print gui/$UID/dev.voidfs.agent (excerpt)
+	state = running
+	program identifier = Contents/MacOS/voidfs (mode: 2)
+	parent bundle identifier = dev.voidfs.app
+			"signing-identifier" => "dev.voidfs.app"
+			"validation-category" => 6
+			"team-identifier" => "HAUTK68F56"
+	runs = 2
+	last exit code = 0

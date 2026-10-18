@@ -76,8 +76,10 @@ with the app's own profile. Installed in `/Applications` with Start at login and
 mount, the notarized app brought the mount back after a logout and login and after a reboot. The
 mount came back offline, read its cached files, and went online when the server returned, all
 without the app being opened. The same check found three faults in the upload queue and the cache
-([18 October](#logout-login-and-a-reboot-18-october)). The approval flow, a busy eject and the
-`/Volumes` helper remain.
+([18 October](#logout-login-and-a-reboot-18-october)). It also found the bridge agent refused for a
+kept launch requirement, which the app now clears by itself, as it does the login job's
+([the agent's requirement](#the-bridge-agents-kept-requirement-18-october)). The approval flow, a
+busy eject and the `/Volumes` helper remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -399,6 +401,11 @@ brought a remembered mount back after a logout and login and after a reboot
 - A failed upload isn't tried again after a restart.
 - A file saved on this Mac isn't cached once it uploads.
 - A queued save is tried at the daemon's start, before the daemon knows the link is offline.
+
+The same check found the bridge agent refused for a development build's kept launch requirement.
+The app now notices that at its launch and registers the agent again, up to twice, as
+`agent-register` does. The login job's check learned the validation category and the second round
+too ([the agent's requirement](#the-bridge-agents-kept-requirement-18-october)).
 
 A busy eject and the `/Volumes` helper, the done-when's other parts, come later.
 
@@ -3026,6 +3033,8 @@ the job is registered again. The first slice's job never shipped, but the app no
   `launchctl print` output and stand-ins for the daemon and launchd. Three breaks each failed it
   ([evidence](../bench/results/item7-keychain/README.md#registering-again)). It wasn't run
   against a real kept requirement.
+- **Since 18 October** the check compares the validation category too, and the job is registered
+  again up to twice ([the agent's requirement](#the-bridge-agents-kept-requirement-18-october)).
 
 **The Developer ID export** (17 October, notarization approved by the user,
 [evidence](../bench/results/item7-keychain/README.md#the-developer-id-export-and-notarization)).
@@ -3062,7 +3071,8 @@ daemon remembers it, and read through the mount, so this Mac cached it.
   was written for, which the self-test had only stood in for.
 - **The bridge agent had kept a development requirement** (`validation-category` 3) and was
   refused. It took two unregister/register rounds to clear, which explains the `/Applications`
-  agent refusals since 15 October. The app doesn't re-register the agent by itself yet.
+  agent refusals since 15 October. The app didn't register the agent again by itself; it now does
+  ([below](#the-bridge-agents-kept-requirement-18-october)).
 - The first mount failed because the agent had started before `VoidfsStateDirectory` was set,
   and it reads the default only at launch. Restarting the agent fixed it. That is a quirk of the
   rig, not of an install.
@@ -3106,3 +3116,45 @@ caught up.
 **Not covered.** Login Items' approval flow (SMAppService enabled the job at once). A login before
 the keychain's first unlock (the job runs in the login session). The menu app at login: Start at
 login starts the daemon, not the menu. A busy eject and the `/Volumes` helper.
+
+### The bridge agent's kept requirement, 18 October
+
+The check above found the bridge agent refused. Background Task Management had kept a development
+build's launch requirement for the Developer ID copy, and two rounds of unregistering and
+registering cleared it. The app now does that itself, as it does for the login job
+([evidence](../bench/results/item7-agent-requirement/README.md)).
+
+- **The check** (`LaunchRequirement.swift`, shared by both jobs) reads `launchctl print`. launchd
+  refuses a job whose requirement names another signing identifier, team or validation category
+  than this binary's, or whose last exit code is 78. The agent's kept requirement had the right
+  identifier and the wrong category, 3 for 6. This binary's category comes from its certificate:
+  Apple Development is 3, Developer ID 6. A job launchd runs now isn't refused, whatever its
+  requirement.
+- **Up to two rounds.** The app unregisters and registers the agent, asks `launchctl` again, and
+  does it once more if the requirement was kept. Then it says what it found, including a refusal
+  that stays.
+- **Where.** At the app's launch, once per run, since mounts need the agent whether or not the
+  menu opens; the menu shows the note. `agent-register` does the same, and exits 1 if launchd still
+  refuses the agent. Turning Start at login on checks the agent after registering it.
+  `agent-status` reports a refusal and changes nothing.
+- **The login job learned the same.** On 18 October `login-item on` caught the job's kept
+  requirement only by exit code 78, after launchd had tried the program. The category catches it
+  before that. The job is also registered again up to twice now: the agent's first round kept its
+  requirement, and the menu's check and turning it on while it's on start from an enabled job, as
+  the agent did.
+- **Self-tests.** `voidfs agent-selftest` uses the live run's `launchctl print` output, the first
+  look as recorded and the later states laid out as this Mac prints the agent, with stand-ins for
+  launchd and SMAppService. It passed all 21 checks, and `login-item selftest` all 23, on a plain
+  `swiftc` build of the app's sources signed for development as `dev.voidfs.app`. Seven breaks each
+  failed one self-test or both: #84's check of the identifier alone, #84's single round, a running
+  job judged by its requirement, a requirement block that doesn't end, a round too many, no check
+  after a round, and the job's wait registering on every refusal.
+
+**Not done.**
+- No live run: a kept requirement needs a switch between registered copies.
+- No Xcode build, so that `/Applications` stays the only registered copy.
+- With two differently signed copies registered, each sees the other's requirement as a refusal
+  while the agent is idle, and would register it again for itself. Keep one copy registered, as
+  before.
+- The check runs when the app opens, not at login, so after an update the app must be opened
+  once. The login job runs this binary at every login and could check the agent too.
