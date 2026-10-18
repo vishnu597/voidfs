@@ -277,9 +277,42 @@ The fix wasn't run against a real kept requirement: that needs a job registered 
 program first. Its build registered the copy with LaunchServices and pluginkit, and unregistering
 it put both back ([snapshots](raw/registration.txt)).
 
+## The Developer ID export
+
+After #84 merged, the user made the "voidfs App Developer ID" profile for `dev.voidfs.app` on the
+developer website. It was in `~/Downloads`, so it was copied into Xcode's profiles folder under
+its UUID ([profile and build](raw/export/build.txt)):
+- `HAUTK68F56.dev.voidfs.app`, granting `keychain-access-groups HAUTK68F56.*`;
+- the Developer ID Application certificate, on all devices, expiring in 2044.
+
+`main` at `2986b57` was archived and exported as `apps/macos/scripts/release.sh` does, into a
+scratch folder (`$EXPORT`), stopping before notarization
+([signatures](raw/export/signatures.txt)):
+
+- **The app** is signed with Developer ID and a secure timestamp. It embeds "voidfs App Developer
+  ID", and claims the application identifier, the App Group and `keychain-access-groups
+  HAUTK68F56.dev.voidfs`, without `get-task-allow`.
+- **`void`** is signed with Developer ID and a timestamp, identifier `dev.voidfs.void`, with no
+  entitlements. It meets the handover's code requirement.
+- **The extensions** are signed with Developer ID too. The FSKit extension embeds "voidfs FSKit
+  Developer ID"; the Finder extension needs no profile.
+- `codesign --verify --deep --strict` passes. `spctl` rejects the export as "Unnotarized Developer
+  ID", as expected before notarization.
+
+**Both self-tests passed from the export**:
+[`server-key selftest`](raw/export/selftest-keychain.txt), 19 of 19, and
+[`login-item selftest`](raw/export/selftest-login-item.txt), 15 of 15. So the Developer ID
+bundle, which was killed at launch without a profile, now reads and writes the Keychain item and
+hands the key to a Developer ID `void`.
+
+**Registration** ([snapshots](raw/export/registration.txt)). The archive's intermediate copy in
+DerivedData and the export were registered with LaunchServices and pluginkit, and FSKit named the
+intermediate copy for a while. `pluginkit -r` and `lsregister -u` put everything back, and the
+earlier `ddr` build's copy, which kept coming back to LaunchServices, was unregistered and deleted.
+
 ## Not covered
 
-- **The Developer ID export**: it needs the "voidfs App Developer ID" profile, then notarizing.
+- **Notarizing the export**, which needs the user's approval of the upload.
 - **Logout and login, and a reboot**: the key read by the job at login, and before the first
   unlock.
 - **Registering again against a real kept requirement**, rather than recorded `launchctl print`

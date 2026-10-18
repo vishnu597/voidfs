@@ -3015,6 +3015,8 @@ the job is registered again. The first slice's job never shipped, but the app no
 
 **Not done yet.**
 
-- **The Developer ID profile** for `dev.voidfs.app`, and so the export and its notarization.
+- **Notarizing the export.** The user made the "voidfs App Developer ID" profile. The export
+  signs the app with it, both self-tests pass from the export, and `spctl` rejects it only as
+  unnotarized ([export](../bench/results/item7-keychain/README.md#the-developer-id-export)).
 - **Logout and login, and a reboot**: the key read at login, and before the first unlock.
 - **The form in the running menu**, and Import key file….

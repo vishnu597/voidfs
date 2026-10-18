@@ -1,0 +1,101 @@
+$ ls voidfs.app/Contents voidfs.app/Contents/MacOS
+Extensions
+Info.plist
+Library
+MacOS
+PkgInfo
+PlugIns
+_CodeSignature
+embedded.provisionprofile
+void
+voidfs
+
+$ codesign -dv --verbose=2 voidfs.app
+Identifier=dev.voidfs.app
+CodeDirectory v=20500 size=3354 flags=0x10000(runtime) hashes=94+7 location=embedded
+Authority=Developer ID Application: … (HAUTK68F56)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=Oct 17, 2026 at 8:03:38 PM
+TeamIdentifier=HAUTK68F56
+Runtime Version=27.0.0
+$ codesign -d --entitlements - voidfs.app
+{
+  "com.apple.application-identifier" => "HAUTK68F56.dev.voidfs.app"
+  "com.apple.developer.team-identifier" => "HAUTK68F56"
+  "com.apple.security.application-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+  "keychain-access-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+}
+embedded profile: voidfs App Developer ID (7698f78d-86df-4b7b-ad31-1ebe06b3005a)
+
+$ codesign -dv --verbose=2 voidfs.app/Contents/MacOS/void
+Identifier=dev.voidfs.void
+CodeDirectory v=20500 size=66459 flags=0x10000(runtime) hashes=2066+7 location=embedded
+Authority=Developer ID Application: … (HAUTK68F56)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=Oct 17, 2026 at 8:03:38 PM
+TeamIdentifier=HAUTK68F56
+Runtime Version=27.0.0
+$ codesign -d --entitlements - voidfs.app/Contents/MacOS/void
+{
+}
+
+$ codesign -dv --verbose=2 voidfs.app/Contents/Extensions/VoidfsFS.appex
+Identifier=dev.voidfs.app.fskit
+CodeDirectory v=20500 size=1376 flags=0x10000(runtime) hashes=32+7 location=embedded
+Authority=Developer ID Application: … (HAUTK68F56)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=Oct 17, 2026 at 8:03:37 PM
+TeamIdentifier=HAUTK68F56
+Runtime Version=27.0.0
+$ codesign -d --entitlements - voidfs.app/Contents/Extensions/VoidfsFS.appex
+{
+  "com.apple.application-identifier" => "HAUTK68F56.dev.voidfs.app.fskit"
+  "com.apple.developer.fskit.fsmodule" => true
+  "com.apple.developer.team-identifier" => "HAUTK68F56"
+  "com.apple.security.app-sandbox" => true
+  "com.apple.security.application-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+  "com.apple.security.network.client" => true
+}
+embedded profile: voidfs FSKit Developer ID (b17a3745-cdb0-4c7f-a983-3519245eb72d)
+
+$ codesign -dv --verbose=2 voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+Identifier=dev.voidfs.app.findersync
+CodeDirectory v=20500 size=773 flags=0x10000(runtime) hashes=13+7 location=embedded
+Authority=Developer ID Application: … (HAUTK68F56)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=Oct 17, 2026 at 8:03:38 PM
+TeamIdentifier=HAUTK68F56
+Runtime Version=27.0.0
+$ codesign -d --entitlements - voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+{
+  "com.apple.security.app-sandbox" => true
+  "com.apple.security.application-groups" => [
+    0 => "HAUTK68F56.dev.voidfs"
+  ]
+}
+embedded profile: none
+
+$ codesign --verify -R='anchor apple generic and certificate leaf[subject.OU] = "HAUTK68F56" and identifier "dev.voidfs.void"' voidfs.app/Contents/MacOS/void
+satisfies
+
+$ codesign --verify --deep --strict --verbose=2 voidfs.app
+--prepared:$EXPORT/out/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+--validated:$EXPORT/out/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+--prepared:$EXPORT/out/voidfs.app/Contents/MacOS/void
+--validated:$EXPORT/out/voidfs.app/Contents/MacOS/void
+$EXPORT/out/voidfs.app: valid on disk
+$EXPORT/out/voidfs.app: satisfies its Designated Requirement
+
+$ spctl --assess --type execute --verbose=4 voidfs.app (before notarization)
+$EXPORT/out/voidfs.app: rejected
+source=Unnotarized Developer ID
