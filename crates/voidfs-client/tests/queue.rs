@@ -427,3 +427,51 @@ async fn a_put_that_landed_as_the_client_stopped_is_not_sent_again() {
     assert_eq!(count(&p, "PUT", "/drv/k"), 0, "known by its marker, not sent again: {:?}", p.seen());
     assert_eq!(direct.list_versions("drv", "k", false).await.unwrap().len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_the_queue_tries_again_is_tried_again_after_a_restart() {
+    let (_s, p, direct, c) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    // Nothing listens there: the connection is refused, as by a server going down.
+    let down = client_for("http://127.0.0.1:1", Config::default());
+    let id = {
+        // Its next try is due after the queue has closed.
+        let q = open(dir.path(), &down, QueueConfig { retry_max: Duration::from_secs(60), ..config() }).await;
+        let id = q.put("drv", "k", "saved".into(), Base::Absent, Attrs::default()).await.unwrap();
+        while q.status().await.unwrap().items[0].state != State::Failed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        q.close().await;
+        id
+    };
+    let q = open(dir.path(), &c, config()).await;
+    q.settle().await;
+    let item = q.status().await.unwrap().items.into_iter().find(|i| i.id == id).unwrap();
+    assert_eq!((item.state, item.error.as_deref()), (State::Done, None), "tried again once the server answers, without a resume: {item:?}");
+    assert_eq!(text(&direct, "k").await.as_deref(), Some("saved"));
+    assert_eq!(count(&p, "PUT", "/drv/k"), 1, "{:?}", p.seen());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_change_still_waits_for_a_resume_after_a_restart() {
+    let (_s, p, direct, c) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let id = {
+        let q = open(dir.path(), &c, config()).await;
+        p.fault(Fault::Status(403));
+        let id = q.put("drv", "k", "refused".into(), Base::Absent, Attrs::default()).await.unwrap();
+        q.settle().await;
+        assert_eq!(q.status().await.unwrap().items[0].state, State::Failed);
+        q.close().await;
+        id
+    };
+    p.clear();
+    let q = open(dir.path(), &c, config()).await;
+    q.settle().await;
+    let item = q.status().await.unwrap().items.into_iter().find(|i| i.id == id).unwrap();
+    assert_eq!(item.state, State::Failed, "{item:?}");
+    assert_eq!(count(&p, "PUT", "/drv/k"), 0, "not tried again: {:?}", p.seen());
+    q.resume(Scope::Entry(id)).await.unwrap();
+    q.settle().await;
+    assert_eq!(text(&direct, "k").await.as_deref(), Some("refused"));
+}

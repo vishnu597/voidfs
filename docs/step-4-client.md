@@ -769,8 +769,12 @@ What the second built (the journal and the upload queue):
   a quarter of a second's burst; a new limit applies to the next piece, and is kept across
   restarts. Space's applies at the next mount and starts at 24 MiB/s (§1.4).
 - **Failures:** a server or network failure the SDK has already retried is tried again after 2,
-  4, 8 … seconds, at most a minute; another failure (a `409`, a `403`) waits for a resume. A
-  failed change holds back the later changes to its key.
+  4, 8 … seconds, at most a minute; another failure (a `409`, a `403`) waits for a resume. This
+  holds across a restart: the journal keeps when a failure is tried again, and the queue that
+  opens it tries it then (at once if that has passed, once the server can be reached), as a change
+  that may have landed, with the backoff starting again. Until 18 October it was kept only in
+  memory, and a restart left such a failure waiting for a resume (found by step 5, item 7's login
+  check). A failed change holds back the later changes to its key.
 - **Attributes:** an import keeps its modification time and permission bits (on the put) and its
   extended attributes (as an attribute version after it), but `com.apple.quarantine`,
   `com.apple.provenance`, `security.*` and `system.*`. Space's uploader drops extended attributes
