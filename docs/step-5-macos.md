@@ -71,8 +71,8 @@ shared team Keychain, and the login job hands it to `void` on a pipe
 ([Keychain](#the-server-key-in-the-keychain-17-october)). On a registered development build, the
 job moved a `daemon.json` into the Keychain, restarted on a new sign-in and stopped on sign-out.
 Its first registration was refused, because a launch requirement from the first slice's job was
-kept, until it was registered again. The Developer ID export, the approval flow, logout and
-reboot remain.
+kept, until it was registered again. Apple notarized this slice's Developer ID export too, signed
+with the app's own profile. The approval flow, logout and reboot remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -2938,8 +2938,8 @@ embedded in its own bundle; now that is the app alone. `App.entitlements` claims
   at launch (amfid -413). Once the user signed Xcode in, automatic signing made the team's
   wildcard profile ("Mac Team Provisioning Profile: *", granting `HAUTK68F56.*`) and the build
   succeeded.
-- **The Developer ID export** needs a profile for `dev.voidfs.app` named "voidfs App Developer
-  ID" (`ExportOptions-DeveloperID.plist`), made on the developer website.
+- **The Developer ID export** uses a profile for `dev.voidfs.app` named "voidfs App Developer
+  ID" (`ExportOptions-DeveloperID.plist`), which the user made on the developer website.
 
 **Evidence.**
 
@@ -3013,10 +3013,18 @@ the job is registered again. The first slice's job never shipped, but the app no
   ([evidence](../bench/results/item7-keychain/README.md#registering-again)). It wasn't run
   against a real kept requirement.
 
+**The Developer ID export** (17 October, notarization approved by the user,
+[evidence](../bench/results/item7-keychain/README.md#the-developer-id-export-and-notarization)).
+`main` at `2986b57` was archived and exported as `scripts/release.sh` does.
+- The app embeds "voidfs App Developer ID" and claims the Keychain group, without
+  `get-task-allow`. Its `void` is signed with Developer ID and meets the handover's requirement.
+- Both self-tests passed from the export (19 and 15 checks), so the Developer ID bundle, killed
+  at launch without a profile, reads the item and hands the key over.
+- Apple accepted it with no issues (submission `684662cc-6303-4123-9183-00b3934f1e01`). Stapled,
+  `spctl` accepts it as "Notarized Developer ID" and `syspolicy_check distribution` passes.
+
 **Not done yet.**
 
-- **Notarizing the export.** The user made the "voidfs App Developer ID" profile. The export
-  signs the app with it, both self-tests pass from the export, and `spctl` rejects it only as
-  unnotarized ([export](../bench/results/item7-keychain/README.md#the-developer-id-export)).
+- **The notarized export installed**, and so run as the login job.
 - **Logout and login, and a reboot**: the key read at login, and before the first unlock.
 - **The form in the running menu**, and Import key file….
