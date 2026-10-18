@@ -1,0 +1,32 @@
+$ void uploads --all
+ID  DRIVE                                   KEY                                SIZE  SENT  STATE
+1   d-01a14f68-3e10-7715-9de3-b427c31f4f47  written-offline-before-logout.txt  69 B  100%  done
+2   d-01a14f68-3e10-7715-9de3-b427c31f4f47  written-offline-before-reboot.txt  70 B  0%    failed: request failed: error sending request for url (http://127.0.0.1:9372/d-01a14f68-3e10-7715-9de3-b427c31f4f47/written-offline-before-reboot.txt): client error (Connect): tcp connect error: Connection refused (os error 61)
+
+0 uploading, 0 queued, 1 failed · 70 B to send
+
+$ stat (through the mount)
+69 bytes, mtime Oct 18 10:29:15 2026, ino 13
+$ dd if=... bs=4096 | wc -c
+0+0 records in
+0+0 records out
+0 bytes transferred in 0.001158 secs (0 bytes/sec)
+$ cat | wc -c:       88
+$ cat exit: 1
+
+$ the same for written-offline-before-reboot.txt and hello.txt
+written-offline-before-reboot.txt: stat 70 bytes, read       70 bytes
+hello.txt: stat 29 bytes, read       29 bytes
+from-server-1-after-login-103412.txt: stat 79 bytes, read       79 bytes
+$ cat written-offline-before-logout.txt (through the mount)
+cat: ~/voidfs/login-test/written-offline-before-logout.txt: Network is down
+exit 1
+$ dd if=written-offline-before-logout.txt bs=4096 of=/dev/null
+dd: ~/voidfs/login-test/written-offline-before-logout.txt: Network is down
+0+0 records in
+0+0 records out
+0 bytes transferred in 0.000508 secs (0 bytes/sec)
+exit 1
+$ shasum -a 256 written-offline-before-logout.txt
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ~/voidfs/login-test/written-offline-before-logout.txt
+exit 0

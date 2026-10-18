@@ -1,0 +1,29 @@
+$ defaults write dev.voidfs.app VoidfsStateDirectory ~/.voidfs-login-rig/state
+exit 0
+
+$ launchctl print gui/$UID/dev.voidfs.app.daemon (before)
+
+$ voidfs server-key sign-in --endpoint http://127.0.0.1:9372 --key-file key.json
+Signed in to http://127.0.0.1:9372 as VF2GYO3CB4DDZZVMNZ3W. Turn on Start at login to start the daemon with it.
+exit 0
+
+$ voidfs server-key status
+signed in to http://127.0.0.1:9372 (region us-east-1) as VF2GYO3CB4DDZZVMNZ3W, for ~/.voidfs-login-rig/state
+login item: off
+
+10:26:43
+$ voidfs login-item on
+launchd refused the job (it can't start the program: exit code 78, EX_CONFIG), so it was registered again. The daemon (pid 33446) starts at login.
+login item: on: the daemon starts at login (dev.voidfs.app.daemon)
+exit 0
+10:26:54
+
+$ launchctl print gui/$UID/dev.voidfs.app.daemon (after)
+state = running signing-identifier => dev.voidfs.app validation-category => 6 runs = 1 pid = 33445 last exit code = (never exited) state = active state = active
+
+$ voidfs login-item status
+login item: on: the daemon starts at login (dev.voidfs.app.daemon)
+
+$ void daemon status
+daemon running · pid 33446 · up 0s · 0 mounts · socket ~/.voidfs-login-rig/state/daemon.sock
+starts at login: voidfs.app (dev.voidfs.app.daemon, Start at login in its menu)

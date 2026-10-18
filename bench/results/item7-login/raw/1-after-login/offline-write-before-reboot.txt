@@ -1,0 +1,28 @@
+## stop the server (pid 38656): 10:36:32
+still running after SIGTERM (an open connection): kill -9 at 10:36:35
+server gone
+link: offline (10:36:35)
+
+$ printf ... > $MNT/written-offline-before-reboot.txt (through the mount, link offline, 10:36:41)
+exit 0
+790701ce0ebfc8a2b9fda27ecde57c1633441ee00993e5a101030d92266793f4  ~/voidfs/login-test/written-offline-before-reboot.txt
+
+$ void uploads (5 s later)
+ID  DRIVE                                   KEY                                SIZE  SENT  STATE
+2   d-01a14f68-3e10-7715-9de3-b427c31f4f47  written-offline-before-reboot.txt  70 B  0%    queued
+
+0 uploading, 1 queued · 70 B to send
+
+$ void status
+daemon    running · pid 36676 · up 6m 9s · socket ~/.voidfs-login-rig/state/daemon.sock
+server    http://127.0.0.1:9372 · offline: uploads wait, and reads of what isn't cached fail
+uploads   1 queued · 70 B to send
+cache     3.0 MiB of 20.0 GiB on disk · 79 B of 192.0 MiB in memory
+mounts    login-test at ~/voidfs/login-test · fskit · mounted · feed at 7, 7 changes
+
+$ cached reads while offline: shasum -a 256 through the mount
+42ff60a7777fc5ba08c1abfbd7bdc7550227fc174cabefc381b4579f790d8647  hello.txt
+374a00810166788fca70634824e28a58b0dc96ead0d73a4e368d018646c7dbbb  random-3MiB.bin
+4b2669612d8fad9795e112ac2fc27a06d438e5b8d7b066db1ccc83605e310280  docs/notes.md
+1df180f73196ee3d25e3c39fe0d9d6353177bdebfb7362e0e27d579b799f9aa0  from-server-1-after-login-103412.txt
+2e2259bcc09f93f20ca9488b7cfe6be251ee35eb5ae6194681dc84c24ee80cb3  written-offline-before-logout.txt

@@ -1,0 +1,60 @@
+## 1. register /Applications/voidfs.app
+$ lsregister -f -R /Applications/voidfs.app
+exit 0
+
+## 2. unregister the other copies (put back after the check)
+remove: no plugin at ~/Coding/voidfs/.claude/worktrees/compassionate-payne-edbb8f/apps/macos/build/Build/Products/Release/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+unregistered ~/Coding/voidfs/.claude/worktrees/compassionate-payne-edbb8f/apps/macos/build/Build/Products/Release/voidfs.app
+remove: no plugin at ~/Coding/voidfs/.claude/worktrees/sleepy-germain-0cf80f/apps/macos/build/Build/Products/Release/voidfs.app/Contents/Extensions/VoidfsFS.appex
+unregistered ~/Coding/voidfs/.claude/worktrees/sleepy-germain-0cf80f/apps/macos/build/Build/Products/Release/voidfs.app
+unregistered ~/Coding/voidfs/apps/macos/build/Build/Products/Release/voidfs.app
+remove: no plugin at ~/Coding/voidfs/apps/macos/build/release/voidfs.xcarchive/Products/Applications/voidfs.app/Contents/Extensions/VoidfsFS.appex
+unregistered ~/Coding/voidfs/apps/macos/build/release/voidfs.xcarchive/Products/Applications/voidfs.app
+remove: no plugin at /private/tmp/claude-501/-Users-vishnu-Coding-voidfs/136b37c5-1812-4ea4-a817-8a75253edd1a/scratchpad/item7/keychain/export/out/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+remove: no plugin at /private/tmp/claude-501/-Users-vishnu-Coding-voidfs/136b37c5-1812-4ea4-a817-8a75253edd1a/scratchpad/item7/keychain/export/out/voidfs.app/Contents/Extensions/VoidfsFS.appex
+unregistered /private/tmp/claude-501/-Users-vishnu-Coding-voidfs/136b37c5-1812-4ea4-a817-8a75253edd1a/scratchpad/item7/keychain/export/out/voidfs.app
+
+## after
+## LaunchServices voidfs.app records
+path:                       /Applications/voidfs.app
+path:                       ~/Library/HTTPStorages/dev.voidfs.app
+## pluginkit voidfs plug-ins
+## FSKit (voidfs status)
+com.apple.fskit.exfat	enabled=true	/System/Library/ExtensionKit/Extensions/com.apple.fskit.exfat.appex
+## launchd jobs
+dev.voidfs.agent loaded: state = not running, runs = 0
+dev.voidfs.app.daemon not loaded
+dev.voidfs.daemon not loaded
+## defaults VoidfsStateDirectory
+Error: Could not find key 'VoidfsStateDirectory' in domain 'dev.voidfs.app'.
+## ~/Library/LaunchAgents voidfs
+## real state directory
+ls: ~/Library/Application Support/voidfs: No such file or directory
+## ~/voidfs
+.DS_Store
+h2h
+spike
+## voidfs mounts
+
+## 3. FSKit before adding the plug-ins
+$ voidfs status
+com.apple.fskit.exfat	enabled=true	/System/Library/ExtensionKit/Extensions/com.apple.fskit.exfat.appex
+com.apple.fskit.msdos	enabled=true	/System/Library/ExtensionKit/Extensions/com.apple.fskit.msdos.appex
+com.apple.fskit.ftp	enabled=true	/System/Library/ExtensionKit/Extensions/com.apple.fskit.ftp.appex
+com.apple.dt.CoreDevice.Extensions.DeviceFS	enabled=true	/Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/PrivateApplications/CoreDeviceExtensions.app/Contents/Extensions/DeviceFS.appex
+dev.voidfs.app.fskit is not installed
+
+## 4. add /Applications's plug-ins
+$ pluginkit -a /Applications/voidfs.app/Contents/Extensions/VoidfsFS.appex
+exit 0
+$ pluginkit -a /Applications/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+exit 0
+$ pluginkit -m -v -A | grep voidfs
+     dev.voidfs.app.fskit((null))	51850B6C-D19D-482B-8A32-BF2E3004C5F9	2026-10-18 14:25:25 +0000	/Applications/voidfs.app/Contents/Extensions/VoidfsFS.appex
++    dev.voidfs.app.findersync(0.1)	2B158516-C052-4C22-9FEE-9ABB4EBEE7F8	2026-10-18 14:25:25 +0000	/Applications/voidfs.app/Contents/PlugIns/VoidfsFinder.appex
+$ voidfs status
+dev.voidfs.app.fskit	enabled=false	/Applications/voidfs.app/Contents/Extensions/VoidfsFS.appex
+com.apple.fskit.exfat	enabled=true	/System/Library/ExtensionKit/Extensions/com.apple.fskit.exfat.appex
+com.apple.fskit.msdos	enabled=true	/System/Library/ExtensionKit/Extensions/com.apple.fskit.msdos.appex
+com.apple.fskit.ftp	enabled=true	/System/Library/ExtensionKit/Extensions/com.apple.fskit.ftp.appex
+com.apple.dt.CoreDevice.Extensions.DeviceFS	enabled=true	/Library/Developer/PrivateFrameworks/CoreDevice.framework/Versions/A/PrivateApplications/CoreDeviceExtensions.app/Contents/Extensions/DeviceFS.appex
