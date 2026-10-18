@@ -747,13 +747,17 @@ mod tests {
         fixture_with_quiet(None).await
     }
 
+    fn plenty(_: &std::path::Path) -> std::io::Result<u64> { Ok(1 << 50) }
+
     async fn fixture_with_quiet(quiet: Option<Duration>) -> (tempfile::TempDir, Arc<Session>, crate::Queue, Fh) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let client = Client::new(voidfs_sdk::Config { endpoint: "http://localhost:9".into(), access_key_id: "test".into(), secret_access_key: "test".into(), ..Default::default() }).unwrap();
         let connectivity = Connectivity::default();
         for _ in 0..3 { connectivity.unanswered(); }
-        let cache = Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone())), crate::CacheConfig::default()).await.unwrap();
+        // The machine's free space doesn't decide whether a publication seeds the cache.
+        let cfg = crate::CacheConfig { min_free_bytes: 0, free_space: Some(plenty), ..Default::default() };
+        let cache = Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone())), cfg).await.unwrap();
         let queue = crate::Queue::open(store.clone(), client.clone(), crate::QueueConfig { connectivity: Some(connectivity.clone()), ..Default::default() }).await.unwrap();
         queue.pause(crate::Scope::All).await.unwrap();
         let session = Arc::new(Session::new_writable_with_config(store.clone(), client, cache, queue.clone(), "drive", connectivity,
@@ -807,13 +811,18 @@ mod tests {
         let earlier = session.open(ino, false).await.unwrap();
         clean_publication(&session, &queue, fh, "one").await;
         assert!(session.data.file(ino).is_none(), "a completed byte view must not mask later remote versions on new opens");
+        session.cache.settle().await;
+        assert_eq!(session.cache.usage().seeded, 1, "the publication seeds its version's one block");
         for handle in [fh, earlier] {
             assert_eq!(session.read(handle, 0, 5).await.unwrap(), b"first"[..]);
             assert_eq!(session.handle_attr(handle).unwrap().sync, Sync::Saved);
         }
+        let hits = || { let u = session.cache.usage(); u.memory_hits + u.disk_hits };
+        let before = hits();
         let later = session.open(ino, false).await.unwrap();
         assert_eq!(session.handle_attr(later).unwrap().version_id.as_deref(), Some("one"));
-        assert_eq!(session.read(later, 0, 5).await.unwrap_err(), FsError::Offline, "fresh opens use the remote snapshot instead of another handle's retained local bytes");
+        assert_eq!(session.read(later, 0, 5).await.unwrap(), b"first"[..]);
+        assert_eq!(hits(), before + 1, "fresh opens read the remote snapshot, seeded by the publication, instead of another handle's retained local bytes");
         for handle in [fh, earlier, later] { session.close(handle).await.unwrap(); }
         queue.close().await;
     }
