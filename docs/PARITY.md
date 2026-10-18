@@ -184,8 +184,10 @@ billing or plans), this page says so.
     ([18 October](step-5-macos.md#logout-login-and-a-reboot-18-october)). It also found three
     faults. A failed upload isn't tried again after a restart. A file saved on this Mac isn't
     cached once it uploads, so it can't be read offline after a restart. And a queued save is
-    tried at the daemon's start, before the daemon knows it's offline. Login Items' approval
-    flow, a busy eject and the `/Volumes` helper are still to come.
+    tried at the daemon's start, before the daemon knows it's offline. The bridge agent's kept
+    launch requirement, found there too, the app now clears by itself at its launch, as it does the
+    login job's ([the agent's requirement](step-5-macos.md#the-bridge-agents-kept-requirement-18-october)).
+    Login Items' approval flow, a busy eject and the `/Volumes` helper are still to come.
     Steps 6–10 have not started.
 
 ## 2. Decisions that shape the plan

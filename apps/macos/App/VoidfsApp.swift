@@ -14,7 +14,7 @@
 //     voidfs.app/Contents/MacOS/voidfs transfers-selftest <drive> [--cancel] [--png <path>]
 //     voidfs.app/Contents/MacOS/voidfs mount <drive> [mount-point]
 //     voidfs.app/Contents/MacOS/voidfs settings
-//     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status
+//     voidfs.app/Contents/MacOS/voidfs agent-register | agent-unregister | agent-status | agent-selftest
 //     voidfs.app/Contents/MacOS/voidfs login-item on | off | status | look <folder> | selftest
 //     voidfs.app/Contents/MacOS/voidfs server-key status | sign-in … | sign-out | selftest
 //     voidfs.app/Contents/MacOS/voidfs bridge-check
@@ -51,7 +51,7 @@ enum Launcher {
             NSApplication.shared.setActivationPolicy(.prohibited)
             NSApplication.shared.run()
         }
-        if let command = args.first, ["status", "transfers", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "login-item", "server-key", "bridge-check", "bridge-selftest", "badges-selftest", "badges-check"].contains(command) {
+        if let command = args.first, ["status", "transfers", "mount", "settings", "agent-register", "agent-unregister", "agent-status", "agent-selftest", "login-item", "server-key", "bridge-check", "bridge-selftest", "badges-selftest", "badges-check"].contains(command) {
             Task {
                 let code = await HostCommands.run(args)
                 exit(code)
@@ -92,13 +92,21 @@ enum HostCommands {
                 print(FSClient.shared.openFileSystemExtensionsSettings() ? "opened System Settings" : "could not open System Settings")
             case "agent-register":
                 do { try Agent.service.register() } catch { print("register: \(error.localizedDescription)") }
+                // A kept launch requirement refuses it until it is registered again.
+                let repair = await Agent.repairIfRefused()
+                if let repair { print(repair.note) }
                 print("agent: \(Agent.status)")
-                return Agent.service.status == .enabled ? 0 : 1
+                return Agent.service.status == .enabled && repair?.fixed != false ? 0 : 1
             case "agent-unregister":
                 try await Agent.service.unregister()
                 print("agent: \(Agent.status)")
             case "agent-status":
                 print("agent: \(Agent.status)")
+                if Agent.service.status == .enabled, let why = await Agent.refused() {
+                    print("launchd refuses the agent: \(why); `agent-register` registers it again")
+                }
+            case "agent-selftest":
+                return await AgentSelfTest.run()
             case "login-item":
                 switch args.dropFirst().first {
                 case "on":
@@ -192,6 +200,8 @@ struct VoidfsApp: App {
         let transfers = Transfers()
         transfers.start()
         _transfers = State(initialValue: transfers)
+        // Mounts reach the daemon through the bridge agent, whether or not the menu opens.
+        Task { @MainActor in _ = await Agent.repairOnce() }
     }
 
     var body: some Scene {
@@ -214,13 +224,16 @@ final class HostModel {
     var login = LoginItem.state
     var loginNote = ""
     var loginBusy = false
+    /// What the launch's check of the bridge agent found, if launchd refused it.
+    var agentNote = ""
     var signedIn = SignIn.summary()
     var signingIn = false
     var form = SignInFields()
     var keyNote = ""
     var keyBusy = false
 
-    func refresh() async {
+    /// What the menu shows. Without `repairing`, it registers nothing again, as for drawing it.
+    func refresh(repairing: Bool = true) async {
         signedIn = SignIn.summary()
         login = LoginItem.state
         finderEnabled = FIFinderSyncController.isExtensionEnabled
@@ -231,6 +244,10 @@ final class HostModel {
         } catch {
             status = "Could not list file system extensions: \(error.localizedDescription)"
         }
+        guard repairing else { return }
+        // After a switch between differently signed copies, launchd refuses the bridge agent
+        // until it is registered again: the launch checked.
+        if let repair = await Agent.repairOnce() { agentNote = repair.note }
         // After an update that changed the job's program, launchd refuses it until it is
         // registered again.
         if let note = await LoginItem.repairIfRefused() {
@@ -349,6 +366,7 @@ struct SetupView: View {
                 Button("Open Finder extension settings") { FIFinderSyncController.showExtensionManagementInterface() }
             case nil: EmptyView()
             }
+            if !model.agentNote.isEmpty { Text(model.agentNote).font(.caption).textSelection(.enabled) }
             ServerKeyView(model: model)
             LoginItemView(model: model)
         }

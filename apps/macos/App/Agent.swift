@@ -6,6 +6,11 @@
 // signature, and forwards each call to the Rust daemon's user-only socket. Finder's badges have a
 // service of their own (`BadgeAgent.swift`). It owns no journal, publisher or cache: the daemon
 // does.
+//
+// A switch between differently signed copies of the app leaves the agent's launch requirement
+// behind, and launchd refuses it (LaunchRequirement.swift): mounts then can't reach the daemon.
+// The app checks once per run, from its launch, and registers it again, up to twice, as do
+// `agent-register` and turning Start at login on.
 
 import Foundation
 import ServiceManagement
@@ -13,6 +18,7 @@ import os
 
 enum Agent {
     static let service = SMAppService.agent(plistName: "dev.voidfs.agent.plist")
+    static let label = "dev.voidfs.agent"
     static let log = Logger(subsystem: "dev.voidfs", category: "agent")
 
     static var status: String {
@@ -23,6 +29,77 @@ enum Agent {
         case .notFound: "not found in the bundle"
         @unknown default: "unknown (\(service.status.rawValue))"
         }
+    }
+
+    /// Why launchd refuses the agent now, or `nil` if it doesn't: `launchctl print`'s view of it.
+    /// It waits up to `wait` for launchd to load a job just registered.
+    static func refused(wait: Duration = .zero) async -> String? {
+        let deadline = ContinuousClock.now + wait
+        while true {
+            if let printed = LaunchRequirement.printed(label) { return LaunchRequirement.refusal(in: printed, own: LaunchRequirement.own) }
+            guard ContinuousClock.now < deadline else { return nil }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    /// Unregisters the agent and registers it again, which gives it a new launch requirement.
+    static func registerAgain() async -> Bool {
+        try? await service.unregister()
+        try? service.register()
+        return service.status == .enabled
+    }
+
+    /// What registering a refused agent again found.
+    struct Repair: Equatable {
+        /// Why launchd refused it at first.
+        var refused: String
+        /// How many times it was registered again.
+        var rounds = 0
+        /// Why launchd refuses it still after the last round, if it does.
+        var still: String?
+        /// Registering it again failed.
+        var failed = false
+
+        var fixed: Bool { still == nil && !failed }
+
+        var note: String {
+            if failed { return "launchd refused the bridge agent (\(refused)), and registering it again failed: the file system extension can't reach the daemon." }
+            let again = rounds > 1 ? "registered again \(rounds == 2 ? "twice" : "\(rounds) times")" : "registered again"
+            guard let still else { return "launchd refused the bridge agent (\(refused)), so it was \(again)." }
+            return "launchd refused the bridge agent (\(refused)). It was \(again), and launchd still refuses it (\(still)), so the file system extension can't reach the daemon. `voidfs agent-register` tries again."
+        }
+    }
+
+    /// While launchd refuses the agent, registers it again, up to `LaunchRequirement.rounds`
+    /// times, and asks again after each. What it found, or `nil` if launchd didn't refuse it.
+    static func repair(refused: () async -> String?, registerAgain: () async -> Bool) async -> Repair? {
+        guard let first = await refused() else { return nil }
+        var repair = Repair(refused: first)
+        while repair.rounds < LaunchRequirement.rounds {
+            repair.rounds += 1
+            guard await registerAgain() else {
+                repair.failed = true
+                return repair
+            }
+            repair.still = await refused()
+            if repair.still == nil { break }
+        }
+        return repair
+    }
+
+    /// The agent, if it is registered, registered again while launchd refuses it.
+    static func repairIfRefused() async -> Repair? {
+        guard service.status == .enabled else { return nil }
+        return await repair(refused: { await refused(wait: .seconds(2)) }, registerAgain: registerAgain)
+    }
+
+    /// Once per run of the app, from its launch and then the menu's: `repairIfRefused`.
+    @MainActor private static var repairing: Task<Repair?, Never>?
+    @MainActor
+    static func repairOnce() async -> Repair? {
+        let task = repairing ?? Task { await repairIfRefused() }
+        repairing = task
+        return await task.value
     }
 
     /// The daemon's state directory: the CLI's default, `voidfs_client::default_dir()`, which the

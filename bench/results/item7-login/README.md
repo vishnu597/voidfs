@@ -42,8 +42,9 @@ log. The job got it from the Keychain and passed it to `void` on stdin (`--key-f
 - **The bridge agent was refused, and a second registration fixed it.** `dev.voidfs.agent` kept
   a development launch requirement (`validation-category` 3) and ended with exit code 78. One
   `agent-unregister`/`agent-register` kept it. A second one made it 6, and the agent ran. This
-  explains the `/Applications` agent refusals since 15 October. The app doesn't yet
-  re-register the agent by itself, as it does the daemon job.
+  explains the `/Applications` agent refusals since 15 October. The app didn't yet
+  re-register the agent by itself, as it does the daemon job. It now does
+  ([the fix](../item7-agent-requirement/README.md)).
 
 ## Start at login
 

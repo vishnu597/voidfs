@@ -1,0 +1,94 @@
+## break 1: the check as #84 had it: only the signing identifier compared
+-            if let team = named["team-identifier"], let ownTeam = own.team, team != ownTeam {
+-                return "its launch requirement names team \(team), not \(ownTeam)"
+-            }
+-            if let category = named["validation-category"].flatMap({ Int($0) }), let ownCategory = own.category, category != ownCategory {
+-                return "its launch requirement names validation category \(describe(category: category)), not \(describe(category: ownCategory))"
+-            }
+FAIL the live run's agent kept a development build's requirement, the right identifier with the wrong category: none
+FAIL registered again once, launchd scheduled it with that requirement still
+FAIL which ended in exit code 78; the requirement is named first
+FAIL another team's requirement is: none
+FAIL so is a Developer ID requirement kept for a development build, as on 9 October: none
+FAIL the live run: kept after one round, it is registered again a second time and accepted (registered 0)
+FAIL the note says so: 
+FAIL cleared by one round, it registers it once
+FAIL and says so
+FAIL refused still, it is registered again only twice (registered 0)
+FAIL and it says launchd still refuses it: none
+FAIL if registering again fails, it stops and says so: none
+agent self-test: 12 failed
+agent-selftest: exit 1, 21 checks
+FAIL a development build's requirement kept for the Developer ID copy is, before launchd has tried the program: none
+FAIL kept after one round, it is registered again a second time and the daemon answers (registered 0)
+FAIL the note says so: Registered, but the daemon didn't answer within 20.0 seconds: see daemon.log in ~/Library/Application Support/voidfs.
+login item self-test: 3 failed
+login-item selftest: exit 1, 23 checks
+
+## break 2: registered again once, as #84 did
+-    static let rounds = 2
++    static let rounds = 1
+FAIL the live run: kept after one round, it is registered again a second time and accepted (registered 1)
+FAIL the note says so: launchd refused the bridge agent (its launch requirement names validation category 3 (development), not 6 (Developer ID)). It was registered again, and launchd still refuses it (its launch requirement names validation category 3 (development), not 6 (Developer ID)), so the file system extension can't reach the daemon. `voidfs agent-register` tries again.
+FAIL refused still, it is registered again only twice (registered 1)
+FAIL and it says launchd still refuses it: launchd refused the bridge agent (its launch requirement names validation category 3 (development), not 6 (Developer ID)). It was registered again, and launchd still refuses it (its launch requirement names validation category 3 (development), not 6 (Developer ID)), so the file system extension can't reach the daemon. `voidfs agent-register` tries again.
+agent self-test: 4 failed
+agent-selftest: exit 1, 21 checks
+FAIL kept after one round, it is registered again a second time and the daemon answers (registered 1)
+FAIL the note says so: launchd refused the job (its launch requirement names validation category 3 (development), not 6 (Developer ID)), so it was registered again. launchd still refuses it (its launch requirement names validation category 3 (development), not 6 (Developer ID)), so the daemon doesn't start.
+FAIL refused still, it is registered again only twice, and the wait starts over each time (2.577025125 seconds)
+FAIL after a round of their own, the wait registers it once more, and keeps the first reason
+login item self-test: 4 failed
+login-item selftest: exit 1, 23 checks
+
+## break 3: a running job judged by its requirement, as before
+-        if lines.first(where: { tabs($0) == 1 && trimmed($0).hasPrefix("state = ") }).map(trimmed) == "state = running" { return nil }
+FAIL a running agent isn't, whatever its requirement: another copy's program may be running
+agent self-test: 1 failed
+agent-selftest: exit 1, 21 checks
+FAIL a job launchd runs isn't, whatever its requirement or last exit
+login item self-test: 1 failed
+login-item selftest: exit 1, 23 checks
+
+## break 4: the requirement's block doesn't end
+-                if t == "}" && tabs(line) == depth { break }
+FAIL a validation category after the requirement's block doesn't count
+agent self-test: 1 failed
+agent-selftest: exit 1, 21 checks
+FAIL a signing identifier after the requirement's block doesn't count
+login item self-test: 1 failed
+login-item selftest: exit 1, 23 checks
+
+## break 5: the agent's rounds: one more than allowed
+-        while repair.rounds < LaunchRequirement.rounds {
++        while repair.rounds <= LaunchRequirement.rounds {
+FAIL refused still, it is registered again only twice (registered 3)
+FAIL and it says launchd still refuses it: launchd refused the bridge agent (its launch requirement names validation category 3 (development), not 6 (Developer ID)). It was registered again 3 times, and launchd still refuses it (its launch requirement names validation category 3 (development), not 6 (Developer ID)), so the file system extension can't reach the daemon. `voidfs agent-register` tries again.
+agent self-test: 2 failed
+agent-selftest: exit 1, 21 checks
+login item self-test passed
+login-item selftest: exit 0, 23 checks
+
+## break 6: the agent's rounds: not asked again after a round
+-            repair.still = await refused()
++            repair.still = nil
+FAIL the live run: kept after one round, it is registered again a second time and accepted (registered 1)
+FAIL the note says so: launchd refused the bridge agent (its launch requirement names validation category 3 (development), not 6 (Developer ID)), so it was registered again.
+FAIL refused still, it is registered again only twice (registered 1)
+FAIL and it says launchd still refuses it: launchd refused the bridge agent (its launch requirement names validation category 3 (development), not 6 (Developer ID)), so it was registered again.
+agent self-test: 4 failed
+agent-selftest: exit 1, 21 checks
+login item self-test passed
+login-item selftest: exit 0, 23 checks
+
+## break 7: the job's wait: registered again on every refusal
+-            if waited.rounds < LaunchRequirement.rounds, ContinuousClock.now - checked >= .seconds(1) {
++            if ContinuousClock.now - checked >= .seconds(1) {
+agent self-test passed
+agent-selftest: exit 0, 21 checks
+FAIL refused still, it is registered again only twice, and the wait starts over each time (3.130450708 seconds)
+FAIL and it says launchd still refuses it: launchd refuses the daemon's job (it can't start the program: exit code 78, EX_CONFIG), and registering it again failed.
+FAIL after a round of their own, the wait registers it once more, and keeps the first reason
+login item self-test: 3 failed
+login-item selftest: exit 1, 23 checks
+

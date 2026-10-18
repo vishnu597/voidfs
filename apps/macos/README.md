@@ -94,8 +94,9 @@ new sign-in, and the stop on sign-out
 ([the Keychain slice](../../docs/step-5-macos.md#the-server-key-in-the-keychain-17-october)).
 launchd may refuse the job after you switch between differently signed copies, or after its
 program changes ("Launch Constraint Violation" in its log, exit code 78). Turning Start at login
-on, and opening the menu, notice that and register the job again; `voidfs login-item status`
-reports it, and `voidfs login-item selftest` checks the logic.
+on, and opening the menu, notice that and register the job again, up to twice; `voidfs login-item
+status` reports it, and `voidfs login-item selftest` checks the logic. The app does the same for
+the bridge agent when it opens (`voidfs agent-selftest`).
 
 Then mount a drive by its alias or id. `void mount` asks the daemon, which mounts it with the
 module (the `fskit` adapter) and mounts it again when it starts:
@@ -275,17 +276,19 @@ void daemon start
 ```
 
 Register the agent from the copy of the app you built (registering from another copy changes which
-binary launchd runs; after switching between a Developer ID and a development copy, launchd may
-refuse the first start, and unregistering and registering again fixes it):
+binary launchd runs). After a switch between a Developer ID and a development copy, launchd may
+refuse it for a kept launch requirement: `agent-register` notices that and registers it again, up
+to twice, as the app does when it opens.
 
 ```bash
 apps/macos/build/Build/Products/Release/voidfs.app/Contents/MacOS/voidfs agent-register
 ```
 
-`agent-status` reports it, `agent-unregister` removes it, and `bridge-check` shows that it turns
-the app itself away. `bridge-selftest <drive>` runs the bridge's checks in process, without
-launchd or FSKit; its modes `daemon-restart`, `agent-restart`, `remote <key>`, `refused` and
-`wire` cover restarts, an outside change, peer refusal and the agent's codecs. (Until item 3 the
+`agent-status` reports it and a refusal, `agent-unregister` removes it, `agent-selftest` checks
+the refusal logic, and `bridge-check` shows that it turns the app itself away.
+`bridge-selftest <drive>` runs the bridge's checks in process, without launchd or FSKit; its modes
+`daemon-restart`, `agent-restart`, `remote <key>`, `refused` and `wire` cover restarts, an outside
+change, peer refusal and the agent's codecs. (Until item 3 the
 extension also ran them when a mount looked up names such as `.voidfs-bridge`; the mount itself now
 goes through the agent, and those names are gone.)
 
