@@ -34,6 +34,22 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+/// An error and what caused it, as `a: b: c`, so that a request that failed says how: reset,
+/// closed before the answer, timed out. A cause whose words the line has already is left out.
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut line = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        let words = c.to_string();
+        if !line.contains(&words) {
+            line.push_str(": ");
+            line.push_str(&words);
+        }
+        cause = c.source();
+    }
+    line
+}
+
 /// Talks to the daemon on one socket. Cloning shares its connections.
 #[derive(Clone, Debug)]
 pub struct DaemonClient {
@@ -60,7 +76,7 @@ impl DaemonClient {
             let why = std::error::Error::source(&e).map_or_else(|| e.to_string(), |s| s.to_string());
             ClientError::NotRunning { socket: self.socket.clone(), why }
         } else {
-            ClientError::Failed(format!("the daemon at {}: {e}", self.socket.display()))
+            ClientError::Failed(format!("the daemon at {}: {}", self.socket.display(), chain(&e)))
         }
     }
 
