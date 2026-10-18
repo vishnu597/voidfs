@@ -3095,7 +3095,9 @@ link was online in 3 s and the waiting save published by itself.
 2. **A file saved on this Mac isn't cached once it uploads.** After the reboot, offline, that save
    failed to read with "Network is down", the rule for uncached bytes. Publication drops the
    staged copy, and nothing puts its bytes in the read cache. So a file written here, and
-   uploaded, can't be read offline after a restart.
+   uploaded, can't be read offline after a restart. **Fixed** in `c85056c`: a publication now
+   seeds the read cache with the save's own bytes under the version it published ([the
+   rule](#staged-file-data-6-october)).
 3. **A queued save is tried at the daemon's start.** A save made while offline stayed queued
    through the shutdown, then failed with "Connection refused" just after the start, before the
    daemon knew it was offline. Its retry time held in that process, so it published once online.
