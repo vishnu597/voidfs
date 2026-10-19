@@ -317,8 +317,11 @@ final class Transfers {
     }
     func limit(_ bytesPerSecond: UInt64?) async { await call("PUT", "/v1/uploads/limit", ["bytesPerSecond": bytesPerSecond.map { $0 as Any } ?? NSNull()]) }
     func clearFinished() async { await call("POST", "/v1/uploads/clear", nil) }
-    /// As `void unmount`: the daemon unmounts it and forgets it; its unpublished changes still go.
-    func unmount(_ m: DaemonStatus.Mount) async { await call("POST", "/v1/mounts/unmount", ["target": m.mountpoint]) }
+    /// As `void unmount`: a normal unmount refuses a busy volume. Force is an explicit choice;
+    /// either way, the daemon keeps its durable unpublished changes and their uploads continue.
+    func unmount(_ m: DaemonStatus.Mount, force: Bool = false) async {
+        await call("POST", "/v1/mounts/unmount", ["target": m.mountpoint, "force": force])
+    }
 
     /// The daemon's answer to a control, when it succeeded.
     @discardableResult
@@ -418,8 +421,9 @@ enum Journal {
 /// imports still to send.
 struct TransfersView: View {
     let transfers: Transfers
+    @State private var forceEject: DaemonStatus.Mount?
     /// Rows past these are left to `void uploads`, which lists them all.
-    static let shownItems = 6, shownBatches = 4
+    nonisolated static let shownItems = 6, shownBatches = 4
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -442,6 +446,15 @@ struct TransfersView: View {
             }
             if let n = transfers.notice { Text(n).font(.caption).textSelection(.enabled) }
             if let e = transfers.controlError { Text(e).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
+        }
+        .confirmationDialog("Force eject this drive?", isPresented: Binding(
+            get: { forceEject != nil },
+            set: { if !$0 { forceEject = nil } }
+        ), titleVisibility: .visible, presenting: forceEject) { mount in
+            Button("Force Eject", role: .destructive, action: act { await $0.unmount(mount, force: true) })
+            Button("Cancel", role: .cancel) {}
+        } message: { mount in
+            Text("Force eject \(mount.drive) at \(mount.mountpoint)? Apps with open files may lose unsaved changes. Close those files and try Unmount first. Queued uploads stay saved on this Mac and are not cancelled.")
         }
     }
 
@@ -493,6 +506,14 @@ struct TransfersView: View {
                         Button("Pause", action: act { await $0.pause(.drive(m.drive)) })
                     }
                     Button("Unmount", action: act { await $0.unmount(m) })
+                    Menu {
+                        Button("Force Eject…", role: .destructive) { forceEject = m }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .menuIndicator(.hidden)
+                    .accessibilityLabel("More actions for \(m.drive)")
+                    .help("More eject options")
                 }
                 .controlSize(.small)
             }

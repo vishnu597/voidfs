@@ -104,6 +104,9 @@ enum Command {
     Unmount {
         /// A mountpoint, or a drive by alias or id
         target: String,
+        /// Force unmounting a busy drive; open files may stop working
+        #[arg(long)]
+        force: bool,
     },
     /// The drives mounted now, and the mounts the daemon remembers
     Mounts,
@@ -209,7 +212,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Daemon(DaemonCommand::Install) => launchd::install(&cli.connection, out).await,
         Command::Daemon(DaemonCommand::Uninstall) => launchd::uninstall(out).await,
         Command::Mount(args) => mounts::mount(&cli.connection, out, args).await,
-        Command::Unmount { target } => mounts::unmount(out, target).await,
+        Command::Unmount { target, force } => mounts::unmount(out, target, *force).await,
         Command::Mounts => mounts::mounts(out).await,
         Command::Drives => drives::list(&client()?, out).await,
         Command::Drive(DriveCommand::Create { name, display_name }) => drives::create(&client()?, out, name, display_name.clone()).await,

@@ -228,6 +228,9 @@ pub struct NewMount {
 #[serde(rename_all = "camelCase")]
 pub struct Unmount {
     pub target: String,
+    /// Explicitly eject even when the volume is busy. Omitted requests remain ordinary unmounts.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

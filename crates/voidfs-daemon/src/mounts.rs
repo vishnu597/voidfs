@@ -55,6 +55,10 @@ pub trait Mounted: Send + Sync + 'static {
     fn local_change(&self, change: &voidfs_client::mount::LocalChange) { self.invalidate(&change.invalidations); }
     /// Unmounts it.
     fn unmount(self: Arc<Self>) -> BoxFuture<'static, Result<(), String>>;
+    /// Explicit force eject. Adapters must opt in; never fall back to an ordinary unmount.
+    fn force_unmount(self: Arc<Self>) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Err("this adapter does not support force eject".into()) })
+    }
 }
 
 enum Is {
@@ -267,26 +271,31 @@ pub(crate) async fn unmount(State(s): State<Arc<Shared>>, Json(u): Json<api::Unm
     let names = |drive: &str, mountpoint: &str| mountpoint == target || drive == target || alias.as_deref() == Some(drive);
     let store = s.store.clone();
     let remembered = blocking(move || voidfs_client::mounts::remembered(&store)).await?;
-    let gone: Vec<Live> = {
-        let mut live = s.mounts.live();
-        let (gone, kept) = std::mem::take(&mut *live).into_iter().partition(|l| names(&l.spec.drive, &l.spec.mountpoint.display().to_string()) || l.drive.as_ref().is_some_and(|d| d.id == target));
-        *live = kept;
-        gone
-    };
+    let targets: Vec<_> = s.mounts.live().iter()
+        .filter(|l| names(&l.spec.drive, &l.spec.mountpoint.display().to_string()) || l.drive.as_ref().is_some_and(|d| d.id == target))
+        .map(|l| (l.spec.mountpoint.clone(), match &l.is { Is::Mounted(handle) => Some(handle.clone()), _ => None }))
+        .collect();
     let mut unmounted: Vec<String> = Vec::new();
-    let mut gone = gone.into_iter();
-    while let Some(l) = gone.next() {
-        if let Is::Mounted(h) = &l.is
-            && let Err(e) = h.clone().unmount().await
-        {
-            // Still mounted (busy, say): it stays in the table and remembered, as do the rest.
-            let message = format!("{}: {e}", l.spec.mountpoint.display());
-            s.mounts.live().extend(std::iter::once(l).chain(gone));
-            return Err(Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "UnmountFailed", message));
+    for (mountpoint, handle) in targets {
+        if let Some(handle) = handle {
+            let result = if u.force { handle.force_unmount().await } else { handle.unmount().await };
+            if let Err(error) = result {
+                // A refusal leaves this mount and every not-yet-tried mount live and remembered.
+                return Err(Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "UnmountFailed", format!("{}: {error}", mountpoint.display())));
+            }
         }
-        unmounted.push(l.spec.mountpoint.display().to_string());
+        // The OS has ejected it even if forgetting it fails: never report a gone volume as
+        // mounted. Persist each success before trying the next, so a later busy mount cannot
+        // resurrect an earlier successful eject when the daemon starts again.
+        s.mounts.live().retain(|l| l.spec.mountpoint != mountpoint);
+        let store = s.store.clone();
+        let mp = mountpoint.display().to_string();
+        let forget = mp.clone();
+        blocking(move || voidfs_client::mounts::forget(&store, &forget)).await?;
+        unmounted.push(mp);
     }
-    let forgotten = remembered.into_iter().filter(|r| names(&r.drive, &r.mountpoint) || r.drive_id.as_deref() == Some(&target) || unmounted.contains(&r.mountpoint)).collect::<Vec<_>>();
+    let forgotten = remembered.into_iter().filter(|r| !unmounted.contains(&r.mountpoint)
+        && (names(&r.drive, &r.mountpoint) || r.drive_id.as_deref() == Some(&target))).collect::<Vec<_>>();
     for r in forgotten {
         let store = s.store.clone();
         let mp = r.mountpoint.clone();

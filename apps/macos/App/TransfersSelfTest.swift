@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// `voidfs transfers-selftest <drive> [--cancel | --no-daemon | --look] [--png <path>]`: the menu's transfers controls
+// `voidfs transfers-selftest <drive> [--cancel | --no-daemon | --look | --eject-busy | --force-eject] [--png <path>]`: the menu's transfers controls
 // against a running daemon, through the same model calls as the menu's buttons, each checked in the
 // daemon's status or queue afterwards. It restores the limit and the pauses it changes. `--cancel`
 // also cancels the newest unfinished import and clears finished uploads, which can't be undone,
@@ -9,6 +9,9 @@
 // stays a conflict, as does a change that waits for one; the menu offers Cancel for neither.
 // `--no-daemon` expects the daemon stopped, and checks that the menu reads what waits in its journal.
 // `--look` changes nothing: it prints the menu's uploads line, for drawing the menu as it is.
+// `--eject-busy` expects an open file held by another process: the normal action must refuse,
+// leaving the mount in place. `--force-eject` explicitly forces one mount of the named drive;
+// it can disrupt open files and is only for a disposable test mount. Neither retries the other.
 // `--png` draws the menu's view, offscreen, to a file.
 //
 // Run it against a test daemon: `-VoidfsStateDirectory <dir>` points the app at one.
@@ -20,15 +23,20 @@ import SwiftUI
 enum TransfersSelfTest {
     static func run(_ args: [String]) async -> Int32 {
         var rest = args
+        // UserDefaults still reads the original process arguments to select the test daemon.
+        if let i = rest.firstIndex(of: "-VoidfsStateDirectory"), i + 1 < rest.count {
+            rest.removeSubrange(i...(i + 1))
+        }
         var png: String?
         if let i = rest.firstIndex(of: "--png"), i + 1 < rest.count {
             png = rest[i + 1]
             rest.removeSubrange(i...(i + 1))
         }
         let cancel = rest.contains("--cancel"), noDaemon = rest.contains("--no-daemon"), look = rest.contains("--look")
-        rest.removeAll { $0 == "--cancel" || $0 == "--no-daemon" || $0 == "--look" }
-        guard let drive = rest.first else {
-            print("usage: transfers-selftest <drive> [--cancel | --no-daemon | --look] [--png <path>]")
+        let ejectBusy = rest.contains("--eject-busy"), forceEject = rest.contains("--force-eject")
+        rest.removeAll { ["--cancel", "--no-daemon", "--look", "--eject-busy", "--force-eject"].contains($0) }
+        guard rest.count == 1, let drive = rest.first, !drive.hasPrefix("-"), [cancel, noDaemon, look, ejectBusy, forceEject].filter({ $0 }).count <= 1 else {
+            print("usage: transfers-selftest <drive> [--cancel | --no-daemon | --look | --eject-busy | --force-eject] [--png <path>]")
             return 2
         }
         // All of the queue, to find the changes it controls; the menu lists only what it shows.
@@ -68,6 +76,24 @@ enum TransfersSelfTest {
         }
         print("transfers self-test: drive \(drive), \(Words.uploads(before))")
         if look {
+            if let png { check("the view draws to \(png)", await draw(TransfersView(transfers: t), to: png)) }
+            print(failed == 0 ? "transfers self-test passed" : "transfers self-test: \(failed) failed")
+            return failed == 0 ? 0 : 1
+        }
+        if ejectBusy || forceEject {
+            guard let mount = t.status?.mounts.first(where: { $0.drive == drive && $0.state == "mounted" }) else {
+                print("FAIL no mounted test drive \(drive)")
+                return 1
+            }
+            await t.unmount(mount, force: forceEject)
+            if ejectBusy {
+                let error = t.controlError?.lowercased() ?? ""
+                check("normal unmount reports a busy refusal", error.contains("busy") || error.contains("in use"), t.controlError ?? "no refusal")
+                check("normal refusal leaves the mount in place", t.status?.mounts.contains { $0.id == mount.id && $0.state == "mounted" } == true)
+            } else {
+                check("explicit force eject succeeds", t.controlError == nil, t.controlError ?? "")
+                check("explicit force eject removes the mount", t.status?.mounts.contains { $0.id == mount.id } == false)
+            }
             if let png { check("the view draws to \(png)", await draw(TransfersView(transfers: t), to: png)) }
             print(failed == 0 ? "transfers self-test passed" : "transfers self-test: \(failed) failed")
             return failed == 0 ? 0 : 1

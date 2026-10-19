@@ -56,6 +56,81 @@ fn path(p: &Path) -> &str {
 }
 
 #[test]
+fn unmount_only_forces_when_explicitly_requested_and_never_falls_back() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Capture the CLI's actual daemon requests, including its force choice, without a mount.
+    let dir = std::env::temp_dir().join(format!("vuf{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let listener = UnixListener::bind(dir.join("daemon.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let stopping = done.clone();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !stopping.load(Ordering::SeqCst) && Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("accepting the CLI request: {error}"),
+            };
+            // macOS inherits the listener's nonblocking mode on accepted sockets.
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                assert!(reader.read_line(&mut header).unwrap() > 0);
+                if header == "\r\n" { break; }
+                if let Some((name, value)) = header.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            requests.push((request.trim().to_owned(), body));
+            let (status, response) = match requests.len() {
+                1 => (409, serde_json::json!({ "error": { "code": "Busy", "message": "drive is busy" } })),
+                2 => (200, serde_json::json!({ "unmounted": ["/test/mount"] })),
+                _ => (501, serde_json::json!({ "error": { "code": "NotSupported", "message": "forced eject is unsupported" } })),
+            };
+            let response = response.to_string();
+            write!(stream, "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        }
+        requests
+    });
+    let env = [("VOIDFS_STATE_DIR", dir.display().to_string())];
+    let ordinary = run(&["unmount", "footage", "--json"], &env, None);
+    let forced = run(&["unmount", "--force", "footage", "--json"], &env, None);
+    let unsupported = run(&["unmount", "footage", "--force", "--json"], &env, None);
+    done.store(true, Ordering::SeqCst);
+    let requests = server.join().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(ordinary.fails(1).error()["code"], "Busy");
+    assert_eq!(forced.ok().json(), serde_json::json!({ "unmounted": ["/test/mount"] }));
+    assert_eq!(unsupported.fails(1).error()["code"], "NotSupported");
+    assert_eq!(requests, [
+        ("POST /v1/mounts/unmount HTTP/1.1".into(), serde_json::json!({ "target": "footage", "force": false })),
+        ("POST /v1/mounts/unmount HTTP/1.1".into(), serde_json::json!({ "target": "footage", "force": true })),
+        ("POST /v1/mounts/unmount HTTP/1.1".into(), serde_json::json!({ "target": "footage", "force": true })),
+    ], "neither a busy normal eject nor an unsupported forced eject may change the user's choice");
+}
+
+#[test]
 fn mounts_through_the_daemon_are_remembered_until_unmounted() {
     let f = Fixture::new("mounts");
     f.drive("footage");
