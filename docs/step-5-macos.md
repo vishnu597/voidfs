@@ -3121,6 +3121,17 @@ the file in 0.03 s, and so did lookups after the reboot, once the listing was us
 cause isn't confirmed: perhaps the restored folder was served as complete before the change feed
 caught up.
 
+**Core investigation, 19 October.** Restored root and nested snapshots remain stale for their
+first online refresh; the proposed complete-offline-listing fault did not reproduce. A different
+race did: a listing can learn a foreign change before its feed event, and the core then suppressed
+the adapter notification because its saved snapshot already matched. Foreign saved changes now
+reach observers even after that refresh, including deletions of names already absent from the
+snapshot. Own acknowledged publications and unpublished local edits retain their suppression.
+The regression and remembered-mount daemon check use a fake adapter, not FSKit
+([evidence](../bench/results/offline-reconnect/README.md)). This does not establish the cause of
+the reboot's live FSKit miss or remove item 3's pinned-name blocker. The notarized update and live
+recheck of #88–#90 remain outstanding.
+
 **Not covered.** Login Items' approval flow (SMAppService enabled the job at once). A login before
 the keychain's first unlock (the job runs in the login session). The menu app at login: Start at
 login starts the daemon, not the menu. A busy eject and the `/Volumes` helper.

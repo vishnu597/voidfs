@@ -786,6 +786,46 @@ fn change(op: &str, key: &str, from_key: Option<&str>, object_id: &str, version_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directory_refresh_before_the_feed_does_not_hide_remote_changes_from_observers() {
+    let f = Fixture::new(Backend::Api).await;
+    f.put("folder/", b"").await;
+    let ns = f.session().await;
+    for prefix in ["", "folder/"] {
+        let parent = if prefix.is_empty() { ns.root() } else { ns.lookup(ns.root(), "folder").await.unwrap().ino };
+        assert_eq!(ns.lookup(parent, "remote").await.unwrap_err(), FsError::NotFound);
+        let mut since = f.remote.changes("drv", 0, Duration::ZERO).await.unwrap().seq;
+        for operation in ["create", "overwrite", "rename", "delete"] {
+            let key = format!("{prefix}remote");
+            let renamed = format!("{prefix}renamed");
+            match operation {
+                "create" => f.put(&key, b"created").await,
+                "overwrite" => f.put(&key, b"updated").await,
+                "rename" => { f.remote.rename("drv", &key, &renamed, Default::default()).await.unwrap(); },
+                "delete" => { f.remote.delete_object("drv", &renamed, Default::default()).await.unwrap(); },
+                _ => unreachable!(),
+            }
+            // The feed is deliberately not applied until a separate metadata refresh has
+            // learned the change. An adapter can still hold older positive or negative names.
+            ns.invalidate(&[Invalidation::All]).await.unwrap();
+            let listing = ns.readdir(parent, None, 10).await.unwrap();
+            let expected = match operation { "rename" => "renamed", _ => "remote" };
+            if operation == "delete" {
+                assert!(!listing.iter().any(|(name, _)| name == "renamed"));
+            } else {
+                assert!(listing.iter().any(|(name, _)| name == expected));
+            }
+            let batch = f.remote.changes("drv", since, Duration::ZERO).await.unwrap();
+            assert_eq!(batch.changes.len(), 1, "{prefix}{operation}");
+            let (reported, inodes) = ns.invalidate_feed(&batch.changes).await.unwrap();
+            assert_eq!(reported, invalidations(&batch.changes), "observers still need {prefix}{operation}");
+            assert!(inodes.contains(&parent), "the containing directory must be invalidated: {inodes:?}");
+            since = batch.seq;
+        }
+    }
+    f.queue.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_feed_reports_other_computers_changes_and_not_this_macs_own() {
     let f = Fixture::new(Backend::Api).await;
     let ns = f.session().await;
@@ -832,9 +872,9 @@ async fn the_feed_reports_other_computers_changes_and_not_this_macs_own() {
     assert_eq!(reported, invalidations(&foreign.changes));
     assert!(inodes.contains(&ns.root()) && inodes.contains(&saved) && inodes.contains(&created.ino), "{inodes:?}");
 
-    // What the local view already shows: a name with an unpublished edit, a rename not yet
-    // acknowledged, and the delete of a name it doesn't have. A change to a name it shows as
-    // saved, or a rename from one, is news.
+    // Unpublished edits and renames keep the local view until publication settles them.
+    // Changes to saved or absent names still need to reach adapters, which may cache an older
+    // view even after a listing refreshes the core.
     f.queue.pause(Scope::All).await.unwrap();
     let to = ns.lookup(ns.root(), "to").await.unwrap();
     let other = ns.lookup(ns.root(), "other").await.unwrap();
@@ -845,7 +885,6 @@ async fn the_feed_reports_other_computers_changes_and_not_this_macs_own() {
     let shown = [
         change("put", "to", None, to.object_id.as_deref().unwrap(), "remote"),
         change("rename", "moved", Some("renamed"), "created", "remote"),
-        change("delete", "never", None, "missing", "remote"),
     ];
     for one in &shown {
         assert_eq!(ns.invalidate_feed(std::slice::from_ref(one)).await.unwrap(), (Vec::new(), Vec::new()), "{one:?}");
@@ -854,6 +893,7 @@ async fn the_feed_reports_other_computers_changes_and_not_this_macs_own() {
         change("put", "other", None, other.object_id.as_deref().unwrap(), "remote"),
         change("rename", "to", Some("other"), other.object_id.as_deref().unwrap(), "remote"),
         change("put", "never", None, "missing", "remote"),
+        change("delete", "never", None, "missing", "remote"),
         // Inside a folder this Mac moved and hasn't published: the local view shows it elsewhere.
         change("put", "dir/inside", None, inside.object_id.as_deref().unwrap(), "remote"),
     ];

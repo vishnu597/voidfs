@@ -257,8 +257,8 @@ impl Sessions {
                 let mut invalidations = event.invalidations;
                 loop {
                     let Some(drive) = weak.upgrade() else { return };
-                    // Observers hear of the changes the local view doesn't show already: this
-                    // Mac's own publications come back through the feed too.
+                    // This Mac's publications echo through the feed too. Foreign changes must
+                    // reach observers even if a listing already refreshed the core's snapshot.
                     let done = if invalidations.contains(&Invalidation::All) || event.changes.is_empty() {
                         drive.core.invalidate(&invalidations).await.map(|inodes| (invalidations.clone(), inodes))
                     } else {

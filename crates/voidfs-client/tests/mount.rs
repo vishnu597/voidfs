@@ -354,6 +354,56 @@ async fn offline_reopening_serves_complete_snapshots_and_fails_uncached_lookups_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_reopened_snapshots_refresh_before_the_feed_and_do_not_retain_misses() {
+    let f = Fixture::new().await;
+    f.put("cached/file", "bytes").await;
+    let ns = f.session("drv").await;
+    let root = ns.root();
+    let cached = ns.lookup(root, "cached").await.unwrap().ino;
+    let file = ns.lookup(cached, "file").await.unwrap();
+    f.connectivity.silent();
+    drop(ns);
+    drop(f.store);
+
+    let store = Arc::new(Store::open(f.state.path()).unwrap());
+    let ns = session(store, f.client, "drv", f.connectivity.clone()).await;
+    f.proxy.clear();
+    assert_eq!(ns.lookup(cached, "file").await.unwrap(), file);
+    assert_eq!(ns.lookup(root, "first-root").await.unwrap_err(), FsError::NotFound);
+    assert_eq!(ns.lookup(cached, "first-child").await.unwrap_err(), FsError::NotFound);
+    assert_eq!(ns.readdir(root, None, 10).await.unwrap()[0].0, "cached");
+    assert_eq!(ns.readdir(cached, None, 10).await.unwrap()[0].0, "file");
+    assert!(f.proxy.seen().is_empty(), "restored complete snapshots are served offline without requests");
+
+    // The server's first answer brings the link online. Remote commits happen immediately
+    // after that; no feed invalidation has been delivered to this restored session yet.
+    f.connectivity.answered(false);
+    f.remote.put_object("drv", "first-root", "root", Default::default()).await.unwrap();
+    f.remote.put_object("drv", "cached/first-child", "child", Default::default()).await.unwrap();
+    assert_eq!(ns.lookup(root, "first-root").await.unwrap().size, 4);
+    assert_eq!(ns.lookup(cached, "first-child").await.unwrap().size, 5);
+    assert_eq!(f.proxy.seen().len(), 2, "both restored directories refresh before trusting their old snapshots online");
+
+    // Once refreshed, names are cached until the caller supplies a feed invalidation. A
+    // negative result in that bounded window must not remain in the core after delivery.
+    let since = f.remote.changes("drv", 0, std::time::Duration::ZERO).await.unwrap().seq;
+    assert_eq!(ns.lookup(root, "later-root").await.unwrap_err(), FsError::NotFound);
+    assert_eq!(ns.lookup(cached, "later-child").await.unwrap_err(), FsError::NotFound);
+    f.remote.put_object("drv", "later-root", "later root", Default::default()).await.unwrap();
+    f.remote.put_object("drv", "cached/later-child", "later child", Default::default()).await.unwrap();
+    assert_eq!(ns.lookup(root, "later-root").await.unwrap_err(), FsError::NotFound);
+    assert_eq!(ns.lookup(cached, "later-child").await.unwrap_err(), FsError::NotFound);
+    assert_eq!(f.proxy.seen().len(), 2, "the feed is deliberately held back");
+    let changes = f.remote.changes("drv", since, std::time::Duration::ZERO).await.unwrap();
+    assert_eq!(changes.changes.len(), 2);
+    ns.invalidate_feed(&changes.changes).await.unwrap();
+    assert_eq!(ns.lookup(root, "later-root").await.unwrap().size, 10);
+    assert_eq!(ns.lookup(cached, "later-child").await.unwrap().size, 11);
+    assert_eq!(ns.lookup(cached, "file").await.unwrap().ino, file.ino);
+    assert_eq!(f.proxy.seen().len(), 4, "delivering the delayed feed refreshes both directories and clears their earlier misses");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_silent_server_fails_uncached_calls_after_the_links_patience_and_serves_what_is_cached() {
     let f = Fixture::new().await;
     f.put("cached/file", "bytes").await;
