@@ -512,7 +512,7 @@ impl Session {
             Ok((root, generation))
         })).await.map_err(Error::from)??;
         let local = Arc::new(notify::Observer::default());
-        let data = data::Staged::load(store.clone(), drive.to_owned(), root, None, StagingConfig::default(), lease, local.clone()).await?;
+        let data = data::Staged::load(store.clone(), drive.to_owned(), root, None, StagingConfig::default(), cache.clone(), lease, local.clone()).await?;
         Ok(Self { store, client, drive: drive.to_owned(), root, connectivity, cache, generation,
             handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()), queue: None, data, local })
     }
@@ -528,7 +528,7 @@ impl Session {
         let lease = store.mount_session(drive, true).ok_or(FsError::Again)?;
         let mut session = Self::new_inner(store, client, cache, drive, connectivity, lease.clone()).await?;
         let registration = queue.mount_registration(drive).await;
-        session.data = data::Staged::load(session.store.clone(), drive.to_owned(), session.root, Some(queue.clone()), cfg, lease, session.local.clone()).await?;
+        session.data = data::Staged::load(session.store.clone(), drive.to_owned(), session.root, Some(queue.clone()), cfg, session.cache.clone(), lease, session.local.clone()).await?;
         queue.register_mount_publisher(drive, Arc::downgrade(&session.data));
         drop(registration);
         session.queue = Some(queue);

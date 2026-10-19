@@ -723,7 +723,13 @@ zeros for that discarded region instead of reviving old bytes.
 The shared local view is visible immediately through earlier handles, lookup, getattr and
 directory listings. A handle keeps its own immutable remote reader for untouched gaps; local
 ranges override it, and gaps beyond the visible remote base return zeros. Cached remote bytes
-remain readable offline, while an uncached remote gap fails promptly. All remote gaps share
+remain readable offline, while an uncached remote gap fails promptly. This Mac's own saves count
+as cached: when one publishes, its staged bytes seed the read cache under the exact published
+version, so the file reads offline after a restart (fault 2 of
+[18 October](#logout-login-and-a-reboot-18-october)). An edit seeds the blocks whose base bytes
+are cached; the others are fetched when read. A save larger than a quarter of the cache's limit
+(5 GiB of the default 20 GiB) isn't seeded, so that one large copy into the drive doesn't push
+out what was read here; it is cached as it is read, as any file is. All remote gaps share
 one relocation request and time budget in a read callback. Local creates and writes work offline
 under complete cached parents or locally created directories. Reopening the state
 restores acknowledged names, staged bytes and the remote base even if the previous session
@@ -3099,7 +3105,9 @@ link was online in 3 s and the waiting save published by itself.
 2. **A file saved on this Mac isn't cached once it uploads.** After the reboot, offline, that save
    failed to read with "Network is down", the rule for uncached bytes. Publication drops the
    staged copy, and nothing puts its bytes in the read cache. So a file written here, and
-   uploaded, can't be read offline after a restart.
+   uploaded, can't be read offline after a restart. **Fixed** in `c85056c`: a publication now
+   seeds the read cache with the save's own bytes under the version it published ([the
+   rule](#staged-file-data-6-october)).
 3. **A queued save is tried at the daemon's start.** A save made while offline stayed queued
    through the shutdown, then failed with "Connection refused" just after the start, before the
    daemon knew it was offline. Its retry time held in that process, so it published once online.

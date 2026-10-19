@@ -15,6 +15,9 @@
 //! - **Read-ahead:** a [`Reader`] that reads forward fetches the blocks ahead of it, up to
 //!   `read_ahead_bytes`, so a reader that waits for each read before the next (Finder's copy)
 //!   still streams, whatever adapter the mount uses.
+//! - **This Mac's saves:** a version a mount published is seeded from the bytes it published
+//!   ([`Cache::seed`]), on disk as a fetched block is, so that it reads offline after a restart.
+//!   A save larger than a quarter of `max_bytes` isn't seeded.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -91,6 +94,8 @@ pub struct Usage {
     /// Blocks on disk that failed their checksum, or went missing, and were dropped.
     pub dropped: u64,
     pub evicted: u64,
+    /// Blocks of this Mac's saves stored from their own bytes ([`Cache::seed`]).
+    pub seeded: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -192,6 +197,7 @@ struct Stats {
     disk_hits: AtomicU64,
     dropped: AtomicU64,
     evicted: AtomicU64,
+    seeded: AtomicU64,
 }
 
 struct Inner {
@@ -213,6 +219,17 @@ struct Inner {
 struct Busy {
     n: AtomicUsize,
     settled: Notify,
+}
+
+/// Work [`Cache::settle`] waits for, until this is dropped.
+pub(crate) struct Working(Arc<Busy>);
+
+impl Drop for Working {
+    fn drop(&mut self) {
+        if self.0.n.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.settled.notify_waiters();
+        }
+    }
 }
 
 /// The block cache. Cloning shares it.
@@ -320,13 +337,23 @@ impl Cache {
 
     async fn read_block_connected(&self, c: &Content, index: u64, lo: u64, hi: u64, conn: Option<&Connectivity>) -> Result<Bytes> {
         let key = BlockKey::of(c, index);
+        if let Some(b) = self.read_held(&key, lo, hi).await? {
+            return Ok(b);
+        }
+        if let Some(conn) = conn { conn.check()?; }
+        let block = self.fill(c, key, false, conn.cloned()).await?;
+        Ok(block.slice(lo as usize..hi as usize))
+    }
+
+    /// Bytes `lo..hi` of a block from memory, or from disk, if the cache holds it.
+    async fn read_held(&self, key: &BlockKey, lo: u64, hi: u64) -> Result<Option<Bytes>> {
         let on_disk = {
             let mut st = self.state();
             // A use from memory is a use: it keeps the block's file from eviction too.
-            let on_disk = st.disk.get(&key).cloned();
-            if let Some(b) = st.mem.get(&key) {
+            let on_disk = st.disk.get(key).cloned();
+            if let Some(b) = st.mem.get(key) {
                 self.0.stats.memory_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(b.slice(lo as usize..hi as usize));
+                return Ok(Some(b.slice(lo as usize..hi as usize)));
             }
             on_disk
         };
@@ -336,14 +363,12 @@ impl Cache {
             match tokio::task::spawn_blocking(move || this.read_disk(&k, &e, lo, hi)).await? {
                 Ok(b) => {
                     self.0.stats.disk_hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(b);
+                    return Ok(Some(b));
                 }
-                Err(_) => self.drop_block(&key).await,
+                Err(_) => self.drop_block(key).await,
             }
         }
-        if let Some(conn) = conn { conn.check()?; }
-        let block = self.fill(c, key, false, conn.cloned()).await?;
-        Ok(block.slice(lo as usize..hi as usize))
+        Ok(None)
     }
 
     /// Reads and checks the 64 KiB pieces of a block file that hold `lo..hi`.
@@ -408,8 +433,7 @@ impl Cache {
         let this = self.clone();
         let c = c.clone();
         let k = key.clone();
-        let busy = self.0.busy.clone();
-        busy.n.fetch_add(1, Ordering::SeqCst);
+        let working = self.working();
         tokio::spawn(async move {
             let r = this.fetch(&c, &k, ahead, conn.as_ref()).await;
             if let Ok(b) = &r {
@@ -427,9 +451,7 @@ impl Cache {
             // Let go of the cache, and so of the store, first: whoever settles and then drops the
             // cache can open the state directory again at once.
             drop(this);
-            if busy.n.fetch_sub(1, Ordering::SeqCst) == 1 {
-                busy.settled.notify_waiters();
-            }
+            drop(working);
         });
         let f = async move { rx.await.unwrap_or_else(|_| Err(Error::Invalid("the fetch stopped".into()))) }.boxed().shared();
         fills.insert(key, f.clone());
@@ -530,11 +552,14 @@ impl Cache {
         })
     }
 
-    /// Writes a fetched block to disk, if there is room for it.
-    fn store_block(&self, key: &BlockKey, b: &Bytes) -> Result<()> {
+    /// Writes a block to disk, if there is room for it. Whether the disk has it.
+    fn store_block(&self, key: &BlockKey, b: &Bytes) -> Result<bool> {
         let len = b.len() as u64;
-        if self.state().disk.map.contains_key(key) || !self.make_room(len)? {
-            return Ok(());
+        if self.state().disk.map.contains_key(key) {
+            return Ok(true);
+        }
+        if !self.make_room(len)? {
+            return Ok(false);
         }
         let path = key.path(&self.0.dir);
         std::fs::create_dir_all(path.parent().unwrap())?;
@@ -554,7 +579,62 @@ impl Cache {
         if st.disk.insert(key.clone(), DiskEntry { len, sums, stored_used: now }).is_none() {
             st.disk_bytes += len;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Whether [`Cache::seed`] takes the blocks of a version of `size` bytes: at most a quarter of
+    /// `max_bytes`, so that one large save doesn't push out most of what was read here.
+    pub fn seeds(&self, size: u64) -> bool {
+        size <= self.0.cfg.max_bytes / 4
+    }
+
+    /// Stores block `index` of `c` from bytes this Mac already has, rather than fetched: a version
+    /// a mount published from them. On disk, as a fetched block is: within the cap and above the
+    /// floor, evicting what was used longest ago. Whether the disk has it: not when
+    /// [`Cache::seeds`] refuses `c`, or there is no room.
+    pub async fn seed(&self, c: &Content, index: u64, block: Bytes) -> Result<bool> {
+        if index.checked_mul(self.0.cfg.block_size).is_none_or(|at| at >= c.size) || block.len() as u64 != self.block_len(c, index) {
+            return Err(Error::Invalid(format!("{} bytes are not block {index} of {}", block.len(), c.key)));
+        }
+        if !self.seeds(c.size) {
+            return Ok(false);
+        }
+        let key = BlockKey::of(c, index);
+        if self.state().disk.map.contains_key(&key) {
+            return Ok(true);
+        }
+        let this = self.clone();
+        let stored = tokio::task::spawn_blocking(move || this.store_block(&key, &block)).await??;
+        if stored {
+            self.0.stats.seeded.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(stored)
+    }
+
+    /// Bytes `offset..offset + len` of `c`, fewer where it ends, if memory or disk holds all of
+    /// them. Nothing is fetched.
+    pub async fn read_cached(&self, c: &Content, offset: u64, len: u64) -> Result<Option<Bytes>> {
+        if offset >= c.size || len == 0 {
+            return Ok(Some(Bytes::new()));
+        }
+        let bs = self.0.cfg.block_size;
+        let end = offset.saturating_add(len).min(c.size);
+        let mut out = BytesMut::with_capacity((end - offset) as usize);
+        for i in offset / bs..=(end - 1) / bs {
+            let lo = offset.max(i * bs) - i * bs;
+            let hi = end.min((i + 1) * bs) - i * bs;
+            match self.read_held(&BlockKey::of(c, i), lo, hi).await? {
+                Some(b) => out.extend_from_slice(&b),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out.freeze()))
+    }
+
+    /// Counts work as the cache's until the guard is dropped: [`Cache::settle`] waits for it.
+    pub(crate) fn working(&self) -> Working {
+        self.0.busy.n.fetch_add(1, Ordering::SeqCst);
+        Working(self.0.busy.clone())
     }
 
     /// Fetches `c`'s block `index` in the background, unless the cache has it or is fetching it.
@@ -639,7 +719,7 @@ impl Cache {
     }
 
     /// Waits until every fill that has started has also been written to disk (or skipped), and
-    /// has let go of the cache.
+    /// has let go of the cache, and so has every save being seeded.
     pub async fn settle(&self) {
         loop {
             let n = self.0.busy.settled.notified();
@@ -664,6 +744,7 @@ impl Cache {
             disk_hits: s.disk_hits.load(Ordering::Relaxed),
             dropped: s.dropped.load(Ordering::Relaxed),
             evicted: s.evicted.load(Ordering::Relaxed),
+            seeded: s.seeded.load(Ordering::Relaxed),
         }
     }
 
@@ -1060,6 +1141,37 @@ mod tests {
         assert_eq!(fake.fetched().len(), before, "both blocks from disk");
         cache.read(&a, 2 * BLOCK, 1).await.unwrap();
         assert_eq!(fake.fetched().len(), before + 1, "the missing one fetched");
+    }
+
+    /// Seeded blocks are stored as fetched ones are, evicting what was used longest ago, and read
+    /// after a restart without a fetch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seeded_blocks_are_stored_as_fetched_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let a = fake.add("a", bytes_of(10, 7 * BLOCK));
+        let src = bytes_of(11, 2 * BLOCK - 5);
+        let saved = Content { drive: "d".into(), key: "saved.bin".into(), version_id: "v-saved".into(), etag: "saved".into(), size: src.len() as u64 };
+        let cfg = CacheConfig { max_bytes: 8 * BLOCK, ..config() };
+        {
+            let cache = open(dir.path(), &fake, cfg.clone()).await;
+            cache.read(&a, 0, 7 * BLOCK).await.unwrap();
+            cache.settle().await;
+            assert!(cache.seed(&saved, 1, src.clone()).await.is_err(), "not the length of block 1");
+            assert!(cache.seed(&saved, 2, Bytes::new()).await.is_err(), "past the end");
+            assert_eq!(cache.read_cached(&saved, 0, 1).await.unwrap(), None);
+            assert!(cache.seed(&saved, 0, src.slice(..BLOCK as usize)).await.unwrap());
+            assert!(cache.seed(&saved, 1, src.slice(BLOCK as usize..)).await.unwrap());
+            let u = cache.usage();
+            assert_eq!((u.seeded, u.evicted, u.disk_bytes), (2, 1, 8 * BLOCK - 5), "the cap evicted a's oldest block");
+            // A quarter of the cap at most.
+            let big = Content { size: 2 * BLOCK + 1, etag: "big".into(), ..saved.clone() };
+            assert!(!cache.seeds(big.size) && !cache.seed(&big, 0, src.slice(..BLOCK as usize)).await.unwrap());
+        }
+        let cache = open(dir.path(), &fake, cfg).await;
+        let before = fake.fetched().len();
+        assert_eq!(cache.read(&saved, 0, 2 * BLOCK).await.unwrap(), src);
+        assert_eq!((fake.fetched().len(), cache.usage().disk_hits), (before, 2));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

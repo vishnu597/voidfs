@@ -17,7 +17,10 @@ pub(super) struct File {
 }
 
 pub(crate) struct Staged {
-    store: Arc<Store>, drive: String, root: Ino, queue: Option<crate::Queue>, cfg: StagingConfig,
+    store: Arc<Store>, drive: String, root: Ino, queue: Option<crate::Queue>, cfg: StagingConfig, cache: Cache,
+    /// Published saves to seed the read cache with, one after another: an edit's base may be the
+    /// save before it.
+    seeder: tokio::sync::mpsc::UnboundedSender<(Seed, Cache, crate::cache::Working)>,
     files: Mutex<HashMap<Ino, Arc<File>>>, creation: Arc<tokio::sync::Mutex<()>>, handles: Mutex<Vec<Weak<Handle>>>,
     normal_commits: AtomicU64, full_commits: AtomicU64,
     damaged: HashSet<Ino>,
@@ -37,7 +40,8 @@ const OWN_VERSIONS: usize = 4096;
 fn own_key(key: &str, version: &str) -> (String, String) { (key.trim_end_matches('/').to_owned(), version.to_owned()) }
 
 impl Staged {
-    pub(super) async fn load(store: Arc<Store>, drive: String, root: Ino, queue: Option<crate::Queue>, cfg: StagingConfig, lease: Arc<crate::store::MountLease>, local: Arc<notify::Observer>) -> Result<Arc<Self>> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn load(store: Arc<Store>, drive: String, root: Ino, queue: Option<crate::Queue>, cfg: StagingConfig, cache: Cache, lease: Arc<crate::store::MountLease>, local: Arc<notify::Observer>) -> Result<Arc<Self>> {
         let (s, d, writer) = (store.clone(), drive.clone(), queue.is_some());
         let (files, damaged) = tokio::task::spawn_blocking(move || {
             if writer {
@@ -76,7 +80,15 @@ impl Staged {
             }).collect::<Result<HashMap<_, _>>>()?;
             Ok::<_, FsError>((files, damaged))
         }).await.map_err(Error::from)??;
-        Ok(Arc::new(Self { store, drive, root, queue, cfg, files: Mutex::new(files), creation: Arc::new(tokio::sync::Mutex::new(())), handles: Mutex::new(Vec::new()), normal_commits: AtomicU64::new(0), full_commits: AtomicU64::new(0), damaged, recovered: tokio::sync::watch::channel(true).0, _lease: lease, local, own: Mutex::new(Own::default()) }))
+        let (seeder, mut seeds) = tokio::sync::mpsc::unbounded_channel::<(Seed, Cache, crate::cache::Working)>();
+        tokio::spawn(async move {
+            while let Some((seed, cache, working)) = seeds.recv().await {
+                seed.run(&cache).await;
+                drop(cache);
+                drop(working);
+            }
+        });
+        Ok(Arc::new(Self { store, drive, root, queue, cfg, cache, seeder, files: Mutex::new(files), creation: Arc::new(tokio::sync::Mutex::new(())), handles: Mutex::new(Vec::new()), normal_commits: AtomicU64::new(0), full_commits: AtomicU64::new(0), damaged, recovered: tokio::sync::watch::channel(true).0, _lease: lease, local, own: Mutex::new(Own::default()) }))
     }
 
     /// Whether this inode's staged bytes were lost: opening it fails rather than read other bytes.
@@ -484,6 +496,10 @@ impl Prepared {
                 if let Some(file) = file && let Some(published) = &report.published && let Some(key) = self.keys.get(&report.ino) {
                     *file.guard.lock().unwrap_or_else(|p| p.into_inner()) = (published.clone(), key.clone());
                 }
+                if retire && let Some(published) = &report.published && let Some((_, file, state)) = self.files.iter().find(|(ino, _, _)| *ino == report.ino)
+                    && let Some(seed) = Seed::of(&self.staged.drive, self.keys.get(&report.ino).map(String::as_str), published, file, state) {
+                    let _ = self.staged.seeder.send((seed, self.staged.cache.clone(), self.staged.cache.working()));
+                }
                 for handle in handles.iter().filter(|handle| handle.attr.ino == report.ino) {
                     if file.is_some() || !handle.frozen.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
                         *handle.local_attr.lock().unwrap_or_else(|p| p.into_inner()) = Some(report.attr.clone());
@@ -508,6 +524,80 @@ impl Prepared {
         let observer = self.staged.local.clone();
         drop(self);
         for change in changes { observer.send(change); }
+    }
+}
+
+/// A save's bytes, seeded into the read cache under the version that published them, so that a
+/// file saved here reads offline after a restart as one read here does.
+struct Seed { _file: Arc<File>, view: View, base: Option<Content>, published: Content }
+
+impl Seed {
+    /// Only for a clean publication of the stage's last flush, whose object, read back at the
+    /// exact version, is the size the stage holds. The stage's bytes are then that version's: a
+    /// mount edit is guarded, and a version is taken as the edit's only when its marker names it.
+    fn of(drive: &str, key: Option<&str>, published: &Attr, file: &Arc<File>, state: &stage::Stage) -> Option<Seed> {
+        let record = &state.record;
+        let version_id = published.version_id.clone().filter(|v| !v.is_empty())?;
+        let etag = published.etag.clone().filter(|e| !e.is_empty())?;
+        if published.kind != Kind::File || record.revision != record.flushed || record.size != published.size { return None; }
+        let base = record.base.etag.clone().filter(|e| !e.is_empty()).map(|etag| Content { drive: drive.to_owned(), key: record.key.clone(),
+            version_id: record.base.version_id.clone().unwrap_or_default(), etag, size: record.base.size });
+        let mut view = View::new(record.base.size);
+        view.overlay(state);
+        let key = key.map_or_else(|| record.key.clone(), str::to_owned);
+        Some(Seed { _file: file.clone(), view, base, published: Content { drive: drive.to_owned(), key, version_id, etag, size: published.size } })
+    }
+
+    /// Block by block, as far as the cache takes them. A block needing base bytes the cache
+    /// doesn't hold is left to be fetched when read.
+    async fn run(self, cache: &Cache) {
+        let size = self.published.size;
+        if !cache.seeds(size) { return; }
+        let bs = cache.config().block_size;
+        for index in 0..size.div_ceil(bs) {
+            let block = match self.block(cache, index * bs, ((index + 1) * bs).min(size)).await {
+                Ok(Some(block)) => block,
+                Ok(None) => continue,
+                Err(e) => { eprintln!("voidfs mount seeding the cache: {e}"); return; }
+            };
+            match cache.seed(&self.published, index, block).await {
+                Ok(true) => {},
+                // No room: the cache stops filling.
+                Ok(false) => return,
+                Err(e) => { eprintln!("voidfs mount seeding the cache: {e}"); return; }
+            }
+        }
+    }
+
+    /// Bytes `start..end` of the published version, as a read through the stage has them: its
+    /// extents, the base's bytes below its remote size, and zeros past it.
+    async fn block(&self, cache: &Cache, start: u64, end: u64) -> Result<Option<Bytes>> {
+        let mut gaps = Vec::new();
+        let mut pieces = Vec::new();
+        let mut at = start;
+        for extent in &self.view.extents {
+            if extent.end <= start || extent.start >= end { continue; }
+            let (from, to) = (extent.start.max(start), extent.end.min(end));
+            if at < from { gaps.push((at, from.min(self.view.remote_size))); }
+            pieces.push((extent.path.clone(), extent.physical + from - extent.start, from, to));
+            at = to;
+        }
+        if at < end { gaps.push((at, end.min(self.view.remote_size))); }
+        let mut body = vec![0u8; usize::try_from(end - start).map_err(|_| FsError::InvalidArgument)?];
+        for (from, to) in gaps.into_iter().filter(|(from, to)| from < to) {
+            let Some(base) = &self.base else { return Ok(None) };
+            let Some(bytes) = cache.read_cached(base, from, to - from).await? else { return Ok(None) };
+            if bytes.len() as u64 != to - from { return Ok(None); }
+            body[(from - start) as usize..(to - start) as usize].copy_from_slice(&bytes);
+        }
+        let body = tokio::task::spawn_blocking(move || {
+            for (path, physical, from, to) in pieces {
+                let bytes = stage::read_range(&path, physical, to - from)?;
+                body[(from - start) as usize..(to - start) as usize].copy_from_slice(&bytes);
+            }
+            Ok::<_, FsError>(body)
+        }).await.map_err(Error::from)??;
+        Ok(Some(Bytes::from(body)))
     }
 }
 
@@ -657,13 +747,17 @@ mod tests {
         fixture_with_quiet(None).await
     }
 
+    fn plenty(_: &std::path::Path) -> std::io::Result<u64> { Ok(1 << 50) }
+
     async fn fixture_with_quiet(quiet: Option<Duration>) -> (tempfile::TempDir, Arc<Session>, crate::Queue, Fh) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let client = Client::new(voidfs_sdk::Config { endpoint: "http://localhost:9".into(), access_key_id: "test".into(), secret_access_key: "test".into(), ..Default::default() }).unwrap();
         let connectivity = Connectivity::default();
         for _ in 0..3 { connectivity.unanswered(); }
-        let cache = Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone())), crate::CacheConfig::default()).await.unwrap();
+        // The machine's free space doesn't decide whether a publication seeds the cache.
+        let cfg = crate::CacheConfig { min_free_bytes: 0, free_space: Some(plenty), ..Default::default() };
+        let cache = Cache::open(store.clone(), Arc::new(crate::ApiFetcher::new(client.clone())), cfg).await.unwrap();
         let queue = crate::Queue::open(store.clone(), client.clone(), crate::QueueConfig { connectivity: Some(connectivity.clone()), ..Default::default() }).await.unwrap();
         queue.pause(crate::Scope::All).await.unwrap();
         let session = Arc::new(Session::new_writable_with_config(store.clone(), client, cache, queue.clone(), "drive", connectivity,
@@ -717,13 +811,18 @@ mod tests {
         let earlier = session.open(ino, false).await.unwrap();
         clean_publication(&session, &queue, fh, "one").await;
         assert!(session.data.file(ino).is_none(), "a completed byte view must not mask later remote versions on new opens");
+        session.cache.settle().await;
+        assert_eq!(session.cache.usage().seeded, 1, "the publication seeds its version's one block");
         for handle in [fh, earlier] {
             assert_eq!(session.read(handle, 0, 5).await.unwrap(), b"first"[..]);
             assert_eq!(session.handle_attr(handle).unwrap().sync, Sync::Saved);
         }
+        let hits = || { let u = session.cache.usage(); u.memory_hits + u.disk_hits };
+        let before = hits();
         let later = session.open(ino, false).await.unwrap();
         assert_eq!(session.handle_attr(later).unwrap().version_id.as_deref(), Some("one"));
-        assert_eq!(session.read(later, 0, 5).await.unwrap_err(), FsError::Offline, "fresh opens use the remote snapshot instead of another handle's retained local bytes");
+        assert_eq!(session.read(later, 0, 5).await.unwrap(), b"first"[..]);
+        assert_eq!(hits(), before + 1, "fresh opens read the remote snapshot, seeded by the publication, instead of another handle's retained local bytes");
         for handle in [fh, earlier, later] { session.close(handle).await.unwrap(); }
         queue.close().await;
     }
