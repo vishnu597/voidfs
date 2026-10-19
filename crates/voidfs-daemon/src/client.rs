@@ -189,7 +189,12 @@ impl DaemonClient {
 
     /// Unmounts and forgets a mountpoint, or every mount of a drive.
     pub async fn unmount(&self, target: &str) -> Result<api::Unmounted, ClientError> {
-        self.post("/v1/mounts/unmount", &api::Unmount { target: target.into() }).await
+        self.post("/v1/mounts/unmount", &api::Unmount { target: target.into(), force: false }).await
+    }
+
+    /// Explicitly force-unmounts a busy mountpoint, or every mount of a drive, and forgets it.
+    pub async fn unmount_force(&self, target: &str) -> Result<api::Unmounted, ClientError> {
+        self.post("/v1/mounts/unmount", &api::Unmount { target: target.into(), force: true }).await
     }
 }
 

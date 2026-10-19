@@ -40,12 +40,12 @@ pub async fn mount(conn: &Connection, out: Out, args: &MountArgs) -> Result<()> 
     out.emit(&m, || format!("mounted {} at {} ({}{ro}); it comes back when the daemon starts", m.drive, m.mountpoint, m.adapter))
 }
 
-/// `unmount <mountpoint | drive>`.
-pub async fn unmount(out: Out, target: &str) -> Result<()> {
+/// `unmount <mountpoint | drive> [--force]`.
+pub async fn unmount(out: Out, target: &str, force: bool) -> Result<()> {
     let place = Place::new()?;
     // A path, as typed or relative; otherwise a drive's alias or id.
     let target = if target.contains('/') || target.starts_with('.') || Path::new(target).exists() { absolute(Path::new(target))? } else { target.to_owned() };
-    let u = place.client.unmount(&target).await.map_err(failure)?;
+    let u = if force { place.client.unmount_force(&target).await } else { place.client.unmount(&target).await }.map_err(failure)?;
     out.emit(&u, || u.unmounted.iter().map(|m| format!("unmounted {m}, and forgot it")).collect::<Vec<_>>().join("\n"))
 }
 

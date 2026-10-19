@@ -112,8 +112,13 @@ server or a key:
 mkdir -p /tmp/voidfs-mnt && mount -F -t voidfs voidfs://footage /tmp/voidfs-mnt
 ```
 
-Unmount with `void unmount footage` or `umount /tmp/voidfs-mnt`. The app's `mount <drive>
-[mountpoint]` command and its menu ask the daemon as `void mount` does.
+Unmount with `void unmount footage` or `umount /tmp/voidfs-mnt`. A normal unmount refuses a busy
+volume and keeps it mounted and remembered. Close its open files and try again. To explicitly
+force an eject, use `void unmount footage --force`, or the mount's **More actions → Force Eject…**
+in the menu and confirm. Force can disrupt applications with open files and lose their unsaved
+changes. Journaled uploads remain on this Mac and continue; eject does not pause or cancel them.
+After a successful daemon eject the mount is forgotten, so mounting again is explicit. The
+app's `mount <drive> [mountpoint]` command and its menu ask the daemon as `void mount` does.
 
 The menu also shows the daemon's transfers, in the words `void status` and `void uploads` use:
 the server and its link, the uploads line, the mounts, and the unfinished changes and imports. It

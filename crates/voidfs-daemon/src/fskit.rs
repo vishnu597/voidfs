@@ -128,13 +128,24 @@ impl Mounted for FsKitMount {
     /// Unmounts it, unless it is gone already (ejected in Finder, or `umount`ed). Something else
     /// mounted there since is left alone.
     fn unmount(self: Arc<Self>) -> BoxFuture<'static, Result<(), String>> {
-        Box::pin(async move {
-            let table = run(&self.mount, Vec::new()).await?;
-            if find(&table, &self.at).as_deref() != Some(self.url.as_str()) {
-                return Ok(());
-            }
-            run(&self.umount, vec![self.at.clone().into_os_string()]).await.map(drop)
-        })
+        Box::pin(async move { self.eject(false).await })
+    }
+
+    fn force_unmount(self: Arc<Self>) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async move { self.eject(true).await })
+    }
+}
+
+impl FsKitMount {
+    async fn eject(&self, force: bool) -> Result<(), String> {
+        let table = run(&self.mount, Vec::new()).await?;
+        if find(&table, &self.at).as_deref() != Some(self.url.as_str()) {
+            return Ok(());
+        }
+        let mut args = Vec::new();
+        if force { args.push("-f".into()); }
+        args.push(self.at.clone().into_os_string());
+        run(&self.umount, args).await.map(drop)
     }
 }
 
