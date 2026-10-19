@@ -81,8 +81,10 @@ kept launch requirement, which the app now clears by itself, as it does the logi
 ([the agent's requirement](#the-bridge-agents-kept-requirement-18-october)). A fresh notarized
 export, installed on 19 October, passed the retry, queued-startup and offline-own-save checks
 through FSKit; both services ran without refusal
-([update and verification](#notarized-update-and-fskit-verification-19-october)). The approval flow, a
-busy eject and the `/Volumes` helper remain.
+([update and verification](#notarized-update-and-fskit-verification-19-october)). Normal eject now
+refuses a busy volume, with force an explicit choice; acknowledged offline saves passed eject,
+remount, daemon restart and later peer verification
+([busy eject](#busy-eject-19-october)). The approval flow and the `/Volumes` helper remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -410,7 +412,11 @@ The app now notices that at its launch and registers the agent again, up to twic
 `agent-register` does. The login job's check learned the validation category and the second round
 too ([the agent's requirement](#the-bridge-agents-kept-requirement-18-october)).
 
-A busy eject and the `/Volumes` helper, the done-when's other parts, come later.
+**Busy eject, 19 October:** ordinary eject refuses open files and held working directories;
+force is explicit in the CLI and menu. A live FSKit run retained every acknowledged offline save
+through eject, a fresh remount and daemon restart, then uploaded it without resume and verified
+its bytes from an independent peer ([busy eject](#busy-eject-19-october)). The `/Volumes` helper
+and approval-flow checks remain; item 7 is not complete.
 
 ### Item 8. Menu-bar transfers and Finder Sync
 
@@ -3221,3 +3227,44 @@ Only `/Applications/voidfs.app` is registered, the bridge is enabled, Start at l
 and no mount is remembered. `~/Library/Application Support/voidfs` stayed absent. No logout or
 reboot was repeated; a clean-Mac install, two Macs, busy eject and the remaining item 7 decisions
 are still untested or outstanding.
+
+### Busy eject, 19 October
+
+The user chose normal refusal while busy, with force an explicit action. `void unmount
+<drive-or-mountpoint>` and the menu's Unmount never retry with force. `--force` opts in at the
+CLI; each mounted row also offers **More actions → Force Eject…**, with confirmation warning
+about unsaved application changes. Journaled uploads remain on this Mac and continue. A
+successful daemon eject forgets the mount; mounting again is explicit. Existing local control
+requests omitting `force` remain ordinary unmounts.
+
+Two bookkeeping faults are covered by regressions: a later busy refusal no longer leaves an
+earlier successful eject remembered for restart, and a database failure after actual OS eject
+no longer leaves the gone volume reported as mounted. Force failure retains the live mount and
+its remembered intent. An adapter must explicitly support force; replacements at the same path
+are left alone.
+
+On this Mac, using the new daemon through the installed notarized FSKit module and bridge:
+
+- Normal CLI, diskutil and menu-model eject refused held writable files. CLI and diskutil
+  also refused a process holding its working directory in the volume.
+- Explicit CLI force, menu-model force and diskutil force succeeded in 0.074, 0.151 and
+  0.237 seconds. The two tested old descriptors returned `EIO` afterwards.
+- Finder's native Eject button/menu left the busy volume mounted, without a dialog. The
+  same normal Eject button removed it once the held file closed; no force was selected.
+- Four offline payloads (262,177, 262,177, 98,357 and 131,111 bytes) each read exactly after
+  a remount and an offline daemon restart. Every mount had a fresh kernel device number.
+  All four uploaded after reconnecting without resume, and the independent peer downloaded
+  identical bytes and hashes.
+
+The new menu compiled without warnings and its model controls passed live self-tests; the
+confirmation dialog itself was not clicked. No new app was notarized or installed. Out-of-band
+Finder/diskutil eject still needs `void unmount` to reconcile and forget the daemon's stale mount
+intent. The startup repair of a dead FSKit mount can still force it; ordinary eject never does.
+The existing resource-check/path-unmount sequence is not proof of race safety for a privileged
+helper. Application buffers and unsynchronized mmap stores were outside the write-acknowledgement
+checks.
+
+The test rig was removed after all four peer verifications. The installed app, registrations,
+bridge, login settings and default app-state absence were preserved
+([evidence, limits and scripts](../bench/results/busy-eject/README.md)). The `/Volumes` decision,
+approval flow and other item 7 work remain; this does not complete item 7 or step 5.
