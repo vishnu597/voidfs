@@ -81,6 +81,8 @@ fn unmount_only_forces_when_explicitly_requested_and_never_falls_back() {
                 }
                 Err(error) => panic!("accepting the CLI request: {error}"),
             };
+            // macOS inherits the listener's nonblocking mode on accepted sockets.
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut request = String::new();
