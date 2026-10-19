@@ -78,7 +78,10 @@ mount came back offline, read its cached files, and went online when the server 
 without the app being opened. The same check found three faults in the upload queue and the cache
 ([18 October](#logout-login-and-a-reboot-18-october)). It also found the bridge agent refused for a
 kept launch requirement, which the app now clears by itself, as it does the login job's
-([the agent's requirement](#the-bridge-agents-kept-requirement-18-october)). The approval flow, a
+([the agent's requirement](#the-bridge-agents-kept-requirement-18-october)). A fresh notarized
+export, installed on 19 October, passed the retry, queued-startup and offline-own-save checks
+through FSKit; both services ran without refusal
+([update and verification](#notarized-update-and-fskit-verification-19-october)). The approval flow, a
 busy eject and the `/Volumes` helper remain.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
@@ -3129,8 +3132,10 @@ reach observers even after that refresh, including deletions of names already ab
 snapshot. Own acknowledged publications and unpublished local edits retain their suppression.
 The regression and remembered-mount daemon check use a fake adapter, not FSKit
 ([evidence](../bench/results/offline-reconnect/README.md)). This does not establish the cause of
-the reboot's live FSKit miss or remove item 3's pinned-name blocker. The notarized update and live
-recheck of #88–#90 remain outstanding.
+the reboot's live FSKit miss or remove item 3's pinned-name blocker. The subsequent notarized
+update and live recheck of #88–#90 passed, as did notification delivery in the controlled live
+race; the deliberate root miss still needed a remount
+([19 October](#notarized-update-and-fskit-verification-19-october)).
 
 **Not covered.** Login Items' approval flow (SMAppService enabled the job at once). A login before
 the keychain's first unlock (the job runs in the login session). The menu app at login: Start at
@@ -3169,11 +3174,50 @@ registering cleared it. The app now does that itself, as it does for the login j
   job judged by its requirement, a requirement block that doesn't end, a round too many, no check
   after a round, and the job's wait registering on every refusal.
 
-**Not done.**
-- No live run: a kept requirement needs a switch between registered copies.
-- No Xcode build, so that `/Applications` stays the only registered copy.
+**Limits, updated 19 October.**
+- No live kept-requirement repair was manufactured: that needs a switch between registered copies.
+- The Xcode archive, Developer ID export, notarization, installed self-tests and live service
+  checks have now passed ([19 October](#notarized-update-and-fskit-verification-19-october)).
 - With two differently signed copies registered, each sees the other's requirement as a refusal
   while the agent is idle, and would register it again for itself. Keep one copy registered, as
   before.
 - The check runs when the app opens, not at login, so after an update the app must be opened
   once. The login job runs this binary at every login and could check the agent too.
+
+### Notarized update and FSKit verification, 19 October
+
+The user authorized a notarized update and the live checks. The Developer ID export of
+`f5f6bd1`, including #88–#90 and the foreign-notification fix, replaced `2986b57` in
+`/Applications`. Xcode archive/export, Apple notarization, the staple, `codesign`, Gatekeeper and
+`syspolicy_check distribution` passed. macOS initially blocked replacement until Codex received
+App Management access. The bridge and both extensions now use the installed copy; build-copy
+registrations were removed, and FSKit's switch stayed on
+([evidence and scripts](../bench/results/notarized-update/README.md)).
+
+On a throwaway local server and writable FSKit mount:
+
+- An injected `503` made a save fail with a persisted retry deadline. The same entry and deadline
+  survived a daemon restart, and it uploaded without a resume when the fault was removed.
+- An offline save stayed queued, without an error, through startup while the endpoint was down.
+  A persistent read-only SQLite observer saw no failed transition. It uploaded without a resume
+  after reconnecting.
+- A 262,177-byte file written and uploaded here, never read through the mount online, read with
+  matching bytes on its first mount read after an offline daemon restart. The kernel mount
+  device changed, so the old mount's pages cannot explain it.
+- The installed agent and login-item self-tests passed. Both live jobs ran with Developer ID
+  validation category 6 and without a refusal. No kept requirement was deliberately introduced.
+- With the endpoint online after an offline restore, fresh root and nested names appeared in
+  listings 0.014 and 0.0185 seconds after their foreground peer upload commands returned; their
+  first pathname reads matched. These timings exclude the peer command's duration.
+- With feed bodies held, the daemon listed both new names before their feed events. Releasing
+  the feed still delivered both foreign creation invalidations. A deliberately primed root
+  `ENOENT` remained after delivery and at a later check, while the nested name read correctly.
+  Both read correctly after remount. Item 3's root-name blocker remains; the earlier reboot's
+  exact cause is still not established.
+
+The test mount was forgotten, the throwaway Keychain item and login job removed, the state
+override cleared and the local services stopped. The rig was removed after saving evidence.
+Only `/Applications/voidfs.app` is registered, the bridge is enabled, Start at login is off,
+and no mount is remembered. `~/Library/Application Support/voidfs` stayed absent. No logout or
+reboot was repeated; a clean-Mac install, two Macs, busy eject and the remaining item 7 decisions
+are still untested or outstanding.

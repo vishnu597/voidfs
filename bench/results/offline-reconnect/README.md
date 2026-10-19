@@ -53,10 +53,13 @@ state directory, credentials, service registrations or FSKit switches were chang
 
 - [x] Investigate the restored offline namespace without FSKit.
 - [x] Fix the reproducible pre-feed-refresh notification gap and add regression coverage.
+- [x] Build, notarize, install and recheck #88–#90 live. The subsequent
+  [notarized-update run](../notarized-update/README.md) passed all four short checks and observed
+  both foreign notifications in a controlled FSKit race. The root pinned-name limitation remains.
 - [ ] Verify the original missed-name symptom on a live FSKit mount. The fake adapter does not
   model FSKit's pinned negative lookups, so these tests do not prove the cause of the reboot
   observation or remove the existing FSKit blocker.
-- [ ] Build, notarize, install and recheck #88–#90 live. The release script combines archive,
+- The initial preflight deferred the release: the release script combines archive,
   export, notarization and stapling; stapling can register its app copy. An attempt to inspect
   an unsigned build plan failed because this Xcode 27 no longer supports `-dry-run`
   ([command and toolchain](raw/xcode-commands.txt), [diagnostic](raw/xcode-dry-run.txt)). No actual
