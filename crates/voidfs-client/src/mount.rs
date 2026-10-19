@@ -364,22 +364,20 @@ fn moved_from(c: &Connection, drive: &str, root: Ino, key: &str) -> rusqlite::Re
     Ok(false)
 }
 
-/// Whether the local view already shows a feed change from another computer: a deletion of a
-/// name it doesn't have, or a change at a name with unpublished local edits, which keep the view
-/// until their own publication settles them (or conflicts). A change that moved something away
-/// from a name the view still shows is not shown, nor anything under a folder moved here and not
-/// yet published.
-fn shown(c: &Connection, drive: &str, root: Ino, change: &voidfs_sdk::Change) -> rusqlite::Result<bool> {
+/// Whether unpublished local edits hide a feed change from another computer until their own
+/// publication settles them (or conflicts). A saved snapshot, including an absent name, is not
+/// evidence that adapters heard of the change: a listing can refresh before the feed arrives
+/// while an adapter still caches an older positive or negative lookup.
+fn hidden_by_local(c: &Connection, drive: &str, root: Ino, change: &voidfs_sdk::Change) -> rusqlite::Result<bool> {
     if moved_from(c, drive, root, &change.key)? { return Ok(false); }
     if let Some(from) = &change.from_key {
         if moved_from(c, drive, root, from)? { return Ok(false); }
         if let At::Node(n) = at(c, drive, root, from)? && n.sync == Sync::Saved { return Ok(false); }
     }
     Ok(match at(c, drive, root, &change.key)? {
-        At::Missing => change.op == "delete",
+        At::Missing => false,
         At::Deleted => true,
-        At::Node(n) => n.sync != Sync::Saved
-            || (change.op != "delete" && n.entry.object_id == change.object_id && n.entry.version_id.as_deref() == Some(change.version_id.as_str())),
+        At::Node(n) => n.sync != Sync::Saved,
     })
 }
 
@@ -1034,9 +1032,9 @@ impl Session {
     }
 
     /// Invalidates what a feed batch affects, as [`Session::invalidate`] does, and returns the
-    /// invalidations and inodes of the changes the local view doesn't already show, for the
-    /// mount's observers. Already shown are this Mac's own publications coming back (a version
-    /// it published at that key, or the one the inode records) and what [`shown`] describes.
+    /// invalidations and inodes for the mount's observers. This Mac's own acknowledged
+    /// publications and changes hidden by unpublished local edits need no notification. Foreign
+    /// changes to saved metadata still do, even when a listing learned them before the feed.
     pub async fn invalidate_feed(&self, changes: &[voidfs_sdk::Change]) -> Result<(Vec<Invalidation>, Vec<Ino>)> {
         let all = crate::feed::invalidations(changes);
         let own = changes.iter().map(|c| self.data.own(&c.key, &c.version_id)).collect::<Vec<_>>();
@@ -1045,7 +1043,7 @@ impl Session {
             let tx = c.transaction()?;
             let mut foreign = Vec::new();
             for (change, own) in changes.into_iter().zip(own) {
-                if !own && !shown(&tx, d, root, &change)? { foreign.push(change); }
+                if !own && !hidden_by_local(&tx, d, root, &change)? { foreign.push(change); }
             }
             let foreign = crate::feed::invalidations(&foreign);
             let reported = affected_inodes(&tx, d, root, &foreign)?;

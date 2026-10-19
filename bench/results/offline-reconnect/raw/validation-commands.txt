@@ -1,0 +1,35 @@
+Base: main at 1b5df16 (fetched before creating codex/offline-reconnect-refresh).
+Rust builds used a fresh target directory created for this investigation:
+  CARGO_TARGET_DIR=/private/tmp/voidfs-oct19-target
+
+Original-code proof (before.txt):
+  cargo test --locked -p voidfs-client --test mount_publication a_directory_refresh_before_the_feed_does_not_hide_remote_changes_from_observers -- --exact --nocapture
+  Exit 101: missing Object("remote") observer invalidation after create.
+
+Fixed code (client-tests.txt):
+  cargo test --locked -p voidfs-client --test mount --test mount_publication --test queue --test mount_seeding
+  Exit 0: 15 + 28 + 18 + 3 tests passed.
+
+Fixed daemon test (daemon-test.txt):
+  cargo test -p voidfs-daemon --test remote_events
+  Exit 0: one test passed.
+
+Original-code daemon proof (daemon-before.txt):
+  Temporarily restored exactly git show main:crates/voidfs-client/src/mount.rs.
+  cargo test --locked -p voidfs-daemon --test remote_events -- --nocapture
+  Exit 101: Object("created") absent at the adapter after feed consumption.
+  Restored the fixed source in a Python finally block before further validation.
+
+Workspace tests (workspace-tests.txt):
+  PATH=/usr/bin:$PATH cargo test --workspace --locked
+  Exit 0: 779 passed, 9 ignored, zero failures across 59 result groups including doc tests.
+
+Workspace lints (clippy.txt):
+  PATH=/usr/bin:$PATH cargo clippy --workspace --all-targets --locked -- -D warnings
+  Exit 0: no warnings.
+
+Additional repository checks:
+  /usr/bin/python3 spec/conformance/validate.py
+  Exit 0: cases.json: 56 cases, 432 steps, OK
+  /usr/bin/python3 tests/bench/credentials_scripts.py
+  Exit 0: Ran 5 tests in 1.903s, OK
