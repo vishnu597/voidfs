@@ -120,6 +120,14 @@ changes. Journaled uploads remain on this Mac and continue; eject does not pause
 After a successful daemon eject the mount is forgotten, so mounting again is explicit. The
 app's `mount <drive> [mountpoint]` command and its menu ask the daemon as `void mount` does.
 
+While the daemon runs, it also reconciles successful Finder, diskutil and other external ejects
+from the OS mount table. A confirmed absence or replacement removes that mount's live and
+remembered state; its queued uploads continue. Mount-table errors and timeouts retain intent,
+as does an unreadable module whose volume is still mounted. Intentional daemon shutdown keeps
+remembered mounts for restoration. Reconciliation runs about once a second and does not require
+the menu to be open. If saving the forgotten intent fails, the daemon retries while running;
+until the database accepts the deletion, that remembered mount can still restore after restart.
+
 The menu also shows the daemon's transfers, in the words `void status` and `void uploads` use:
 the server and its link, the uploads line, the mounts, and the unfinished changes and imports. It
 can pause and resume everything, a drive, an import or one change, set a bandwidth limit, clear

@@ -119,6 +119,7 @@ pub struct Daemon {
     server: tokio::task::JoinHandle<()>,
     probe: tokio::task::JoinHandle<()>,
     sampler: tokio::task::JoinHandle<()>,
+    mount_watch: tokio::task::JoinHandle<()>,
     /// Tells the server to stop answering.
     shutdown: watch::Sender<bool>,
 }
@@ -286,7 +287,8 @@ impl Daemon {
         let s2 = store.clone();
         let remembered = tokio::task::spawn_blocking(move || crate::mounts::stored(&s2)).await.map_err(voidfs_client::Error::from)?;
         Mounts::restore(&shared, remembered?);
-        Ok(Daemon { shared, store, server, probe, sampler, shutdown })
+        let mount_watch = Mounts::watch(shared.clone());
+        Ok(Daemon { shared, store, server, probe, sampler, mount_watch, shutdown })
     }
 
     async fn open_core(cfg: &DaemonConfig, store: &Arc<Store>) -> Result<(Queue, Cache, Connectivity, voidfs_sdk::Client), Error> {
@@ -321,8 +323,11 @@ impl Daemon {
     /// its next request), the socket goes, and then the state directory is let go, so that
     /// another daemon may take it.
     pub async fn stop(self) {
-        let Daemon { shared, store, mut server, probe, sampler, shutdown } = self;
+        let Daemon { shared, store, mut server, probe, sampler, mount_watch, shutdown } = self;
         shared.closing.send_replace(true);
+        // Read-only probes cancel on closing; a forgetting transaction already begun drains.
+        // Join before intentional detach so orderly stop never forgets mounts meant to restore.
+        let _ = mount_watch.await;
         sampler.abort();
         let _ = sampler.await;
         let _ = shutdown.send(true);

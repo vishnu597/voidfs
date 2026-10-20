@@ -3,14 +3,18 @@
 //! remembered mounts, which the daemon mounts again when it starts. Mounting is an [`Adapter`]'s
 //! (step 5: FSKit, SMB or FUSE); the `void` binary has [`crate::FsKit`] on macOS.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use chrono::{SecondsFormat, Utc};
 use futures::future::BoxFuture;
+use futures::StreamExt;
+use tokio::sync::watch;
 use voidfs_client::{Cache, Connectivity, Invalidation, Queue, Remembered, Store};
 
 use crate::api;
@@ -53,6 +57,12 @@ pub trait Mounted: Send + Sync + 'static {
     fn invalidate(&self, _changes: &[Invalidation]) {}
     /// Local edits also name inode attributes, including open files without a linked path.
     fn local_change(&self, change: &voidfs_client::mount::LocalChange) { self.invalidate(&change.invalidations); }
+    /// Whether this exact volume remains mounted. Only authoritative absence/replacement is
+    /// false; failed I/O, an unavailable bridge, and probe errors do not establish an eject.
+    /// Adapters without an OS presence check retain their mount intent.
+    fn is_present(&self) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async { Ok(true) })
+    }
     /// Unmounts it.
     fn unmount(self: Arc<Self>) -> BoxFuture<'static, Result<(), String>>;
     /// Explicit force eject. Adapters must opt in; never fall back to an ordinary unmount.
@@ -102,9 +112,15 @@ pub(crate) struct Mounts {
     /// Where a drive mounts when no mountpoint is named: `<root>/<drive>`.
     root: Option<PathBuf>,
     live: Mutex<Vec<Live>>,
+    /// Ejected volumes whose remembered row still needs deleting. Separate from `live` so an
+    /// OS eject never remains reported as mounted when SQLite is temporarily unavailable.
+    forgetting: Mutex<HashSet<PathBuf>>,
     /// One mount or unmount at a time.
     ops: tokio::sync::Mutex<()>,
 }
+
+const RECONCILE_EVERY: Duration = Duration::from_secs(1);
+const PRESENCE_WAIT: Duration = Duration::from_secs(1);
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -118,7 +134,7 @@ fn key(p: &str) -> String {
 
 impl Mounts {
     pub(crate) fn new(adapters: Vec<Arc<dyn Adapter>>, root: Option<PathBuf>) -> Mounts {
-        Mounts { adapters, root, live: Mutex::new(Vec::new()), ops: tokio::sync::Mutex::new(()) }
+        Mounts { adapters, root, live: Mutex::new(Vec::new()), forgetting: Mutex::new(HashSet::new()), ops: tokio::sync::Mutex::new(()) }
     }
 
     fn live(&self) -> std::sync::MutexGuard<'_, Vec<Live>> {
@@ -127,6 +143,100 @@ impl Mounts {
 
     pub(crate) fn table(&self) -> Vec<api::Mount> {
         self.live().iter().map(Live::api).collect()
+    }
+
+    fn forgetting(&self) -> std::sync::MutexGuard<'_, HashSet<PathBuf>> {
+        self.forgetting.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Retire a volume the OS has already ejected; never call the adapter or touch its uploads.
+    /// The caller holds `ops`. Keep failed persistence available for a later retry, including
+    /// after the last live volume has gone. A failed delete remains durable remembered intent
+    /// until it can succeed; no in-memory retry can promise otherwise across a storage failure.
+    async fn forget(s: &Shared, at: &Path) -> Result<(), Failure> {
+        let removed = {
+            let mut live = s.mounts.live();
+            live.iter().position(|l| l.spec.mountpoint == at).map(|i| live.remove(i))
+        };
+        drop(removed);
+        s.mounts.forgetting().insert(at.to_owned());
+        Self::forget_pending(s, at).await
+    }
+
+    async fn forget_pending(s: &Shared, at: &Path) -> Result<(), Failure> {
+        let store = s.store.clone();
+        let point = at.display().to_string();
+        blocking(move || voidfs_client::mounts::forget(&store, &point)).await?;
+        s.mounts.forgetting().remove(at);
+        Ok(())
+    }
+
+    /// Observe OS mount presence independently of the status/menu being open. Read-only probes
+    /// run outside `ops`, so a slow or failed adapter cannot block mount/eject controls. Before
+    /// forgetting, revalidate the handle under `ops`: an old observation cannot erase a remount.
+    pub(crate) fn watch(s: Arc<Shared>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut closing = s.closing.subscribe();
+            let mut tick = tokio::time::interval(RECONCILE_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = closing.wait_for(|v| *v) => break,
+                    _ = tick.tick() => {}
+                }
+                Self::reconcile(&s, &mut closing).await;
+            }
+        })
+    }
+
+    async fn reconcile(s: &Shared, closing: &mut watch::Receiver<bool>) {
+        let pending: Vec<_> = s.mounts.forgetting().iter().cloned().collect();
+        for point in pending {
+            let _op = tokio::select! {
+                biased;
+                _ = closing.wait_for(|v| *v) => return,
+                op = s.mounts.ops.lock() => op
+            };
+            if *closing.borrow() { return; }
+            // An explicit remount owns this path now. Its successful remember supersedes the
+            // old pending deletion; even a failed remember must not delete a live mount's intent.
+            if s.mounts.live().iter().any(|l| l.spec.mountpoint == point) { continue; }
+            let _ = Self::forget_pending(s, &point).await;
+        }
+        let mounted: Vec<_> = s.mounts.live().iter().filter_map(|l| match &l.is {
+            Is::Mounted(handle) => Some((l.spec.mountpoint.clone(), handle.clone())),
+            _ => None,
+        }).collect();
+        let pending: Vec<_> = mounted.into_iter().map(Self::probe).collect();
+        let mut probes = futures::stream::iter(pending).buffer_unordered(8);
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = closing.wait_for(|v| *v) => return,
+                next = probes.next() => next
+            };
+            let Some((point, handle, gone)) = next else { break };
+            if !gone { continue; }
+            let _op = tokio::select! {
+                biased;
+                _ = closing.wait_for(|v| *v) => return,
+                op = s.mounts.ops.lock() => op
+            };
+            if *closing.borrow() { return; }
+            let current = s.mounts.live().iter().any(|l| l.spec.mountpoint == point
+                && matches!(&l.is, Is::Mounted(h) if Arc::ptr_eq(h, &handle)));
+            if current {
+                // Once persistence begins, drain it even when shutdown is requested. The watcher
+                // is joined before orderly detach; cancellation cannot strand a DB job after stop.
+                let _ = Self::forget(s, &point).await;
+            }
+        }
+    }
+
+    async fn probe((point, handle): (PathBuf, Arc<dyn Mounted>)) -> (PathBuf, Arc<dyn Mounted>, bool) {
+        let gone = matches!(tokio::time::timeout(PRESENCE_WAIT, handle.is_present()).await, Ok(Ok(false)));
+        (point, handle, gone)
     }
 
     fn adapter(&self, name: Option<&str>) -> Result<Arc<dyn Adapter>, Failure> {
@@ -258,6 +368,7 @@ pub(crate) async fn mount(State(s): State<Arc<Shared>>, Json(m): Json<api::NewMo
     let r = Remembered { mountpoint: mountpoint.display().to_string(), drive, drive_id, adapter: adapter.name().into(), read_only: m.read_only };
     let store = s.store.clone();
     blocking(move || voidfs_client::mounts::remember(&store, &r)).await?;
+    s.mounts.forgetting().remove(&mountpoint);
     let view = s.mounts.live().iter().find(|l| l.spec.mountpoint == mountpoint).map(Live::api);
     view.map(Json).ok_or_else(|| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", "the mount went away"))
 }
@@ -287,19 +398,14 @@ pub(crate) async fn unmount(State(s): State<Arc<Shared>>, Json(u): Json<api::Unm
         // The OS has ejected it even if forgetting it fails: never report a gone volume as
         // mounted. Persist each success before trying the next, so a later busy mount cannot
         // resurrect an earlier successful eject when the daemon starts again.
-        s.mounts.live().retain(|l| l.spec.mountpoint != mountpoint);
-        let store = s.store.clone();
         let mp = mountpoint.display().to_string();
-        let forget = mp.clone();
-        blocking(move || voidfs_client::mounts::forget(&store, &forget)).await?;
+        Mounts::forget(&s, &mountpoint).await?;
         unmounted.push(mp);
     }
     let forgotten = remembered.into_iter().filter(|r| !unmounted.contains(&r.mountpoint)
         && (names(&r.drive, &r.mountpoint) || r.drive_id.as_deref() == Some(&target))).collect::<Vec<_>>();
     for r in forgotten {
-        let store = s.store.clone();
-        let mp = r.mountpoint.clone();
-        blocking(move || voidfs_client::mounts::forget(&store, &mp)).await?;
+        Mounts::forget(&s, Path::new(&r.mountpoint)).await?;
         if !unmounted.contains(&r.mountpoint) {
             unmounted.push(r.mountpoint);
         }
