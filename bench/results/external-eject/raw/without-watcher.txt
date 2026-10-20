@@ -1,0 +1,52 @@
+   Compiling voidfs-daemon v0.0.0 (/Users/vishnu/Coding/voidfs/crates/voidfs-daemon)
+warning: constant `RECONCILE_EVERY` is never used
+   --> crates/voidfs-daemon/src/mounts.rs:122:7
+    |
+122 | const RECONCILE_EVERY: Duration = Duration::from_secs(1);
+    |       ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `PRESENCE_WAIT` is never used
+   --> crates/voidfs-daemon/src/mounts.rs:123:7
+    |
+123 | const PRESENCE_WAIT: Duration = Duration::from_secs(1);
+    |       ^^^^^^^^^^^^^
+
+warning: associated functions `watch`, `reconcile`, and `probe` are never used
+   --> crates/voidfs-daemon/src/mounts.rs:177:19
+    |
+135 | impl Mounts {
+    | ----------- associated functions in this implementation
+...
+177 |     pub(crate) fn watch(s: Arc<Shared>) -> tokio::task::JoinHandle<()> {
+    |                   ^^^^^
+...
+193 |     async fn reconcile(s: &Shared, closing: &mut watch::Receiver<bool>) {
+    |              ^^^^^^^^^
+...
+237 |     async fn probe((point, handle): (PathBuf, Arc<dyn Mounted>)) -> (PathBuf, Arc<dyn Mounted>, bool) {
+    |              ^^^^^
+
+warning: `voidfs-daemon` (lib) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.07s
+     Running tests/fskit.rs (/private/tmp/voidfs-busy-eject-target/debug/deps/fskit-49de2649a99da036)
+
+running 1 test
+test external_eject_forgets_only_that_mountpoint_without_unmounting_its_replacement ... FAILED
+
+failures:
+
+---- external_eject_forgets_only_that_mountpoint_without_unmounting_its_replacement stdout ----
+
+thread 'external_eject_forgets_only_that_mountpoint_without_unmounting_its_replacement' (1719429) panicked at crates/voidfs-daemon/tests/fskit.rs:95:9:
+only the externally removed mountpoint is forgotten
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    external_eject_forgets_only_that_mountpoint_without_unmounting_its_replacement
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 20.38s
+
+error: test failed, to rerun pass `-p voidfs-daemon --test fskit`

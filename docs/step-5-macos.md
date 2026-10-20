@@ -85,6 +85,9 @@ through FSKit; both services ran without refusal
 refuses a busy volume, with force an explicit choice; acknowledged offline saves passed eject,
 remount, daemon restart and later peer verification
 ([busy eject](#busy-eject-19-october)). The approval flow and the `/Volumes` helper remain.
+Successful Finder/diskutil ejects now also clear live and remembered state automatically;
+intentional daemon restarts still restore mounts
+([external ejects](#external-eject-reconciliation-19-october)).
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -3268,3 +3271,43 @@ The test rig was removed after all four peer verifications. The installed app, r
 bridge, login settings and default app-state absence were preserved
 ([evidence, limits and scripts](../bench/results/busy-eject/README.md)). The `/Volumes` decision,
 approval flow and other item 7 work remain; this does not complete item 7 or step 5.
+
+### External eject reconciliation, 19 October
+
+Finder and diskutil ejects no longer require a later `void unmount` to clear daemon-managed
+FSKit mount intent. While running, the daemon checks the OS table about once a second. An
+absent or replaced exact resource retires only that mountpoint, leaving other mounts, replacement
+volumes and queued uploads alone. Probe errors, timeouts and malformed snapshots retain intent;
+an unreadable module with its OS volume still present is not an eject.
+
+Read-only probes run outside the mount-operation lock. Before forgetting, the watcher rechecks
+the same handle still owns the path, protecting a new mount from an older result. FSKit shares
+a short-lived table snapshot and invalidates it before exposing a new or adopted handle. Failed
+SQLite deletions retry even with no live mounts; a newly remembered mount supersedes an older
+pending delete. Shutdown cancels probes and drains begun persistence before intentional detach,
+so orderly daemon restart keeps its restoration behavior.
+
+Sixteen integration and three focused unit tests passed, including held-probe shutdown,
+replacement mounts, probe errors/timeouts, storage failures, remount races and queued bytes.
+With the watcher disabled, the external-eject regression fails; with it enabled, it passes.
+The live checks used the new daemon through the installed notarized module and bridge:
+
+- Normal diskutil eject automatically cleared live and remembered state after 0.565 seconds;
+  explicit diskutil force after 0.405 seconds. These are single API observations after command
+  return, sampled about every 50 ms, not latency bounds.
+- Native Finder refused normal eject with a writer held open. Once it closed, the same eject
+  button removed the volume and the watcher cleared intent, without CLI reconciliation.
+- Three acknowledged offline saves (131,111, 262,177 and 98,357 bytes) survived a restart with
+  no remount, an explicit fresh offline mount, and an intentional restart that did restore the
+  mount. All byte/hash comparisons matched. Every new mount had a fresh kernel device number.
+- All three saves uploaded after reconnecting without resume and matched an independent peer's
+  downloads. The old force-ejected file descriptor returned `EIO`.
+
+The watcher cannot infer external ejects performed while the daemon is stopped. A persistent
+database deletion failure retains durable intent until it can be removed; restarting before
+that succeeds can still restore it. This introduces no force fallback or privileged helper.
+No new app was notarized or installed, and no reboot or two-Mac scenario was run. The disposable
+rig was removed after peer verification; the installed app, bridge, login settings and absence
+of default app state were preserved
+([evidence, limitations and scripts](../bench/results/external-eject/README.md)). Item 7's
+approval flow, native sign-in checks and `/Volumes` decision remain.
