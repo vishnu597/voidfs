@@ -393,8 +393,8 @@ async fn conditional_normal_eject_forgets_only_the_unchanged_failed_attachment()
     assert!(!failed_first.instance.is_empty() && !failed_second.instance.is_empty());
     let before = commands.calls().len();
     refused(c.unmount_if_instance(&failed_first.mountpoint, &failed_first.instance, true).await, 409, "MountChanged");
-    assert_eq!(c.unmount_if_instance(&failed_first.mountpoint, &failed_first.instance, false).await.unwrap().unmounted,
-        [failed_first.mountpoint.clone()]);
+    assert_eq!(c.unmount_if_instance(&failed_first.mountpoint, &failed_first.instance, false).await.unwrap().unmounted.as_slice(),
+        std::slice::from_ref(&failed_first.mountpoint));
     assert_eq!(commands.calls().len(), before, "forgetting a failed attachment has no OS handle to eject");
     let remaining = c.mounts().await.unwrap();
     assert_eq!((remaining.mounts.len(), remaining.remembered.len()), (1, 1));
