@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -79,6 +80,7 @@ enum Is {
 
 struct Live {
     spec: MountSpec,
+    instance: String,
     adapter: String,
     since: String,
     is: Is,
@@ -96,6 +98,7 @@ impl Live {
         api::Mount {
             drive: self.spec.drive.clone(),
             mountpoint: self.spec.mountpoint.display().to_string(),
+            instance: self.instance.clone(),
             adapter: self.adapter.clone(),
             read_only: self.spec.read_only,
             state: state.into(),
@@ -112,6 +115,8 @@ pub(crate) struct Mounts {
     /// Where a drive mounts when no mountpoint is named: `<root>/<drive>`.
     root: Option<PathBuf>,
     live: Mutex<Vec<Live>>,
+    /// Unique attachment suffix within this daemon; paired with `Shared::nonce` at creation.
+    next_instance: AtomicU64,
     /// Ejected volumes whose remembered row still needs deleting. Separate from `live` so an
     /// OS eject never remains reported as mounted when SQLite is temporarily unavailable.
     forgetting: Mutex<HashSet<PathBuf>>,
@@ -134,7 +139,7 @@ fn key(p: &str) -> String {
 
 impl Mounts {
     pub(crate) fn new(adapters: Vec<Arc<dyn Adapter>>, root: Option<PathBuf>) -> Mounts {
-        Mounts { adapters, root, live: Mutex::new(Vec::new()), forgetting: Mutex::new(HashSet::new()), ops: tokio::sync::Mutex::new(()) }
+        Mounts { adapters, root, live: Mutex::new(Vec::new()), next_instance: AtomicU64::new(1), forgetting: Mutex::new(HashSet::new()), ops: tokio::sync::Mutex::new(()) }
     }
 
     fn live(&self) -> std::sync::MutexGuard<'_, Vec<Live>> {
@@ -143,6 +148,10 @@ impl Mounts {
 
     pub(crate) fn table(&self) -> Vec<api::Mount> {
         self.live().iter().map(Live::api).collect()
+    }
+
+    fn instance(s: &Shared) -> String {
+        format!("{:x}.{}", s.nonce, s.mounts.next_instance.fetch_add(1, Ordering::Relaxed))
     }
 
     fn forgetting(&self) -> std::sync::MutexGuard<'_, HashSet<PathBuf>> {
@@ -288,7 +297,7 @@ impl Mounts {
                 Ok(_) => Is::Mounting,
                 Err(f) => Is::Failed(f.2.clone()),
             };
-            s.mounts.live().push(Live { spec: spec.clone(), adapter: r.adapter.clone(), since: now(), is, drive: None });
+            s.mounts.live().push(Live { spec: spec.clone(), instance: Self::instance(s), adapter: r.adapter.clone(), since: now(), is, drive: None });
             let Ok(adapter) = adapter else { continue };
             let s = s.clone();
             tokio::spawn(async move {
@@ -359,7 +368,7 @@ pub(crate) async fn mount(State(s): State<Arc<Shared>>, Json(m): Json<api::NewMo
     {
         let mut live = s.mounts.live();
         live.retain(|l| l.spec.mountpoint != mountpoint);
-        live.push(Live { spec: spec.clone(), adapter: adapter.name().into(), since: now(), is: Is::Mounting, drive: None });
+        live.push(Live { spec: spec.clone(), instance: Mounts::instance(&s), adapter: adapter.name().into(), since: now(), is: Is::Mounting, drive: None });
     }
     if let Err(f) = Mounts::attach(&s, &spec, &adapter, Some(session)).await {
         s.mounts.live().retain(|l| l.spec.mountpoint != mountpoint);
@@ -377,17 +386,34 @@ pub(crate) async fn mount(State(s): State<Arc<Shared>>, Json(m): Json<api::NewMo
 pub(crate) async fn unmount(State(s): State<Arc<Shared>>, Json(u): Json<api::Unmount>) -> Answer<api::Unmounted> {
     let _op = s.mounts.ops.lock().await;
     let target = if u.target.starts_with('/') { key(&u.target) } else { u.target.clone() };
-    // A drive named by id finds its mounts by alias, which the drive it keeps open here knows.
-    let alias = if target.starts_with('/') { None } else { s.sessions.mount_alias(&s, &target).await.ok() };
+    // Conditional requests can name only a current attachment's path, alias or pinned id.
+    // Do not resolve unknown names (which can update the alias memo) before checking identity.
+    // Legacy drive targets also use the known alias for remembered-only cleanup.
+    let alias = if target.starts_with('/') || u.expected_instance.is_some() { None } else { s.sessions.mount_alias(&s, &target).await.ok() };
     let names = |drive: &str, mountpoint: &str| mountpoint == target || drive == target || alias.as_deref() == Some(drive);
-    let store = s.store.clone();
-    let remembered = blocking(move || voidfs_client::mounts::remembered(&store)).await?;
     let targets: Vec<_> = s.mounts.live().iter()
         .filter(|l| names(&l.spec.drive, &l.spec.mountpoint.display().to_string()) || l.drive.as_ref().is_some_and(|d| d.id == target))
-        .map(|l| (l.spec.mountpoint.clone(), match &l.is { Is::Mounted(handle) => Some(handle.clone()), _ => None }))
+        .map(|l| (l.spec.mountpoint.clone(), l.instance.clone(), match &l.is { Is::Mounted(handle) => Some(handle.clone()), _ => None }, matches!(l.is, Is::Failed(_))))
         .collect();
+    // Hold `ops` from the identity check through OS eject and forgetting. A confirmation from
+    // an earlier attachment must never eject its replacement, even at the same path and drive.
+    // An unchanged failed attachment supports normal bookkeeping cleanup only; it has no OS
+    // handle to force-eject. A mounting attachment is not yet safe to act on conditionally.
+    if let Some(expected) = &u.expected_instance
+        && !matches!(targets.as_slice(), [(_, instance, handle, failed)] if instance == expected && (handle.is_some() || (!u.force && *failed)))
+    {
+        return Err(Failure::new(StatusCode::CONFLICT, "MountChanged", format!("{} is no longer the mounted volume you selected. Close this dialog and try again.", u.target)));
+    }
+    let remembered = if u.expected_instance.is_some() {
+        // A conditional request concerns only the checked live attachment. Do not fall back to
+        // other remembered rows named by a drive alias after ejecting that one attachment.
+        Vec::new()
+    } else {
+        let store = s.store.clone();
+        blocking(move || voidfs_client::mounts::remembered(&store)).await?
+    };
     let mut unmounted: Vec<String> = Vec::new();
-    for (mountpoint, handle) in targets {
+    for (mountpoint, _, handle, _) in targets {
         if let Some(handle) = handle {
             let result = if u.force { handle.force_unmount().await } else { handle.unmount().await };
             if let Err(error) = result {

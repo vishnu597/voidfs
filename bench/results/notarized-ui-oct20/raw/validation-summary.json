@@ -1,0 +1,95 @@
+{
+  "case_validator": {
+    "cases": 56,
+    "command": "/usr/bin/python3 spec/conformance/validate.py",
+    "exit": 0,
+    "log": "conformance-validate.txt",
+    "steps": 432
+  },
+  "clippy": {
+    "command": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "exit": 0,
+    "first_attempt": "one cloned_ref_to_slice_refs warning in a new test assertion; owning agent corrected it; focused regression and strict Clippy then passed",
+    "first_attempt_log": "workspace-clippy-first-attempt.txt",
+    "log": "workspace-clippy.txt"
+  },
+  "conformance_build": {
+    "command": "cargo build --locked -p voidfs-server -p voidfs-conformance",
+    "exit": 0,
+    "log": "conformance-build.txt"
+  },
+  "credential_scripts": {
+    "command": "/usr/bin/python3 tests/bench/credentials_scripts.py",
+    "exit": 0,
+    "log": "credentials-scripts.txt",
+    "passed": 5
+  },
+  "daemon_final_source": {
+    "command": "cargo test -p voidfs-daemon --locked",
+    "exit": 0,
+    "failed": 0,
+    "harnesses": 16,
+    "ignored": 1,
+    "log": "daemon-final-tests.txt",
+    "passed": 83
+  },
+  "failed_attachment_final_assertion": {
+    "command": "cargo test -p voidfs-daemon --locked --test fskit conditional_normal_eject_forgets_only_the_unchanged_failed_attachment",
+    "exit": 0,
+    "failed": 0,
+    "harnesses": 1,
+    "ignored": 0,
+    "log": "failed-attachment-final-test.txt",
+    "passed": 1
+  },
+  "notes": [
+    "Workspace run preceded the last failed-attachment normal-cleanup fix; entire daemon package was rerun on final production source, then its assertion-only Clippy correction received a focused rerun.",
+    "Each protocol run had six optional direct-upload skips and four scoped-storage-credential skips because memory/filesystem stores do not provide those capabilities.",
+    "PATH python3 was an incompatible Intel binary; Python checks passed using /usr/bin/python3 instead.",
+    "Only disposable loopback test servers and temporary stores were used; all conformance servers exited cleanly."
+  ],
+  "protocol_conformance": [
+    {
+      "exit": 0,
+      "log": "conformance-memory-path.txt",
+      "seconds": 3.316,
+      "store": "memory",
+      "style": "path",
+      "summary": "46 passed, 0 failed, 10 skipped"
+    },
+    {
+      "exit": 0,
+      "log": "conformance-memory-virtual.txt",
+      "seconds": 2.873,
+      "store": "memory",
+      "style": "virtual",
+      "summary": "46 passed, 0 failed, 10 skipped"
+    },
+    {
+      "exit": 0,
+      "log": "conformance-fs-path.txt",
+      "seconds": 3.701,
+      "store": "fs",
+      "style": "path",
+      "summary": "46 passed, 0 failed, 10 skipped"
+    },
+    {
+      "exit": 0,
+      "log": "conformance-fs-virtual.txt",
+      "seconds": 3.659,
+      "store": "fs",
+      "style": "virtual",
+      "summary": "46 passed, 0 failed, 10 skipped"
+    }
+  ],
+  "target": "/private/tmp/voidfs-ui-oct20-target",
+  "workspace": {
+    "command": "cargo test --workspace --locked",
+    "exit": 0,
+    "failed": 0,
+    "harnesses": 59,
+    "ignored": 9,
+    "log": "workspace-tests.txt",
+    "passed": 800
+  }
+}

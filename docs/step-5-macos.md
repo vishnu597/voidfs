@@ -88,6 +88,14 @@ remount, daemon restart and later peer verification
 Successful Finder/diskutil ejects now also clear live and remembered state automatically;
 intentional daemon restarts still restore mounts
 ([external ejects](#external-eject-reconciliation-19-october)).
+On 20 October, guarded `45c449f` was notarized and installed. The actual menu passed
+key-file import and Sign in, the disabled Login Items warning and settings recovery,
+and busy Unmount followed by Force Eject's Cancel and Confirm controls
+([native controls](#notarized-native-controls-20-october)). Saved-byte recovery and
+fixture cleanup passed, and the final plug-in inventory contains only the installed copies.
+This later section updates the
+dated approval, sign-in and native-dialog coverage limits below; the `/Volumes`
+helper and the other remaining item 7 decisions are still open.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -3311,3 +3319,63 @@ rig was removed after peer verification; the installed app, bridge, login settin
 of default app state were preserved
 ([evidence, limitations and scripts](../bench/results/external-eject/README.md)). Item 7's
 approval flow, native sign-in checks and `/Volumes` decision remain.
+
+### Notarized native controls, 20 October
+
+The user authorized building, notarizing and installing current main, including PRs #92 and
+#93, then checking the native menu controls. Main `2ba2c4b` passed archive/export, Apple
+notarization and installed distribution checks. During those checks, a stale-confirmation
+guard was added: each mount attachment has an instance token, and a confirmation can eject
+only that instance. Replacement at the same path or daemon restart makes the request stale.
+The menu refuses force when an older daemon cannot supply the identity. Guarded `45c449f`
+then passed its own archive/export, notarization and installation; the enabled FSKit module
+resolves to `/Applications/voidfs.app` ([release and native evidence](../bench/results/notarized-ui-oct20/README.md)).
+
+On the installed app with a disposable loopback server and private state directory:
+
+- The signed-out menu disabled Start at login and explained that sign-in was needed. Native
+  Sign in opened its fields, and Cancel returned to signed out. Importing `key.env` through
+  the native file panel retained the filled form on reopening; Sign in then showed the local
+  endpoint and enabled Start at login. Private checks confirmed the expected Keychain account
+  and no `daemon.json`. That account survived installation of the guarded update.
+- Turning on Start at login in the actual menu started the guarded daemon. Disabling voidfs
+  in System Settings produced the app's actual `needsApproval` state. Reopening the menu showed
+  “Waiting for your approval in Login Items” and **Open Login Items settings**. That button opened
+  the correct native page; restoring the switch returned the service to on with the daemon ready.
+- With an acknowledged 262,177-byte offline save and its writer still open, native **Unmount**
+  refused Resource busy. **More actions → Force Eject…** opened the alert naming the drive and
+  path and warning about unsaved application changes while retaining saved queued uploads.
+  **Cancel** closed it and preserved the mounted row, kernel device, remembered intent and
+  exact bytes. Confirming the next alert removed the row and OS mount, cleared both mount
+  tables and retained the same queued entry while the writer was still open. Its old descriptor
+  later returned `EIO`. The first post-click observation was already clear; no GUI latency was measured.
+- After confirmed force eject, restarting left intent forgotten across a two-second observation.
+  Explicit offline remount and an intentional restart-restoration each read all 262,177 bytes
+  on fresh kernel devices. The same journal entry uploaded after reconnecting without resume,
+  and an independent peer downloaded identical bytes and hash. Ordinary eject ended the check.
+- With another force alert open, ordinary CLI unmount/remount replaced the attachment at the
+  same path. At the next native accessibility observation, the stale alert had dismissed itself,
+  the replacement remained mounted and no Confirm was clicked. Native ordinary Unmount then
+  removed it. This observes dialog invalidation; separate tests exercise stale-request refusal.
+
+The installed stale-eject self-test passed, including local refusal without an instance and
+retention of the current attachment after a stale force request. The workspace passed 800 tests
+(9 ignored) before the last failed-attachment cleanup fix; all daemon tests were rerun on final
+production source (83 passed, 1 ignored). Strict workspace Clippy, the 56-case/432-step spec
+validator, four protocol configurations (46 passed and 10 documented skips each) and five
+credential-script checks passed. Native Start at login off and Sign out returned the menu to
+signed out with its login control disabled. Fixture cleanup restored the original account,
+absent state override and login-off state, removed the private rig and stopped both services.
+The one saved entry was done, and the known-key scan found no leaks. The final snapshot confirms
+installed `45c449f` with a valid signature; one installed-path record each for FSKit and Finder
+Sync; enabled FSKit and bridge; signed out, login off, no mounts or default state directory;
+and no state override, rig or loopback listeners. The native permission switch was restored to
+its original on state before turning the login service off. Native interaction descriptions in
+the linked record are explicitly operator notes from accessibility observations, not raw tool
+output or screenshots.
+
+These native observations supersede the earlier slices' dated statements that approval,
+native sign-in and the confirmation dialog were not covered. They do not repeat logout/reboot,
+establish a clean-Mac install or cover another Mac. Application buffers and unsynchronized mmap
+stores remain outside acknowledged-write guarantees. The `/Volumes` decision, other item 7
+work and the existing FSKit/application limitations remain; item 7 and step 5 are not complete.
