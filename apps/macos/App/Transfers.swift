@@ -33,10 +33,13 @@ struct DaemonStatus: Decodable {
         let bandwidth: UInt64?
     }
 
-    struct Mount: Decodable, Identifiable {
+    struct Mount: Decodable, Identifiable, Equatable {
         let drive, mountpoint, adapter, state: String
         let readOnly: Bool
         let error: String?
+        /// One runtime attachment, so a delayed eject cannot act on its replacement. Older
+        /// daemons omit this; ordinary unmount remains available, but force eject needs it.
+        let instance: String?
         var id: String { mountpoint }
     }
 
@@ -317,10 +320,19 @@ final class Transfers {
     }
     func limit(_ bytesPerSecond: UInt64?) async { await call("PUT", "/v1/uploads/limit", ["bytesPerSecond": bytesPerSecond.map { $0 as Any } ?? NSNull()]) }
     func clearFinished() async { await call("POST", "/v1/uploads/clear", nil) }
+    static let forceNeedsIdentity = "Update the voidfs daemon, reopen this menu, and try Force Eject again: this daemon cannot safely identify the mounted volume."
     /// As `void unmount`: a normal unmount refuses a busy volume. Force is an explicit choice;
     /// either way, the daemon keeps its durable unpublished changes and their uploads continue.
     func unmount(_ m: DaemonStatus.Mount, force: Bool = false) async {
-        await call("POST", "/v1/mounts/unmount", ["target": m.mountpoint, "force": force])
+        var body: [String: Any] = ["target": m.mountpoint, "force": force]
+        if let instance = m.instance, !instance.isEmpty {
+            body["expectedInstance"] = instance
+        } else if force {
+            notice = nil
+            controlError = Self.forceNeedsIdentity
+            return
+        }
+        await call("POST", "/v1/mounts/unmount", body)
     }
 
     /// The daemon's answer to a control, when it succeeded.
@@ -455,6 +467,12 @@ struct TransfersView: View {
             Button("Cancel", role: .cancel) {}
         } message: { mount in
             Text("Force eject \(mount.drive) at \(mount.mountpoint)? Apps with open files may lose unsaved changes. Close those files and try Unmount first. Queued uploads stay saved on this Mac and are not cancelled.")
+        }
+        .onChange(of: transfers.status?.mounts) { _, mounts in
+            guard let pending = forceEject else { return }
+            if mounts?.contains(where: { $0.mountpoint == pending.mountpoint && $0.instance == pending.instance && $0.state == "mounted" }) != true {
+                forceEject = nil
+            }
         }
     }
 

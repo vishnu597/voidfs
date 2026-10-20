@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// `voidfs transfers-selftest <drive> [--cancel | --no-daemon | --look | --eject-busy | --force-eject] [--png <path>]`: the menu's transfers controls
+// `voidfs transfers-selftest <drive> [--cancel | --no-daemon | --look | --eject-busy | --force-eject | --eject-stale] [--png <path>]`: the menu's transfers controls
 // against a running daemon, through the same model calls as the menu's buttons, each checked in the
 // daemon's status or queue afterwards. It restores the limit and the pauses it changes. `--cancel`
 // also cancels the newest unfinished import and clears finished uploads, which can't be undone,
@@ -12,6 +12,8 @@
 // `--eject-busy` expects an open file held by another process: the normal action must refuse,
 // leaving the mount in place. `--force-eject` explicitly forces one mount of the named drive;
 // it can disrupt open files and is only for a disposable test mount. Neither retries the other.
+// `--eject-stale` verifies that a missing identity is rejected locally, and that a stale identity
+// is refused by the daemon without ejecting the current attachment. It needs an updated daemon.
 // `--png` draws the menu's view, offscreen, to a file.
 //
 // Run it against a test daemon: `-VoidfsStateDirectory <dir>` points the app at one.
@@ -34,9 +36,10 @@ enum TransfersSelfTest {
         }
         let cancel = rest.contains("--cancel"), noDaemon = rest.contains("--no-daemon"), look = rest.contains("--look")
         let ejectBusy = rest.contains("--eject-busy"), forceEject = rest.contains("--force-eject")
-        rest.removeAll { ["--cancel", "--no-daemon", "--look", "--eject-busy", "--force-eject"].contains($0) }
-        guard rest.count == 1, let drive = rest.first, !drive.hasPrefix("-"), [cancel, noDaemon, look, ejectBusy, forceEject].filter({ $0 }).count <= 1 else {
-            print("usage: transfers-selftest <drive> [--cancel | --no-daemon | --look | --eject-busy | --force-eject] [--png <path>]")
+        let ejectStale = rest.contains("--eject-stale")
+        rest.removeAll { ["--cancel", "--no-daemon", "--look", "--eject-busy", "--force-eject", "--eject-stale"].contains($0) }
+        guard rest.count == 1, let drive = rest.first, !drive.hasPrefix("-"), [cancel, noDaemon, look, ejectBusy, forceEject, ejectStale].filter({ $0 }).count <= 1 else {
+            print("usage: transfers-selftest <drive> [--cancel | --no-daemon | --look | --eject-busy | --force-eject | --eject-stale] [--png <path>]")
             return 2
         }
         // All of the queue, to find the changes it controls; the menu lists only what it shows.
@@ -80,17 +83,39 @@ enum TransfersSelfTest {
             print(failed == 0 ? "transfers self-test passed" : "transfers self-test: \(failed) failed")
             return failed == 0 ? 0 : 1
         }
-        if ejectBusy || forceEject {
+        if ejectBusy || forceEject || ejectStale {
             guard let mount = t.status?.mounts.first(where: { $0.drive == drive && $0.state == "mounted" }) else {
                 print("FAIL no mounted test drive \(drive)")
                 return 1
             }
-            await t.unmount(mount, force: forceEject)
+            if ejectStale {
+                guard let instance = mount.instance, !instance.isEmpty else {
+                    print("FAIL the daemon needs an updated mount instance before testing guarded eject")
+                    return 1
+                }
+                let legacy = try? JSONDecoder().decode(DaemonStatus.Mount.self, from: Data("""
+                    {"drive":"legacy","mountpoint":"/voidfs-selftest-never-mounted","adapter":"fskit","state":"mounted","readOnly":false,"error":null}
+                    """.utf8))
+                check("older mount JSON decodes without an instance", legacy != nil && legacy?.instance == nil)
+                if let legacy {
+                    await t.unmount(legacy, force: true)
+                    check("force without an instance is rejected locally", t.controlError == Transfers.forceNeedsIdentity, t.controlError ?? "no refusal")
+                }
+                let stale = DaemonStatus.Mount(drive: mount.drive, mountpoint: mount.mountpoint, adapter: mount.adapter,
+                                               state: mount.state, readOnly: mount.readOnly, error: mount.error, instance: "stale-" + instance)
+                await t.unmount(stale, force: true)
+                check("a stale force eject is refused", t.controlError?.contains("Close this dialog and try again.") == true, t.controlError ?? "no refusal")
+                check("a stale force eject leaves the current attachment mounted", t.status?.mounts.contains {
+                    $0.id == mount.id && $0.instance == instance && $0.state == "mounted"
+                } == true)
+            } else {
+                await t.unmount(mount, force: forceEject)
+            }
             if ejectBusy {
                 let error = t.controlError?.lowercased() ?? ""
                 check("normal unmount reports a busy refusal", error.contains("busy") || error.contains("in use"), t.controlError ?? "no refusal")
                 check("normal refusal leaves the mount in place", t.status?.mounts.contains { $0.id == mount.id && $0.state == "mounted" } == true)
-            } else {
+            } else if forceEject {
                 check("explicit force eject succeeds", t.controlError == nil, t.controlError ?? "")
                 check("explicit force eject removes the mount", t.status?.mounts.contains { $0.id == mount.id } == false)
             }

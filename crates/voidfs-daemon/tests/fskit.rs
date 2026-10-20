@@ -257,6 +257,164 @@ async fn normal_eject_refuses_a_busy_mount_and_explicit_force_forgets_it_only_on
     d.stop().await;
 }
 
+#[test]
+fn older_mount_and_unmount_payloads_remain_compatible() {
+    let mounted: voidfs_daemon::api::Mount = serde_json::from_value(serde_json::json!({
+        "drive": "footage", "mountpoint": "/test/mnt", "adapter": "fskit", "readOnly": false,
+        "state": "mounted", "error": null, "since": "2026-10-20T00:00:00Z", "feed": null,
+    })).unwrap();
+    assert!(mounted.instance.is_empty(), "an older daemon has no attachment identity");
+    let unmount: voidfs_daemon::api::Unmount = serde_json::from_value(serde_json::json!({ "target": "footage" })).unwrap();
+    assert!(!unmount.force && unmount.expected_instance.is_none());
+    assert_eq!(serde_json::to_value(unmount).unwrap(), serde_json::json!({ "target": "footage", "force": false }),
+        "unconditional clients keep their original request body");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_eject_rejects_replacement_at_the_same_path_even_for_the_same_drive() {
+    for replacement in ["footage", "other"] {
+        let server = TestServer::start().await.unwrap();
+        let sdk = voidfs_sdk::Client::new(sdk(&server)).unwrap();
+        sdk.create_drive("footage", Default::default()).await.unwrap();
+        sdk.create_drive("other", Default::default()).await.unwrap();
+        let dir = tempfile::Builder::new().prefix("vdkstaleeject").tempdir_in(std::env::temp_dir()).unwrap();
+        let commands = Commands::new(dir.path());
+        let mp = dir.path().join("mnt");
+        let target = mp.display().to_string();
+        let (d, c) = start(&server, dir.path(), &commands).await;
+        let old = c.mount(&new_mount("footage", &mp)).await.unwrap();
+        assert!(!old.instance.is_empty());
+        c.unmount(&target).await.unwrap();
+        let before = commands.calls().len();
+        for force in [false, true] {
+            refused(c.unmount_if_instance(&target, &old.instance, force).await, 409, "MountChanged");
+        }
+        assert_eq!(commands.calls().len(), before, "a gone attachment must never reach the adapter");
+
+        let current = c.mount(&new_mount(replacement, &mp)).await.unwrap();
+        assert_ne!(old.instance, current.instance, "same-path attachments need distinct identities");
+        let before = commands.calls().len();
+        for force in [false, true] {
+            let message = refused(c.unmount_if_instance(&target, &old.instance, force).await, 409, "MountChanged");
+            assert!(message.contains("Close this dialog") && message.contains("try again"), "{message}");
+        }
+        assert_eq!(commands.calls().len(), before, "a stale dialog must never eject the replacement");
+        let view = c.mounts().await.unwrap();
+        assert_eq!((view.mounts.len(), view.remembered.len()), (1, 1));
+        assert_eq!(view.mounts[0].instance, current.instance);
+        assert_eq!(view.remembered[0].drive, replacement);
+        assert!(commands.table().contains(&format!("voidfs://{replacement} on ")));
+        assert_eq!(c.unmount_if_instance(&target, &current.instance, false).await.unwrap().unmounted, [target]);
+        assert!(commands.table().is_empty());
+        d.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_eject_rejects_a_prior_daemon_instance_and_requires_explicit_force_when_busy() {
+    let server = TestServer::start().await.unwrap();
+    voidfs_sdk::Client::new(sdk(&server)).unwrap().create_drive("footage", Default::default()).await.unwrap();
+    let dir = tempfile::Builder::new().prefix("vdkrestarteject").tempdir_in(std::env::temp_dir()).unwrap();
+    let commands = Commands::new(dir.path());
+    let mp = dir.path().join("mnt");
+    let target = mp.display().to_string();
+    let (d, c) = start(&server, dir.path(), &commands).await;
+    let old = c.mount(&new_mount("footage", &mp)).await.unwrap();
+    d.stop().await;
+    let (d, c) = start(&server, dir.path(), &commands).await;
+    until("the remembered attachment restores with a new identity", async || {
+        c.mounts().await.unwrap().mounts.first().is_some_and(|m| m.state == "mounted")
+    }).await;
+    let current = c.mounts().await.unwrap().mounts.remove(0);
+    assert!(!current.instance.is_empty());
+    assert_ne!(old.instance, current.instance, "runtime identity must not persist across daemon restart");
+    let before = commands.calls().len();
+    for force in [false, true] {
+        refused(c.unmount_if_instance(&target, &old.instance, force).await, 409, "MountChanged");
+    }
+    assert_eq!(commands.calls().len(), before, "a prior daemon's dialog must never reach the adapter");
+    commands.set("busy", Some(""));
+    let error = refused(c.unmount_if_instance(&target, &current.instance, false).await, 500, "UnmountFailed");
+    assert!(error.contains("Resource busy"), "{error}");
+    let real = std::fs::canonicalize(&mp).unwrap();
+    assert_eq!(commands.calls()[before..], [format!("umount {}", real.display())], "matching identity does not implicitly authorize force");
+    let view = c.mounts().await.unwrap();
+    assert_eq!((view.mounts.len(), view.remembered.len()), (1, 1));
+    assert_eq!(view.mounts[0].instance, current.instance);
+    assert_eq!(c.unmount_if_instance(&target, &current.instance, true).await.unwrap().unmounted, [target]);
+    assert_eq!(commands.calls().last(), Some(&format!("umount -f {}", real.display())));
+    let view = c.mounts().await.unwrap();
+    assert!(view.mounts.is_empty() && view.remembered.is_empty());
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_eject_refuses_a_drive_target_with_multiple_attachments() {
+    let server = TestServer::start().await.unwrap();
+    voidfs_sdk::Client::new(sdk(&server)).unwrap().create_drive("footage", Default::default()).await.unwrap();
+    let dir = tempfile::Builder::new().prefix("vdkambiguouseject").tempdir_in(std::env::temp_dir()).unwrap();
+    let commands = Commands::new(dir.path());
+    let (d, c) = start(&server, dir.path(), &commands).await;
+    let first = c.mount(&new_mount("footage", &dir.path().join("first"))).await.unwrap();
+    c.mount(&new_mount("footage", &dir.path().join("second"))).await.unwrap();
+    let before = commands.calls().len();
+    for force in [false, true] {
+        refused(c.unmount_if_instance("footage", &first.instance, force).await, 409, "MountChanged");
+    }
+    assert_eq!(commands.calls().len(), before, "a conditional eject must identify exactly one attachment");
+    let view = c.mounts().await.unwrap();
+    assert_eq!((view.mounts.len(), view.remembered.len()), (2, 2));
+    c.unmount("footage").await.unwrap();
+    assert!(commands.table().is_empty(), "legacy unconditional drive eject remains supported");
+    d.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_normal_eject_forgets_only_the_unchanged_failed_attachment() {
+    let server = TestServer::start().await.unwrap();
+    voidfs_sdk::Client::new(sdk(&server)).unwrap().create_drive("footage", Default::default()).await.unwrap();
+    let dir = tempfile::Builder::new().prefix("vdkfailedeject").tempdir_in(std::env::temp_dir()).unwrap();
+    let commands = Commands::new(dir.path());
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    let (d, c) = start(&server, dir.path(), &commands).await;
+    c.mount(&new_mount("footage", &first)).await.unwrap();
+    c.mount(&new_mount("footage", &second)).await.unwrap();
+    d.stop().await;
+    commands.set("refuse", Some("mount: injected restore failure\n"));
+    let (d, c) = start(&server, dir.path(), &commands).await;
+    until("both remembered attachments have failed to restore", async || {
+        let view = c.mounts().await.unwrap();
+        view.mounts.len() == 2 && view.mounts.iter().all(|m| m.state == "failed")
+    }).await;
+    let view = c.mounts().await.unwrap();
+    let failed_first = view.mounts.iter().find(|m| m.mountpoint == first.to_str().unwrap()).unwrap();
+    let failed_second = view.mounts.iter().find(|m| m.mountpoint == second.to_str().unwrap()).unwrap();
+    assert!(!failed_first.instance.is_empty() && !failed_second.instance.is_empty());
+    let before = commands.calls().len();
+    refused(c.unmount_if_instance(&failed_first.mountpoint, &failed_first.instance, true).await, 409, "MountChanged");
+    assert_eq!(c.unmount_if_instance(&failed_first.mountpoint, &failed_first.instance, false).await.unwrap().unmounted,
+        [failed_first.mountpoint.clone()]);
+    assert_eq!(commands.calls().len(), before, "forgetting a failed attachment has no OS handle to eject");
+    let remaining = c.mounts().await.unwrap();
+    assert_eq!((remaining.mounts.len(), remaining.remembered.len()), (1, 1));
+    assert_eq!(remaining.mounts[0].instance, failed_second.instance);
+
+    commands.set("refuse", None);
+    let replacement = c.mount(&new_mount("footage", &second)).await.unwrap();
+    assert_ne!(replacement.instance, failed_second.instance);
+    let before = commands.calls().len();
+    for force in [false, true] {
+        refused(c.unmount_if_instance(&failed_second.mountpoint, &failed_second.instance, force).await, 409, "MountChanged");
+    }
+    assert_eq!(commands.calls().len(), before, "the failed row's old identity must not eject its replacement");
+    let remaining = c.mounts().await.unwrap();
+    assert_eq!((remaining.mounts.len(), remaining.remembered.len()), (1, 1));
+    assert_eq!(remaining.mounts[0].instance, replacement.instance);
+    c.unmount_if_instance(&replacement.mountpoint, &replacement.instance, false).await.unwrap();
+    d.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn force_eject_never_unmounts_a_different_volume_at_the_same_path() {
     let server = TestServer::start().await.unwrap();
@@ -523,7 +681,7 @@ async fn external_eject_retries_failed_forgetting_without_another_os_unmount() {
     let commands = Commands::new(dir.path());
     let mp = dir.path().join("mnt");
     let (d, c) = start(&server, dir.path(), &commands).await;
-    c.mount(&new_mount("footage", &mp)).await.unwrap();
+    let old = c.mount(&new_mount("footage", &mp)).await.unwrap();
     let database = rusqlite::Connection::open(dir.path().join("state.sqlite")).unwrap();
     database.busy_timeout(Duration::from_secs(5)).unwrap();
     database.execute_batch("CREATE TRIGGER refuse_external_forgetting BEFORE DELETE ON mounts
@@ -535,6 +693,11 @@ async fn external_eject_retries_failed_forgetting_without_another_os_unmount() {
         view.mounts.iter().all(|m| m.state != "mounted") && view.remembered.len() == 1
     }).await;
     assert_eq!(commands.calls().len(), before, "reconciling a gone resource may never invoke umount");
+    for force in [false, true] {
+        refused(c.unmount_if_instance("footage", &old.instance, force).await, 409, "MountChanged");
+    }
+    assert_eq!(c.mounts().await.unwrap().remembered.len(), 1,
+        "a stale conditional request must not fall back to forgetting remembered-only intent");
     database.execute_batch("DROP TRIGGER refuse_external_forgetting;").unwrap();
     until("background reconciliation retries the remembered-row deletion", async || {
         let view = c.mounts().await.unwrap();

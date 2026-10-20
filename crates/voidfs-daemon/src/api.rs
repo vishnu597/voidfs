@@ -189,6 +189,9 @@ pub struct Mount {
     /// The drive's alias.
     pub drive: String,
     pub mountpoint: String,
+    /// Runtime attachment identity; changes after remount or daemon restart.
+    #[serde(default)]
+    pub instance: String,
     pub adapter: String,
     pub read_only: bool,
     /// `mounting`, `mounted` or `failed`.
@@ -231,6 +234,9 @@ pub struct Unmount {
     /// Explicitly eject even when the volume is busy. Omitted requests remain ordinary unmounts.
     #[serde(default)]
     pub force: bool,
+    /// Eject only the still-mounted attachment observed by the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_instance: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

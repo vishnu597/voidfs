@@ -189,12 +189,18 @@ impl DaemonClient {
 
     /// Unmounts and forgets a mountpoint, or every mount of a drive.
     pub async fn unmount(&self, target: &str) -> Result<api::Unmounted, ClientError> {
-        self.post("/v1/mounts/unmount", &api::Unmount { target: target.into(), force: false }).await
+        self.post("/v1/mounts/unmount", &api::Unmount { target: target.into(), force: false, expected_instance: None }).await
     }
 
     /// Explicitly force-unmounts a busy mountpoint, or every mount of a drive, and forgets it.
     pub async fn unmount_force(&self, target: &str) -> Result<api::Unmounted, ClientError> {
-        self.post("/v1/mounts/unmount", &api::Unmount { target: target.into(), force: true }).await
+        self.post("/v1/mounts/unmount", &api::Unmount { target: target.into(), force: true, expected_instance: None }).await
+    }
+
+    /// Ejects only one current attachment with this instance, optionally with explicit force.
+    /// A changed or missing attachment returns `MountChanged` without ejecting a replacement.
+    pub async fn unmount_if_instance(&self, target: &str, instance: &str, force: bool) -> Result<api::Unmounted, ClientError> {
+        self.post("/v1/mounts/unmount", &api::Unmount { target: target.into(), force, expected_instance: Some(instance.into()) }).await
     }
 }
 
