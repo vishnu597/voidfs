@@ -449,6 +449,31 @@ async fn a_local_mutation_wins_an_inflight_remote_snapshot() {
     f.queue.close().await;
 }
 
+/// Finder's xattr reads at 12 ms made 68 requests for 42 files: the kernel asks for a file's
+/// names and values at once (bench/results/finder-requests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_readers_share_one_remote_snapshot() {
+    let f = Fixture::new().await;
+    f.put("file", &[("user.tag", b"remote")]).await;
+    let proxy = AttrProxy::start(&f._server.endpoint).await;
+    let ns = Arc::new(f.session_with(client_for(&proxy.endpoint, Config::default())).await);
+    let file = ns.lookup(ns.root(), "file").await.unwrap();
+    proxy.state.hold_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    let value = { let ns = ns.clone(); tokio::spawn(async move { ns.getxattr(file.ino, "user.tag").await }) };
+    proxy.started().await;
+    let names = { let ns = ns.clone(); tokio::spawn(async move { ns.listxattr(file.ino).await }) };
+    let again = { let ns = ns.clone(); tokio::spawn(async move { ns.getxattr(file.ino, "user.tag").await }) };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(proxy.count(), 1, "readers of the same file must wait for its fetch, not make their own");
+    proxy.state.release.add_permits(1);
+    let done = Duration::from_secs(5);
+    assert_eq!(tokio::time::timeout(done, value).await.unwrap().unwrap().unwrap(), b"remote");
+    assert_eq!(tokio::time::timeout(done, names).await.unwrap().unwrap().unwrap(), vec!["user.tag".to_owned()]);
+    assert_eq!(tokio::time::timeout(done, again).await.unwrap().unwrap().unwrap(), b"remote");
+    assert_eq!(proxy.count(), 1);
+    f.queue.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_xattr_generation_races_have_a_bounded_retry_count() {
     let f = Fixture::new().await;

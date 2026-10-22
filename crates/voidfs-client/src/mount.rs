@@ -466,6 +466,18 @@ impl Drop for Closing<'_> {
 }
 struct Handles { next: u64, entries: std::collections::HashMap<Fh, Arc<Handle>> }
 
+/// Per-inode locks, each kept only while someone holds or waits for it.
+type InoLocks = Mutex<HashMap<Ino, Weak<tokio::sync::Mutex<()>>>>;
+
+/// The lock of `ino` in `locks`: the one already held or waited for, or a new one.
+fn ino_lock(locks: &InoLocks, ino: Ino) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = locks.lock().unwrap_or_else(|p| p.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = locks.get(&ino).and_then(Weak::upgrade).unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+    locks.insert(ino, Arc::downgrade(&lock));
+    lock
+}
+
 /// One drive's persistent namespace. The caller supplies its feed invalidations; opening a
 /// session distrusts persisted metadata online and retains complete snapshots for offline use.
 /// `drive` must be a stable canonical drive identifier, rather than a reusable display alias.
@@ -473,7 +485,9 @@ struct Handles { next: u64, entries: std::collections::HashMap<Fh, Arc<Handle>> 
 pub struct Session {
     store: Arc<Store>, client: Client, drive: String, root: Ino, connectivity: Connectivity,
     cache: Cache, generation: u32, handles: Mutex<Handles>,
-    refresh: Mutex<HashMap<Ino, Weak<tokio::sync::Mutex<()>>>>,
+    refresh: InoLocks,
+    /// Readers of an inode's xattrs share one remote fetch (`mount_xattrs`).
+    xattr_fetches: InoLocks,
     queue: Option<crate::Queue>,
     data: Arc<data::Staged>,
     local: Arc<notify::Observer>,
@@ -512,7 +526,8 @@ impl Session {
         let local = Arc::new(notify::Observer::default());
         let data = data::Staged::load(store.clone(), drive.to_owned(), root, None, StagingConfig::default(), cache.clone(), lease, local.clone()).await?;
         Ok(Self { store, client, drive: drive.to_owned(), root, connectivity, cache, generation,
-            handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()), queue: None, data, local })
+            handles: Mutex::new(Handles { next: 1, entries: Default::default() }), refresh: Mutex::new(HashMap::new()),
+            xattr_fetches: Mutex::new(HashMap::new()), queue: None, data, local })
     }
 
     /// A writable session on the daemon's queue and state store. One writer owns each drive;
@@ -556,6 +571,16 @@ impl Session {
         let d = self.drive.clone();
         let root = self.root;
         Ok(tokio::task::spawn_blocking(move || s.with(|c| f(c, &d, root))).await.map_err(Error::from)??)
+    }
+
+    /// As `db`, but its commit doesn't wait for the disk (`synchronous=NORMAL`): only for what
+    /// can be fetched again if a crash loses it, never for the journal or this Mac's changes. A
+    /// later full commit makes it durable too, since the log keeps commits in order.
+    async fn db_cache<T: Send + 'static>(&self, f: impl FnOnce(&mut Connection, &str, Ino) -> rusqlite::Result<T> + Send + 'static) -> Result<T> {
+        let s = self.store.clone();
+        let d = self.drive.clone();
+        let root = self.root;
+        Ok(tokio::task::spawn_blocking(move || s.with_normal(|c| f(c, &d, root))).await.map_err(Error::from)??)
     }
 
     /// `work`, unless the server answers nothing at all, to anyone, for the link's patience: a
@@ -863,13 +888,7 @@ impl Session {
     }
 
     async fn refresh_dir(&self, dir: Ino) -> Result<()> {
-        let lock = {
-            let mut locks = self.refresh.lock().unwrap_or_else(|p| p.into_inner());
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            let lock = locks.get(&dir).and_then(Weak::upgrade).unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
-            locks.insert(dir, Arc::downgrade(&lock));
-            lock
-        };
+        let lock = ino_lock(&self.refresh, dir);
         let _refresh = lock.lock().await;
         for _ in 0..4 {
             let state = self.db(move |c, d, root| {
