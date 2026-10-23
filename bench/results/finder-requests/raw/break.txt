@@ -1,0 +1,14 @@
+# The failure proof for concurrent_readers_share_one_remote_snapshot, 22 October.
+# Break: readers made not to share (`let lock = (share && false).then(...)` in xattr_snapshot),
+# which is the old code's behaviour: no lock, each reader fetches. Then restored byte for byte.
+$ cargo test -p voidfs-client --test mount_xattrs concurrent_readers
+test concurrent_readers_share_one_remote_snapshot ... FAILED
+thread 'concurrent_readers_share_one_remote_snapshot' (4128043) panicked at crates/voidfs-client/tests/mount_xattrs.rs:467:5:
+assertion `left == right` failed: readers of the same file must wait for its fetch, not make their own
+  left: 3
+ right: 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.61s
+
+# Restored (the break's line gone, `grep -c 'share && false'` printed 0):
+$ cargo test -p voidfs-client --test mount_xattrs
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s

@@ -50,11 +50,18 @@ fn same_snapshot(a: &Node, b: &Node) -> bool {
 }
 
 impl Session {
-    async fn xattr_snapshot(&self, ino: Ino) -> Result<(Node, String, Xattrs)> {
+    /// The inode's complete map. Readers (`share`) wait for one another's remote fetch and find
+    /// its map, so the kernel's getxattr and listxattr of one file, which arrive together, cost
+    /// one request; a change never waits behind a read's fetch.
+    async fn xattr_snapshot(&self, ino: Ino, share: bool) -> Result<(Node, String, Xattrs)> {
+        let lock = share.then(|| ino_lock(&self.xattr_fetches, ino));
+        let _shared = match &lock { Some(lock) => Some(lock.lock().await), None => None };
         for _ in 0..4 {
             self.ancestors(ino).await?;
             let offline = self.connectivity.link() == Link::Offline;
-            let state = self.db(move |c, d, root| {
+            // A clean map is a cache: saving it needn't wait for the disk (about 5 ms of the
+            // 9.8 ms a file took in `ls -l@`, bench/results/finder-requests).
+            let state = self.db_cache(move |c, d, root| {
                 let tx = c.transaction()?;
                 let state = (|| {
                     let (n, key) = mutation_node(&tx, d, root, ino, offline)?;
@@ -101,7 +108,7 @@ impl Session {
             }).collect::<Result<_>>()?;
             if !valid_xattrs(&attrs) { return Err(FsError::Io("invalid remote extended attributes".into())); }
             let old_key = key.clone();
-            let accepted = self.db(move |c, d, root| {
+            let accepted = self.db_cache(move |c, d, root| {
                 let tx = c.transaction()?;
                 let state = (|| {
                     let (current, current_key) = mutation_node(&tx, d, root, ino, offline)?;
@@ -122,13 +129,13 @@ impl Session {
     /// Returns raw bytes, including an empty value. A missing name is ENOATTR/ENODATA.
     pub async fn getxattr(&self, ino: Ino, name: &str) -> Result<Vec<u8>> {
         if !valid_xattr_name(name) { return Err(FsError::InvalidName); }
-        let (_, _, mut attrs) = self.xattr_snapshot(ino).await?;
+        let (_, _, mut attrs) = self.xattr_snapshot(ino, true).await?;
         attrs.remove(name).ok_or(FsError::NoAttr)
     }
 
     /// Sorted byte-exact names from one complete local or pinned remote xattr snapshot.
     pub async fn listxattr(&self, ino: Ino) -> Result<Vec<String>> {
-        Ok(self.xattr_snapshot(ino).await?.2.into_keys().collect())
+        Ok(self.xattr_snapshot(ino, true).await?.2.into_keys().collect())
     }
 
     /// Updates the durable local map and its guarded journal entry in one transaction.
@@ -148,7 +155,7 @@ impl Session {
         if ino == self.root { return Err(FsError::Unsupported); }
         for _ in 0..4 {
             match self.prepare_mutation(ino).await { Err(FsError::Again) => continue, other => other? }
-            let (snapshot, key, _) = match self.xattr_snapshot(ino).await {
+            let (snapshot, key, _) = match self.xattr_snapshot(ino, false).await {
                 Err(FsError::Again) => continue, other => other?,
             };
             let drive = self.drive.clone();
