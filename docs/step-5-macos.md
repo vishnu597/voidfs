@@ -96,6 +96,11 @@ fixture cleanup passed, and the final plug-in inventory contains only the instal
 This later section updates the
 dated approval, sign-in and native-dialog coverage limits below; the `/Volumes`
 helper and the other remaining item 7 decisions are still open.
+**Item 9's measurements are recorded** ([22 October](#finders-request-counts-22-october)): a
+Finder window asks only about the files it shows, one listing page per 1,000 names plus attrs for
+its visible rows, whether the folder holds 1,000 files or 10,000. Two daemon costs the run exposed
+are fixed. `ls -l@` and file indexers still make one attrs request per file with xattrs, and whether
+to propose xattrs in `?x-voidfs-list` is the user's decision.
 The later deliverables remain an implementation plan; no platform service installation, new
 protocol field or format feature is delivered by these slices.*
 
@@ -502,6 +507,12 @@ and states survive app/bridge/daemon restart. Badge requests for a folder do not
 request per file. The app stays usable while offline and while a large upload runs.
 
 ### Item 9. Protocol additions only where measured
+
+**Measured, 22 October; not complete:** request counts and timings for 1,000- and 10,000-file
+folders, plain and xattr-heavy, are recorded for Finder and the shell
+([Finder's request counts](#finders-request-counts-22-october)). Memoization bounds a Finder
+window's requests by what it shows; whole-folder walkers still make one attrs request per file
+with xattrs. Proposing the listing RFC is the user's decision.
 
 The spike proposed xattr names in `?x-voidfs-list` so provenance-bearing folders avoid an attrs
 request per file. Begin with memoized/batched metadata and measure Finder's request count. If
@@ -3379,3 +3390,54 @@ native sign-in and the confirmation dialog were not covered. They do not repeat 
 establish a clean-Mac install or cover another Mac. Application buffers and unsynchronized mmap
 stores remain outside acknowledged-write guarantees. The `/Volumes` decision, other item 7
 work and the existing FSKit/application limitations remain; item 7 and step 5 are not complete.
+
+### Finder's request counts, 22 October
+
+Item 9 asks for request counts and timings on 1,000- and 10,000-file listings and xattr-heavy
+Finder folders before any protocol field. The user approved a live run. The installed notarized
+app (`45c449f`) mounted a throwaway loopback drive through its own FSKit module and bridge, with
+the daemon on a private state directory and every request passing through a logging relay
+([`request-relay.py`](../apps/macos/scripts/request-relay.py)). The drive
+([`finder_seed`](../crates/voidfs-sdk/examples/finder_seed.rs)) held folders of 1,000 and 10,000
+small files, plain and with the xattrs downloads carry: provenance on every file, quarantine and
+where-froms on every third, a colour label and a tag on every tenth.
+[`finder-requests.py`](../apps/macos/scripts/finder-requests.py) opened 1000 × 700 point Finder
+windows in list and icon view and ran `ls -l@` and getattrlistbulk, each from a cold daemon, with
+no delay and with every request held 12 ms in the relay.
+
+- **Finder asks about the files it shows.** A cold list window cost one listing page per 1,000
+  names and attrs for the 31 visible files, for 1,000 and for 10,000 files alike. Icon view read
+  42 files' attrs and their bytes for thumbnails. Reopening read the next 44 rows, or 7 more icons.
+  A plain folder, whose listing says no file has xattrs, made no attrs request. A remount with the
+  daemon's state kept brought only the listing pages again.
+- **Finder's spans are its own pacing.** It asked for the visible files 0.2–0.6 s after the
+  listing for 1,000 files and 2.3–5.8 s after for 10,000. A cold window's requests were done within
+  1.0–1.5 s and 2.9–6.9 s.
+- **Walkers pay one request per file with xattrs, one at a time.** `ls -l@` made 1,000 attrs
+  requests for 1,000 such files: 8.8 s on loopback, 25.1 s at 12 ms. For 10,000 files it took
+  84.6 s and 245.4 s. getattrlistbulk, Finder's listing call, took 0.08–0.6 s over the same folders.
+  Raycast's file indexer walked the whole drive (11,000 attrs requests in 49 s) after each cold
+  mount under `~/voidfs`. The measurements used a hidden mountpoint, which it left alone.
+- **Two costs were the daemon's, fixed in `5e8a907`.** Readers of one file each fetched its map,
+  so Finder's first look made up to 68 attrs requests for 42 files at 12 ms. Readers now share one
+  fetch; a regression test, broken and restored, makes 3 requests without the fix and 1 with it.
+  Each clean map was also saved with a full sync, about 5 ms a file. It is a cache, fetched again
+  if a crash loses it, so it is now saved on the store's NORMAL connection like staged writes.
+  Alternating old and new daemons, `ls -l@` over 1,000 files went from 9.8 s to 4.7–5.0 s on
+  loopback and from 25.6 s to 21.6 s at 12 ms. Finder's cold windows then made one attrs request
+  per visible file.
+
+Local memoization meets item 9's need for Finder windows: their requests are bounded by the
+window, and a second look costs none. It doesn't for whole-folder walkers such as `ls -l@`,
+indexers and backup tools, which still make one attrs request per file with xattrs, about 21 s
+per 1,000 files at a 12 ms round trip. Only xattr names, and small values, in `?x-voidfs-list`
+would remove that, through the RFC this item describes. Whether to propose it is the user's
+decision; until then item 9 stays open with its measurements recorded. No protocol, spec or app
+change was made, and nothing was installed or registered.
+
+The run used one Mac, a loopback server, and a fixed 12 ms hold in a Python relay rather than a
+network. It covered list and icon view at one window size, one Finder run each, and no column
+view, Quick Look or Get Info. The remaining 4 ms a file on this Mac (kernel, FSKit, bridge, daemon
+and relay) wasn't broken down. The rig was restored: no state override, the agent running, no
+mount, daemon or listeners, no default state directory, and the rig's folder deleted after the
+evidence was copied ([evidence, method and scripts](../bench/results/finder-requests/README.md)).
